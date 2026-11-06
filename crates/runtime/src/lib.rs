@@ -5,6 +5,7 @@
 //! `gyroship_*` symbols below.
 
 pub mod harness;
+pub mod interp;
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -90,7 +91,9 @@ pub fn lookup(addr: u64) -> Option<Guest> {
     t.binary_search_by_key(&addr, |e| e.0).ok().map(|i| t[i].1)
 }
 
-/// Instructions the generator did not translate, counted (ponytail: counted, not yet logged one by one).
+/// Untranslated instructions the interpreter executed.
+pub static INTERPRETED: AtomicU64 = AtomicU64::new(0);
+/// Untranslated instructions the interpreter does not cover either (each logged once).
 pub static UNHANDLED: AtomicU64 = AtomicU64::new(0);
 
 /// Calls the guest function at `target` through the dispatch table.
@@ -105,9 +108,28 @@ pub unsafe extern "C" fn gyroship_call(cpu: *mut Cpu, target: u64) {
     }
 }
 
+/// An instruction the generator did not translate: the interpreter runs it.
+///
+/// # Safety
+/// `cpu` must point to a valid context.
 #[unsafe(no_mangle)]
-pub extern "C" fn gyroship_unhandled(_cpu: *mut Cpu, _pc: u64, _word: u32) {
-    UNHANDLED.fetch_add(1, Ordering::Relaxed);
+pub unsafe extern "C" fn gyroship_unhandled(cpu: *mut Cpu, pc: u64, word: u32) {
+    static LOGGED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+    // SAFETY: guaranteed by the caller.
+    let c = unsafe { &mut *cpu };
+    match interp::execute(c, pc, word) {
+        Ok(()) => {
+            INTERPRETED.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(why) => {
+            UNHANDLED.fetch_add(1, Ordering::Relaxed);
+            let mut logged = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
+            if !logged.contains(&word) {
+                logged.push(word);
+                eprintln!("gyroship: instruction {word:08x} at {pc:#x} is not executed: {why}");
+            }
+        }
+    }
 }
 
 #[unsafe(no_mangle)]

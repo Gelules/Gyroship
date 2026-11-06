@@ -7,3 +7,4 @@ publish.workspace = true
 
 [dependencies]
 gyroship-loader = { version = "0.1.0", path = "../loader" }
+gyroship-analysis = { version = "0.1.0", path = "../analysis" }
