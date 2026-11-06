@@ -99,9 +99,10 @@ impl Applet {
                 }
                 None => Reply::error(NO_MESSAGE),
             },
-            // GetOperationMode: docked (1); GetPerformanceMode: boost (1).
-            (Applet::CommonState { .. }, 5) => Reply::with(&[1]),
-            (Applet::CommonState { .. }, 6) => Reply::with(&1u32.to_le_bytes()),
+            // GetOperationMode: handheld (0); GetPerformanceMode: normal (0), as Lichii,
+            // which reaches the title screen so.
+            (Applet::CommonState { .. }, 5) => Reply::with(&[0]),
+            (Applet::CommonState { .. }, 6) => Reply::with(&0u32.to_le_bytes()),
             // GetCurrentFocusState.
             (Applet::CommonState { .. }, 9) => Reply::with(&[IN_FOCUS]),
             // SetCpuBoostMode, SetRequestExitToLibraryAppletAtExecuteNextProgramEnabled.
@@ -148,6 +149,18 @@ impl Applet {
             }
             // GetGpuErrorDetectedSystemEvent.
             (Applet::Functions { .. }, 130) => Reply { copy_handles: vec![k.new_event_handle()?], ..Reply::ok() },
+            // IApplicationProxy 60 (Switch 2), a graphics scale controller:
+            // SetGraphicsScaleChangedNotificationEnabled, GetCurrentGraphicsScale (Lichii's 10).
+            (Applet::Unknown(60), 1050) => Reply::ok(),
+            (Applet::Unknown(60), 10) => Reply::with(&10u32.to_le_bytes()),
+            // EnsureSaveData: nothing more to allocate.
+            (Applet::Functions { .. }, 20) => Reply::with(&0u64.to_le_bytes()),
+            // NotifyRunning: not "becoming foreground" again.
+            (Applet::Functions { .. }, 40) => Reply::with(&[0]),
+            // GetFriendInvitationStorageChannelEvent: never signaled.
+            (Applet::Functions { .. }, 140) => Reply { copy_handles: vec![k.lone_event()?], ..Reply::ok() },
+            // 210 (Switch 2): an event, the operation mode refresh by Lichii's guess; never signaled.
+            (Applet::Functions { .. }, 210) => Reply { copy_handles: vec![k.lone_event()?], ..Reply::ok() },
             // Switch 2 320 and 321: two booleans, both off.
             (Applet::Functions { .. }, 320 | 321) => Reply::with(&[0]),
             // GetPseudoDeviceId: a fixed id derived from the run's seed.

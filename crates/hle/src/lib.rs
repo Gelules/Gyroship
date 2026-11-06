@@ -10,6 +10,7 @@ pub mod boot;
 pub mod bsd;
 pub mod fs;
 pub mod gs;
+pub mod hid;
 pub mod ipc;
 pub mod journal;
 pub mod nvdrv;
@@ -84,11 +85,13 @@ pub struct Config {
     pub non_system_memory: u64,
     /// Stop the run past this virtual time (ticks).
     pub time_limit: Option<u64>,
+    /// End the run after this many presented frames.
+    pub frames: Option<u64>,
 }
 
 impl Default for Config {
     fn default() -> Config {
-        Config { seed: 0x5EED, explore: false, non_system_memory: 0x2_6410_0000, time_limit: None }
+        Config { seed: 0x5EED, explore: false, non_system_memory: 0x2_6410_0000, time_limit: None, frames: None }
     }
 }
 
@@ -119,6 +122,8 @@ pub struct Kernel {
     pub romfs: Option<fs::RomFs>,
     /// State the graphics sessions share.
     pub gs: gs::State,
+    /// hid's shared memory, once a client asked for it.
+    pub hid_shared: Option<usize>,
 }
 
 /// Exit code of a run the HLE stops (an unknown or forbidden SVC, a guest
@@ -129,7 +134,7 @@ impl Kernel {
     pub fn new(mem: Memory, mut journal: Journal, config: Config) -> Kernel {
         let mode = if config.explore { "exploration (not a validation run)" } else { "strict" };
         journal.line(0, 0, &format!("gyroship hle: mode {mode}, seed {:#x}, non-system memory {:#x}", config.seed, config.non_system_memory));
-        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None, sessions: Vec::new(), objects: Vec::new(), domains: Vec::new(), allowed_services: Vec::new(), shared: Vec::new(), transfers: Vec::new(), time_shared: None, frame: (0, 0, 0), symbols: Vec::new(), romfs: None, gs: gs::State::default() }
+        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None, sessions: Vec::new(), objects: Vec::new(), domains: Vec::new(), allowed_services: Vec::new(), shared: Vec::new(), transfers: Vec::new(), time_shared: None, frame: (0, 0, 0), symbols: Vec::new(), romfs: None, gs: gs::State::default(), hid_shared: None }
     }
 
     /// Logs a line for the running thread (0 when none runs).
@@ -153,7 +158,11 @@ impl Kernel {
     /// chain (x29 -> [previous x29, return address]), each with the nearest
     /// exported symbol.
     pub fn backtrace(&self) -> Vec<String> {
-        let (pc, lr, mut fp) = self.frame;
+        self.backtrace_from(self.frame)
+    }
+
+    /// The same, from a given (pc, lr, x29).
+    pub fn backtrace_from(&self, (pc, lr, mut fp): (u64, u64, u64)) -> Vec<String> {
         let mut addrs = vec![pc, lr];
         for _ in 0..24 {
             let mut b = [0; 16];
@@ -189,7 +198,34 @@ thread_local! {
 /// Makes `kernel` the one this thread's guest code talks to.
 pub fn install(kernel: Kernel) {
     KERNEL.with(|k| *k.borrow_mut() = Some(kernel));
-    gyroship_runtime::set_hooks(Hooks { svc: on_svc, counter: on_counter, wait: on_wait, probe: boot::on_probe });
+    gyroship_runtime::set_hooks(Hooks { svc: on_svc, counter: on_counter, wait: on_wait, probe: boot::on_probe, fault: on_fault });
+}
+
+/// A guest fault: the message and the stack at the last SVC go to the
+/// journal, which is flushed (the runtime exits next). Guest code faults
+/// outside any kernel borrow; if one is held, nothing is written.
+fn on_fault(what: &str) {
+    KERNEL.with(|k| {
+        if let Ok(mut k) = k.try_borrow_mut()
+            && let Some(k) = k.as_mut()
+        {
+            k.log(what);
+            // The faulting thread's lr and frame chain (registers live in its context).
+            if let Some(t) = k.sched.current {
+                // SAFETY: the running thread's context; its code is stopped in the fault.
+                let (lr, fp) = unsafe { ((*k.sched.threads[t].cpu).x[30], (*k.sched.threads[t].cpu).x[29]) };
+                k.log("stack at the fault (lr, then the frame chain):");
+                for line in k.backtrace_from((lr, lr, fp)).into_iter().skip(1) {
+                    k.log(&line);
+                }
+            }
+            k.log("stack at the last SVC:");
+            for line in k.backtrace() {
+                k.log(&line);
+            }
+            k.journal.flush();
+        }
+    });
 }
 
 /// Takes this thread's kernel back.

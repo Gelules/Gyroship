@@ -413,6 +413,10 @@ unsafe extern "system" fn on_exception(info: *mut EXCEPTION_POINTERS) -> i32 {
     };
     let rip = rec.ExceptionAddress as u64;
     let near = crate::function_at_host(rip).map_or_else(|| "none".to_string(), |g| format!("{g:#x}"));
-    eprintln!("gyroship: guest fault: {kind} at guest address {:#x} (nearest recompiled function: {near})", host - base);
+    let what = format!("guest fault: {kind} at guest address {:#x} (nearest recompiled function: {near})", host - base);
+    eprintln!("gyroship: {what}");
+    if let Some(h) = crate::HOOKS.get() {
+        (h.fault)(&what);
+    }
     std::process::exit(FAULT_EXIT);
 }

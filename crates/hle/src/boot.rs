@@ -169,6 +169,12 @@ pub(crate) unsafe fn on_probe(cpu: *mut Cpu, pc: u64, name: &str) {
     crate::with(|k| {
         let caller = k.symbolize(lr);
         k.log(&format!("probe {name} at {pc:#x}: x0={:#x} x1={:#x} x2={:#x} x3={:#x}, called from {lr:#x} {caller}", x[0], x[1], x[2], x[3]));
+        // Probes named `stack:...` also log their frame chain.
+        if name.starts_with("stack:") {
+            for line in k.backtrace_from((pc, lr, x[29])) {
+                k.log(&line);
+            }
+        }
         if name == ORACLE_PROBE {
             k.check_oracle();
         }
@@ -176,8 +182,9 @@ pub(crate) unsafe fn on_probe(cpu: *mut Cpu, pc: u64, name: &str) {
 }
 
 /// The generated harness's `main`: `boot <exefs> [--log FILE] [--explore]
-/// [--all-svcs] [--seconds N]` runs the game (for N virtual seconds, 60 by
-/// default); any other mode is the runtime's.
+/// [--all-svcs] [--seconds N] [--frames N]` runs the game (for N virtual
+/// seconds, 60 by default, or until N frames are presented); any other mode
+/// is the runtime's.
 pub fn main(table: Vec<rt::Entry>) {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) != Some("boot") {
@@ -193,7 +200,8 @@ pub fn main(table: Vec<rt::Entry>) {
     journal.all_svcs = flag("--all-svcs");
     // A virtual time limit, 60 s unless --seconds says otherwise.
     let seconds: u64 = args.iter().position(|a| a == "--seconds").and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()).unwrap_or(60);
-    let config = Config { explore: flag("--explore"), time_limit: Some(seconds * 31_250_000), ..Config::default() };
+    let frames: Option<u64> = args.iter().position(|a| a == "--frames").and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok());
+    let config = Config { explore: flag("--explore"), time_limit: Some(seconds * 31_250_000), frames, ..Config::default() };
     let installed = table.len();
     rt::install(table);
     mem::install_fault_handler();

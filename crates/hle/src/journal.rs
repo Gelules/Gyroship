@@ -13,6 +13,7 @@ enum Sink {
 pub struct Journal {
     sink: Sink,
     seen: BTreeSet<String>,
+    counts: std::collections::BTreeMap<String, u32>,
     /// Every SVC, instead of the first of each kind.
     pub all_svcs: bool,
 }
@@ -20,11 +21,11 @@ pub struct Journal {
 impl Journal {
     /// A journal kept in memory (tests).
     pub fn memory() -> Journal {
-        Journal { sink: Sink::Memory(Vec::new()), seen: BTreeSet::new(), all_svcs: false }
+        Journal { sink: Sink::Memory(Vec::new()), seen: BTreeSet::new(), counts: Default::default(), all_svcs: false }
     }
 
     pub fn file(path: &std::path::Path) -> std::io::Result<Journal> {
-        Ok(Journal { sink: Sink::File(std::io::BufWriter::new(std::fs::File::create(path)?)), seen: BTreeSet::new(), all_svcs: false })
+        Ok(Journal { sink: Sink::File(std::io::BufWriter::new(std::fs::File::create(path)?)), seen: BTreeSet::new(), counts: Default::default(), all_svcs: false })
     }
 
     /// Logs one line at virtual time `time` for guest thread `thread`.
@@ -41,6 +42,13 @@ impl Journal {
     /// Whether `key` is new; it is then remembered.
     pub fn first(&mut self, key: &str) -> bool {
         !self.seen.contains(key) && self.seen.insert(key.to_string())
+    }
+
+    /// Whether `key` has been seen fewer than `n` times; counts this one.
+    pub fn few(&mut self, key: &str, n: u32) -> bool {
+        let c = self.counts.entry(key.to_string()).or_insert(0);
+        *c += 1;
+        *c <= n
     }
 
     /// What a memory journal holds so far.

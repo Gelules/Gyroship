@@ -231,6 +231,9 @@ pub struct Hooks {
     pub wait: unsafe fn(*mut Cpu, u32),
     /// The first pass at a probe (`pc`, its name).
     pub probe: unsafe fn(*mut Cpu, u64, &str),
+    /// A guest fault (its message), just before the process exits: a last
+    /// chance to write the journal.
+    pub fault: fn(&str),
 }
 
 static HOOKS: OnceLock<Hooks> = OnceLock::new();

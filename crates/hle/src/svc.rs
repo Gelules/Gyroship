@@ -195,7 +195,12 @@ impl Kernel {
             0x12 => (self.clear_event(a[0] as u32), 0, format!("{:#x}", a[0] as u32)),
             0x16 => (self.close_handle(a[0] as u32), 0, format!("{:#x}", a[0] as u32)),
             0x17 => (self.reset_signal(a[0] as u32), 0, format!("{:#x}", a[0] as u32)),
-            0x18 => (self.wait_synchronization(cpu, a[1], a[2] as u32, a[3] as i64), 0, format!("{} handles at {:#x} timeout {}", a[2] as u32, a[1], a[3] as i64)),
+            0x18 => {
+                let mut first = [0; 4];
+                let _ = self.mem.read(a[1], &mut first);
+                let detail = format!("{} handles at {:#x} (first {:#x}) timeout {}", a[2] as u32, a[1], u32::from_le_bytes(first), a[3] as i64);
+                (self.wait_synchronization(cpu, a[1], a[2] as u32, a[3] as i64), 0, detail)
+            }
             0x19 => (self.cancel_synchronization(a[0] as u32), 0, format!("{:#x}", a[0] as u32)),
             0x1A => (self.arbitrate_lock(a[0] as u32, a[1], a[2] as u32), 0, format!("owner {:#x} at {:#x} tag {:#x}", a[0] as u32, a[1], a[2] as u32)),
             0x1B => (self.arbitrate_unlock(a[0]), 0, format!("{:#x}", a[0])),
@@ -241,7 +246,8 @@ impl Kernel {
         // failure but those the SDK expects of futexes and waits.
         let expected = matches!(result, SUCCESS | INVALID_STATE | TIMED_OUT | CANCELLED);
         let key = format!("{imm:#x} {kind:#x} {result:#x}");
-        if !expected || kind == u64::MAX || self.journal.all_svcs || self.journal.first(&key) {
+        // Unexpected failures: their first four occurrences.
+        if self.journal.all_svcs || self.journal.first(&key) || kind == u64::MAX || (!expected && self.journal.few(&key, 4)) {
             let status = if result == SUCCESS { String::new() } else { format!(" -> {result:#x}") };
             self.log(&format!("{call} {detail}{status}"));
         }
