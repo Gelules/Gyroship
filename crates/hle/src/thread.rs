@@ -157,6 +157,32 @@ pub enum Outcome {
     Deadlock(String),
 }
 
+/// A periodic virtual timer: its k-th deadline is `start + k × num / den`
+/// ticks, computed from `k` each time so that rounding never accumulates.
+#[derive(Clone, Copy, Debug)]
+pub struct Timer {
+    pub start: u64,
+    pub k: u64,
+    pub num: u64,
+    pub den: u64,
+    pub action: TimerAction,
+}
+
+impl Timer {
+    pub fn at(&self) -> u64 {
+        self.start + (u128::from(self.k) * u128::from(self.num) / u128::from(self.den)) as u64
+    }
+}
+
+/// What a timer does at its deadline (plain data).
+#[derive(Clone, Copy, Debug)]
+pub enum TimerAction {
+    /// The silent audio sink of an audsmx stream: the ring's read index
+    /// (+0x44) takes the write index (+0x1004) if valid, then the stream's
+    /// data event (`Kernel::events` index) is signaled.
+    AudioSink { ring: u64, slots: u32, event: usize },
+}
+
 /// The scheduler's state, inside the kernel.
 #[derive(Default)]
 pub struct Sched {
@@ -406,6 +432,20 @@ impl Kernel {
                 }
             }
             let deadline = self.sched.threads.iter().filter(|t| t.state == State::Waiting).filter_map(|t| t.deadline).min();
+            // A timer fires when it comes before every thread start and deadline; when
+            // nothing else could ever run, only if a thread waits for its event (else the
+            // run is deadlocked, and firing it would loop forever).
+            if let Some((at, i)) = self.timers.iter().enumerate().map(|(i, t)| (t.at(), i)).min()
+                && best.is_none_or(|b| at < b.2)
+                && deadline.is_none_or(|d| at < d)
+                && (best.is_some() || deadline.is_some() || self.timer_awaited(i))
+            {
+                if self.config.time_limit.is_some_and(|l| at > l) {
+                    self.stop(crate::STOP_EXIT, "the run reached its virtual time limit");
+                }
+                self.fire(i, at);
+                continue;
+            }
             match (best, deadline) {
                 (b, Some(d)) if b.is_none_or(|b| d < b.2) => {
                     let due: Vec<usize> = (0..self.sched.threads.len()).filter(|&t| self.sched.threads[t].state == State::Waiting && self.sched.threads[t].deadline == Some(d)).collect();
@@ -423,6 +463,36 @@ impl Kernel {
                 (None, _) => return None,
             }
         }
+    }
+
+    /// Whether a thread waits for the event timer `i` signals.
+    fn timer_awaited(&self, i: usize) -> bool {
+        let TimerAction::AudioSink { event, .. } = self.timers[i].action;
+        self.sched.threads.iter().any(|t| t.state == State::Waiting && matches!(&t.wait, Wait::Sync(list) if list.contains(&Object::ReadableEvent(event))))
+    }
+
+    /// Timer `i` reaches its deadline `at`: its action runs, the threads it
+    /// wakes start at `at`, and it rearms.
+    fn fire(&mut self, i: usize, at: u64) {
+        let was_ready: Vec<bool> = self.sched.threads.iter().map(|t| t.state == State::Ready).collect();
+        let TimerAction::AudioSink { ring, slots, event } = self.timers[i].action;
+        // The silent sink plays everything written: the read index catches up with the write index.
+        let mut w = [0; 4];
+        let write = self.mem.read(ring + 0x1004, &mut w).map(|()| u32::from_le_bytes(w)).unwrap_or(u32::MAX);
+        if write < slots {
+            let _ = self.mem.write(ring + 0x44, &write.to_le_bytes());
+        }
+        self.signal_event(event);
+        let k = self.timers[i].k;
+        if k == 1 || k.is_multiple_of(100) {
+            self.journal.line(at, 0, &format!("audio sink: tick {k} read index -> {write}"));
+        }
+        for (t, was) in was_ready.into_iter().enumerate() {
+            if !was && self.sched.threads[t].state == State::Ready {
+                self.sched.threads[t].ready_at = at;
+            }
+        }
+        self.timers[i].k += 1;
     }
 
     /// When core `c` can start its next thread, and which: the highest

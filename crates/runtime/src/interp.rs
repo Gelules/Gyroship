@@ -938,6 +938,8 @@ fn exec(c: &mut Cpu, _pc: u64, i: &Instruction) -> Result {
             Ok(())
         }
 
+        // SQSHL by register (vector); the immediate form is a shift_imm.
+        C::SQSHL if matches!(o[2], O::SIMDRegisterElements(..)) => int_vector(c, i),
         // Scalar pairwise add: ADDP d0, v1.2d adds the two 64-bit lanes.
         C::ADDP if matches!(o[0], O::SIMDRegister(..)) => {
             let ((d, _), (a, _, _)) = (scalar(&o[0])?, vec(&o[1])?);
@@ -1244,7 +1246,7 @@ fn int_vector(c: &mut Cpu, i: &Instruction) -> Result {
     let signed = matches!(
         i.opcode,
         C::SMAX | C::SMIN | C::SQADD | C::SQSUB | C::SHADD | C::SHSUB | C::SRHADD | C::SABD | C::SABA | C::CMGE | C::CMGT | C::CMLE | C::CMLT
-            | C::SQDMULH | C::SQRDMULH | C::SSHL | C::NEG | C::ABS
+            | C::SQDMULH | C::SQRDMULH | C::SSHL | C::SQSHL | C::NEG | C::ABS
     );
     let n = lanes(q, e);
     let mut r = 0;
@@ -1287,6 +1289,19 @@ fn int_vector(c: &mut Cpu, i: &Instruction) -> Result {
                     0
                 } else {
                     x >> -s
+                }
+            }
+            // Saturating shift left by register (the low byte, signed): negative shifts right.
+            C::SQSHL => {
+                let s = sext(y & 0xFF, 8);
+                if s < 0 {
+                    (sx >> (-s).min(i64::from(e) - 1)) as u64
+                } else if sx == 0 {
+                    0
+                } else if s >= i64::from(e) {
+                    saturate(if sx > 0 { i128::MAX } else { i128::MIN }, e, true)
+                } else {
+                    saturate(sx << s, e, true)
                 }
             }
             C::ADDP | C::UMAXP | C::UMINP => {

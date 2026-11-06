@@ -48,6 +48,11 @@ fn vector_lanes() {
     c.vr[1] = 5 << 64 | 7;
     run(&mut c, 0x5ef1b820); // addp d0, v1.2d
     assert_eq!(c.vr[0], 12, "the two lanes' sum, the rest cleared");
+
+    c.vr[4] = lanes32([1, 0x4000_0000, 0xffff_ffff, 100]);
+    c.vr[3] = lanes32([1, 1, 1, 0xff]); // shifts 1, 1, 1, -1
+    run(&mut c, 0x4ea34c84); // sqshl v4.4s, v4.4s, v3.4s
+    assert_eq!(c.vr[4], lanes32([2, 0x7fff_ffff, 0xffff_fffe, 50]), "saturated left, arithmetic right");
 }
 
 #[test]

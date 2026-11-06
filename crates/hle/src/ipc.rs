@@ -324,12 +324,21 @@ impl Kernel {
         let target = match (session.domain, req.object) {
             (Some(d), Some(id)) => {
                 if req.close_object {
-                    self.domains[d].objects.remove(&id);
+                    let known = self.domains[d].objects.remove(&id).is_some();
+                    if self.journal.all_svcs || !known {
+                        self.log(&format!("ipc domain {d}: close object {id}{}", if known { "" } else { " (unknown)" }));
+                    }
                     return (Reply::ok(), Vec::new());
                 }
                 match self.domains[d].objects.get(&id) {
                     Some(&o) => o,
-                    None => return (Reply::error(crate::result::INVALID_HANDLE), Vec::new()),
+                    None => {
+                        if self.journal.few("ipc unknown domain object", 8) {
+                            let ids: Vec<u32> = self.domains[d].objects.keys().copied().collect();
+                            self.log(&format!("ipc domain {d}: command {} for unknown object {id} (known {ids:?})", req.command));
+                        }
+                        return (Reply::error(crate::result::INVALID_HANDLE), Vec::new());
+                    }
                 }
             }
             _ => session.object,

@@ -191,8 +191,36 @@ unsafe extern "C" fn waiter(cpu: *mut Cpu, _: u64) {
     }
 }
 
+// A timer: the silent audio sink over a ring at DATA (read index +0x44,
+// write index +0x1004), every 1000 ticks.
+const TIMED: u64 = 0x1800;
+const RING: u64 = DATA;
+unsafe extern "C" fn timed(cpu: *mut Cpu, _: u64) {
+    unsafe {
+        use gyroship_hle::thread::{Timer, TimerAction};
+        use gyroship_runtime::mem::{Block, perm, state};
+        let start = now(cpu);
+        let r = gyroship_hle::with(|k| {
+            k.mem.map(DATA + 0x1000, 0x1000, Block::new(state::NORMAL, perm::RW)).unwrap();
+            let (w, r) = k.create_event().unwrap();
+            k.handles.close(w);
+            let event = k.event_of(r).unwrap();
+            k.timers.push(Timer { start, k: 1, num: 1000, den: 1, action: TimerAction::AudioSink { ring: RING, slots: 4, event } });
+            r
+        });
+        store(cpu, RING + 0x1004, 2);
+        store(cpu, LIST + 0x20, r);
+        record("start", start);
+        record("woken", svc(cpu, 0x18, &[0, LIST + 0x20, 1, FOREVER]));
+        event(cpu, "at");
+        record("read index", u64::from(load(cpu, RING + 0x44)));
+        ret(cpu);
+    }
+}
+
 fn go(entry: u64) -> (Outcome, Vec<(&'static str, u64)>, String) {
     install(&[
+        (TIMED, timed),
         (PING, ping),
         (PONG, pong),
         (CONSUMER, consumer),
@@ -250,6 +278,20 @@ fn results_the_sdk_expects() {
 fn a_thread_nothing_wakes_is_a_deadlock() {
     let (outcome, _, journal) = go(STUCK);
     assert_eq!(outcome, Outcome::Deadlock("thread 1 (Waiting)".to_string()), "{journal}");
+}
+
+#[test]
+fn a_timer_wakes_its_waiter_at_its_deadline_then_the_run_ends() {
+    let (outcome, events, journal) = go(TIMED);
+    // With nobody left waiting for it, the timer does not keep the run alive.
+    assert_eq!(outcome, Outcome::Finished, "{journal}");
+    let get = |what| events.iter().find(|e| e.0 == what).map(|e| e.1).unwrap_or_else(|| panic!("{what}: {events:?}"));
+    assert_eq!(get("woken"), 0);
+    // Woken at the deadline (the read of the counter itself costs a step).
+    let late = get("at") - (get("start") + 1000);
+    assert!(late <= 64, "{events:?}");
+    assert_eq!(get("read index"), 2, "the sink caught up with the write index");
+    assert!(journal.contains("audio sink: tick 1 read index -> 2"), "{journal}");
 }
 
 #[test]

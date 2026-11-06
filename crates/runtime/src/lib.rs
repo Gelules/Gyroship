@@ -196,6 +196,14 @@ pub unsafe extern "C" fn gyroship_unhandled(cpu: *mut Cpu, pc: u64, word: u32) {
         }
         Err(why) => {
             UNHANDLED.fetch_add(1, Ordering::Relaxed);
+            // Under an HLE (a real run), a skipped instruction would leave wrong state
+            // behind: it stops the run like a guest fault. Bare harnesses count and go on.
+            if let Some(h) = HOOKS.get() {
+                let what = format!("instruction {word:08x} at {pc:#x} cannot be executed: {why}");
+                eprintln!("gyroship: {what}");
+                (h.fault)(&what);
+                std::process::exit(mem::FAULT_EXIT);
+            }
             let mut logged = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
             if !logged.contains(&word) {
                 logged.push(word);

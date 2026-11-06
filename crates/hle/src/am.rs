@@ -106,7 +106,8 @@ impl Applet {
             // GetCurrentFocusState.
             (Applet::CommonState { .. }, 9) => Reply::with(&[IN_FOCUS]),
             // SetCpuBoostMode, SetRequestExitToLibraryAppletAtExecuteNextProgramEnabled.
-            (Applet::CommonState { .. }, 66 | 900) => Reply::ok(),
+            // 650 and 651 (Switch 2, around the camera): Lichii's answer, success.
+            (Applet::CommonState { .. }, 66 | 650 | 651 | 900) => Reply::ok(),
             // SetScreenShotPermission, SetOperationModeChangedNotification,
             // SetPerformanceModeChangedNotification, SetFocusHandlingMode,
             // SetOutOfFocusSuspendingEnabled, Switch 2 2400.

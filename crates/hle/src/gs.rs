@@ -70,6 +70,8 @@ pub enum Gs {
     Vi2,
     /// The chat session (gsv 1202).
     Chat,
+    /// The camera session (gsv 602, CMIF).
+    Camera,
 }
 
 /// vi2: the mask of free server-side buffer slots handed back at every
@@ -89,6 +91,7 @@ impl Gs {
             Gs::GpuMemory => "gsv gpu memory".into(),
             Gs::Vi2 => "vi2".into(),
             Gs::Chat => "gsv chat".into(),
+            Gs::Camera => "gsv camera".into(),
         }
     }
 
@@ -235,6 +238,11 @@ impl Gs {
             (Gs::Chat, 1) => Reply::with(&0u32.to_le_bytes()),
             (Gs::Chat, 11) => Reply { move_handles: vec![k.lone_event()?], ..Reply::ok() },
             (Gs::Chat, 103) => Reply::ok(),
+            // Camera (Lichii's answers: success, no data; the game goes on without one):
+            // initialize (601), the session (602), finalize (603).
+            (Gs::Supervisor, 601 | 603) => Reply::ok(),
+            (Gs::Supervisor, 602) => return gs(Gs::Camera),
+            (Gs::Camera, 3 | 4 | 21 | 22 | 24 | 25 | 28 | 29) => Reply::ok(),
             // Window images: the size of an image (1510, 435), native memory (111, 423),
             // the image (429), then 315.
             (Gs::Supervisor, 1510) => Reply::with(&[image_size(req).to_le_bytes(), 0x1000u64.to_le_bytes()].concat()),

@@ -134,6 +134,8 @@ pub struct Kernel {
     pub spin: Vec<u32>,
     /// Open saves, by key (user id and save type).
     pub saves: std::collections::BTreeMap<String, save::SaveFs>,
+    /// Virtual timers (the audio sink).
+    pub timers: Vec<thread::Timer>,
 }
 
 /// Exit code of a run the HLE stops (an unknown or forbidden SVC, a guest
@@ -144,7 +146,7 @@ impl Kernel {
     pub fn new(mem: Memory, mut journal: Journal, config: Config) -> Kernel {
         let mode = if config.explore { "exploration (not a validation run)" } else { "strict" };
         journal.line(0, 0, &format!("gyroship hle: mode {mode}, seed {:#x}, non-system memory {:#x}", config.seed, config.non_system_memory));
-        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None, sessions: Vec::new(), objects: Vec::new(), domains: Vec::new(), allowed_services: Vec::new(), shared: Vec::new(), transfers: Vec::new(), time_shared: None, frame: (0, 0, 0), symbols: Vec::new(), romfs: None, gs: gs::State::default(), hid_shared: None, spin: Vec::new(), saves: Default::default() }
+        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None, sessions: Vec::new(), objects: Vec::new(), domains: Vec::new(), allowed_services: Vec::new(), shared: Vec::new(), transfers: Vec::new(), time_shared: None, frame: (0, 0, 0), symbols: Vec::new(), romfs: None, gs: gs::State::default(), hid_shared: None, spin: Vec::new(), saves: Default::default(), timers: Vec::new() }
     }
 
     /// Logs a line for the running thread (0 when none runs).
@@ -166,6 +168,12 @@ impl Kernel {
             self.log("  running thread (lr, then the frame chain):");
             for line in self.backtrace_from((lr, lr, fp)).into_iter().skip(1) {
                 self.log(&line);
+            }
+        }
+        // How many times guest code passed each probe (e.g. the engine stages' ticks).
+        for (addr, name, n) in gyroship_runtime::probe_counts() {
+            if n > 0 {
+                self.log(&format!("  probe {name} at {addr:#x}: {n} passes"));
             }
         }
         // Every thread: who holds the cores, who waits.
