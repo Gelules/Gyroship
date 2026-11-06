@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
+mod experiment;
+mod measure;
+
 #[derive(Parser)]
 #[command(name = "gyroship-tools", version, about = "Gyroship developer tools")]
 struct Cli {
@@ -47,6 +50,16 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         examples: usize,
     },
+    /// Backend experiment: generate every N-th function of main (or chosen
+    /// functions) as a project ready to build and measure
+    Experiment(ExperimentArgs),
+    /// Run a command; report its wall time and the peak memory of its whole
+    /// process tree
+    Measure {
+        program: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Function ranges from a module's unwind tables (.eh_frame_hdr), optionally
     /// compared with a function list exported from Ghidra
     Functions {
@@ -87,6 +100,12 @@ fn main() -> ExitCode {
         Command::Discover { exefs, examples } => discover(&exefs, examples).map(|_| true),
         Command::Functions { nso, compare } => functions(&nso, compare.as_deref()).map(|_| true),
         Command::Capture { title, out } => capture::window(&title, &out).map(|_| true),
+        Command::Experiment(args) => run_experiment(&args).map(|_| true),
+        Command::Measure { program, args } => measure::run(&program, &args).map(|u| {
+            let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+            println!("measure     {:.1} s, peak {:.2} GiB for the process tree, {:.2} GiB for one process", u.seconds, gib(u.peak_total), gib(u.peak_process));
+            u.success
+        }),
     };
     match result {
         Ok(true) => ExitCode::SUCCESS,
@@ -263,6 +282,63 @@ fn discover(exefs: &Path, examples: usize) -> Result<()> {
         show("undecodable", &undecodable);
     }
     println!("cfg         {:.2} s", start.elapsed().as_secs_f64());
+    Ok(())
+}
+
+#[derive(clap::Args)]
+struct ExperimentArgs {
+    /// exefs folder
+    exefs: PathBuf,
+    /// Output folder (under generated/, which Git ignores)
+    #[arg(long, short)]
+    out: PathBuf,
+    /// Take every N-th FDE function of main
+    #[arg(long, default_value_t = 124)]
+    every: usize,
+    /// Generate the functions at these guest addresses instead (hex, comma-separated)
+    #[arg(long, value_delimiter = ',')]
+    functions: Vec<String>,
+    /// Functions per generated file
+    #[arg(long, default_value_t = 256)]
+    per_file: usize,
+    /// Files per generated crate
+    #[arg(long, default_value_t = 4)]
+    files_per_crate: usize,
+    /// Release opt-level of the generated project
+    #[arg(long, default_value_t = 1)]
+    opt_level: u8,
+    /// rust (source crates) or clif (one Cranelift object)
+    #[arg(long, default_value = "rust")]
+    backend: String,
+}
+
+fn run_experiment(a: &ExperimentArgs) -> Result<()> {
+    let (out, backend) = (a.out.as_path(), a.backend.as_str());
+    let p = load(&a.exefs)?;
+    let d = gyroship_analysis::discover::discover(&p)?;
+    let start = Instant::now();
+    let s = if a.functions.is_empty() {
+        experiment::sample(&p, &d, a.every)?
+    } else {
+        let addrs = a.functions.iter().map(|x| u64::from_str_radix(x.trim_start_matches("0x"), 16)).collect::<std::result::Result<Vec<_>, _>>()?;
+        experiment::chosen(&p, &d, &addrs)?
+    };
+    let (total, unhandled, top) = experiment::coverage(&s);
+    println!("sample      {} functions, {total} instructions, {unhandled} untranslated ({:.2}%)", s.functions.len(), 100.0 * unhandled as f64 / total as f64);
+    let top: Vec<String> = top.iter().map(|(n, c)| format!("{n} {c}")).collect();
+    println!("untranslated: {}", top.join(", "));
+    let mib = |b: u64| b as f64 / (1u64 << 20) as f64;
+    match backend {
+        "rust" => {
+            let bytes = experiment::write_rust(&s, out, a.per_file, a.files_per_crate, a.opt_level)?;
+            println!("generated   {:.1} MiB of Rust in {:.2} s -> {}", mib(bytes), start.elapsed().as_secs_f64(), out.display());
+        }
+        "clif" => {
+            let (bytes, seconds) = experiment::write_clif(&s, out, false)?;
+            println!("generated   {:.1} MiB object, Cranelift {seconds:.2} s (one thread) -> {}", mib(bytes), out.display());
+        }
+        other => return Err(format!("unknown backend {other:?}").into()),
+    }
     Ok(())
 }
 

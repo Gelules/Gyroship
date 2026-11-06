@@ -6,3 +6,11 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+gyroship-analysis = { version = "0.1.0", path = "../analysis" }
+gyroship-runtime = { version = "0.1.0", path = "../runtime" }
+# Backend B of the M1 experiment; pinned so measurements stay comparable.
+cranelift-codegen = "=0.137.0"
+cranelift-frontend = "=0.137.0"
+cranelift-module = "=0.137.0"
+cranelift-object = "=0.137.0"
+cranelift-native = "=0.137.0"

@@ -1,3 +1,231 @@
 //! Guest CPU context, guest memory, dispatch table and exceptions.
 //!
-//! Skeleton created in M0; its content starts with the milestone that needs it.
+//! Recompiled functions are `extern "C" fn(*mut Cpu)`, whatever backend
+//! generated them. They reach the rest of the runtime through the
+//! `gyroship_*` symbols below.
+
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// The context of one guest thread. The layout is fixed: generated code
+/// addresses its fields by offset (see the `OFFSET_*` constants).
+#[repr(C)]
+pub struct Cpu {
+    /// x0..x30, then SP.
+    pub x: [u64; 32],
+    pub n: bool,
+    pub z: bool,
+    pub c: bool,
+    pub v: bool,
+    pub tpidr: u64,
+    pub tpidrro: u64,
+    /// Host address of guest address 0.
+    pub mem: *mut u8,
+}
+
+pub const OFFSET_X: i32 = 0;
+pub const OFFSET_N: i32 = 256;
+pub const OFFSET_Z: i32 = 257;
+pub const OFFSET_C: i32 = 258;
+pub const OFFSET_V: i32 = 259;
+pub const OFFSET_TPIDR: i32 = 264;
+pub const OFFSET_TPIDRRO: i32 = 272;
+pub const OFFSET_MEM: i32 = 280;
+
+const _: () = {
+    assert!(std::mem::offset_of!(Cpu, x) == OFFSET_X as usize);
+    assert!(std::mem::offset_of!(Cpu, n) == OFFSET_N as usize);
+    assert!(std::mem::offset_of!(Cpu, z) == OFFSET_Z as usize);
+    assert!(std::mem::offset_of!(Cpu, c) == OFFSET_C as usize);
+    assert!(std::mem::offset_of!(Cpu, v) == OFFSET_V as usize);
+    assert!(std::mem::offset_of!(Cpu, tpidr) == OFFSET_TPIDR as usize);
+    assert!(std::mem::offset_of!(Cpu, tpidrro) == OFFSET_TPIDRRO as usize);
+    assert!(std::mem::offset_of!(Cpu, mem) == OFFSET_MEM as usize);
+};
+
+impl Cpu {
+    pub fn new(mem: *mut u8) -> Cpu {
+        Cpu { x: [0; 32], n: false, z: false, c: false, v: false, tpidr: 0, tpidrro: 0, mem }
+    }
+}
+
+/// A recompiled guest function.
+pub type Guest = unsafe extern "C" fn(*mut Cpu);
+
+static DISPATCH: OnceLock<Vec<(u64, Guest)>> = OnceLock::new();
+
+/// Installs the dispatch table: guest entry address -> host function.
+pub fn install(mut table: Vec<(u64, Guest)>) {
+    table.sort_unstable_by_key(|e| e.0);
+    let _ = DISPATCH.set(table);
+}
+
+pub fn lookup(addr: u64) -> Option<Guest> {
+    let t = DISPATCH.get()?;
+    t.binary_search_by_key(&addr, |e| e.0).ok().map(|i| t[i].1)
+}
+
+/// Instructions the generator did not translate, counted (ponytail: counted, not yet logged one by one).
+pub static UNHANDLED: AtomicU64 = AtomicU64::new(0);
+
+/// Calls the guest function at `target` through the dispatch table.
+///
+/// # Safety
+/// `cpu` must point to a valid context whose memory covers what the callee touches.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gyroship_call(cpu: *mut Cpu, target: u64) {
+    match lookup(target) {
+        Some(f) => unsafe { f(cpu) },
+        None => panic!("no recompiled function at guest address {target:#x}"),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn gyroship_unhandled(_cpu: *mut Cpu, _pc: u64, _word: u32) {
+    UNHANDLED.fetch_add(1, Ordering::Relaxed);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn gyroship_trap(_cpu: *mut Cpu, pc: u64, imm: u32) {
+    panic!("guest trap #{imm:#x} at {pc:#x}");
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn gyroship_svc(_cpu: *mut Cpu, pc: u64, imm: u32) {
+    panic!("guest svc #{imm:#x} at {pc:#x} (no HLE yet)");
+}
+
+/// A computed jump inside a function landed outside its known blocks.
+#[unsafe(no_mangle)]
+pub extern "C" fn gyroship_miss(_cpu: *mut Cpu, pc: u64) {
+    panic!("indirect jump to {pc:#x} is not a known block");
+}
+
+// Helpers for generated Rust code; Cranelift code inlines the same semantics.
+
+#[inline(always)]
+pub fn cond(c: &Cpu, code: u8) -> bool {
+    let r = match code >> 1 {
+        0 => c.z,
+        1 => c.c,
+        2 => c.n,
+        3 => c.v,
+        4 => c.c && !c.z,
+        5 => c.n == c.v,
+        6 => !c.z && c.n == c.v,
+        _ => true,
+    };
+    if code & 1 == 1 && code != 15 { !r } else { r }
+}
+
+#[inline(always)]
+pub fn set_nzcv(c: &mut Cpu, nzcv: u8) {
+    (c.n, c.z, c.c, c.v) = (nzcv & 8 != 0, nzcv & 4 != 0, nzcv & 2 != 0, nzcv & 1 != 0);
+}
+
+#[inline(always)]
+pub fn adds64(c: &mut Cpu, a: u64, b: u64) -> u64 {
+    let (r, carry) = a.overflowing_add(b);
+    (c.n, c.z, c.c, c.v) = ((r as i64) < 0, r == 0, carry, (a as i64).overflowing_add(b as i64).1);
+    r
+}
+
+#[inline(always)]
+pub fn subs64(c: &mut Cpu, a: u64, b: u64) -> u64 {
+    let r = a.wrapping_sub(b);
+    (c.n, c.z, c.c, c.v) = ((r as i64) < 0, r == 0, a >= b, (a as i64).overflowing_sub(b as i64).1);
+    r
+}
+
+#[inline(always)]
+pub fn adds32(c: &mut Cpu, a: u32, b: u32) -> u32 {
+    let (r, carry) = a.overflowing_add(b);
+    (c.n, c.z, c.c, c.v) = ((r as i32) < 0, r == 0, carry, (a as i32).overflowing_add(b as i32).1);
+    r
+}
+
+#[inline(always)]
+pub fn subs32(c: &mut Cpu, a: u32, b: u32) -> u32 {
+    let r = a.wrapping_sub(b);
+    (c.n, c.z, c.c, c.v) = ((r as i32) < 0, r == 0, a >= b, (a as i32).overflowing_sub(b as i32).1);
+    r
+}
+
+#[inline(always)]
+pub fn logic64(c: &mut Cpu, r: u64) -> u64 {
+    (c.n, c.z, c.c, c.v) = ((r as i64) < 0, r == 0, false, false);
+    r
+}
+
+#[inline(always)]
+pub fn logic32(c: &mut Cpu, r: u32) -> u32 {
+    (c.n, c.z, c.c, c.v) = ((r as i32) < 0, r == 0, false, false);
+    r
+}
+
+#[inline(always)]
+fn mask(bits: u32) -> u64 {
+    if bits >= 64 { !0 } else { (1 << bits) - 1 }
+}
+
+/// UBFM on `bits`-wide data (32 or 64).
+#[inline(always)]
+pub fn ubfm(bits: u32, src: u64, immr: u32, imms: u32) -> u64 {
+    let src = src & mask(bits);
+    let r = if imms >= immr { (src >> immr) & mask(imms - immr + 1) } else { (src & mask(imms + 1)) << (bits - immr) };
+    r & mask(bits)
+}
+
+#[inline(always)]
+pub fn sbfm(bits: u32, src: u64, immr: u32, imms: u32) -> u64 {
+    let r = if imms >= immr {
+        let width = imms - immr + 1;
+        (((src >> immr) << (64 - width)) as i64 >> (64 - width)) as u64
+    } else {
+        let width = imms + 1;
+        ((((src << (64 - width)) as i64) >> (64 - width)) as u64) << (bits - immr)
+    };
+    r & mask(bits)
+}
+
+#[inline(always)]
+pub fn bfm(bits: u32, dst: u64, src: u64, immr: u32, imms: u32) -> u64 {
+    let r = if imms >= immr {
+        let m = mask(imms - immr + 1);
+        (dst & !m) | ((src >> immr) & m)
+    } else {
+        let lsb = bits - immr;
+        let m = mask(imms + 1) << lsb;
+        (dst & !m) | ((src << lsb) & m)
+    };
+    r & mask(bits)
+}
+
+#[inline(always)]
+pub fn rev16(bits: u32, v: u64) -> u64 {
+    (((v >> 8) & 0x00FF_00FF_00FF_00FF) | ((v << 8) & 0xFF00_FF00_FF00_FF00)) & mask(bits)
+}
+
+#[inline(always)]
+pub fn rev32(v: u64) -> u64 {
+    u64::from((v as u32).swap_bytes()) | u64::from(((v >> 32) as u32).swap_bytes()) << 32
+}
+
+macro_rules! access {
+    ($ld:ident, $st:ident, $t:ty) => {
+        #[inline(always)]
+        pub fn $ld(c: &Cpu, addr: u64) -> u64 {
+            // SAFETY: the guest address space is one reservation that covers every guest address.
+            unsafe { (c.mem.add(addr as usize) as *const $t).read_unaligned() as u64 }
+        }
+        #[inline(always)]
+        pub fn $st(c: &Cpu, addr: u64, v: u64) {
+            // SAFETY: as above.
+            unsafe { (c.mem.add(addr as usize) as *mut $t).write_unaligned(v as $t) }
+        }
+    };
+}
+access!(ld8, st8, u8);
+access!(ld16, st16, u16);
+access!(ld32, st32, u32);
+access!(ld64, st64, u64);
