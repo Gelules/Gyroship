@@ -293,6 +293,17 @@ impl Nvdrv {
                 if n <= 3 || n.is_multiple_of(600) {
                     k.log(&format!("nvsrv: submit #{n} fd {fd}, {} entries, flags {flags:#x}{fence}", u32_at(&input, 8)));
                 }
+                // The first submits' GPFIFO entries (GPU address = CPU address) and their first words.
+                if n <= 3 {
+                    let entries = read(k, req.send_buffer(1));
+                    for e in entries.as_chunks::<8>().0.iter().map(|e| u64::from_le_bytes(*e)) {
+                        let (addr, words) = (e & 0xffff_fffc | (e >> 32 & 0xff) << 32, (e >> 42 & 0x1f_ffff) as usize);
+                        let mut raw = vec![0; 4 * words.min(48)];
+                        let _ = k.mem.read(addr, &mut raw);
+                        let dump: Vec<String> = raw.as_chunks::<4>().0.iter().map(|w| format!("{:08x}", u32::from_le_bytes(*w))).collect();
+                        k.log(&format!("nvsrv: gpfifo {addr:#x}, {words} words: {}", dump.join(" ")));
+                    }
+                }
             }
             _ => {
                 let bytes: String = input.iter().take(64).map(|b| format!("{b:02x}")).collect();

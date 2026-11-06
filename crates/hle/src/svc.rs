@@ -198,7 +198,12 @@ impl Kernel {
             0x18 => {
                 let mut first = [0; 4];
                 let _ = self.mem.read(a[1], &mut first);
-                let detail = format!("{} handles at {:#x} (first {:#x}) timeout {}", a[2] as u32, a[1], u32::from_le_bytes(first), a[3] as i64);
+                let h = u32::from_le_bytes(first);
+                let state = match self.handles.get(h) {
+                    Some(crate::thread::Object::ReadableEvent(e)) => format!(", event {e} signaled {}", self.events[e].signaled),
+                    _ => String::new(),
+                };
+                let detail = format!("{} handles at {:#x} (first {h:#x}{state}) timeout {}", a[2] as u32, a[1], a[3] as i64);
                 (self.wait_synchronization(cpu, a[1], a[2] as u32, a[3] as i64), 0, detail)
             }
             0x19 => (self.cancel_synchronization(a[0] as u32), 0, format!("{:#x}", a[0] as u32)),

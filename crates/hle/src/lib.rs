@@ -6,6 +6,7 @@
 
 pub mod account;
 pub mod am;
+pub mod audio;
 pub mod boot;
 pub mod bsd;
 pub mod fs;
@@ -124,6 +125,8 @@ pub struct Kernel {
     pub gs: gs::State,
     /// hid's shared memory, once a client asked for it.
     pub hid_shared: Option<usize>,
+    /// Spin detector: each thread's counter reads and waits since its last SVC.
+    pub spin: Vec<u32>,
 }
 
 /// Exit code of a run the HLE stops (an unknown or forbidden SVC, a guest
@@ -134,7 +137,7 @@ impl Kernel {
     pub fn new(mem: Memory, mut journal: Journal, config: Config) -> Kernel {
         let mode = if config.explore { "exploration (not a validation run)" } else { "strict" };
         journal.line(0, 0, &format!("gyroship hle: mode {mode}, seed {:#x}, non-system memory {:#x}", config.seed, config.non_system_memory));
-        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None, sessions: Vec::new(), objects: Vec::new(), domains: Vec::new(), allowed_services: Vec::new(), shared: Vec::new(), transfers: Vec::new(), time_shared: None, frame: (0, 0, 0), symbols: Vec::new(), romfs: None, gs: gs::State::default(), hid_shared: None }
+        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None, sessions: Vec::new(), objects: Vec::new(), domains: Vec::new(), allowed_services: Vec::new(), shared: Vec::new(), transfers: Vec::new(), time_shared: None, frame: (0, 0, 0), symbols: Vec::new(), romfs: None, gs: gs::State::default(), hid_shared: None, spin: Vec::new() }
     }
 
     /// Logs a line for the running thread (0 when none runs).
@@ -147,6 +150,21 @@ impl Kernel {
     pub fn stop(&mut self, code: i32, why: &str) -> ! {
         self.log(why);
         for line in self.backtrace() {
+            self.log(&line);
+        }
+        // The running thread's own lr and frame chain (the stop may come from one of its hooks).
+        if let Some(t) = self.sched.current {
+            // SAFETY: the running thread's context; it is stopped in this hook.
+            let (lr, fp) = unsafe { ((*self.sched.threads[t].cpu).x[30], (*self.sched.threads[t].cpu).x[29]) };
+            self.log("  running thread (lr, then the frame chain):");
+            for line in self.backtrace_from((lr, lr, fp)).into_iter().skip(1) {
+                self.log(&line);
+            }
+        }
+        // Every thread: who holds the cores, who waits.
+        for i in 0..self.sched.threads.len() {
+            let t = &self.sched.threads[i];
+            let line = format!("  thread {} {:?} priority {} core {} affinity {:#x} cpu time {} wait {:?}", t.id, t.state, t.priority, t.core, t.affinity, t.cpu_time, t.wait);
             self.log(&line);
         }
         self.journal.flush();
@@ -244,6 +262,9 @@ pub fn with<R>(f: impl FnOnce(&mut Kernel) -> R) -> R {
 unsafe fn on_svc(cpu: *mut Cpu, pc: u64, imm: u32) {
     let next = with(|k| {
         k.tick();
+        if let Some(n) = k.sched.current.and_then(|t| k.spin.get_mut(t)) {
+            *n = 0;
+        }
         // SAFETY: the running thread's context, for the time of the call.
         k.svc(unsafe { &mut *cpu }, pc, imm);
         k.reschedule()
@@ -251,9 +272,37 @@ unsafe fn on_svc(cpu: *mut Cpu, pc: u64, imm: u32) {
     thread::switch_to(next);
 }
 
+/// Counter reads without an SVC in between that mean a thread spins.
+const SPIN_READS: u32 = 10_000;
+
+impl Kernel {
+    /// A thread that reads the counter or waits (yield, wfe, wfi) SPIN_READS
+    /// times without an SVC spins on something: its frame chain goes to the
+    /// journal, once per thread.
+    fn count_spin(&mut self, cpu: *mut Cpu, what: &str) {
+        let Some(t) = self.sched.current else { return };
+        if self.spin.len() <= t {
+            self.spin.resize(t + 1, 0);
+        }
+        self.spin[t] += 1;
+        if self.spin[t] == SPIN_READS {
+            let id = self.sched.current.map_or(0, |t| self.sched.threads[t].id);
+            if self.journal.first(&format!("spin {id}")) {
+                // SAFETY: the running thread's context, stopped in the hook.
+                let (lr, fp) = unsafe { ((*cpu).x[30], (*cpu).x[29]) };
+                self.log(&format!("thread {id} spins: {SPIN_READS} {what} without an SVC; lr, then its frame chain:"));
+                for line in self.backtrace_from((lr, lr, fp)).into_iter().skip(1) {
+                    self.log(&line);
+                }
+            }
+        }
+    }
+}
+
 unsafe fn on_counter(cpu: *mut Cpu, rt: u32) {
     let next = with(|k| {
         k.tick();
+        k.count_spin(cpu, "counter reads or waits");
         if rt < 31 {
             // SAFETY: as above.
             unsafe { (*cpu).x[rt as usize] = k.now() };
@@ -263,9 +312,10 @@ unsafe fn on_counter(cpu: *mut Cpu, rt: u32) {
     thread::switch_to(next);
 }
 
-unsafe fn on_wait(_cpu: *mut Cpu, _kind: u32) {
+unsafe fn on_wait(cpu: *mut Cpu, _kind: u32) {
     let next = with(|k| {
         k.tick();
+        k.count_spin(cpu, "counter reads or waits");
         k.reschedule()
     });
     thread::switch_to(next);

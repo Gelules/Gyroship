@@ -52,6 +52,8 @@ pub enum Gs {
     GpuMemory,
     /// The display and layer session (gsv 305).
     Vi2,
+    /// The chat session (gsv 1202).
+    Chat,
 }
 
 /// vi2: the mask of free server-side buffer slots handed back at every
@@ -70,6 +72,7 @@ impl Gs {
             Gs::Gpu => "gsv gpu".into(),
             Gs::GpuMemory => "gsv gpu memory".into(),
             Gs::Vi2 => "vi2".into(),
+            Gs::Chat => "gsv chat".into(),
         }
     }
 
@@ -170,12 +173,20 @@ impl Gs {
                 let n = req.u32_at(0)? as usize;
                 let (r, e) = k.numbered_event()?;
                 put(&mut k.gs.syncpt_waits, n, e);
+                if k.journal.few("syncpt 22", 4) {
+                    k.log(&format!("gsv syncpt 22: wait index {n} -> handle {r:#x} (event {e})"));
+                }
                 Reply { move_handles: vec![r], ..Reply::ok() }
             }
             // Arm a wait: the fake GPU has always got there (the syncpoint is raised to the
             // threshold, 32-bit wrapping compare), so the event is signaled at once.
             (Gs::Syncpt, 201) => {
                 let (n, id, threshold) = (req.u32_at(0)? as usize, !req.u32_at(4)? as usize, req.u64_at(8)? as u32);
+                if k.journal.few("syncpt 201", 4) {
+                    let armed = k.gs.syncpt_waits.get(n).copied().flatten().is_some();
+                    let now = k.gs.syncpts.get(id).copied();
+                    k.log(&format!("gsv syncpt 201: wait index {n} syncpoint {id} threshold {threshold} mode {} value {now:?} event {armed}", req.data.get(0x10).copied().unwrap_or(0)));
+                }
                 if let Some(s) = k.gs.syncpts.get_mut(id)
                     && (threshold.wrapping_sub(*s) as i32) > 0
                 {
@@ -189,6 +200,13 @@ impl Gs {
                 k.signal_wait(req.u32_at(0)? as usize);
                 Reply::ok()
             }
+            // Chat (Lichii's answers): register (1201) and unregister (1203), the session
+            // (1202); in it, an event id (1), its event (11), and 103 answered empty.
+            (Gs::Supervisor, 1201 | 1203) => Reply::ok(),
+            (Gs::Supervisor, 1202) => return gs(Gs::Chat),
+            (Gs::Chat, 1) => Reply::with(&0u32.to_le_bytes()),
+            (Gs::Chat, 11) => Reply { move_handles: vec![k.lone_event()?], ..Reply::ok() },
+            (Gs::Chat, 103) => Reply::ok(),
             // Window images: the size of an image (1510, 435), native memory (111, 423),
             // the image (429), then 315.
             (Gs::Supervisor, 1510) => Reply::with(&[image_size(req).to_le_bytes(), 0x1000u64.to_le_bytes()].concat()),

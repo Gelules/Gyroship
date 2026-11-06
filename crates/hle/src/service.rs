@@ -47,6 +47,8 @@ pub enum Service {
     Ldr,
     /// `hid` and its objects.
     Hid(crate::hid::Hid),
+    /// `aud:u`, `hwopus`, `auddmg:u`, `audsmx:u` and their objects.
+    Audio(crate::audio::Audio),
     /// The graphics supervisor and its sessions.
     Gs(crate::gs::Gs),
     /// The nvdrv-like session of the graphics supervisor.
@@ -59,6 +61,10 @@ pub enum Service {
     PurchaseEvents,
     /// `prepo:u`: play reports, dropped.
     Prepo,
+    /// `ssl`: only SetInterfaceVersion; no context, so no connection (offline).
+    Ssl,
+    /// `chat:u` and the session its command 0 opens (Lichii's empty answers).
+    Chat { session: bool },
     /// `aoc:u` and `ectx:aw`: no command seen yet.
     Aoc,
     Ectx,
@@ -84,6 +90,7 @@ impl Service {
             Service::Bsd(b) => b.name.clone(),
             Service::Gs(g) => g.label(),
             Service::Hid(h) => h.label(),
+            Service::Audio(a) => a.label(),
             Service::Nvdrv(n) => n.label(),
             Service::Account(a) => a.label(),
             Service::Nifm(n) => n.label(),
@@ -94,6 +101,9 @@ impl Service {
             Service::Csrng { .. } => "csrng".to_string(),
             Service::PurchaseEvents => "aoc IPurchaseEventManager".to_string(),
             Service::Prepo => "prepo:u".to_string(),
+            Service::Ssl => "ssl".to_string(),
+            Service::Chat { session: false } => "chat:u".to_string(),
+            Service::Chat { session: true } => "chat:u session".to_string(),
             Service::Ectx => "ectx:aw".to_string(),
         }
     }
@@ -106,6 +116,7 @@ impl Service {
             Service::Bsd(b) => b.request(k, req),
             Service::Gs(g) => g.request(k, req),
             Service::Hid(h) => h.request(k, req),
+            Service::Audio(a) => a.request(k, req),
             Service::Nvdrv(n) => n.request(k, req),
             Service::Account(a) => a.request(k, req),
             Service::Nifm(n) => n.request(k, req),
@@ -146,6 +157,15 @@ impl Service {
             },
             // prepo: reports are accepted and dropped (offline).
             (Service::Prepo, _) => Reply::ok(),
+            (Service::Ssl, 5) => Reply::ok(),
+            // chat:u: open a session, then 3 and 11 (11 at every frame) succeed empty.
+            (Service::Chat { session: false }, 0) => Reply::object(Service::Chat { session: true }),
+            (Service::Chat { session: false }, 3 | 11) => Reply::ok(),
+            // The session's event: never signaled.
+            (Service::Chat { session: true }, 1) => match k.lone_event() {
+                Some(h) => Reply { copy_handles: vec![h], ..Reply::ok() },
+                None => Reply::error(crate::result::OUT_OF_HANDLES),
+            },
             (Service::Sm(sm), 0) => {
                 sm.registered = true;
                 Reply::ok()
@@ -209,10 +229,16 @@ impl Kernel {
             "nifm:u" => Service::Nifm(crate::account::Nifm::Service),
             "ldr:ro" => Service::Ldr,
             "hid" => Service::Hid(crate::hid::Hid::Service { styles: 0, ids: Vec::new() }),
+            "aud:u" => Service::Audio(crate::audio::Audio::AudU),
+            "hwopus" => Service::Audio(crate::audio::Audio::Opus),
+            "auddmg:u" => Service::Audio(crate::audio::Audio::DevMgr),
+            "audsmx:u" => Service::Audio(crate::audio::Audio::Mixer),
             "bsd:s" | "bsd:u" => Service::Bsd(crate::bsd::Bsd { name: name.clone() }),
             "aoc:u" => Service::Aoc,
             "csrng" => Service::Csrng { state: self.config.seed ^ 0x6373_726E },
             "prepo:u" => Service::Prepo,
+            "ssl" => Service::Ssl,
+            "chat:u" => Service::Chat { session: false },
             "ectx:aw" => Service::Ectx,
             _ if self.config.explore => Service::Stub(name.clone()),
             _ => self.stop(crate::STOP_EXIT, &format!("sm: service {name:?} is not implemented")),
