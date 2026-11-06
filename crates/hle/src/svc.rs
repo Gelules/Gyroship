@@ -8,6 +8,7 @@
 //! GetThreadContext3) write guest memory directly.
 
 use crate::result::*;
+use crate::thread::{CORES, PRIORITIES, State, THREAD_LIMIT};
 use crate::{Kernel, STOP_EXIT, layout};
 use gyroship_runtime::Cpu;
 use gyroship_runtime::mem::{self, Block, attr, perm, state};
@@ -121,6 +122,56 @@ impl Kernel {
                 (r, 0, format!("{:#x} -> {:#x}+{:#x} state {:#x} perm {} attr {:#x}", a[2], info.base, info.size, info.block.state, info.block.perm, info.block.attr))
             }
             0x07 => self.stop(0, &format!("{call} at {pc:#x}: the guest exits")),
+            0x08 => match self.create_thread(a[1], a[2], a[3], a[4] as u32, a[5] as i32) {
+                Ok(h) => {
+                    cpu.x[1] = u64::from(h);
+                    (SUCCESS, 0, format!("entry {:#x} arg {:#x} stack {:#x} priority {} core {} -> {h:#x}", a[1], a[2], a[3], a[4] as u32, a[5] as i32))
+                }
+                Err(e) => (e, 0, format!("priority {} core {}", a[4] as u32, a[5] as i32)),
+            },
+            0x09 => (self.start_thread(a[0] as u32), 0, format!("{:#x}", a[0] as u32)),
+            0x0A => {
+                self.end_current();
+                (SUCCESS, 0, String::new())
+            }
+            0x0B => {
+                self.sleep(a[0] as i64);
+                (SUCCESS, u64::from(a[0] as i64 <= 0), format!("{}", a[0] as i64))
+            }
+            0x0C => match self.thread_of(a[1] as u32) {
+                Some(t) => {
+                    cpu.x[1] = u64::from(self.sched.threads[t].priority);
+                    (SUCCESS, 0, format!("{:#x} -> {}", a[1] as u32, cpu.x[1]))
+                }
+                None => (INVALID_HANDLE, 0, format!("{:#x}", a[1] as u32)),
+            },
+            0x0D => (self.set_priority(a[0] as u32, a[1] as u32), 0, format!("{:#x} priority {}", a[0] as u32, a[1] as u32)),
+            0x0E => match self.thread_of(a[2] as u32) {
+                Some(t) => {
+                    let th = &self.sched.threads[t];
+                    (cpu.x[1], cpu.x[2]) = (th.ideal as u64, th.affinity);
+                    (SUCCESS, 0, format!("{:#x} -> core {} mask {:#x}", a[2] as u32, cpu.x[1], cpu.x[2]))
+                }
+                None => (INVALID_HANDLE, 0, format!("{:#x}", a[2] as u32)),
+            },
+            0x0F => (self.set_core_mask(a[0] as u32, a[1] as i32, a[2]), 0, format!("{:#x} core {} mask {:#x}", a[0] as u32, a[1] as i32, a[2])),
+            0x10 => {
+                // w0 is the core number, not a Result.
+                let core = self.sched.current.map_or(0, |t| self.sched.threads[t].core);
+                cpu.x[0] = core as u64;
+                if self.journal.all_svcs || self.journal.first("0x10") {
+                    self.log(&format!("{call} -> {core}"));
+                }
+                return;
+            }
+            0x25 => match self.thread_of(a[1] as u32) {
+                Some(t) => {
+                    cpu.x[1] = self.sched.threads[t].id;
+                    (SUCCESS, 0, format!("{:#x} -> {}", a[1] as u32, cpu.x[1]))
+                }
+                None => (INVALID_HANDLE, 0, format!("{:#x}", a[1] as u32)),
+            },
+            0x36 => (SUCCESS, 0, String::new()),
             0x26 => {
                 let reason = a[0] as u32;
                 if reason & 0x8000_0000 == 0 {
@@ -158,6 +209,67 @@ impl Kernel {
             let status = if result == SUCCESS { String::new() } else { format!(" -> {result:#x}") };
             self.log(&format!("{call} {detail}{status}"));
         }
+    }
+
+    fn start_thread(&mut self, h: u32) -> u32 {
+        match self.thread_of(h) {
+            Some(t) if self.sched.threads[t].state == State::Created => {
+                let now = self.now();
+                self.ready(t, now);
+                SUCCESS
+            }
+            Some(_) => INVALID_STATE,
+            None => INVALID_HANDLE,
+        }
+    }
+
+    /// SleepThread: 0 yields to threads of the same priority, -1 and -2 also
+    /// let another core take this thread, anything positive sleeps that many
+    /// nanoseconds (a tick is 32 ns).
+    fn sleep(&mut self, ns: i64) {
+        let t = self.sched.current.expect("a running thread");
+        let now = self.now();
+        if ns <= 0 {
+            // ponytail: -1 and -2 behave as 0; an idle core takes waiting threads anyway.
+            self.ready(t, now);
+        } else {
+            self.block(Some(now + (ns as u64).div_ceil(32)), SUCCESS);
+        }
+    }
+
+    fn set_priority(&mut self, h: u32, priority: u32) -> u32 {
+        let Some(t) = self.thread_of(h) else { return INVALID_HANDLE };
+        if !PRIORITIES.contains(&priority) {
+            return INVALID_PRIORITY;
+        }
+        self.sched.threads[t].priority = priority;
+        SUCCESS
+    }
+
+    /// SetThreadCoreMask: `core` -1 keeps the ideal core, -2 does not care,
+    /// -3 takes the process's default (0). A thread off its new mask moves.
+    fn set_core_mask(&mut self, h: u32, core: i32, mask: u64) -> u32 {
+        let Some(t) = self.thread_of(h) else { return INVALID_HANDLE };
+        let all = (1u64 << CORES) - 1;
+        if mask == 0 || mask & !all != 0 {
+            return INVALID_CORE_ID;
+        }
+        let ideal = match core {
+            -3 => 0,
+            -2 | -1 => self.sched.threads[t].ideal,
+            0..=5 => core as usize,
+            _ => return INVALID_CORE_ID,
+        };
+        if core >= 0 && mask & 1 << ideal == 0 {
+            return INVALID_COMBINATION;
+        }
+        let th = &mut self.sched.threads[t];
+        (th.ideal, th.affinity) = (ideal, mask);
+        if mask & 1 << th.core == 0 {
+            let to = if mask & 1 << ideal != 0 { ideal } else { mask.trailing_zeros() as usize };
+            self.move_thread(t, to);
+        }
+        SUCCESS
     }
 
     fn set_permission(&mut self, addr: u64, size: u64, p: u32) -> u32 {
@@ -258,8 +370,7 @@ impl Kernel {
             0x15 => process(self.config.non_system_memory),
             0x16 => process(self.mem.blocks().map(|b| b.size).sum()),
             0x17 => process(1),
-            // ponytail: a fixed allowance until threads exist.
-            0x18 => process(96),
+            0x18 => process(THREAD_LIMIT - self.sched.threads.iter().filter(|t| t.state != State::Done).count() as u64),
             0x1C => process(0),
             0x1D => process(layout::REMOTE.0),
             0x1E => process(layout::REMOTE.1),

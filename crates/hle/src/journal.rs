@@ -4,7 +4,6 @@
 
 use std::collections::BTreeSet;
 use std::io::Write;
-use std::sync::atomic::Ordering;
 
 enum Sink {
     Memory(Vec<u8>),
@@ -28,9 +27,8 @@ impl Journal {
         Ok(Journal { sink: Sink::File(std::io::BufWriter::new(std::fs::File::create(path)?)), seen: BTreeSet::new(), all_svcs: false })
     }
 
-    /// Logs one line for guest thread `thread`.
-    pub fn line(&mut self, thread: u64, text: &str) {
-        let time = gyroship_runtime::COUNTER.load(Ordering::Relaxed);
+    /// Logs one line at virtual time `time` for guest thread `thread`.
+    pub fn line(&mut self, time: u64, thread: u64, text: &str) {
         let line = format!("{time:>12} t{thread} {text}\n");
         match &mut self.sink {
             Sink::Memory(v) => v.extend_from_slice(line.as_bytes()),

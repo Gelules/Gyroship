@@ -14,6 +14,8 @@
 pub mod harness;
 pub mod interp;
 pub mod mem;
+#[cfg(windows)]
+pub mod fiber;
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -215,10 +217,29 @@ pub extern "C" fn gyroship_trap(_cpu: *mut Cpu, pc: u64, imm: u32) {
     panic!("guest trap #{imm:#x} at {pc:#x}");
 }
 
-/// The virtual counter (`CNTPCT_EL0`), in ticks of 31.25 MHz.
-///
-/// ponytail: one global clock that each read advances by [`COUNTER_STEP`];
-/// the kernel's per-core clocks (D19) replace it with the scheduler.
+/// What the HLE plugs into generated code (`gyroship-hle` registers it; the
+/// runtime does not depend on the HLE, so harnesses without one still link).
+/// Every hook is a point where the scheduler may switch guest threads, and
+/// writes its results into the context before it does.
+#[derive(Clone, Copy)]
+pub struct Hooks {
+    /// `svc #imm` at `pc`: arguments in x0..x7, Result in w0, outputs in x1 and x2.
+    pub svc: unsafe fn(*mut Cpu, u64, u32),
+    /// `mrs x<rt>, CNTPCT_EL0`: writes the virtual counter to x<rt> (31: nowhere).
+    pub counter: unsafe fn(*mut Cpu, u32),
+    /// `yield` (1), `wfe` (2) or `wfi` (3).
+    pub wait: unsafe fn(*mut Cpu, u32),
+}
+
+static HOOKS: OnceLock<Hooks> = OnceLock::new();
+
+/// Registers the hooks; the first registration wins.
+pub fn set_hooks(hooks: Hooks) {
+    let _ = HOOKS.set(hooks);
+}
+
+/// The virtual counter without an HLE (`CNTPCT_EL0`, in ticks of 31.25 MHz):
+/// one global clock that each read advances by [`COUNTER_STEP`].
 pub static COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Ticks one counter read costs: 1.024 µs.
 pub const COUNTER_STEP: u64 = 32;
@@ -229,6 +250,10 @@ pub const COUNTER_STEP: u64 = 32;
 /// `cpu` must point to a valid context.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gyroship_counter(cpu: *mut Cpu, _pc: u64, rt: u32) {
+    if let Some(h) = HOOKS.get() {
+        // SAFETY: guaranteed by the caller.
+        return unsafe { (h.counter)(cpu, rt) };
+    }
     let v = COUNTER.fetch_add(COUNTER_STEP, Ordering::Relaxed) + COUNTER_STEP;
     if rt < 31 {
         // SAFETY: guaranteed by the caller.
@@ -236,10 +261,17 @@ pub unsafe extern "C" fn gyroship_counter(cpu: *mut Cpu, _pc: u64, rt: u32) {
     }
 }
 
-/// `yield` (1), `wfe` (2) or `wfi` (3): a point where the scheduler may switch
-/// threads. Nothing to do while there is a single guest thread.
+/// `yield` (1), `wfe` (2) or `wfi` (3): nothing to do without a scheduler.
+///
+/// # Safety
+/// `cpu` must point to a valid context.
 #[unsafe(no_mangle)]
-pub extern "C" fn gyroship_yield(_cpu: *mut Cpu, _pc: u64, _kind: u32) {}
+pub unsafe extern "C" fn gyroship_yield(cpu: *mut Cpu, _pc: u64, kind: u32) {
+    if let Some(h) = HOOKS.get() {
+        // SAFETY: guaranteed by the caller.
+        unsafe { (h.wait)(cpu, kind) }
+    }
+}
 
 /// Named guest addresses whose passes are counted (D21: sondes).
 static PROBES: OnceLock<Vec<(u64, String, AtomicU64)>> = OnceLock::new();
@@ -265,26 +297,16 @@ pub extern "C" fn gyroship_probe(_cpu: *mut Cpu, pc: u64) {
     }
 }
 
-/// Handles `svc #imm` at `pc`: arguments in x0..x7, Result in w0, outputs
-/// in x1 and x2. `gyroship-hle` registers it; the runtime does not depend on
-/// the HLE, so harnesses without one still link.
-pub type SvcHandler = fn(&mut Cpu, u64, u32);
-
-static SVC: OnceLock<SvcHandler> = OnceLock::new();
-
-/// Registers the SVC handler; the first registration wins.
-pub fn set_svc_handler(handler: SvcHandler) {
-    let _ = SVC.set(handler);
-}
-
+/// `svc #imm` at `pc`, handled by the HLE's hook.
+///
 /// # Safety
 /// `cpu` must point to a valid context.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gyroship_svc(cpu: *mut Cpu, pc: u64, imm: u32) {
-    match SVC.get() {
+    match HOOKS.get() {
         // SAFETY: guaranteed by the caller.
-        Some(handler) => handler(unsafe { &mut *cpu }, pc, imm),
-        None => panic!("guest svc #{imm:#x} at {pc:#x} and no SVC handler"),
+        Some(h) => unsafe { (h.svc)(cpu, pc, imm) },
+        None => panic!("guest svc #{imm:#x} at {pc:#x} and no HLE"),
     }
 }
 

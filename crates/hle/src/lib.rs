@@ -6,8 +6,9 @@
 
 pub mod journal;
 pub mod svc;
+pub mod thread;
 
-use gyroship_runtime::Cpu;
+use gyroship_runtime::{Cpu, Hooks};
 use gyroship_runtime::mem::Memory;
 use journal::Journal;
 use std::cell::RefCell;
@@ -20,6 +21,9 @@ pub mod result {
     }
     pub const SUCCESS: u32 = 0;
     pub const NOT_IMPLEMENTED: u32 = kernel(33);
+    pub const OUT_OF_HANDLES: u32 = kernel(105);
+    pub const INVALID_PRIORITY: u32 = kernel(112);
+    pub const INVALID_CORE_ID: u32 = kernel(113);
     pub const INVALID_SIZE: u32 = kernel(101);
     pub const INVALID_ADDRESS: u32 = kernel(102);
     pub const INVALID_CURRENT_MEMORY: u32 = kernel(106);
@@ -77,8 +81,8 @@ pub struct Kernel {
     pub mem: Memory,
     pub journal: Journal,
     pub config: Config,
-    /// The running guest thread's id (the main thread is 1).
-    pub thread: u64,
+    pub handles: thread::Handles,
+    pub sched: thread::Sched,
 }
 
 /// Exit code of a run the HLE stops (an unknown or forbidden SVC, a guest
@@ -88,13 +92,14 @@ pub const STOP_EXIT: i32 = 0x48;
 impl Kernel {
     pub fn new(mem: Memory, mut journal: Journal, config: Config) -> Kernel {
         let mode = if config.explore { "exploration (not a validation run)" } else { "strict" };
-        journal.line(0, &format!("gyroship hle: mode {mode}, seed {:#x}, non-system memory {:#x}", config.seed, config.non_system_memory));
-        Kernel { mem, journal, config, thread: 1 }
+        journal.line(0, 0, &format!("gyroship hle: mode {mode}, seed {:#x}, non-system memory {:#x}", config.seed, config.non_system_memory));
+        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default() }
     }
 
-    /// Logs a line for the running thread.
+    /// Logs a line for the running thread (0 when none runs).
     pub fn log(&mut self, text: &str) {
-        self.journal.line(self.thread, text);
+        let id = self.sched.current.map_or(0, |t| self.sched.threads[t].id);
+        self.journal.line(self.now(), id, text);
     }
 
     /// Ends the run: logs why, flushes the journal, exits with `code`.
@@ -113,7 +118,12 @@ thread_local! {
 /// Makes `kernel` the one this thread's guest code talks to.
 pub fn install(kernel: Kernel) {
     KERNEL.with(|k| *k.borrow_mut() = Some(kernel));
-    gyroship_runtime::set_svc_handler(on_svc);
+    gyroship_runtime::set_hooks(Hooks { svc: on_svc, counter: on_counter, wait: on_wait });
+}
+
+/// Takes this thread's kernel back.
+pub fn uninstall() -> Option<Kernel> {
+    KERNEL.with(|k| k.borrow_mut().take())
 }
 
 /// Runs `f` on this thread's kernel.
@@ -121,6 +131,35 @@ pub fn with<R>(f: impl FnOnce(&mut Kernel) -> R) -> R {
     KERNEL.with(|k| f(k.borrow_mut().as_mut().expect("no kernel installed on this thread")))
 }
 
-fn on_svc(cpu: &mut Cpu, pc: u64, imm: u32) {
-    with(|k| k.svc(cpu, pc, imm));
+// Each hook releases the kernel before it switches fibers: the next thread
+// borrows it too.
+
+unsafe fn on_svc(cpu: *mut Cpu, pc: u64, imm: u32) {
+    let next = with(|k| {
+        k.tick();
+        // SAFETY: the running thread's context, for the time of the call.
+        k.svc(unsafe { &mut *cpu }, pc, imm);
+        k.reschedule()
+    });
+    thread::switch_to(next);
+}
+
+unsafe fn on_counter(cpu: *mut Cpu, rt: u32) {
+    let next = with(|k| {
+        k.tick();
+        if rt < 31 {
+            // SAFETY: as above.
+            unsafe { (*cpu).x[rt as usize] = k.now() };
+        }
+        k.reschedule()
+    });
+    thread::switch_to(next);
+}
+
+unsafe fn on_wait(_cpu: *mut Cpu, _kind: u32) {
+    let next = with(|k| {
+        k.tick();
+        k.reschedule()
+    });
+    thread::switch_to(next);
 }
