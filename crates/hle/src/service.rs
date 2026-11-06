@@ -47,6 +47,8 @@ pub enum Service {
     Ldr,
     /// `hid` and its objects.
     Hid(crate::hid::Hid),
+    /// Save file systems and their files.
+    Save(crate::save::Save),
     /// `aud:u`, `hwopus`, `auddmg:u`, `audsmx:u` and their objects.
     Audio(crate::audio::Audio),
     /// The graphics supervisor and its sessions.
@@ -91,6 +93,7 @@ impl Service {
             Service::Gs(g) => g.label(),
             Service::Hid(h) => h.label(),
             Service::Audio(a) => a.label(),
+            Service::Save(s) => s.label(),
             Service::Nvdrv(n) => n.label(),
             Service::Account(a) => a.label(),
             Service::Nifm(n) => n.label(),
@@ -117,6 +120,7 @@ impl Service {
             Service::Gs(g) => g.request(k, req),
             Service::Hid(h) => h.request(k, req),
             Service::Audio(a) => a.request(k, req),
+            Service::Save(s) => s.request(k, req),
             Service::Nvdrv(n) => n.request(k, req),
             Service::Account(a) => a.request(k, req),
             Service::Nifm(n) => n.request(k, req),
@@ -233,7 +237,7 @@ impl Kernel {
             "hwopus" => Service::Audio(crate::audio::Audio::Opus),
             "auddmg:u" => Service::Audio(crate::audio::Audio::DevMgr),
             "audsmx:u" => Service::Audio(crate::audio::Audio::Mixer),
-            "bsd:s" | "bsd:u" => Service::Bsd(crate::bsd::Bsd { name: name.clone() }),
+            "bsd:s" | "bsd:u" => Service::Bsd(crate::bsd::Bsd::new(name.clone())),
             "aoc:u" => Service::Aoc,
             "csrng" => Service::Csrng { state: self.config.seed ^ 0x6373_726E },
             "prepo:u" => Service::Prepo,

@@ -16,6 +16,7 @@ pub mod ipc;
 pub mod journal;
 pub mod nvdrv;
 pub mod pushbuf;
+pub mod save;
 pub mod service;
 pub mod shared;
 pub mod svc;
@@ -89,11 +90,14 @@ pub struct Config {
     pub time_limit: Option<u64>,
     /// End the run after this many presented frames.
     pub frames: Option<u64>,
+    /// `--save DIR`: saves are loaded from and committed to DIR; otherwise
+    /// every run starts from empty saves, kept in memory.
+    pub save_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for Config {
     fn default() -> Config {
-        Config { seed: 0x5EED, explore: false, non_system_memory: 0x2_6410_0000, time_limit: None, frames: None }
+        Config { seed: 0x5EED, explore: false, non_system_memory: 0x2_6410_0000, time_limit: None, frames: None, save_dir: None }
     }
 }
 
@@ -128,6 +132,8 @@ pub struct Kernel {
     pub hid_shared: Option<usize>,
     /// Spin detector: each thread's counter reads and waits since its last SVC.
     pub spin: Vec<u32>,
+    /// Open saves, by key (user id and save type).
+    pub saves: std::collections::BTreeMap<String, save::SaveFs>,
 }
 
 /// Exit code of a run the HLE stops (an unknown or forbidden SVC, a guest
@@ -138,7 +144,7 @@ impl Kernel {
     pub fn new(mem: Memory, mut journal: Journal, config: Config) -> Kernel {
         let mode = if config.explore { "exploration (not a validation run)" } else { "strict" };
         journal.line(0, 0, &format!("gyroship hle: mode {mode}, seed {:#x}, non-system memory {:#x}", config.seed, config.non_system_memory));
-        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None, sessions: Vec::new(), objects: Vec::new(), domains: Vec::new(), allowed_services: Vec::new(), shared: Vec::new(), transfers: Vec::new(), time_shared: None, frame: (0, 0, 0), symbols: Vec::new(), romfs: None, gs: gs::State::default(), hid_shared: None, spin: Vec::new() }
+        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None, sessions: Vec::new(), objects: Vec::new(), domains: Vec::new(), allowed_services: Vec::new(), shared: Vec::new(), transfers: Vec::new(), time_shared: None, frame: (0, 0, 0), symbols: Vec::new(), romfs: None, gs: gs::State::default(), hid_shared: None, spin: Vec::new(), saves: Default::default() }
     }
 
     /// Logs a line for the running thread (0 when none runs).

@@ -273,7 +273,7 @@ impl Kernel {
     /// SleepThread: 0 yields to threads of the same priority, -1 also pulls
     /// a waiting thread from another core, anything positive sleeps that
     /// many nanoseconds (a tick is 32 ns).
-    fn sleep(&mut self, ns: i64) {
+    pub(crate) fn sleep(&mut self, ns: i64) {
         let t = self.sched.current.expect("a running thread");
         let now = self.now();
         if ns == -1 {

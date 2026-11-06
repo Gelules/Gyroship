@@ -207,6 +207,8 @@ impl Fs {
             (Fs::Proxy, 1) => Reply::ok(),
             (Fs::Proxy, 1005) => Reply::with(&0u32.to_le_bytes()),
             (Fs::Proxy, 200) => Reply::object(Service::Fs(Fs::RomStorage)),
+            // OpenSaveDataFileSystem(space id, attribute).
+            (Fs::Proxy, 51) => return k.open_save(req),
             // Read(offset, size) into the B buffer; GetSize.
             (Fs::RomStorage, 0) => {
                 let (offset, size) = (req.u64_at(0)?, req.u64_at(8)?);
