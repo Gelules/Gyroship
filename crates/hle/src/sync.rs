@@ -54,7 +54,7 @@ impl Kernel {
         match o {
             Object::Thread(t) => self.sched.threads[t].state == State::Done,
             Object::ReadableEvent(e) => self.events[e].signaled,
-            Object::WritableEvent(_) => false,
+            Object::WritableEvent(_) | Object::Session(_) => false,
         }
     }
 

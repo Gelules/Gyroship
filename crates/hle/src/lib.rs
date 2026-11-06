@@ -5,7 +5,9 @@
 //! of it must never stay open across a guest fiber switch.
 
 pub mod boot;
+pub mod ipc;
 pub mod journal;
+pub mod service;
 pub mod svc;
 pub mod sync;
 pub mod thread;
@@ -89,6 +91,9 @@ pub struct Kernel {
     pub events: Vec<sync::Event>,
     /// `link()`'s view of memory, compared at the oracle probe (boot).
     pub oracle: Option<gyroship_loader::link::Program>,
+    pub sessions: Vec<Option<ipc::Session>>,
+    /// The services the NPDM grants (its service access control).
+    pub allowed_services: Vec<String>,
 }
 
 /// Exit code of a run the HLE stops (an unknown or forbidden SVC, a guest
@@ -99,7 +104,7 @@ impl Kernel {
     pub fn new(mem: Memory, mut journal: Journal, config: Config) -> Kernel {
         let mode = if config.explore { "exploration (not a validation run)" } else { "strict" };
         journal.line(0, 0, &format!("gyroship hle: mode {mode}, seed {:#x}, non-system memory {:#x}", config.seed, config.non_system_memory));
-        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None }
+        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None, sessions: Vec::new(), allowed_services: Vec::new() }
     }
 
     /// Logs a line for the running thread (0 when none runs).

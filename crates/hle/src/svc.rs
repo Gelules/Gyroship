@@ -149,7 +149,7 @@ impl Kernel {
             0x0E => match self.thread_of(a[2] as u32) {
                 Some(t) => {
                     let th = &self.sched.threads[t];
-                    (cpu.x[1], cpu.x[2]) = (th.ideal as u64, th.affinity);
+                    (cpu.x[1], cpu.x[2]) = (u64::from(th.ideal as u32), th.affinity);
                     (SUCCESS, 0, format!("{:#x} -> core {} mask {:#x}", a[2] as u32, cpu.x[1], cpu.x[2]))
                 }
                 None => (INVALID_HANDLE, 0, format!("{:#x}", a[2] as u32)),
@@ -172,6 +172,15 @@ impl Kernel {
                 None => (INVALID_HANDLE, 0, format!("{:#x}", a[1] as u32)),
             },
             0x36 => (SUCCESS, 0, String::new()),
+            0x1F => match self.connect_to_named_port(a[1]) {
+                Ok(h) => {
+                    cpu.x[1] = u64::from(h);
+                    (SUCCESS, 0, format!("-> {h:#x}"))
+                }
+                Err(e) => (e, 0, String::new()),
+            },
+            0x21 => (self.send_request(a[0] as u32, cpu.tpidrro, 0x100), 0, format!("{:#x}", a[0] as u32)),
+            0x22 => (self.send_request(a[2] as u32, a[0], a[1]), 0, format!("{:#x} buffer {:#x}+{:#x}", a[2] as u32, a[0], a[1])),
             0x11 => (self.signal_event_handle(a[0] as u32), 0, format!("{:#x}", a[0] as u32)),
             0x12 => (self.clear_event(a[0] as u32), 0, format!("{:#x}", a[0] as u32)),
             0x16 => (self.close_handle(a[0] as u32), 0, format!("{:#x}", a[0] as u32)),
@@ -240,14 +249,16 @@ impl Kernel {
         }
     }
 
-    /// SleepThread: 0 yields to threads of the same priority, -1 and -2 also
-    /// let another core take this thread, anything positive sleeps that many
-    /// nanoseconds (a tick is 32 ns).
+    /// SleepThread: 0 yields to threads of the same priority, -1 also pulls
+    /// a waiting thread from another core, anything positive sleeps that
+    /// many nanoseconds (a tick is 32 ns).
     fn sleep(&mut self, ns: i64) {
         let t = self.sched.current.expect("a running thread");
         let now = self.now();
-        if ns <= 0 {
-            // ponytail: -1 and -2 behave as 0; an idle core takes waiting threads anyway.
+        if ns == -1 {
+            self.yield_with_migration(t);
+        } else if ns <= 0 {
+            // ponytail: -2 (yield to any thread) behaves as 0; the SDK only uses -1.
             self.ready(t, now);
         } else {
             self.block(Wait::Sleep, Some(now + ns_to_ticks(ns)), SUCCESS);
@@ -263,27 +274,36 @@ impl Kernel {
         SUCCESS
     }
 
-    /// SetThreadCoreMask: `core` -1 keeps the ideal core, -2 does not care,
-    /// -3 takes the process's default (0). A thread off its new mask moves.
+    /// SetThreadCoreMask. `core` -1: no preferred core; -2: the process's
+    /// default core (0), alone in the mask, whatever `mask` says; -3: keep
+    /// the ideal core, which must be in the mask. A thread off its new mask
+    /// moves to its ideal core, or to the highest core of the mask.
     fn set_core_mask(&mut self, h: u32, core: i32, mask: u64) -> u32 {
         let Some(t) = self.thread_of(h) else { return INVALID_HANDLE };
-        let all = (1u64 << CORES) - 1;
-        if mask == 0 || mask & !all != 0 {
-            return INVALID_CORE_ID;
-        }
-        let ideal = match core {
-            -3 => 0,
-            -2 | -1 => self.sched.threads[t].ideal,
-            0..=5 => core as usize,
-            _ => return INVALID_CORE_ID,
+        let (ideal, mask) = if core == -2 {
+            (0, 1)
+        } else {
+            if mask & !((1u64 << CORES) - 1) != 0 {
+                return INVALID_CORE_ID;
+            }
+            if mask == 0 {
+                return INVALID_COMBINATION;
+            }
+            let ideal = match core {
+                0..=5 => core,
+                -3 => self.sched.threads[t].ideal,
+                -1 => -1,
+                _ => return INVALID_CORE_ID,
+            };
+            if ideal >= 0 && mask & 1 << ideal == 0 {
+                return INVALID_COMBINATION;
+            }
+            (ideal, mask)
         };
-        if core >= 0 && mask & 1 << ideal == 0 {
-            return INVALID_COMBINATION;
-        }
         let th = &mut self.sched.threads[t];
         (th.ideal, th.affinity) = (ideal, mask);
         if mask & 1 << th.core == 0 {
-            let to = if mask & 1 << ideal != 0 { ideal } else { mask.trailing_zeros() as usize };
+            let to = if ideal >= 0 { ideal as usize } else { 63 - mask.leading_zeros() as usize };
             self.move_thread(t, to);
         }
         SUCCESS

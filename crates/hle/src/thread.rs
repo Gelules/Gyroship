@@ -47,6 +47,8 @@ pub enum Object {
     /// The two ends of an event (an index into `Kernel::events`).
     ReadableEvent(usize),
     WritableEvent(usize),
+    /// A client session (an index into `Kernel::sessions`).
+    Session(usize),
 }
 
 /// What a waiting thread waits for.
@@ -121,7 +123,8 @@ pub struct Thread {
     pub cpu: *mut Cpu,
     pub tlr: u64,
     pub priority: u32,
-    pub ideal: usize,
+    /// The ideal core, or -1 when the thread has no preference.
+    pub ideal: i32,
     pub core: usize,
     pub affinity: u64,
     pub state: State,
@@ -224,7 +227,7 @@ impl Kernel {
             cpu: Box::into_raw(cpu),
             tlr,
             priority,
-            ideal: core,
+            ideal: core as i32,
             core,
             affinity: 1 << core,
             state: State::Created,
@@ -319,16 +322,15 @@ impl Kernel {
         self.sched.current = None;
     }
 
-    /// Moves thread `t` to core `c`.
+    /// Moves thread `t` to core `c`; the scheduler places it there at its next decision.
     pub fn move_thread(&mut self, t: usize, c: usize) {
         self.leave_core(t);
         self.sched.threads[t].core = c;
-        if self.sched.current == Some(t) {
-            self.enter(t);
-        }
     }
 
-    /// Thread `t` stops running on its core: its running time is counted.
+    /// Thread `t` stops running on its core: its running time is counted,
+    /// and a thread that stays ready cannot start anywhere before the time
+    /// it has reached.
     fn leave_core(&mut self, t: usize) {
         let c = self.sched.threads[t].core;
         if let Some((r, since)) = self.sched.on_core[c]
@@ -336,6 +338,11 @@ impl Kernel {
         {
             self.sched.threads[t].cpu_time += self.sched.clocks[c] - since;
             self.sched.on_core[c] = None;
+        }
+        let now = self.sched.clocks[c];
+        let th = &mut self.sched.threads[t];
+        if th.state == State::Ready {
+            th.ready_at = th.ready_at.max(now);
         }
     }
 
@@ -421,25 +428,57 @@ impl Kernel {
         Some((start, t))
     }
 
+    /// The thread each core runs next.
+    fn heads(&self) -> Vec<Option<usize>> {
+        (0..CORES).map(|k| self.next_on(k).map(|(_, t)| t)).collect()
+    }
+
+    fn ready_on(&self, c: usize) -> usize {
+        self.sched.threads.iter().filter(|t| t.state == State::Ready && t.core == c).count()
+    }
+
     /// A core with nothing ready takes the best ready thread that waits
-    /// behind another on its own core and may run here.
+    /// behind another and may run here; failing that, the thread another
+    /// core runs next, if that core has another thread to run (as the
+    /// Horizon scheduler does).
     fn migrate(&mut self) {
         for c in 0..CORES {
-            if self.sched.threads.iter().any(|t| t.state == State::Ready && t.core == c) {
+            if self.ready_on(c) > 0 {
                 continue;
             }
-            let heads: Vec<Option<usize>> = (0..CORES).map(|k| self.next_on(k).map(|(_, t)| t)).collect();
-            let candidate = self
-                .sched
-                .threads
-                .iter()
-                .enumerate()
-                .filter(|&(i, t)| t.state == State::Ready && t.affinity & 1 << c != 0 && heads[t.core] != Some(i))
-                .min_by_key(|(_, t)| (t.priority, t.seq))
-                .map(|(i, _)| i);
-            if let Some(i) = candidate {
-                self.sched.threads[i].core = c;
+            let heads = self.heads();
+            let allowed = |t: &Thread| t.state == State::Ready && t.affinity & 1 << c != 0;
+            let rank = |i: &usize| (self.sched.threads[*i].priority, self.sched.threads[*i].seq);
+            let all = 0..self.sched.threads.len();
+            let waiting = all.clone().filter(|&i| allowed(&self.sched.threads[i]) && heads[self.sched.threads[i].core] != Some(i)).min_by_key(rank);
+            let head = || all.clone().filter(|&i| allowed(&self.sched.threads[i]) && heads[self.sched.threads[i].core] == Some(i) && self.ready_on(self.sched.threads[i].core) > 1).min_by_key(rank);
+            if let Some(i) = waiting.or_else(head) {
+                self.move_thread(i, c);
             }
+        }
+    }
+
+    /// SleepThread(-1), the yield the SDK uses: the thread goes behind those
+    /// of its priority, and its core may take a ready thread waiting on
+    /// another core, of higher priority, or of the same priority if none is
+    /// queued here.
+    pub fn yield_with_migration(&mut self, t: usize) {
+        let now = self.now();
+        self.ready(t, now);
+        let (c, priority) = (self.sched.threads[t].core, self.sched.threads[t].priority);
+        let heads = self.heads();
+        let peers = self.sched.threads.iter().enumerate().filter(|&(i, x)| i != t && x.state == State::Ready && x.core == c && x.priority == priority).count();
+        let candidate = self
+            .sched
+            .threads
+            .iter()
+            .enumerate()
+            .filter(|&(i, x)| i != t && x.state == State::Ready && x.core != c && heads[x.core] != Some(i) && x.affinity & 1 << c != 0)
+            .filter(|(_, x)| x.priority < priority || (x.priority == priority && peers == 0))
+            .min_by_key(|(_, x)| (x.priority, x.seq))
+            .map(|(i, _)| i);
+        if let Some(i) = candidate {
+            self.move_thread(i, c);
         }
     }
 

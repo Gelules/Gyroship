@@ -32,6 +32,34 @@ pub fn read_modules(exefs: &Path) -> Result<Vec<(String, Module)>, String> {
     Ok(out)
 }
 
+/// The client services an NPDM grants: the service access control of its
+/// ACI0 (offset at ACI0+0x28, size at +0x2C), whose entries are a control
+/// byte (bits 0-2: length - 1, bit 7: server) and the name.
+pub fn npdm_services(npdm: &[u8]) -> Option<Vec<String>> {
+    let u32_at = |o: usize| Some(u32::from_le_bytes(npdm.get(o..o + 4)?.try_into().ok()?) as usize);
+    if npdm.get(0..4)? != b"META" {
+        return None;
+    }
+    let aci = u32_at(0x70)?;
+    if npdm.get(aci..aci + 4)? != b"ACI0" {
+        return None;
+    }
+    let (off, size) = (u32_at(aci + 0x28)?, u32_at(aci + 0x2C)?);
+    let sac = npdm.get(aci + off..aci + off + size)?;
+    let mut names = Vec::new();
+    let mut i = 0;
+    while i < sac.len() {
+        let control = sac[i];
+        let len = usize::from(control & 7) + 1;
+        let name = sac.get(i + 1..i + 1 + len)?;
+        if control & 0x80 == 0 {
+            names.push(String::from_utf8_lossy(name).into_owned());
+        }
+        i += 1 + len;
+    }
+    Some(names)
+}
+
 fn round_up(v: u64) -> u64 {
     v.div_ceil(mem::PAGE) * mem::PAGE
 }
@@ -73,6 +101,10 @@ pub fn boot(exefs: &Path, journal: Journal, config: Config) -> Result<Kernel, St
     for line in k_lines {
         k.log(&line);
     }
+    let npdm = std::fs::read(exefs.join("main.npdm")).map_err(|e| format!("main.npdm: {e}"))?;
+    k.allowed_services = npdm_services(&npdm).ok_or("main.npdm: no service access control")?;
+    let services = format!("npdm: {} services granted: {}", k.allowed_services.len(), k.allowed_services.join(" "));
+    k.log(&services);
     let rtld = link::base_of("rtld").expect("rtld's base");
     k.create_main(rtld, MAIN_STACK.0 + MAIN_STACK.1);
     k.oracle = Some(Program::link(modules).map_err(|e| format!("link: {}", e.0))?);

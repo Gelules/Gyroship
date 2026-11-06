@@ -85,7 +85,7 @@ unsafe extern "C" fn busy(cpu: *mut Cpu, _: u64) {
     unsafe {
         assert_eq!(svc(cpu, 0x08, &[0, MIGRANT, 0, 0, 44, 0]), 0);
         let h = (*cpu).x[1];
-        assert_eq!(svc(cpu, 0x0F, &[h, (-2i64) as u64, 0x3F]), 0, "SetThreadCoreMask");
+        assert_eq!(svc(cpu, 0x0F, &[h, (-1i64) as u64, 0x3F]), 0, "SetThreadCoreMask, no preferred core");
         svc(cpu, 0x09, &[h]);
         for _ in 0..200 {
             now(cpu);
@@ -97,6 +97,90 @@ unsafe extern "C" fn migrant(cpu: *mut Cpu, _: u64) {
     unsafe {
         let core = svc(cpu, 0x10, &[]);
         record("migrant core", core);
+        ret(cpu);
+    }
+}
+
+// Case 6: an idle core takes the head of a core that has another thread to run.
+const WIDE: u64 = 0x1900;
+const PINNED: u64 = 0x1A00;
+unsafe extern "C" fn wide(cpu: *mut Cpu, _: u64) {
+    unsafe {
+        FLAG.set(false);
+        assert_eq!(svc(cpu, 0x0F, &[u64::from(CURRENT_THREAD as u32), (-1i64) as u64, 0x3F]), 0);
+        // A lower priority, pinned to this core: it only runs if this thread moves.
+        spawn(cpu, PINNED, 0, 50, 0);
+        while !FLAG.get() {
+            rt::gyroship_yield(cpu, PC, 1);
+        }
+        record("wide core", svc(cpu, 0x10, &[]));
+        ret(cpu);
+    }
+}
+unsafe extern "C" fn pinned(cpu: *mut Cpu, _: u64) {
+    unsafe {
+        FLAG.set(true);
+        record("pinned core", svc(cpu, 0x10, &[]));
+        ret(cpu);
+    }
+}
+
+// Case 7: a thread's time and tick count never go back, while it migrates.
+const ROAMER: u64 = 0x1B00;
+const PREEMPTER: u64 = 0x1C00;
+unsafe extern "C" fn roamer(cpu: *mut Cpu, _: u64) {
+    unsafe {
+        let me = u64::from(CURRENT_THREAD as u32);
+        assert_eq!(svc(cpu, 0x0F, &[me, (-1i64) as u64, 0x3]), 0);
+        spawn(cpu, PREEMPTER, 0, 30, 0);
+        let tlr = (*cpu).tpidrro;
+        let (mut last, mut last_ticks, mut ok) = (0, 0, true);
+        for i in 0..400 {
+            if i == 300 {
+                // Off to a core that never ran: it must not send the thread back in time.
+                assert_eq!(svc(cpu, 0x0F, &[me, 4, 1 << 4]), 0);
+            }
+            let t = now(cpu);
+            let ticks = t.wrapping_add(rt::ld64(&*cpu, tlr + 0x108));
+            ok &= t >= last && ticks >= last_ticks;
+            (last, last_ticks) = (t, ticks);
+        }
+        record("monotonic", u64::from(ok));
+        record("final core", svc(cpu, 0x10, &[]));
+        ret(cpu);
+    }
+}
+unsafe extern "C" fn preempter(cpu: *mut Cpu, _: u64) {
+    unsafe {
+        for _ in 0..20 {
+            svc(cpu, 0x0B, &[500]);
+        }
+        ret(cpu);
+    }
+}
+
+// Case 8: the special core ids of SetThreadCoreMask.
+const MASKS: u64 = 0x1D00;
+unsafe extern "C" fn masks(cpu: *mut Cpu, _: u64) {
+    unsafe {
+        let me = u64::from(CURRENT_THREAD as u32);
+        let get = |cpu: *mut Cpu| {
+            svc(cpu, 0x0E, &[0, 0, me]);
+            ((*cpu).x[1] as u32 as i32, (*cpu).x[2])
+        };
+        svc(cpu, 0x0F, &[me, 2, 0x6]);
+        record("2, 0x6", u64::from(get(cpu) == (2, 0x6)));
+        // -3 keeps the ideal core, which must stay in the mask.
+        record("-3 outside", svc(cpu, 0x0F, &[me, (-3i64) as u64, 0x1]));
+        svc(cpu, 0x0F, &[me, (-3i64) as u64, 0xC]);
+        record("-3", u64::from(get(cpu) == (2, 0xC)));
+        // -1: no preference.
+        svc(cpu, 0x0F, &[me, (-1i64) as u64, 0x30]);
+        record("-1", u64::from(get(cpu) == (-1, 0x30)));
+        // -2: the process's default core, alone, whatever the mask.
+        svc(cpu, 0x0F, &[me, (-2i64) as u64, 0x3F]);
+        record("-2", u64::from(get(cpu) == (0, 0x1)));
+        record("empty mask", svc(cpu, 0x0F, &[me, (-1i64) as u64, 0]));
         ret(cpu);
     }
 }
@@ -128,6 +212,11 @@ fn go(entry: u64) -> (Outcome, Vec<(&'static str, u64)>, String) {
         (BUSY, busy),
         (MIGRANT, migrant),
         (TICKS, ticks),
+        (WIDE, wide),
+        (PINNED, pinned),
+        (ROAMER, roamer),
+        (PREEMPTER, preempter),
+        (MASKS, masks),
     ]);
     run(entry)
 }
@@ -180,4 +269,31 @@ fn thread_tick_count_leaves_out_sleep() {
     // 100 µs of sleep are 3125 ticks; the thread itself ran a few steps.
     assert!(ticks < 10 * STEP, "{ticks} ticks: {journal}");
     assert_eq!(events[1].1, 1 << 8, "GetThreadId of the main thread: success, id 1");
+}
+
+#[test]
+fn an_idle_core_takes_a_head_that_blocks_a_pinned_thread() {
+    let (outcome, mut events, journal) = go(WIDE);
+    assert_eq!(outcome, Outcome::Finished, "{journal}");
+    events.sort();
+    // The spinning thread moved away; the pinned one ran on core 0.
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!(events[1], ("wide core", 1), "{events:?}");
+    assert_eq!(events[0], ("pinned core", 0), "{events:?}");
+}
+
+#[test]
+fn time_never_goes_back_across_cores() {
+    let (outcome, events, journal) = go(ROAMER);
+    assert_eq!(outcome, Outcome::Finished, "{journal}");
+    assert_eq!(events, [("monotonic", 1), ("final core", 4)], "{journal}");
+}
+
+#[test]
+fn set_thread_core_mask_special_values() {
+    use gyroship_hle::result::INVALID_COMBINATION;
+    let (outcome, events, journal) = go(MASKS);
+    assert_eq!(outcome, Outcome::Finished, "{journal}");
+    let c = u64::from(INVALID_COMBINATION);
+    assert_eq!(events, [("2, 0x6", 1), ("-3 outside", c), ("-3", 1), ("-1", 1), ("-2", 1), ("empty mask", c)], "{journal}");
 }
