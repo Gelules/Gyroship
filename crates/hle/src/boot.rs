@@ -168,8 +168,12 @@ pub(crate) unsafe fn on_probe(cpu: *mut Cpu, pc: u64, name: &str) {
     let (x, lr) = unsafe { ((*cpu).x, (*cpu).x[30]) };
     crate::with(|k| {
         let caller = k.symbolize(lr);
-        k.log(&format!("probe {name} at {pc:#x}: x0={:#x} x1={:#x} x2={:#x} x3={:#x}, called from {lr:#x} {caller}", x[0], x[1], x[2], x[3]));
-        // Probes named `stack:...` also log their frame chain.
+        k.log(&format!("probe {name} at {pc:#x}: x0={:#x} x1={:#x} x2={:#x} x3={:#x} x8={:#x}, called from {lr:#x} {caller}", x[0], x[1], x[2], x[3], x[8]));
+        // Probes named `regs:...` also log every register, `stack:...` their frame chain.
+        if name.starts_with("regs:") {
+            let all: Vec<String> = x.iter().enumerate().map(|(i, v)| format!("x{i}={v:#x}")).collect();
+            k.log(&format!("  {}", all.join(" ")));
+        }
         if name.starts_with("stack:") {
             for line in k.backtrace_from((pc, lr, x[29])) {
                 k.log(&line);

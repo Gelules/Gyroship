@@ -34,8 +34,17 @@ pub fn characteristics() -> [u8; 0xd0] {
     // SM and SPA versions: NVN's precompiled blobs exist for SM 8.8 only.
     put(0x3c, &0x808u32.to_le_bytes());
     put(0x40, &0x808u32.to_le_bytes());
-    // Flags: TSG (8), read-only syncpoint map (26), ZCULL (41).
-    put(0x50, &(1u64 << 8 | 1 << 26 | 1 << 41).to_le_bytes());
+    // Flags: TSG (8), read-only syncpoint map (26), and the engine classes the
+    // chip has: 2D (40), 3D (41, which also brings ZCULL), compute (42) and
+    // inline-to-memory (43). nvrm builds the class list from these bits; NVN
+    // needs a compute class.
+    put(0x50, &(1u64 << 8 | 1 << 26 | 0xf << 40).to_le_bytes());
+    // Classes: 2D, 3D, compute, GPFIFO, inline-to-memory, DMA copy (NVIDIA's
+    // public ids, Ampere B). NVN only accepts a known compute class; Lichii's
+    // channel gets the 3D class 0xc797.
+    for (i, class) in [0x902du32, 0xc797, 0xc7c0, 0xc76f, 0xa140, 0xc7b5].iter().enumerate() {
+        put(0x58 + 4 * i, &class.to_le_bytes());
+    }
     // Highest ioctl number per device: ctrl-gpu, tsg, dbg, channel, as, ..., prof.
     // dbg at least 2: below, nvrm leaves a string of the device info null that
     // NVN (subsdk1) always reads.
@@ -51,6 +60,8 @@ pub fn characteristics() -> [u8; 0xd0] {
 const ZCULL_INFO: [u32; 10] = [0x40; 10];
 /// TPCs of the one GPC.
 const TPC_MASK: u32 = 0x3f;
+/// GetVARegions: the 64 KiB-page region, at the top of each AS.
+const BIG_PAGES: u64 = 0x10_0000_0000;
 /// The channel's syncpoint; Lichii's present fences carry id 1.
 const CHANNEL_SYNCPT: u32 = 1;
 
@@ -235,8 +246,13 @@ impl Nvdrv {
                 put32(&mut out, 0xc, 192);
             }
             (Device::AsGpu, 0xc0404108) => {
+                // Small pages but for the top BIG_PAGES bytes. NVN (subsdk1)
+                // builds an allocator per region, fails on an empty one, and
+                // takes 512 GiB of small pages from the second AS (640 GiB).
+                // Our split.
                 let (start, end) = self.spaces.get(&fd).copied().unwrap_or_default();
-                let regions = [(start, 0x1000u32, end.saturating_sub(start) / 0x1000), (end, 0x10000, 0)];
+                let split = end.saturating_sub(BIG_PAGES).max(start);
+                let regions = [(start, 0x1000u32, (split - start) / 0x1000), (split, 0x10000, (end - split) / 0x10000)];
                 // The regions go inline (Ioctl) or in the extra output (Ioctl3).
                 let target = if req.command == 12 { &mut extra[..] } else { out.get_mut(0x10..).unwrap_or_default() };
                 for ((base, page, pages), r) in regions.iter().zip(target.as_chunks_mut::<0x18>().0) {
