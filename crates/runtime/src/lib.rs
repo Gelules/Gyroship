@@ -309,7 +309,7 @@ pub fn probe_counts() -> Vec<(u64, &'static str, u64)> {
 pub unsafe extern "C" fn gyroship_probe(cpu: *mut Cpu, pc: u64) {
     let Some(p) = PROBES.get() else { return };
     if let Ok(i) = p.binary_search_by_key(&pc, |e| e.0)
-        && p[i].2.fetch_add(1, Ordering::Relaxed) < if p[i].1.starts_with("stack:") { 4 } else { 1 }
+        && p[i].2.fetch_add(1, Ordering::Relaxed) < if p[i].1.starts_with("stack:") || p[i].1.starts_with("dump:") { 4 } else { 1 }
     {
         match HOOKS.get() {
             // SAFETY: guaranteed by the caller.

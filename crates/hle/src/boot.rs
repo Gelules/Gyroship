@@ -174,6 +174,16 @@ pub(crate) unsafe fn on_probe(cpu: *mut Cpu, pc: u64, name: &str) {
             let all: Vec<String> = x.iter().enumerate().map(|(i, v)| format!("x{i}={v:#x}")).collect();
             k.log(&format!("  {}", all.join(" ")));
         }
+        // `dump:...`: the 0x700 bytes at x0, as u64 words, 8 per line.
+        if name.starts_with("dump:") {
+            let mut raw = vec![0u8; 0x700];
+            if k.mem.read(x[0], &mut raw).is_ok() {
+                for (i, row) in raw.as_chunks::<64>().0.iter().enumerate() {
+                    let words: Vec<String> = row.as_chunks::<8>().0.iter().map(|w| format!("{:x}", u64::from_le_bytes(*w))).collect();
+                    k.log(&format!("  +{:#05x}: {}", i * 64, words.join(" ")));
+                }
+            }
+        }
         if name.starts_with("stack:") {
             for line in k.backtrace_from((pc, lr, x[29])) {
                 k.log(&line);
@@ -206,7 +216,7 @@ pub fn main(table: Vec<rt::Entry>) {
     let seconds: u64 = args.iter().position(|a| a == "--seconds").and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()).unwrap_or(60);
     let frames: Option<u64> = args.iter().position(|a| a == "--frames").and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok());
     let save_dir = args.iter().position(|a| a == "--save").and_then(|i| args.get(i + 1)).map(std::path::PathBuf::from);
-    let config = Config { explore: flag("--explore"), time_limit: Some(seconds * 31_250_000), frames, save_dir, ..Config::default() };
+    let config = Config { explore: flag("--explore"), time_limit: Some(seconds * 31_250_000), frames, save_dir, vsync: !flag("--no-vsync"), ..Config::default() };
     let installed = table.len();
     rt::install(table);
     mem::install_fault_handler();

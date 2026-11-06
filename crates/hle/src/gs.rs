@@ -20,8 +20,9 @@ pub struct State {
     /// gsv 204: the syncpoint memory (read-only page for the guest) and its two events.
     pub syncpt_page: Option<u64>,
     pub syncpt_events: Option<(usize, usize)>,
-    /// vi2 229: frames presented.
+    /// vi2 229: frames presented, and the vsync the last one waited for.
     pub presents: u64,
+    pub vsync: u64,
     /// Syncpoint values (syncpt GetCount says 32).
     pub syncpts: [u32; 32],
     /// syncpt 22: the event of each wait index.
@@ -300,6 +301,14 @@ impl Gs {
     }
 }
 
+/// Virtual ticks per second (31.25 MHz).
+const TICKS_PER_SECOND: u64 = 31_250_000;
+
+/// The k-th vsync of a 60 Hz display, in ticks.
+fn vsync(k: u64) -> u64 {
+    k * TICKS_PER_SECOND / 60
+}
+
 /// Stores event `e` at index `n` of a numbered table.
 fn put(table: &mut Vec<Option<usize>>, n: usize, e: usize) {
     if table.len() <= n {
@@ -362,6 +371,15 @@ impl Kernel {
         }
         if self.config.frames.is_some_and(|f| n >= f) {
             self.stop(0, &format!("{n} frames presented"));
+        }
+        // The display's cadence (as a console's compositor, or Lichii's pace to
+        // vblank): the presenting thread resumes at the next vsync its swap
+        // interval allows, on a 60 Hz grid computed from k (no drift).
+        if self.config.vsync {
+            let interval = u64::from((req.u32_at(0x10 + 0x18).unwrap_or(0) >> 16).max(1));
+            let first = (self.now() * 60).div_ceil(TICKS_PER_SECOND);
+            self.gs.vsync = (self.gs.vsync + interval).max(first);
+            self.block(crate::thread::Wait::Sleep, Some(vsync(self.gs.vsync)), crate::result::SUCCESS);
         }
     }
 

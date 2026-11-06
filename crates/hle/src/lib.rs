@@ -93,11 +93,13 @@ pub struct Config {
     /// `--save DIR`: saves are loaded from and committed to DIR; otherwise
     /// every run starts from empty saves, kept in memory.
     pub save_dir: Option<std::path::PathBuf>,
+    /// vi2 presents wait for the display's next vsync (60 Hz); `--no-vsync` turns it off.
+    pub vsync: bool,
 }
 
 impl Default for Config {
     fn default() -> Config {
-        Config { seed: 0x5EED, explore: false, non_system_memory: 0x2_6410_0000, time_limit: None, frames: None, save_dir: None }
+        Config { seed: 0x5EED, explore: false, non_system_memory: 0x2_6410_0000, time_limit: None, frames: None, save_dir: None, vsync: true }
     }
 }
 

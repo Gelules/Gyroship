@@ -136,6 +136,13 @@ impl Kernel {
                 (SUCCESS, 0, String::new())
             }
             0x0B => {
+                // A long sleep (a frame or more): its caller's stack, once per call site.
+                if a[0] as i64 >= 20_000_000 && self.journal.first(&format!("long sleep {:#x}", self.frame.1)) {
+                    self.log(&format!("sleep of {} ns, from:", a[0] as i64));
+                    for line in self.backtrace() {
+                        self.log(&line);
+                    }
+                }
                 self.sleep(a[0] as i64);
                 (SUCCESS, u64::from(a[0] as i64 <= 0), format!("{}", a[0] as i64))
             }
