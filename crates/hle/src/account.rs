@@ -19,6 +19,8 @@ pub enum Account {
     /// `acc:u0`.
     Service,
     Profile,
+    /// IManagerForApplication (acc:u0 101), the online account: no command seen yet.
+    Baas,
 }
 
 impl Account {
@@ -26,6 +28,7 @@ impl Account {
         match self {
             Account::Service => "acc:u0".into(),
             Account::Profile => "acc IProfile".into(),
+            Account::Baas => "acc IManagerForApplication".into(),
         }
     }
 
@@ -49,6 +52,8 @@ impl Account {
             (Account::Service, 5) => Reply::object(Service::Account(Account::Profile)),
             // IsUserAccountSwitchLocked; InitializeApplicationInfo(V2).
             (Account::Service, 150) => Reply::with(&[0]),
+            // GetBaasAccountManagerForApplication: the manager of the user's online account.
+            (Account::Service, 101) => return Some(Reply::object(crate::service::Service::Account(Account::Baas))),
             (Account::Service, 100 | 140 | 160) => Reply::ok(),
             // GetBase: the user id, a last-edit time, the nickname (0x21 bytes).
             (Account::Profile, 0 | 1) => {

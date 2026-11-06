@@ -15,6 +15,7 @@ pub mod hid;
 pub mod ipc;
 pub mod journal;
 pub mod nvdrv;
+pub mod pushbuf;
 pub mod service;
 pub mod shared;
 pub mod svc;

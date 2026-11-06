@@ -938,6 +938,14 @@ fn exec(c: &mut Cpu, _pc: u64, i: &Instruction) -> Result {
             Ok(())
         }
 
+        // Scalar pairwise add: ADDP d0, v1.2d adds the two 64-bit lanes.
+        C::ADDP if matches!(o[0], O::SIMDRegister(..)) => {
+            let ((d, _), (a, _, _)) = (scalar(&o[0])?, vec(&o[1])?);
+            let v = c.vr[a];
+            c.vr[d] = u128::from((v as u64).wrapping_add((v >> 64) as u64));
+            Ok(())
+        }
+
         // ---- vector integer ----
         C::ADD | C::SUB | C::MUL | C::MLA | C::MLS | C::SMAX | C::SMIN | C::UMAX | C::UMIN | C::SQADD | C::UQADD | C::SQSUB | C::UQSUB
         | C::SHADD | C::UHADD | C::SHSUB | C::URHADD | C::SRHADD | C::SABD | C::UABD | C::SABA | C::UABA | C::CMEQ | C::CMGE | C::CMGT

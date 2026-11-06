@@ -34,6 +34,22 @@ pub struct State {
     pub images: u32,
     /// GPU memory calls (101, 102, 211, 212), for a summary line.
     pub memory_calls: [u64; 4],
+    /// GPU memories (gpu 101): CPU address, by handle - 1.
+    pub gpu_mems: Vec<u64>,
+    /// GPU mappings (gpu 211): address space, GPU range (bounds included), CPU address.
+    pub gpu_maps: Vec<(u32, u64, u64, u64)>,
+}
+
+impl crate::Kernel {
+    /// The CPU address of a GPU address in address space `space`; addresses
+    /// no mapping covers are taken as CPU addresses (NVN maps the CPU's ASLR
+    /// region one to one).
+    pub fn gpu_to_cpu(&mut self, space: u32, gpu: u64) -> u64 {
+        match self.gs.gpu_maps.iter().rev().find(|m| m.0 == space && (m.1..=m.2).contains(&gpu)) {
+            Some(m) => m.3 + (gpu - m.1),
+            None => gpu,
+        }
+    }
 }
 
 /// The user partition of every GPU address space (gpu 203), bounds
@@ -135,11 +151,19 @@ impl Gs {
             // GPU memory: create (a handle), destroy, map, change kind. The client then
             // waits for the event its last word names: signaled before replying. Map and
             // change kind answer the fallback kind (no compression).
+            // Unmap: the mapping goes; then its event.
+            (Gs::GpuMemory, 213) => {
+                let (space, first, last) = (req.u32_at(0)?, req.u64_at(4)?, req.u64_at(0xc)?);
+                k.gs.gpu_maps.retain(|m| m.0 != space || m.2 < first || m.1 > last);
+                k.signal_gpu(req.u32_at(0x18)? as usize);
+                Reply::ok()
+            }
             (Gs::GpuMemory, c @ (101 | 102 | 211 | 212)) => {
                 k.memory_call(c);
                 match c {
                     101 => {
                         k.gs.gpu_memories += 1;
+                        k.gs.gpu_mems.push(req.u64_at(0)?);
                         Reply::with(&k.gs.gpu_memories.to_le_bytes())
                     }
                     102 => {
@@ -153,6 +177,10 @@ impl Gs {
                                 "gsv gpu memory 211: space {} gpu {:#x}..={:#x} memory {} offset {:#x} perm {} cache {} kind {:#x} second kind {:#x} raw {} device {} sync {}",
                                 req.u32_at(0)?, req.u64_at(4)?, req.u64_at(0xc)?, req.u32_at(0x14)?, req.u64_at(0x18)?, d.get(0x20)?, d.get(0x24)?, d.get(0x28)?, d.get(0x2c)?, d.get(0x30)?, d.get(0x34)?, d.get(0x38)?
                             ));
+                        }
+                        let (space, first, last, mem, offset) = (req.u32_at(0)?, req.u64_at(4)?, req.u64_at(0xc)?, req.u32_at(0x14)?, req.u64_at(0x18)?);
+                        if let Some(&base) = k.gs.gpu_mems.get(mem.wrapping_sub(1) as usize) {
+                            k.gs.gpu_maps.push((space, first, last, base + offset));
                         }
                         k.signal_gpu(req.u32_at(0x3c)? as usize);
                         Reply::with(&[*req.data.get(0x2c)?])

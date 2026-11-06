@@ -43,6 +43,11 @@ fn vector_lanes() {
     c.vr[4] = lanes32([10, 11, 12, 13]);
     run(&mut c, 0x6e042486); // mov v6.s[0], v4.s[1]
     assert_eq!(c.vr[6], u128::MAX << 32 | 11, "other lanes are kept");
+
+    c.vr[0] = u128::MAX;
+    c.vr[1] = 5 << 64 | 7;
+    run(&mut c, 0x5ef1b820); // addp d0, v1.2d
+    assert_eq!(c.vr[0], 12, "the two lanes' sum, the rest cleared");
 }
 
 #[test]

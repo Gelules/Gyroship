@@ -106,6 +106,12 @@ pub struct Nvdrv {
     fds: Vec<Option<Device>>,
     /// Address spaces (AllocAsEx): start and end, by fd.
     spaces: BTreeMap<u32, (u64, u64)>,
+    /// The gsv address space of each AS fd (AllocAsEx +4, which the SDK's
+    /// hook fills in) and of each channel fd (the AS it is bound to).
+    as_space: BTreeMap<u32, u32>,
+    channel_space: BTreeMap<u32, u32>,
+    /// Each channel's command processor.
+    channels: BTreeMap<u32, crate::pushbuf::Channel>,
     submits: u64,
 }
 
@@ -237,7 +243,8 @@ impl Nvdrv {
             (Device::AsGpu, 0x40284109) => {
                 let at = |o: usize| u64::from_le_bytes(input.get(o..o + 8).and_then(|s| s.try_into().ok()).unwrap_or([0; 8]));
                 self.spaces.insert(fd, (at(0x10), at(0x18)));
-                k.log(&format!("nvsrv: fd {fd} address space {:#x}..{:#x}", at(0x10), at(0x18)));
+                self.as_space.insert(fd, u32_at(&input, 4));
+                k.log(&format!("nvsrv: fd {fd} address space {:#x}..{:#x} (gsv space {})", at(0x10), at(0x18), u32_at(&input, 4)));
             }
             (Device::AsGpu, 0x8010410b) => {
                 let (_, end) = self.spaces.get(&fd).copied().unwrap_or_default();
@@ -262,7 +269,12 @@ impl Nvdrv {
                 }
                 put32(&mut out, 8, (regions.len() * 0x18) as u32);
             }
-            (Device::AsGpu, 0x40044101) => {}
+            // Bind a channel (its fd) to this address space.
+            (Device::AsGpu, 0x40044101) => {
+                if let Some(&space) = self.as_space.get(&fd) {
+                    self.channel_space.insert(u32_at(&input, 0), space);
+                }
+            }
             // tsg-gpu: bind a channel, time slice.
             (Device::TsgGpu, 0xc018540b | 0xc0045408) => {}
             // gpu (the channel): GPFIFO allocation hands out the channel's syncpoint.
@@ -293,17 +305,8 @@ impl Nvdrv {
                 if n <= 3 || n.is_multiple_of(600) {
                     k.log(&format!("nvsrv: submit #{n} fd {fd}, {} entries, flags {flags:#x}{fence}", u32_at(&input, 8)));
                 }
-                // The first submits' GPFIFO entries (GPU address = CPU address) and their first words.
-                if n <= 3 {
-                    let entries = read(k, req.send_buffer(1));
-                    for e in entries.as_chunks::<8>().0.iter().map(|e| u64::from_le_bytes(*e)) {
-                        let (addr, words) = (e & 0xffff_fffc | (e >> 32 & 0xff) << 32, (e >> 42 & 0x1f_ffff) as usize);
-                        let mut raw = vec![0; 4 * words.min(48)];
-                        let _ = k.mem.read(addr, &mut raw);
-                        let dump: Vec<String> = raw.as_chunks::<4>().0.iter().map(|w| format!("{:08x}", u32::from_le_bytes(*w))).collect();
-                        k.log(&format!("nvsrv: gpfifo {addr:#x}, {words} words: {}", dump.join(" ")));
-                    }
-                }
+                let entries = read(k, req.send_buffer(1));
+                self.run_gpfifo(k, fd, &entries);
             }
             _ => {
                 let bytes: String = input.iter().take(64).map(|b| format!("{b:02x}")).collect();
@@ -330,6 +333,49 @@ impl Nvdrv {
             let _ = k.mem.write(extra_buf.addr, &extra);
         }
         OK
+    }
+}
+
+impl Nvdrv {
+    /// Runs a submit's GPFIFO entries (GPU address bits 2..40, length in
+    /// words at bits 42..63) through the channel's command processor, and
+    /// performs its semaphore releases in guest memory.
+    fn run_gpfifo(&mut self, k: &mut Kernel, fd: u32, entries: &[u8]) {
+        let space = self.channel_space.get(&fd).copied().unwrap_or(0);
+        let channel = self.channels.entry(fd).or_default();
+        for e in entries.as_chunks::<8>().0.iter().map(|e| u64::from_le_bytes(*e)) {
+            let (gpu, len) = (e & 0xffff_fffc | (e >> 32 & 0xff) << 32, (e >> 42 & 0x1f_ffff) as usize);
+            let mut raw = vec![0u8; 4 * len.min(0x10_0000)];
+            let addr = k.gpu_to_cpu(space, gpu);
+            if k.mem.read(addr, &mut raw).is_err() {
+                if k.journal.few("gpfifo unreadable", 4) {
+                    k.log(&format!("nvsrv: channel fd {fd}: pushbuffer {gpu:#x} ({len} words) is not readable at {addr:#x}"));
+                }
+                continue;
+            }
+            let words: Vec<u32> = raw.as_chunks::<4>().0.iter().map(|w| u32::from_le_bytes(*w)).collect();
+            for effect in channel.run(&words) {
+                match effect {
+                    crate::pushbuf::Effect::Release(r) => {
+                        let at = k.gpu_to_cpu(space, r.addr);
+                        let mut bytes = r.value.to_le_bytes()[..r.width as usize].to_vec();
+                        if r.timestamp {
+                            bytes.resize(8, 0);
+                            bytes.extend((k.now() * 32).to_le_bytes());
+                        }
+                        let ok = k.mem.write_object(at, &bytes).is_ok();
+                        if k.journal.few("gpu release", 8) || !ok {
+                            k.log(&format!("gpu: method {:#x} releases {} at {:#x} (cpu {at:#x}){}{}", r.method, r.value, r.addr, if r.timestamp { " with timestamp" } else { "" }, if ok { "" } else { ": not writable" }));
+                        }
+                    }
+                    crate::pushbuf::Effect::Ignored { class, method, value } => {
+                        if k.journal.few(&format!("gpu ignored {class:#x} {method:#x}"), 2) {
+                            k.log(&format!("gpu: class {class:#x} method {method:#x} = {value:#x} not executed"));
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
