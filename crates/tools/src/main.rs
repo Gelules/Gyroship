@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 use gyroship_loader::Module;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Instant;
 
 #[derive(Parser)]
 #[command(name = "gyroship-tools", version, about = "Gyroship developer tools")]
@@ -195,6 +196,19 @@ fn functions(path: &Path, compare: Option<&Path>) -> Result<()> {
     let covered: u64 = ranges.iter().map(|r| r.len).sum();
     let outside = ranges.iter().filter(|r| r.start + r.len > m.text.end()).count();
     println!("eh_frame     {} functions, {covered:#x} bytes = {:.1}% of text ({outside} outside text)", ranges.len(), 100.0 * covered as f64 / m.text.size as f64);
+    let start = Instant::now();
+    let (mut words, mut refused) = (0u64, Vec::new());
+    for r in &ranges {
+        for at in (r.start..r.start + r.len).step_by(4) {
+            let word = u32::from_le_bytes(m.image[at as usize..at as usize + 4].try_into()?);
+            words += 1;
+            if gyroship_analysis::decode::decode(word).is_none() {
+                refused.push((at, word));
+            }
+        }
+    }
+    let sample: Vec<String> = refused.iter().take(8).map(|(a, w)| format!("{name}+{a:#x}={w:08x}")).collect();
+    println!("decode       {words} words in FDE ranges, {} refused, {:.2} s  {}", refused.len(), start.elapsed().as_secs_f64(), sample.join(" "));
     let Some(compare) = compare else { return Ok(()) };
 
     let mut ghidra = BTreeMap::new();
