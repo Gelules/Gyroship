@@ -56,7 +56,7 @@ impl Time {
             (Time::Static, 100) => Reply::with(&[0]),
             // GetClockSnapshot: zeros but the times, into the output buffer.
             (Time::Static, 400) => {
-                if let Some(b) = req.b.first().filter(|b| b.size as usize >= SNAPSHOT_SIZE) {
+                if let Some(b) = req.out_buffer(0).filter(|b| b.size as usize >= SNAPSHOT_SIZE) {
                     let mut s = vec![0u8; SNAPSHOT_SIZE];
                     s[0x40..0x48].copy_from_slice(&seconds.to_le_bytes());
                     s[0x48..0x50].copy_from_slice(&seconds.to_le_bytes());

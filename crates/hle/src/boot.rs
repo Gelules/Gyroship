@@ -105,6 +105,10 @@ pub fn boot(exefs: &Path, journal: Journal, config: Config) -> Result<Kernel, St
     k.allowed_services = npdm_services(&npdm).ok_or("main.npdm: no service access control")?;
     let services = format!("npdm: {} services granted: {}", k.allowed_services.len(), k.allowed_services.join(" "));
     k.log(&services);
+    let romfs = exefs.parent().map(|p| p.join("romfs")).filter(|p| p.is_dir()).ok_or("no romfs folder next to the exefs")?;
+    let image = crate::fs::RomFs::build(&romfs).map_err(|e| format!("{}: {e}", romfs.display()))?;
+    k.log(&format!("romfs: an image of {} bytes", image.size()));
+    k.romfs = Some(image);
     let rtld = link::base_of("rtld").expect("rtld's base");
     k.create_main(rtld, MAIN_STACK.0 + MAIN_STACK.1);
     let program = Program::link(modules).map_err(|e| format!("link: {}", e.0))?;
@@ -172,7 +176,8 @@ pub(crate) unsafe fn on_probe(cpu: *mut Cpu, pc: u64, name: &str) {
 }
 
 /// The generated harness's `main`: `boot <exefs> [--log FILE] [--explore]
-/// [--all-svcs]` runs the game; any other mode is the runtime's.
+/// [--all-svcs] [--seconds N]` runs the game (for N virtual seconds, 60 by
+/// default); any other mode is the runtime's.
 pub fn main(table: Vec<rt::Entry>) {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) != Some("boot") {
@@ -186,7 +191,9 @@ pub fn main(table: Vec<rt::Entry>) {
     let log = args.iter().position(|a| a == "--log").and_then(|i| args.get(i + 1)).map_or("boot.log", String::as_str);
     let mut journal = Journal::file(Path::new(log)).unwrap_or_else(|e| panic!("{log}: {e}"));
     journal.all_svcs = flag("--all-svcs");
-    let config = Config { explore: flag("--explore"), ..Config::default() };
+    // A virtual time limit, 60 s unless --seconds says otherwise.
+    let seconds: u64 = args.iter().position(|a| a == "--seconds").and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()).unwrap_or(60);
+    let config = Config { explore: flag("--explore"), time_limit: Some(seconds * 31_250_000), ..Config::default() };
     let installed = table.len();
     rt::install(table);
     mem::install_fault_handler();

@@ -14,6 +14,10 @@ pub const NO_MESSAGE: u32 = 128 | 3 << 9;
 /// Applet message: the focus state changed. `nn::oe::InitializeApplet`
 /// waits for it, then for the focus state 1.
 pub const FOCUS_STATE_CHANGED: u32 = 15;
+/// am's result for an empty channel (module 128, description 2).
+pub const NO_DATA_IN_CHANNEL: u32 = 128 | 2 << 9;
+/// The launch parameter that names the preselected user.
+const PRESELECTED_USER_MAGIC: u32 = 0xC794_97CA;
 /// GetCurrentFocusState: in focus.
 const IN_FOCUS: u8 = 1;
 /// The applet resource user id this process gets (Lichii's: 81).
@@ -32,8 +36,12 @@ pub enum Applet {
     Display,
     LibraryAppletCreator,
     ProcessWinding,
-    Functions,
+    /// IApplicationFunctions; the preselected user is handed out once.
+    Functions { popped: bool },
     Debug,
+    /// An IStorage of bytes and its accessor.
+    Storage(Vec<u8>),
+    StorageAccessor(Vec<u8>),
     /// Switch 2: IApplicationProxy 40 and 60, not identified yet.
     Unknown(u32),
 }
@@ -50,7 +58,9 @@ impl Applet {
             Applet::Display => "IDisplayController".into(),
             Applet::LibraryAppletCreator => "ILibraryAppletCreator".into(),
             Applet::ProcessWinding => "IProcessWindingController".into(),
-            Applet::Functions => "IApplicationFunctions".into(),
+            Applet::Functions { .. } => "IApplicationFunctions".into(),
+            Applet::Storage(_) => "am IStorage".into(),
+            Applet::StorageAccessor(_) => "am IStorageAccessor".into(),
             Applet::Debug => "IDebugFunctions".into(),
             Applet::Unknown(c) => format!("IApplicationProxy {c} interface"),
         }
@@ -74,7 +84,7 @@ impl Applet {
             (Applet::Proxy, 4) => return applet(Applet::Display),
             (Applet::Proxy, 10) => return applet(Applet::ProcessWinding),
             (Applet::Proxy, 11) => return applet(Applet::LibraryAppletCreator),
-            (Applet::Proxy, 20) => return applet(Applet::Functions),
+            (Applet::Proxy, 20) => return applet(Applet::Functions { popped: false }),
             (Applet::Proxy, 1000) => return applet(Applet::Debug),
             (Applet::Proxy, c @ (40 | 60)) => return applet(Applet::Unknown(c)),
             // GetEventHandle.
@@ -105,12 +115,37 @@ impl Applet {
             // GetAppletResourceUserId, AcquireForegroundRights.
             (Applet::Window, 1) => Reply::with(&ARUID.to_le_bytes()),
             (Applet::Window, 10) => Reply::ok(),
+            // PopLaunchParameter: the preselected user (kind 2), once; nothing else.
+            (Applet::Functions { popped }, 1) => {
+                if req.u32_at(0) != Some(2) || *popped {
+                    return Some(Reply::error(NO_DATA_IN_CHANNEL));
+                }
+                *popped = true;
+                let mut p = vec![0u8; 0x88];
+                p[0..4].copy_from_slice(&PRESELECTED_USER_MAGIC.to_le_bytes());
+                p[4] = 1;
+                p[8..24].copy_from_slice(&crate::account::user_id(k));
+                return applet(Applet::Storage(p));
+            }
+            // GetDesiredLanguage.
+            (Applet::Functions { .. }, 21) => Reply::with(b"en-US\0\0\0"),
+            // IStorage Open; IStorageAccessor GetSize, Read(offset) into the B buffer.
+            (Applet::Storage(bytes), 0) => return applet(Applet::StorageAccessor(bytes.clone())),
+            (Applet::StorageAccessor(bytes), 0) => Reply::with(&(bytes.len() as u64).to_le_bytes()),
+            (Applet::StorageAccessor(bytes), 11) => {
+                let offset = req.u64_at(0)? as usize;
+                if let Some(b) = req.out_buffer(0) {
+                    let chunk = bytes.get(offset..).unwrap_or(&[]);
+                    let _ = k.mem.write(b.addr, &chunk[..chunk.len().min(b.size as usize)]);
+                }
+                Reply::ok()
+            }
             // GetGpuErrorDetectedSystemEvent.
-            (Applet::Functions, 130) => Reply { copy_handles: vec![k.new_event_handle()?], ..Reply::ok() },
+            (Applet::Functions { .. }, 130) => Reply { copy_handles: vec![k.new_event_handle()?], ..Reply::ok() },
             // Switch 2 320 and 321: two booleans, both off.
-            (Applet::Functions, 320 | 321) => Reply::with(&[0]),
+            (Applet::Functions { .. }, 320 | 321) => Reply::with(&[0]),
             // GetPseudoDeviceId: a fixed id derived from the run's seed.
-            (Applet::Functions, 50) => {
+            (Applet::Functions { .. }, 50) => {
                 let s = k.config.seed;
                 Reply::with(&[s.to_le_bytes(), (!s).to_le_bytes()].concat())
             }

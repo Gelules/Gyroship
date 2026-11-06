@@ -192,6 +192,9 @@ impl Kernel {
         if let Some(t) = self.sched.current {
             self.sched.clocks[self.sched.threads[t].core] += STEP;
         }
+        if self.config.time_limit.is_some_and(|l| self.now() > l) {
+            self.stop(crate::STOP_EXIT, "the run reached its virtual time limit");
+        }
     }
 
     /// The index of the thread a handle (or the current-thread pseudo-handle) designates.

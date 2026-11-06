@@ -12,6 +12,11 @@ use crate::ipc::{Reply, Request};
 /// does not grant.
 pub const SM_NOT_ALLOWED: u32 = 21 | 8 << 9;
 
+/// Services granted although the NPDM's list does not name them. `bsd:s`:
+/// the SDK's socket layer asks for it (Lichii sees it too) and aborts when
+/// it is refused, so the console must grant it; its rule is not known.
+const ALSO_GRANTED: [&str; 1] = ["bsd:s"];
+
 #[derive(Debug, Default)]
 pub enum Service {
     /// The place of a service that is answering a request, or closed.
@@ -32,6 +37,16 @@ pub enum Service {
     /// `pctl` (IParentalControlServiceFactory) and IParentalControlService.
     Pctl,
     ParentalControl,
+    /// `fsp-srv` and its objects.
+    Fs(crate::fs::Fs),
+    /// `acc:u0` and its profiles.
+    Account(crate::account::Account),
+    /// `nifm:u`, never connected.
+    Nifm(crate::account::Nifm),
+    /// `ldr:ro`.
+    Ldr,
+    /// `bsd:s` and `bsd:u`, offline.
+    Bsd(crate::bsd::Bsd),
     /// `aoc:u` and `ectx:aw`: no command seen yet.
     Aoc,
     Ectx,
@@ -53,6 +68,11 @@ impl Service {
             Service::Stub(name) => format!("{name} (stub)"),
             Service::Applet(a) => a.label(),
             Service::Time(t) => t.label(),
+            Service::Fs(f) => f.label(),
+            Service::Bsd(b) => b.name.clone(),
+            Service::Account(a) => a.label(),
+            Service::Nifm(n) => n.label(),
+            Service::Ldr => "ldr:ro".to_string(),
             Service::Pctl => "pctl".to_string(),
             Service::ParentalControl => "pctl IParentalControlService".to_string(),
             Service::Aoc => "aoc:u".to_string(),
@@ -64,6 +84,10 @@ impl Service {
         let answer = match self {
             Service::Applet(a) => a.request(k, req),
             Service::Time(t) => t.request(k, req),
+            Service::Fs(f) => f.request(k, req),
+            Service::Bsd(b) => b.request(k, req),
+            Service::Account(a) => a.request(k, req),
+            Service::Nifm(n) => n.request(k, req),
             _ => None,
         };
         if let Some(reply) = answer {
@@ -73,6 +97,8 @@ impl Service {
             // CreateService, CreateServiceWithoutInitialize; Initialize.
             (Service::Pctl, 0 | 1) => Reply::object(Service::ParentalControl),
             (Service::ParentalControl, 1) => Reply::ok(),
+            // RegisterProcessHandle.
+            (Service::Ldr, 4) => Reply::ok(),
             (Service::Sm(sm), 0) => {
                 sm.registered = true;
                 Reply::ok()
@@ -102,7 +128,9 @@ impl Service {
                 if !k.config.explore {
                     k.stop(crate::STOP_EXIT, &what);
                 }
-                k.log(&what);
+                if k.journal.first(&format!("unknown {} {c}", svc.label())) {
+                    k.log(&what);
+                }
                 Reply::error(crate::result::NOT_IMPLEMENTED)
             }
         }
@@ -120,7 +148,7 @@ impl Kernel {
     /// sm GetServiceHandle: a service the NPDM grants and the HLE implements.
     fn get_service(&mut self, packed: u64) -> Reply {
         let name = name_of(packed);
-        if !self.allowed_services.contains(&name) {
+        if !self.allowed_services.contains(&name) && !ALSO_GRANTED.contains(&name.as_str()) {
             self.log(&format!("sm: {name:?} is not in the NPDM's service list: NotAllowed"));
             return Reply::error(SM_NOT_ALLOWED);
         }
@@ -129,6 +157,11 @@ impl Kernel {
             "appletOE" => Service::Applet(crate::am::Applet::Service),
             "time:u" => Service::Time(crate::time::Time::Static),
             "pctl" => Service::Pctl,
+            "fsp-srv" => Service::Fs(crate::fs::Fs::Proxy),
+            "acc:u0" => Service::Account(crate::account::Account::Service),
+            "nifm:u" => Service::Nifm(crate::account::Nifm::Service),
+            "ldr:ro" => Service::Ldr,
+            "bsd:s" | "bsd:u" => Service::Bsd(crate::bsd::Bsd { name: name.clone() }),
             "aoc:u" => Service::Aoc,
             "ectx:aw" => Service::Ectx,
             _ if self.config.explore => Service::Stub(name.clone()),

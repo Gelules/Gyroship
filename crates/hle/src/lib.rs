@@ -4,8 +4,11 @@
 //! host thread (D19), and each test thread gets a kernel of its own. A borrow
 //! of it must never stay open across a guest fiber switch.
 
+pub mod account;
 pub mod am;
 pub mod boot;
+pub mod bsd;
+pub mod fs;
 pub mod ipc;
 pub mod journal;
 pub mod service;
@@ -77,11 +80,13 @@ pub struct Config {
     /// GetInfo 0x15 TotalNonSystemMemorySize: 9 793 MiB, Lichii's value, the
     /// one known to reach the title screen (an arena of 128 MiB).
     pub non_system_memory: u64,
+    /// Stop the run past this virtual time (ticks).
+    pub time_limit: Option<u64>,
 }
 
 impl Default for Config {
     fn default() -> Config {
-        Config { seed: 0x5EED, explore: false, non_system_memory: 0x2_6410_0000 }
+        Config { seed: 0x5EED, explore: false, non_system_memory: 0x2_6410_0000, time_limit: None }
     }
 }
 
@@ -95,6 +100,9 @@ pub struct Kernel {
     /// `link()`'s view of memory, compared at the oracle probe (boot).
     pub oracle: Option<gyroship_loader::link::Program>,
     pub sessions: Vec<Option<ipc::Session>>,
+    /// The service objects sessions and domains refer to.
+    pub objects: Vec<service::Service>,
+    pub domains: Vec<ipc::Domain>,
     /// The services the NPDM grants (its service access control).
     pub allowed_services: Vec<String>,
     pub shared: Vec<shared::SharedMemory>,
@@ -104,6 +112,8 @@ pub struct Kernel {
     pub frame: (u64, u64, u64),
     /// Exported function symbols of every module, sorted: (address, name).
     pub symbols: Vec<(u64, String)>,
+    /// The game's RomFS, served by fsp-srv.
+    pub romfs: Option<fs::RomFs>,
 }
 
 /// Exit code of a run the HLE stops (an unknown or forbidden SVC, a guest
@@ -114,7 +124,7 @@ impl Kernel {
     pub fn new(mem: Memory, mut journal: Journal, config: Config) -> Kernel {
         let mode = if config.explore { "exploration (not a validation run)" } else { "strict" };
         journal.line(0, 0, &format!("gyroship hle: mode {mode}, seed {:#x}, non-system memory {:#x}", config.seed, config.non_system_memory));
-        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None, sessions: Vec::new(), allowed_services: Vec::new(), shared: Vec::new(), time_shared: None, frame: (0, 0, 0), symbols: Vec::new() }
+        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None, sessions: Vec::new(), objects: Vec::new(), domains: Vec::new(), allowed_services: Vec::new(), shared: Vec::new(), time_shared: None, frame: (0, 0, 0), symbols: Vec::new(), romfs: None }
     }
 
     /// Logs a line for the running thread (0 when none runs).

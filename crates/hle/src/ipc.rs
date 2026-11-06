@@ -49,6 +49,8 @@ pub struct Request {
     pub a: Vec<Buffer>,
     pub b: Vec<Buffer>,
     pub w: Vec<Buffer>,
+    /// Receive lists (C): where pointer outputs go.
+    pub c: Vec<Buffer>,
     /// The command's arguments (after the CMIF header, or the TIPC header).
     pub data: Vec<u8>,
     /// Domain: the target object, and the objects passed in.
@@ -60,6 +62,11 @@ pub struct Request {
 
 impl Request {
     /// The send buffer of an "auto-select" argument: the pointer or the A buffer, whichever is used.
+    /// The output buffer of an argument: the B buffer or the receive list, whichever is used.
+    pub fn out_buffer(&self, i: usize) -> Option<Buffer> {
+        [self.b.get(i), self.c.get(i)].into_iter().flatten().copied().find(|b| b.size != 0)
+    }
+
     pub fn send_buffer(&self, i: usize) -> Option<Buffer> {
         [self.x.get(i), self.a.get(i)].into_iter().flatten().copied().find(|b| b.size != 0)
     }
@@ -102,13 +109,21 @@ impl Reply {
     }
 }
 
-/// A client session: one service object, or a domain of them.
-#[derive(Debug)]
+/// A client session: one service object, or a domain of them. Objects
+/// live in `Kernel::objects`, so that cloned sessions share them.
+#[derive(Debug, Clone, Copy)]
 pub struct Session {
-    pub service: Service,
-    /// After ConvertCurrentObjectToDomain: object id -> service (the session's own is 1).
-    pub domain: Option<std::collections::BTreeMap<u32, Service>>,
-    next_object: u32,
+    pub object: usize,
+    /// After ConvertCurrentObjectToDomain: its index in `Kernel::domains`.
+    pub domain: Option<usize>,
+}
+
+/// A domain: object id -> index in `Kernel::objects` (the converted
+/// session's own object is 1).
+#[derive(Debug, Default)]
+pub struct Domain {
+    pub objects: std::collections::BTreeMap<u32, usize>,
+    next: u32,
 }
 
 fn word(buf: &[u8], i: usize) -> Option<u32> {
@@ -158,7 +173,15 @@ pub fn parse(buf: &[u8], domain: bool) -> Option<Request> {
     let (a, b, w) = (abw(na, &mut i)?, abw(nb, &mut i)?, abw(nw, &mut i)?);
     let raw_start = 4 * i;
     let raw = buf.get(raw_start..raw_start + 4 * data_words)?;
-    let mut r = Request { kind: Kind::Close, command: 0, pid, copy_handles, move_handles, x, a, b, w, data: Vec::new(), object: None, in_objects: Vec::new(), close_object: false };
+    // Receive lists after the data: mode 0 none, 2 one, n + 2 n of them.
+    let mut c = Vec::new();
+    let mode = (w1 >> 10 & 0xF) as usize;
+    for k in 0..mode.saturating_sub(2).max(usize::from(mode == 2)) {
+        let at = raw_start / 4 + data_words + 2 * k;
+        let (lo, hi) = (u64::from(word(buf, at)?), u64::from(word(buf, at + 1)?));
+        c.push(Buffer { addr: lo | (hi & 0xFFFF) << 32, size: hi >> 16 });
+    }
+    let mut r = Request { kind: Kind::Close, command: 0, pid, copy_handles, move_handles, x, a, b, w, c, data: Vec::new(), object: None, in_objects: Vec::new(), close_object: false };
     match ty {
         2 => {}
         TIPC_CLOSE => r.kind = Kind::Close,
@@ -248,11 +271,16 @@ fn encode(req: &Request, reply: &Reply, objects: &[u32], domain: bool, size: usi
 }
 
 impl Kernel {
-    /// A new session to `service`; returns its handle.
+    /// A new session to a new object; returns its handle.
     pub fn open_session(&mut self, service: Service) -> Result<u32, u32> {
+        self.objects.push(service);
+        self.add_session(Session { object: self.objects.len() - 1, domain: None })
+    }
+
+    fn add_session(&mut self, session: Session) -> Result<u32, u32> {
         let s = self.sessions.len();
         let h = self.handles.add(Object::Session(s)).ok_or(OUT_OF_HANDLES)?;
-        self.sessions.push(Some(Session { service, domain: None, next_object: 1 }));
+        self.sessions.push(Some(session));
         Ok(h)
     }
 
@@ -267,7 +295,7 @@ impl Kernel {
         if self.mem.read(buf, &mut msg).is_err() {
             return INVALID_POINTER;
         }
-        let domain = self.sessions[s].as_ref().is_some_and(|x| x.domain.is_some());
+        let domain = self.sessions[s].is_some_and(|x| x.domain.is_some());
         let Some(req) = parse(&msg, domain) else {
             let words: Vec<String> = msg.chunks(4).take(16).map(|c| format!("{:08x}", u32::from_le_bytes(c.try_into().unwrap_or([0; 4])))).collect();
             let what = format!("ipc: malformed message on session {s}: {}", words.join(" "));
@@ -286,69 +314,71 @@ impl Kernel {
 
     /// Runs one request; returns the reply and, in a domain, the ids of its new objects.
     fn dispatch(&mut self, s: usize, req: &Request) -> (Reply, Vec<u32>) {
-        let session = self.sessions[s].as_mut().expect("an open session");
+        let session = self.sessions[s].expect("an open session");
         match req.kind {
             Kind::Close => return (Reply::ok(), Vec::new()),
             Kind::Control => return (self.control(s, req), Vec::new()),
             _ => {}
         }
         // The target: the session's object, or an object of its domain.
-        let target = match (&mut session.domain, req.object) {
+        let target = match (session.domain, req.object) {
             (Some(d), Some(id)) => {
                 if req.close_object {
-                    d.remove(&id);
+                    self.domains[d].objects.remove(&id);
                     return (Reply::ok(), Vec::new());
                 }
-                match d.get_mut(&id) {
-                    Some(svc) => std::mem::take(svc),
+                match self.domains[d].objects.get(&id) {
+                    Some(&o) => o,
                     None => return (Reply::error(crate::result::INVALID_HANDLE), Vec::new()),
                 }
             }
-            _ => std::mem::take(&mut session.service),
+            _ => session.object,
         };
-        let mut svc = target;
+        let mut svc = std::mem::take(&mut self.objects[target]);
         let label = svc.label();
         let mut reply = svc.request(self, req);
+        self.objects[target] = svc;
         let mut ids = Vec::new();
-        let session = self.sessions[s].as_mut().expect("an open session");
-        match (&mut session.domain, req.object) {
-            (Some(d), Some(id)) => {
-                d.insert(id, svc);
-                for o in reply.objects.drain(..) {
-                    session.next_object += 1;
-                    d.insert(session.next_object, o);
-                    ids.push(session.next_object);
+        for o in std::mem::take(&mut reply.objects) {
+            self.objects.push(o);
+            let o = self.objects.len() - 1;
+            match (session.domain, req.object) {
+                (Some(d), Some(_)) => {
+                    let domain = &mut self.domains[d];
+                    domain.next += 1;
+                    domain.objects.insert(domain.next, o);
+                    ids.push(domain.next);
                 }
-            }
-            _ => {
-                session.service = svc;
-                for o in std::mem::take(&mut reply.objects) {
-                    match self.open_session(o) {
-                        Ok(h) => reply.move_handles.push(h),
-                        Err(e) => reply.result = e,
-                    }
-                }
+                _ => match self.add_session(Session { object: o, domain: None }) {
+                    Ok(h) => reply.move_handles.push(h),
+                    Err(e) => reply.result = e,
+                },
             }
         }
         let key = format!("ipc {label} {}", req.command);
-        if self.journal.all_svcs || self.journal.first(&key) || reply.result != SUCCESS {
+        let key = format!("{key} {:#x}", reply.result);
+        if self.journal.all_svcs || self.journal.first(&key) {
             let status = if reply.result == SUCCESS { String::new() } else { format!(" -> {:#x}", reply.result) };
             self.log(&format!("ipc {label} {}{status}", req.command));
         }
         (reply, ids)
     }
 
-    /// IHipcManager: domains and the pointer buffer size.
+    /// IHipcManager: domains, clones and the pointer buffer size.
     fn control(&mut self, s: usize, req: &Request) -> Reply {
-        let session = self.sessions[s].as_mut().expect("an open session");
+        let session = self.sessions[s].expect("an open session");
         let reply = match req.command {
             0 => {
                 // ConvertCurrentObjectToDomain: the session's object becomes object 1.
-                let svc = std::mem::take(&mut session.service);
-                session.domain = Some(std::collections::BTreeMap::from([(1, svc)]));
-                session.next_object = 1;
+                self.domains.push(Domain { objects: std::collections::BTreeMap::from([(1, session.object)]), next: 1 });
+                self.sessions[s] = Some(Session { domain: Some(self.domains.len() - 1), ..session });
                 Reply::with(&1u32.to_le_bytes())
             }
+            // CloneCurrentObject, CloneCurrentObjectEx: one more session to the same object (or domain).
+            2 | 4 => match self.add_session(session) {
+                Ok(h) => Reply { move_handles: vec![h], ..Reply::ok() },
+                Err(e) => Reply::error(e),
+            },
             // QueryPointerBufferSize.
             3 => Reply::with(&0x8000u16.to_le_bytes()),
             c => {

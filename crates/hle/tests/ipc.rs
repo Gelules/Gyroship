@@ -220,3 +220,20 @@ fn time_s_shared_memory_has_a_steady_clock_source() {
     k.mem.read(at + 0xD8 + 0x28, &mut id).unwrap();
     assert_ne!(id, [0; 16]);
 }
+
+#[test]
+fn a_cloned_session_reaches_the_same_object() {
+    let (mut k, mut cpu) = kernel();
+    let sm = connect_sm(&mut k, &mut cpu);
+    let (_, lm) = get_service(&mut k, &mut cpu, sm, "lm");
+    // CloneCurrentObject (control 2): a moved handle to a second session.
+    let mut control = cmif(&[5], 2, &[], None);
+    control[0] = 5;
+    let (r, w) = send(&mut k, &mut cpu, lm, &control);
+    assert_eq!(r, SUCCESS);
+    let clone = moved(&w);
+    assert_ne!(clone, lm);
+    let (_, w) = send(&mut k, &mut cpu, clone, &cmif(&[4], 0, &[0, 0], None));
+    assert_ne!(moved(&w), 0, "OpenLogger through the clone");
+    assert_eq!(k.objects.iter().filter(|o| matches!(o, gyroship_hle::service::Service::Lm)).count(), 1, "one lm object");
+}
