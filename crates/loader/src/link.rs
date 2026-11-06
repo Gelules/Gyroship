@@ -112,6 +112,18 @@ impl Program {
     pub fn unresolved(&self) -> impl Iterator<Item = &Import> {
         self.imports.iter().filter(|i| i.target.is_none())
     }
+
+    /// The module whose image contains this guest address.
+    pub fn module_at(&self, addr: u64) -> Option<&Placed> {
+        self.modules.iter().find(|m| (m.base..m.end()).contains(&addr))
+    }
+
+    /// `len` bytes of guest memory at `addr`, if they lie within one module.
+    pub fn read(&self, addr: u64, len: usize) -> Option<&[u8]> {
+        let m = self.module_at(addr)?;
+        let at = (addr - m.base) as usize;
+        m.module.image.get(at..at.checked_add(len)?)
+    }
 }
 
 fn relocate(index: usize, p: &mut Placed, scope: &HashMap<String, u64>, imports: &mut Vec<Import>) -> Result<Stats> {

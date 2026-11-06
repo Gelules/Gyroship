@@ -214,6 +214,10 @@ fn links_imports_and_applies_every_relocation_kind() {
     assert_eq!(p.unresolved().count(), 0);
     let import = p.imports.iter().find(|i| i.name == "imported").unwrap();
     assert_eq!((import.slot, import.target), (main_base + 0x2108, Some(sdk_base + 0x60)));
+    assert_eq!(p.read(main_base + 0x2108, 8), Some(&(sdk_base + 0x60).to_le_bytes()[..]));
+    assert_eq!(p.module_at(sdk_base + 0x10).map(|m| m.name.as_str()), Some("sdk"));
+    assert_eq!(p.read(main_base + 0x22FC, 8), None, "crosses the end of main");
+    assert!(p.module_at(main_base + 0x2300).is_none());
 }
 
 #[test]
