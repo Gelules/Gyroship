@@ -1,0 +1,10 @@
+[package]
+name = "gyroship-loader"
+description = "NX executables: NSO segments, compression, symbols, relocations, ELF export"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+lz4_flex = { version = "0.14", default-features = false, features = ["safe-decode", "std"] }
+sha2.workspace = true
