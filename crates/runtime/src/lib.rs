@@ -1,11 +1,19 @@
 //! Guest CPU context, guest memory, dispatch table and exceptions.
 //!
-//! Recompiled functions are `extern "C" fn(*mut Cpu)`, whatever backend
-//! generated them. They reach the rest of the runtime through the
+//! Recompiled functions are `extern "C" fn(*mut Cpu, resume: u64)`, whatever
+//! backend generated them. They reach the rest of the runtime through the
 //! `gyroship_*` symbols below.
+//!
+//! Control transfers (D20): `RET` writes its target to `Cpu::pc`, and after
+//! each call the caller checks that `pc` is its own continuation. When it is
+//! not (an exception landing pad, `longjmp`, a fiber switch), the caller
+//! jumps there if the address is one of its resume points, or returns, and
+//! the mismatch travels down the host stack to the frame that owns the
+//! target, or to [`run`], which resumes the function that contains it.
 
 pub mod harness;
 pub mod interp;
+pub mod mem;
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,6 +36,12 @@ pub struct Cpu {
     pub vr: [u128; 32],
     pub fpcr: u64,
     pub fpsr: u64,
+    /// Where guest execution goes on: set by `RET`, by non-local jumps and
+    /// before [`run`].
+    pub pc: u64,
+    /// Host stack address below which generated code stops nesting tail
+    /// calls and hands them to [`run`] instead (set by `run`).
+    pub stack_limit: u64,
 }
 
 pub const OFFSET_X: i32 = 0;
@@ -39,6 +53,8 @@ pub const OFFSET_TPIDR: i32 = 264;
 pub const OFFSET_TPIDRRO: i32 = 272;
 pub const OFFSET_MEM: i32 = 280;
 pub const OFFSET_VR: i32 = 288;
+pub const OFFSET_PC: i32 = 816;
+pub const OFFSET_STACK_LIMIT: i32 = 824;
 
 const _: () = {
     assert!(std::mem::offset_of!(Cpu, x) == OFFSET_X as usize);
@@ -50,22 +66,28 @@ const _: () = {
     assert!(std::mem::offset_of!(Cpu, tpidrro) == OFFSET_TPIDRRO as usize);
     assert!(std::mem::offset_of!(Cpu, mem) == OFFSET_MEM as usize);
     assert!(std::mem::offset_of!(Cpu, vr) == OFFSET_VR as usize);
+    assert!(std::mem::offset_of!(Cpu, pc) == OFFSET_PC as usize);
+    assert!(std::mem::offset_of!(Cpu, stack_limit) == OFFSET_STACK_LIMIT as usize);
 };
 
 impl Cpu {
     pub fn new(mem: *mut u8) -> Cpu {
-        Cpu { x: [0; 32], n: false, z: false, c: false, v: false, tpidr: 0, tpidrro: 0, mem, vr: [0; 32], fpcr: 0, fpsr: 0 }
+        Cpu { x: [0; 32], n: false, z: false, c: false, v: false, tpidr: 0, tpidrro: 0, mem, vr: [0; 32], fpcr: 0, fpsr: 0, pc: 0, stack_limit: 0 }
     }
 }
 
-/// A recompiled guest function.
-pub type Guest = unsafe extern "C" fn(*mut Cpu);
+/// A recompiled guest function. `resume` is 0 to start at the beginning, or
+/// one of the function's resume points (an entry, or the continuation of a
+/// call or SVC); any other address is a fatal [`gyroship_miss`].
+pub type Guest = unsafe extern "C" fn(*mut Cpu, u64);
 
-/// One entry of a dispatch table emitted by the generator.
+/// One entry of a dispatch table emitted by the generator: a guest function,
+/// its size in bytes, and its host code.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Entry {
     pub addr: u64,
+    pub len: u64,
     pub function: Guest,
 }
 
@@ -73,22 +95,66 @@ pub struct Entry {
 ///
 /// # Safety
 /// `table` must point to `len` entries that live for the whole program.
-pub unsafe fn entries(table: *const Entry, len: u64) -> impl Iterator<Item = (u64, Guest)> {
+pub unsafe fn entries(table: *const Entry, len: u64) -> impl Iterator<Item = Entry> {
     // SAFETY: guaranteed by the caller.
-    unsafe { std::slice::from_raw_parts(table, len as usize) }.iter().map(|e| (e.addr, e.function))
+    unsafe { std::slice::from_raw_parts(table, len as usize) }.iter().copied()
 }
 
-static DISPATCH: OnceLock<Vec<(u64, Guest)>> = OnceLock::new();
+static DISPATCH: OnceLock<Vec<Entry>> = OnceLock::new();
 
-/// Installs the dispatch table: guest entry address -> host function.
-pub fn install(mut table: Vec<(u64, Guest)>) {
-    table.sort_unstable_by_key(|e| e.0);
+/// Installs the dispatch table. Functions never overlap (D14).
+pub fn install(mut table: Vec<Entry>) {
+    table.sort_unstable_by_key(|e| e.addr);
     let _ = DISPATCH.set(table);
 }
 
+/// The function that starts at `addr`.
 pub fn lookup(addr: u64) -> Option<Guest> {
+    containing(addr).filter(|e| e.addr == addr).map(|e| e.function)
+}
+
+/// The function whose body contains `pc`.
+pub fn containing(pc: u64) -> Option<Entry> {
     let t = DISPATCH.get()?;
-    t.binary_search_by_key(&addr, |e| e.0).ok().map(|i| t[i].1)
+    let e = t[..t.partition_point(|e| e.addr <= pc)].last()?;
+    (pc - e.addr < e.len).then_some(*e)
+}
+
+/// The guest function whose recompiled code starts closest below host address
+/// `rip`. Host code sizes are not recorded, so this is only a hint.
+pub fn function_at_host(rip: u64) -> Option<u64> {
+    let host = |e: &Entry| e.function as usize as u64;
+    DISPATCH.get()?.iter().filter(|e| host(e) <= rip).max_by_key(|e| host(e)).map(|e| e.addr)
+}
+
+/// The return address of a thread's first function: [`run`] stops there.
+pub const EXIT: u64 = 0xFFFF_FFFF_FFFF_FFF0;
+
+/// Host stack that generated code may use below [`run`] before it hands tail
+/// calls back to it. The host thread or fiber needs this much plus a margin.
+pub const STACK_BUDGET: u64 = 512 << 10;
+
+/// Runs guest code from `cpu.pc` until it returns to [`EXIT`]: the driver of
+/// one guest thread. Each step calls the function that contains `cpu.pc`, at
+/// its start or at a resume point; a non-local jump unwinds host frames back
+/// here, and the loop goes on at the new `cpu.pc`.
+///
+/// # Safety
+/// `cpu` must point to a valid context whose memory covers what guest code touches.
+pub unsafe fn run(cpu: *mut Cpu) {
+    let here = 0u8;
+    // SAFETY: guaranteed by the caller.
+    unsafe { (*cpu).stack_limit = (&raw const here as u64).saturating_sub(STACK_BUDGET) };
+    loop {
+        // SAFETY: as above.
+        let pc = unsafe { (*cpu).pc };
+        if pc == EXIT {
+            return;
+        }
+        let Some(e) = containing(pc) else { panic!("guest pc {pc:#x} is in no recompiled function") };
+        // SAFETY: as above.
+        unsafe { (e.function)(cpu, if pc == e.addr { 0 } else { pc }) };
+    }
 }
 
 /// Untranslated instructions the interpreter executed.
@@ -96,15 +162,20 @@ pub static INTERPRETED: AtomicU64 = AtomicU64::new(0);
 /// Untranslated instructions the interpreter does not cover either (each logged once).
 pub static UNHANDLED: AtomicU64 = AtomicU64::new(0);
 
-/// Calls the guest function at `target` through the dispatch table.
+/// An indirect call or jump to `target`: calls the function that starts
+/// there. An address inside a function is a non-local jump: it becomes
+/// `cpu.pc`, and the generated callers hand it down to [`run`].
 ///
 /// # Safety
 /// `cpu` must point to a valid context whose memory covers what the callee touches.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gyroship_call(cpu: *mut Cpu, target: u64) {
-    match lookup(target) {
-        Some(f) => unsafe { f(cpu) },
-        None => panic!("no recompiled function at guest address {target:#x}"),
+    match containing(target) {
+        // SAFETY: guaranteed by the caller.
+        Some(e) if e.addr == target => unsafe { (e.function)(cpu, 0) },
+        // SAFETY: as above.
+        Some(_) => unsafe { (*cpu).pc = target },
+        None => panic!("no recompiled function contains guest address {target:#x}"),
     }
 }
 
@@ -142,10 +213,11 @@ pub extern "C" fn gyroship_svc(_cpu: *mut Cpu, pc: u64, imm: u32) {
     panic!("guest svc #{imm:#x} at {pc:#x} (no HLE yet)");
 }
 
-/// A computed jump inside a function landed outside its known blocks.
+/// A computed jump or a resume landed on an address its function does not
+/// know: an analysis gap, fatal.
 #[unsafe(no_mangle)]
 pub extern "C" fn gyroship_miss(_cpu: *mut Cpu, pc: u64) {
-    panic!("indirect jump to {pc:#x} is not a known block");
+    panic!("guest address {pc:#x} is neither a known block nor a resume point of its function");
 }
 
 // Helpers for generated Rust code; Cranelift code inlines the same semantics.
@@ -258,17 +330,25 @@ pub fn rev32(v: u64) -> u64 {
     u64::from((v as u32).swap_bytes()) | u64::from(((v >> 32) as u32).swap_bytes()) << 32
 }
 
+/// Offset of a guest address in the reservation. The mask keeps a wild
+/// address inside the reservation, where it faults instead of touching host
+/// memory; it does not make the access correct.
+#[inline(always)]
+pub(crate) fn host(addr: u64) -> usize {
+    (addr & (mem::SPACE - 1)) as usize
+}
+
 macro_rules! access {
     ($ld:ident, $st:ident, $t:ty) => {
         #[inline(always)]
         pub fn $ld(c: &Cpu, addr: u64) -> u64 {
-            // SAFETY: the guest address space is one reservation that covers every guest address.
-            unsafe { (c.mem.add(addr as usize) as *const $t).read_unaligned() as u64 }
+            // SAFETY: the guest address space is one reservation that covers every masked address.
+            unsafe { (c.mem.add(host(addr)) as *const $t).read_unaligned() as u64 }
         }
         #[inline(always)]
         pub fn $st(c: &Cpu, addr: u64, v: u64) {
             // SAFETY: as above.
-            unsafe { (c.mem.add(addr as usize) as *mut $t).write_unaligned(v as $t) }
+            unsafe { (c.mem.add(host(addr)) as *mut $t).write_unaligned(v as $t) }
         }
     };
 }
@@ -280,13 +360,13 @@ access!(ld64, st64, u64);
 #[inline(always)]
 pub fn ld128(c: &Cpu, addr: u64) -> u128 {
     // SAFETY: as for the other accesses.
-    unsafe { (c.mem.add(addr as usize) as *const u128).read_unaligned() }
+    unsafe { (c.mem.add(host(addr)) as *const u128).read_unaligned() }
 }
 
 #[inline(always)]
 pub fn st128(c: &Cpu, addr: u64, v: u128) {
     // SAFETY: as for the other accesses.
-    unsafe { (c.mem.add(addr as usize) as *mut u128).write_unaligned(v) }
+    unsafe { (c.mem.add(host(addr)) as *mut u128).write_unaligned(v) }
 }
 
 /// NZCV of an FCMP: equal 0110, less 1000, greater 0010, unordered 0011.

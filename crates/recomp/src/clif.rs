@@ -1,6 +1,14 @@
 //! Backend B: Cranelift IR, emitted as one native object file. Each guest
-//! function becomes the exported symbol `f_<addr>` with the platform C
-//! calling convention, so it links with the runtime like the Rust backend.
+//! function becomes the exported symbol `f_<addr>(cpu, resume)` with the
+//! platform C calling convention, so it links with the runtime like the Rust
+//! backend.
+//!
+//! Control transfers follow D20 (see `gyroship_runtime`): `RET` writes
+//! `cpu.pc`; after each call, `cpu.pc` must be the continuation, or the
+//! function's rescue block takes over. The rescue block switches on the
+//! function's resume points (its entries, and the continuations of its calls
+//! and SVCs); a miss returns (after a call), dispatches (after an indirect
+//! jump) or is fatal (when entered with `resume`).
 //!
 //! ponytail: guest registers live in the `Cpu` struct and every access is a
 //! load or store; caching them in SSA values between calls is the upgrade if
@@ -13,22 +21,28 @@ use cranelift_codegen::ir::types::{F32, F32X4, F64, F64X2, I8, I8X16, I16, I16X8
 use cranelift_codegen::ir::{
     AbiParam, AliasRegionData, Block, FuncRef, Function, InstBuilder, MemFlagsData, Signature, UserFuncName, Value,
 };
+use cranelift_codegen::isa::OwnedTargetIsa;
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch};
 use cranelift_module::{DataDescription, FuncId, Linkage, Module, default_libcall_names};
 use cranelift_object::{ObjectBuilder, ObjectModule};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 pub type Result<T> = std::result::Result<T, String>;
 
 /// Field offsets of the runtime's `Cpu`, which checks them at compile time.
 mod layout {
     pub use gyroship_runtime::{
-        OFFSET_C as C, OFFSET_MEM as MEM, OFFSET_N as N, OFFSET_TPIDR as TPIDR, OFFSET_TPIDRRO as TPIDRRO, OFFSET_V as V, OFFSET_VR as VR,
-        OFFSET_X as X, OFFSET_Z as Z,
+        OFFSET_C as C, OFFSET_MEM as MEM, OFFSET_N as N, OFFSET_PC as PC, OFFSET_STACK_LIMIT as STACK_LIMIT, OFFSET_TPIDR as TPIDR,
+        OFFSET_TPIDRRO as TPIDRRO, OFFSET_V as V, OFFSET_VR as VR, OFFSET_X as X, OFFSET_Z as Z,
     };
 }
+
+/// What the rescue block does when the target is not a resume point.
+const RETURN: i64 = 0;
+const DISPATCH: i64 = 1;
+const MISS: i64 = 2;
 
 struct Runtime {
     call: FuncId,
@@ -38,27 +52,45 @@ struct Runtime {
     miss: FuncId,
 }
 
-pub struct Object {
-    module: ObjectModule,
+/// The functions of one output: an object file (`ObjectModule`), or JIT
+/// code in tests.
+pub struct Object<M: Module = ObjectModule> {
+    module: M,
     sig: Signature,
     /// Every guest function this object refers to: its own (exported), others (imported).
     ids: HashMap<u64, FuncId>,
-    defined: Vec<u64>,
+    /// Start and size of each function this object defines.
+    defined: Vec<(u64, u64)>,
     rt: Runtime,
     ctx: Context,
     fbc: FunctionBuilderContext,
 }
 
-impl Object {
-    /// An object that will define the functions at `defined`; direct calls to
-    /// any other guest function become imports, resolved when linking.
-    pub fn new(defined: &[u64], verify: bool) -> Result<Object> {
-        let mut flags = settings::builder();
-        flags.set("opt_level", "speed").map_err(|e| e.to_string())?;
-        flags.set("enable_verifier", if verify { "true" } else { "false" }).map_err(|e| e.to_string())?;
-        let isa = cranelift_native::builder()?.finish(settings::Flags::new(flags)).map_err(|e| e.to_string())?;
-        let builder = ObjectBuilder::new(isa, "guest", default_libcall_names()).map_err(|e| e.to_string())?;
-        let mut module = ObjectModule::new(builder);
+/// The host target, optimizing for speed, with the IR verifier if asked.
+pub fn isa(verify: bool) -> Result<OwnedTargetIsa> {
+    let mut flags = settings::builder();
+    flags.set("opt_level", "speed").map_err(|e| e.to_string())?;
+    flags.set("enable_verifier", if verify { "true" } else { "false" }).map_err(|e| e.to_string())?;
+    cranelift_native::builder()?.finish(settings::Flags::new(flags)).map_err(|e| e.to_string())
+}
+
+impl Object<ObjectModule> {
+    /// An object that will define the functions in `defined` (start, size);
+    /// direct calls to any other guest function become imports, resolved
+    /// when linking.
+    pub fn new(defined: &[(u64, u64)], verify: bool) -> Result<Object> {
+        let builder = ObjectBuilder::new(isa(verify)?, "guest", default_libcall_names()).map_err(|e| e.to_string())?;
+        Object::with_module(ObjectModule::new(builder), defined)
+    }
+
+    pub fn finish(self) -> Result<Vec<u8>> {
+        self.module.finish().emit().map_err(|e| e.to_string())
+    }
+}
+
+impl<M: Module> Object<M> {
+    /// Like [`Object::new`], into any Cranelift module.
+    pub fn with_module(mut module: M, defined: &[(u64, u64)]) -> Result<Object<M>> {
         let cc = module.isa().default_call_conv();
         let ptr = module.target_config().pointer_type();
         let sig_with = |params: &[Type]| {
@@ -66,7 +98,7 @@ impl Object {
             s.params.extend(params.iter().map(|&t| AbiParam::new(t)));
             s
         };
-        let sig = sig_with(&[ptr]);
+        let sig = sig_with(&[ptr, I64]);
         let mut import = |name: &str, params: &[Type]| module.declare_function(name, Linkage::Import, &sig_with(params)).map_err(|e| e.to_string());
         let rt = Runtime {
             call: import("gyroship_call", &[ptr, I64])?,
@@ -76,27 +108,28 @@ impl Object {
             miss: import("gyroship_miss", &[ptr, I64])?,
         };
         let mut ids = HashMap::new();
-        for &a in defined {
+        for &(a, _) in defined {
             ids.insert(a, module.declare_function(&crate::rust::name(a), Linkage::Export, &sig).map_err(|e| e.to_string())?);
         }
         Ok(Object { module, sig, ids, defined: defined.to_vec(), rt, ctx: Context::new(), fbc: FunctionBuilderContext::new() })
     }
 
     /// Defines `symbol`, the dispatch table of this object: for each defined
-    /// function, its guest address then its host address (16 bytes), and
-    /// `<symbol>_len`, the entry count.
+    /// function, its guest address, its size, then its host address (the
+    /// runtime's `Entry`, 24 bytes), and `<symbol>_len`, the entry count.
     pub fn table(&mut self, symbol: &str) -> Result<()> {
         let err = |e: cranelift_module::ModuleError| e.to_string();
-        let mut contents = vec![0u8; 16 * self.defined.len()];
-        for (i, a) in self.defined.iter().enumerate() {
-            contents[16 * i..16 * i + 8].copy_from_slice(&a.to_le_bytes());
+        let mut contents = vec![0u8; 24 * self.defined.len()];
+        for (i, (a, len)) in self.defined.iter().enumerate() {
+            contents[24 * i..24 * i + 8].copy_from_slice(&a.to_le_bytes());
+            contents[24 * i + 8..24 * i + 16].copy_from_slice(&len.to_le_bytes());
         }
         let mut table = DataDescription::new();
         table.define(contents.into_boxed_slice());
         table.set_align(8);
-        for (i, a) in self.defined.iter().enumerate() {
+        for (i, (a, _)) in self.defined.iter().enumerate() {
             let f = self.module.declare_func_in_data(self.ids[a], &mut table);
-            table.write_function_addr((16 * i + 8) as u32, f);
+            table.write_function_addr((24 * i + 16) as u32, f);
         }
         let id = self.module.declare_data(symbol, Linkage::Export, false, false).map_err(err)?;
         self.module.define_data(id, &table).map_err(err)?;
@@ -126,13 +159,21 @@ impl Object {
         let entry = b.create_block();
         b.append_block_params_for_function_params(entry);
         b.switch_to_block(entry);
-        let cpu = b.block_params(entry)[0];
+        let (cpu, resume) = (b.block_params(entry)[0], b.block_params(entry)[1]);
         let mem = b.ins().load(I64, cpu_flags, cpu, layout::MEM);
         let blocks: Vec<Block> = input.cfg.blocks.iter().map(|_| b.create_block()).collect();
         let index = |a: u64| input.cfg.blocks.binary_search_by_key(&a, |b| b.start).ok();
         let first = blocks[index(f.start).unwrap_or(0)];
-        b.ins().jump(first, &[]);
-        let mut e = Emit { b, cpu, mem, cpu_flags, heap_flags, module, rt, ids, sig, refs: &mut refs, callee: input.callee };
+        // The rescue block: (target, what to do when it is not a resume point).
+        let rescue = b.create_block();
+        b.append_block_param(rescue, I64);
+        b.append_block_param(rescue, I8);
+        let resuming = b.ins().icmp_imm_s(IntCC::NotEqual, resume, 0);
+        let miss = b.ins().iconst(I8, MISS);
+        b.ins().brif(resuming, rescue, &[resume.into(), miss.into()], first, &[]);
+        // Resume points: guest address -> block. Entries, then continuations.
+        let mut points: BTreeMap<u64, Block> = f.entries.iter().filter_map(|&a| Some((a, blocks[index(a)?]))).collect();
+        let mut e = Emit { b, cpu, mem, cpu_flags, heap_flags, module, rt, ids, sig, refs: &mut refs, callee: input.callee, pending: Vec::new() };
         for (bi, block) in input.cfg.blocks.iter().enumerate() {
             e.b.switch_to_block(blocks[bi]);
             let end = block.start + block.len;
@@ -140,6 +181,20 @@ impl Object {
             for pc in (block.start..end).step_by(4) {
                 let word = (input.word)(pc);
                 let op = crate::lift::lift(word, pc);
+                // After a call or an SVC, execution goes on in a block of its own,
+                // so that the continuation is a resume point.
+                let mut continuation = |e: &mut Emit<M>, ended: &mut bool| -> Block {
+                    let cont = if pc + 4 < end {
+                        e.b.create_block()
+                    } else {
+                        *ended = true;
+                        e.target_block(end, index(end).map(|i| blocks[i]))
+                    };
+                    if pc + 4 < end || index(end).is_some() {
+                        points.insert(pc + 4, cont);
+                    }
+                    cont
+                };
                 match op {
                     Op::Jump(t) => {
                         ended = true;
@@ -152,17 +207,26 @@ impl Object {
                         let next = e.target_block(pc + 4, index(pc + 4).map(|i| blocks[i]));
                         e.b.ins().brif(c, taken, &[], next, &[]);
                     }
-                    Op::Call(t) => {
+                    Op::Call(_) | Op::CallIndirect(_) => {
+                        let target = match op {
+                            Op::CallIndirect(r) => Some(e.get(r, W::W64)),
+                            _ => None,
+                        };
                         let ret = e.b.ins().iconst(I64, (pc + 4) as i64);
                         e.set(Reg::X(30), W::W64, ret);
-                        e.call(t);
-                    }
-                    Op::CallIndirect(r) => {
-                        let t = e.get(r, W::W64);
-                        let ret = e.b.ins().iconst(I64, (pc + 4) as i64);
-                        e.set(Reg::X(30), W::W64, ret);
-                        let f = e.func(e.rt.call);
-                        e.b.ins().call(f, &[cpu, t]);
+                        match (op, target) {
+                            (Op::Call(t), _) => e.call(t),
+                            (_, Some(t)) => {
+                                let f = e.func(e.rt.call);
+                                e.b.ins().call(f, &[cpu, t]);
+                            }
+                            _ => unreachable!(),
+                        }
+                        let cont = continuation(&mut e, &mut ended);
+                        e.returned(pc + 4, cont, rescue);
+                        if !ended {
+                            e.b.switch_to_block(cont);
+                        }
                     }
                     Op::JumpIndirect(r) => {
                         ended = true;
@@ -186,14 +250,15 @@ impl Object {
                                 e.b.ins().return_(&[]);
                             }
                             None => {
-                                let f = e.func(e.rt.call);
-                                e.b.ins().call(f, &[cpu, t]);
-                                e.b.ins().return_(&[]);
+                                let mode = e.b.ins().iconst(I8, DISPATCH);
+                                e.b.ins().jump(rescue, &[t.into(), mode.into()]);
                             }
                         }
                     }
                     Op::Return => {
                         ended = true;
+                        let lr = e.get(Reg::X(30), W::W64);
+                        e.b.ins().store(e.cpu_flags, lr, cpu, layout::PC);
                         e.b.ins().return_(&[]);
                     }
                     Op::Trap(imm) => {
@@ -201,7 +266,16 @@ impl Object {
                         e.runtime(e.rt.trap, pc, u32::from(imm));
                         e.b.ins().return_(&[]);
                     }
-                    Op::Svc(imm) => e.runtime(e.rt.svc, pc, u32::from(imm)),
+                    Op::Svc(imm) => {
+                        e.runtime(e.rt.svc, pc, u32::from(imm));
+                        if pc + 4 < end {
+                            let cont = continuation(&mut e, &mut ended);
+                            e.b.ins().jump(cont, &[]);
+                            e.b.switch_to_block(cont);
+                        } else if let Some(i) = index(end) {
+                            points.insert(end, blocks[i]);
+                        }
+                    }
                     Op::Unhandled => e.runtime(e.rt.unhandled, pc, word),
                     ref op => e.data(op),
                 }
@@ -210,6 +284,8 @@ impl Object {
                 e.goto(end, index(end).map(|i| blocks[i]));
             }
         }
+        e.fill_pending();
+        e.rescue(rescue, &points);
         e.b.seal_all_blocks();
         e.b.finalize(config);
         self.module.define_function(id, &mut self.ctx).map_err(|e| format!("{e:?}"))?;
@@ -217,22 +293,25 @@ impl Object {
         Ok(())
     }
 
-    pub fn finish(self) -> Result<Vec<u8>> {
-        self.module.finish().emit().map_err(|e| e.to_string())
+    /// The module, and the id of each guest function it declares.
+    pub fn into_parts(self) -> (M, HashMap<u64, FuncId>) {
+        (self.module, self.ids)
     }
 }
 
-struct Emit<'a, 'b> {
+struct Emit<'a, 'b, M: Module> {
     b: FunctionBuilder<'b>,
     cpu: Value,
     mem: Value,
     cpu_flags: MemFlagsData,
     heap_flags: MemFlagsData,
-    module: &'a mut ObjectModule,
+    module: &'a mut M,
     rt: &'a Runtime,
     ids: &'a mut HashMap<u64, FuncId>,
     sig: &'a Signature,
     refs: &'a mut HashMap<FuncId, FuncRef>,
+    /// Tail-call blocks still to fill: (block, guest target).
+    pending: Vec<(Block, u64)>,
     callee: &'a dyn Fn(u64) -> Callee,
 }
 
@@ -247,7 +326,7 @@ fn mask(bits: u32) -> i64 {
     if bits >= 64 { -1 } else { ((1u64 << bits) - 1) as i64 }
 }
 
-impl Emit<'_, '_> {
+impl<M: Module> Emit<'_, '_, M> {
     fn func(&mut self, id: FuncId) -> FuncRef {
         *self.refs.entry(id).or_insert_with(|| self.module.declare_func_in_func(id, self.b.func))
     }
@@ -390,7 +469,9 @@ impl Emit<'_, '_> {
                 self.set(a.base, W::W64, next);
             }
         }
-        let host = self.b.ins().iadd(self.mem, at);
+        // The 39-bit mask keeps a wild address inside the reservation (D18).
+        let masked = self.b.ins().band_imm_s(at, (gyroship_runtime::mem::SPACE - 1) as i64);
+        let host = self.b.ins().iadd(self.mem, masked);
         (at, host)
     }
 
@@ -866,7 +947,8 @@ impl Emit<'_, '_> {
                     }
                 };
                 let f = self.func(id);
-                self.b.ins().call(f, &[self.cpu]);
+                let zero = self.b.ins().iconst(I64, 0);
+                self.b.ins().call(f, &[self.cpu, zero]);
             }
             Callee::Dispatch(t) => {
                 let f = self.func(self.rt.call);
@@ -876,31 +958,100 @@ impl Emit<'_, '_> {
         }
     }
 
+    /// A tail call to `t`. Below the host stack limit, the call is handed to
+    /// the runtime's driver instead (`cpu.pc = t`, return), so that chains of
+    /// tail calls cannot overflow the host stack.
+    fn tail_call(&mut self, t: u64) {
+        let resolved = match (self.callee)(t) {
+            Callee::Direct(t) | Callee::Dispatch(t) => t,
+        };
+        let target = self.b.ins().iconst(I64, resolved as i64);
+        self.unless_deep(target);
+        self.call(t);
+        self.b.ins().return_(&[]);
+    }
+
+    /// Below the host stack limit, hands the jump to `target` to the driver
+    /// (`cpu.pc = target`, return); otherwise goes on in a fresh block.
+    fn unless_deep(&mut self, target: Value) {
+        let sp = self.b.ins().get_stack_pointer(I64);
+        let limit = self.b.ins().load(I64, self.cpu_flags, self.cpu, layout::STACK_LIMIT);
+        let deep = self.b.ins().icmp(IntCC::UnsignedLessThan, sp, limit);
+        let (handoff, go) = (self.b.create_block(), self.b.create_block());
+        self.b.ins().brif(deep, handoff, &[], go, &[]);
+        self.b.switch_to_block(handoff);
+        self.b.ins().store(self.cpu_flags, target, self.cpu, layout::PC);
+        self.b.ins().return_(&[]);
+        self.b.switch_to_block(go);
+    }
+
+    /// After a call that should come back to `next`: goes on in `cont` when
+    /// `cpu.pc` says so, else in the rescue block.
+    fn returned(&mut self, next: u64, cont: Block, rescue: Block) {
+        let pc = self.b.ins().load(I64, self.cpu_flags, self.cpu, layout::PC);
+        let ok = self.b.ins().icmp_imm_s(IntCC::Equal, pc, next as i64);
+        let mode = self.b.ins().iconst(I8, RETURN);
+        self.b.ins().brif(ok, cont, &[], rescue, &[pc.into(), mode.into()]);
+    }
+
+    /// The rescue block: jumps to `target` if it is one of `points`; else
+    /// returns, dispatches or fails, as its mode says.
+    fn rescue(&mut self, rescue: Block, points: &BTreeMap<u64, Block>) {
+        self.b.switch_to_block(rescue);
+        let (target, mode) = (self.b.block_params(rescue)[0], self.b.block_params(rescue)[1]);
+        let mut sw = Switch::new();
+        for (&a, &blk) in points {
+            sw.set_entry(u128::from(a), blk);
+        }
+        let (other, not_miss, dispatch, fail, ret) = (self.b.create_block(), self.b.create_block(), self.b.create_block(), self.b.create_block(), self.b.create_block());
+        sw.emit(&mut self.b, target, other);
+        self.b.switch_to_block(other);
+        let is_miss = self.b.ins().icmp_imm_s(IntCC::Equal, mode, MISS);
+        self.b.ins().brif(is_miss, fail, &[], not_miss, &[]);
+        self.b.switch_to_block(not_miss);
+        let is_dispatch = self.b.ins().icmp_imm_s(IntCC::Equal, mode, DISPATCH);
+        self.b.ins().brif(is_dispatch, dispatch, &[], ret, &[]);
+        for (blk, id) in [(fail, self.rt.miss), (dispatch, self.rt.call)] {
+            self.b.switch_to_block(blk);
+            if blk == dispatch {
+                // An indirect tail call nests host frames like a direct one.
+                self.unless_deep(target);
+            }
+            let f = self.func(id);
+            self.b.ins().call(f, &[self.cpu, target]);
+            self.b.ins().return_(&[]);
+        }
+        self.b.switch_to_block(ret);
+        self.b.ins().return_(&[]);
+    }
+
     /// Jumps to a block of the function, or tail-calls `t`.
     fn goto(&mut self, t: u64, block: Option<Block>) {
         match block {
             Some(blk) => {
                 self.b.ins().jump(blk, &[]);
             }
-            None => {
-                self.call(t);
-                self.b.ins().return_(&[]);
-            }
+            None => self.tail_call(t),
         }
     }
 
-    /// A block that continues at `t`: the function's own, or a new one that tail-calls it.
+    /// A block that continues at `t`: the function's own, or a new one that
+    /// tail-calls it. The new one is filled after the body (`fill_pending`):
+    /// the builder must not leave the current block before it is terminated.
     fn target_block(&mut self, t: u64, block: Option<Block>) -> Block {
         if let Some(blk) = block {
             return blk;
         }
-        let here = self.b.current_block().expect("in a block");
         let tail = self.b.create_block();
-        self.b.switch_to_block(tail);
-        self.call(t);
-        self.b.ins().return_(&[]);
-        self.b.switch_to_block(here);
+        self.pending.push((tail, t));
         tail
+    }
+
+    fn fill_pending(&mut self) {
+        for (tail, t) in std::mem::take(&mut self.pending) {
+            self.b.switch_to_block(tail);
+            self.tail_call(t);
+        }
     }
 }
 

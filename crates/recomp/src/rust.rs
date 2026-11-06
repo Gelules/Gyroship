@@ -1,6 +1,8 @@
 //! Backend A: Rust source. Each guest function becomes
-//! `pub unsafe extern "C" fn f_<addr>(cpu: *mut Cpu)`; its blocks are the
-//! arms of a `loop { match b { .. } }`.
+//! `pub unsafe extern "C" fn f_<addr>(cpu: *mut Cpu, resume: u64)`; its blocks are the
+//! arms of a `loop { match b { .. } }`. `RET` writes `cpu.pc`, but calls do
+//! not check it and `resume` must be 0: this backend is the oracle for code
+//! without non-local jumps (D15, D20).
 
 use crate::ir::{Addr, Alu, Cond, FBin, FUn, Op, Operand, Reg, Select, Shift, Unary, Writeback, W};
 use crate::{Callee, Input};
@@ -402,7 +404,7 @@ pub fn function(out: &mut String, input: &Input) {
     let index = |a: u64| blocks.binary_search_by_key(&a, |b| b.start).ok();
     let call = |target: u64| -> String {
         match (input.callee)(target) {
-            Callee::Direct(t) => format!("unsafe {{ {}(c) }}", name(t)),
+            Callee::Direct(t) => format!("unsafe {{ {}(c, 0) }}", name(t)),
             Callee::Dispatch(t) => format!("unsafe {{ rt::gyroship_call(c, {t:#x}) }}"),
         }
     };
@@ -413,8 +415,8 @@ pub fn function(out: &mut String, input: &Input) {
             None => format!("{}; return;", call(t)),
         }
     };
-    let _ = writeln!(out, "#[unsafe(no_mangle)]\npub unsafe extern \"C\" fn {}(c: *mut Cpu) {{", name(f.start));
-    out.push_str("    let c = unsafe { &mut *c };\n");
+    let _ = writeln!(out, "#[unsafe(no_mangle)]\npub unsafe extern \"C\" fn {}(c: *mut Cpu, resume: u64) {{", name(f.start));
+    out.push_str("    let c = unsafe { &mut *c };\n    if resume != 0 {\n        rt::gyroship_miss(c, resume);\n        return;\n    }\n");
     // One block that never jumps back into itself needs no state machine.
     let single = blocks.len() == 1
         && input.cfg.tables.is_empty()
@@ -460,7 +462,7 @@ pub fn function(out: &mut String, input: &Input) {
                 }
                 Op::Return => {
                     ended = true;
-                    "return;".to_string()
+                    "c.pc = c.x[30]; return;".to_string()
                 }
                 Op::Trap(imm) => {
                     ended = true;

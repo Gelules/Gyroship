@@ -97,7 +97,7 @@ fn picked_sample<'a>(program: &'a Program, d: &'a discover::Discovery, picked: V
 }
 
 /// The harness `main`: installs the dispatch table (`table`, an expression
-/// of type `Vec<(u64, rt::Guest)>` that `prelude` may define), then runs the
+/// of type `Vec<rt::Entry>` that `prelude` may define), then runs the
 /// runtime's test modes (see `gyroship_runtime::harness`).
 pub fn harness_main(prelude: &str, table: &str) -> String {
     format!("use gyroship_runtime as rt;\n{prelude}\nfn main() {{\n    rt::harness::main({table});\n}}\n")
@@ -168,13 +168,13 @@ pub fn write_rust(s: &Sample, out: &Path, per_file: usize, files_per_crate: usiz
             if !external.is_empty() {
                 src.push_str("unsafe extern \"C\" {\n");
                 for t in external {
-                    let _ = writeln!(src, "    fn {}(c: *mut Cpu);", rust::name(t));
+                    let _ = writeln!(src, "    fn {}(c: *mut Cpu, resume: u64);", rust::name(t));
                 }
                 src.push_str("}\n\n");
             }
             for (f, g) in file.iter() {
                 rust::function(&mut src, &Input { function: f, cfg: g, word: &word, callee: &callee });
-                let _ = writeln!(table, "    ({:#x}, g{ci}::f{fi}::{}),", f.start, rust::name(f.start));
+                let _ = writeln!(table, "    rt::Entry {{ addr: {:#x}, len: {:#x}, function: g{ci}::f{fi}::{} }},", f.start, f.len, rust::name(f.start));
             }
             bytes += src.len() as u64;
             std::fs::write(dir.join(format!("f{fi}.rs")), src)?;
@@ -197,7 +197,7 @@ pub fn write_rust(s: &Sample, out: &Path, per_file: usize, files_per_crate: usiz
     )?;
     std::fs::write(
         out.join("harness/src/main.rs"),
-        harness_main(&format!("\nstatic TABLE: &[(u64, rt::Guest)] = &[\n{table}];\n"), "TABLE.to_vec()"),
+        harness_main(&format!("\nstatic TABLE: &[rt::Entry] = &[\n{table}];\n"), "TABLE.to_vec()"),
     )?;
     Ok(bytes)
 }
@@ -209,7 +209,7 @@ pub fn write_clif(s: &Sample, out: &Path, verify: bool) -> super::Result<(u64, f
     use gyroship_recomp::clif;
     std::fs::create_dir_all(out.join("harness/src"))?;
     let start = std::time::Instant::now();
-    let defined: Vec<u64> = s.functions.iter().map(|(f, _)| f.start).collect();
+    let defined: Vec<(u64, u64)> = s.functions.iter().map(|(f, _)| (f.start, f.len)).collect();
     let mut obj = clif::Object::new(&defined, verify)?;
     let word = |a: u64| s.word(a);
     let callee = |t: u64| s.callee(t);
@@ -236,13 +236,13 @@ pub fn write_clif(s: &Sample, out: &Path, verify: bool) -> super::Result<(u64, f
     )?;
     let mut decls = String::new();
     let mut table = String::new();
-    for a in &defined {
-        let _ = writeln!(decls, "    fn {}(c: *mut rt::Cpu);", rust::name(*a));
-        let _ = writeln!(table, "    ({a:#x}, {}),", rust::name(*a));
+    for &(a, len) in &defined {
+        let _ = writeln!(decls, "    fn {}(c: *mut rt::Cpu, resume: u64);", rust::name(a));
+        let _ = writeln!(table, "    rt::Entry {{ addr: {a:#x}, len: {len:#x}, function: {} }},", rust::name(a));
     }
     std::fs::write(
         out.join("harness/src/main.rs"),
-        harness_main(&format!("\nunsafe extern \"C\" {{\n{decls}}}\n\nstatic TABLE: &[(u64, rt::Guest)] = &[\n{table}];\n"), "TABLE.to_vec()"),
+        harness_main(&format!("\nunsafe extern \"C\" {{\n{decls}}}\n\nstatic TABLE: &[rt::Entry] = &[\n{table}];\n"), "TABLE.to_vec()"),
     )?;
     Ok((bytes.len() as u64, seconds))
 }

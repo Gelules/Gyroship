@@ -54,7 +54,7 @@ pub fn run(exefs: &Path, out: &Path, threads: usize, verify: bool) -> super::Res
                 let (callee, word) = (&callee, &word);
                 let p = &p;
                 scope.spawn(move || -> Result<Part, String> {
-                    let defined: Vec<u64> = part.iter().map(|f| f.start).collect();
+                    let defined: Vec<(u64, u64)> = part.iter().map(|f| (f.start, f.len)).collect();
                     let mut obj = clif::Object::new(&defined, verify)?;
                     let mut stats = Part { functions: part.len(), ..Part::default() };
                     for f in part.iter() {

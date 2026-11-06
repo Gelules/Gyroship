@@ -14,3 +14,7 @@ cranelift-frontend = "=0.137.0"
 cranelift-module = "=0.137.0"
 cranelift-object = "=0.137.0"
 cranelift-native = "=0.137.0"
+
+[dev-dependencies]
+# Runs synthetic guest programs in-process (tests of control transfers).
+cranelift-jit = "=0.137.0"

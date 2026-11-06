@@ -85,13 +85,13 @@ fn both_backends_emit_a_loop_with_a_call() {
     let input = Input { function: &f, cfg: &cfg, word: &word, callee: &callee };
     let mut src = String::new();
     rust::function(&mut src, &input);
-    assert!(src.contains("pub unsafe extern \"C\" fn f_1000(c: *mut Cpu)"));
+    assert!(src.contains("pub unsafe extern \"C\" fn f_1000(c: *mut Cpu, resume: u64)"));
     assert!(src.contains("rt::subs64(c, a as _, b as _)"));
     assert!(src.contains("if rt::cond(c, 1) { b = 0; } else { b = 1; }"), "b.ne back to the loop head:\n{src}");
-    assert!(src.contains("c.x[30] = 0x1010; unsafe { f_2000(c) };"));
+    assert!(src.contains("c.x[30] = 0x1010; unsafe { f_2000(c, 0) };"));
     // Cranelift, with its verifier on; the callee goes through the dispatch table here.
     let dispatch = |t: u64| Callee::Dispatch(t);
-    let mut obj = clif::Object::new(&[0x1000], true).unwrap();
+    let mut obj = clif::Object::new(&[(0x1000, 0x100)], true).unwrap();
     obj.function(&Input { callee: &dispatch, ..input }).unwrap();
     assert!(!obj.finish().unwrap().is_empty());
 }

@@ -6,11 +6,11 @@
 //! - `math <exefs> <name>=<addr>...`: runs libm functions of the SDK (sinf,
 //!   expf, powf...) over many inputs and compares them with the host's.
 
-use crate::{Cpu, Guest, UNHANDLED, install, lookup};
+use crate::{Cpu, EXIT, Entry, UNHANDLED, install, lookup, run};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-pub fn main(table: Vec<(u64, Guest)>) {
+pub fn main(table: Vec<Entry>) {
     let installed = table.len();
     install(table);
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -57,12 +57,12 @@ fn adler(target: u64, len: usize, rounds: usize) {
     let host = host.elapsed().as_secs_f64();
     let top = GUEST + mem.len() as u64 - 64;
     let mut cpu = Cpu::new(mem.as_mut_ptr().wrapping_sub(GUEST as usize));
-    let f = lookup(target).expect("no such function");
+    lookup(target).expect("no such function");
     let start = Instant::now();
     let mut result = 0;
     for _ in 0..rounds {
-        (cpu.x[0], cpu.x[1], cpu.x[2], cpu.x[31], cpu.x[30]) = (1, GUEST, len as u64, top, 0);
-        unsafe { f(&mut cpu) };
+        (cpu.x[0], cpu.x[1], cpu.x[2], cpu.x[31], cpu.x[30], cpu.pc) = (1, GUEST, len as u64, top, EXIT, target);
+        unsafe { run(&mut cpu) };
         result = cpu.x[0];
     }
     let guest = start.elapsed().as_secs_f64();
@@ -127,7 +127,8 @@ fn math(exefs: &str, functions: &[String]) {
     for spec in functions {
         let (name, addr) = spec.split_once('=').expect("name=addr");
         let (host, dx, dy) = reference(name).unwrap_or_else(|| panic!("no host reference for {name}"));
-        let f = lookup(u64::from_str_radix(addr.trim_start_matches("0x"), 16).expect("hex")).expect("no such function");
+        let target = u64::from_str_radix(addr.trim_start_matches("0x"), 16).expect("hex");
+        lookup(target).expect("no such function");
         let (mut s, mut exact, mut worst, mut sum) = (0x9E37_79B9u32, 0u32, 0u32, 0u64);
         let n = 20_000;
         let unhandled = UNHANDLED.load(Ordering::Relaxed);
@@ -136,8 +137,8 @@ fn math(exefs: &str, functions: &[String]) {
             let (x, y) = (pick(dx), pick(dy));
             cpu.vr[0] = u128::from(x.to_bits());
             cpu.vr[1] = u128::from(y.to_bits());
-            (cpu.x[31], cpu.x[30]) = (top, 0);
-            unsafe { f(&mut cpu) };
+            (cpu.x[31], cpu.x[30], cpu.pc) = (top, EXIT, target);
+            unsafe { run(&mut cpu) };
             let got = f32::from_bits(cpu.vr[0] as u32);
             sum = sum.wrapping_mul(31).wrapping_add(u64::from(got.to_bits()));
             let u = ulps(got, host(x, y));

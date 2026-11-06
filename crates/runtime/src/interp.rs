@@ -130,7 +130,7 @@ fn read(c: &Cpu, addr: u64, n: usize) -> u128 {
     }
     let mut b = [0u8; 16];
     // SAFETY: the guest address space covers every guest address.
-    unsafe { std::ptr::copy_nonoverlapping(c.mem.add(addr as usize), b.as_mut_ptr(), n) };
+    unsafe { std::ptr::copy_nonoverlapping(c.mem.add(crate::host(addr)), b.as_mut_ptr(), n) };
     u128::from_le_bytes(b)
 }
 
@@ -140,7 +140,7 @@ fn write(c: &Cpu, addr: u64, n: usize, v: u128) {
     }
     let b = v.to_le_bytes();
     // SAFETY: as for `read`.
-    unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), c.mem.add(addr as usize), n) };
+    unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), c.mem.add(crate::host(addr)), n) };
 }
 
 /// The effective address of a memory operand; applies any writeback.
@@ -184,7 +184,7 @@ fn atomic(c: &Cpu, addr: u64, bytes: u32, f: impl Fn(u64) -> Option<u64>) -> u64
         return 0;
     }
     // SAFETY: guest atomics are naturally aligned (the architecture faults otherwise).
-    let p = unsafe { c.mem.add(addr as usize) };
+    let p = unsafe { c.mem.add(crate::host(addr)) };
     let (ord, fail) = (Ordering::SeqCst, Ordering::SeqCst);
     unsafe {
         match bytes {
