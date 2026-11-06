@@ -786,6 +786,7 @@ name = "gyroship-tools"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "gyroship-analysis",
  "gyroship-loader",
  "windows-capture",
 ]

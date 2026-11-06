@@ -37,6 +37,15 @@ enum Command {
         #[arg(long)]
         verbose: bool,
     },
+    /// Function ranges from a module's unwind tables (.eh_frame_hdr), optionally
+    /// compared with a function list exported from Ghidra
+    Functions {
+        /// NSO module; its file name (main, sdk...) gives its guest base
+        nso: PathBuf,
+        /// Ghidra list to compare with: tab-separated address, size, name
+        #[arg(long)]
+        compare: Option<PathBuf>,
+    },
     /// Convert NSO executables to AArch64 ELF files for disassemblers
     Nso2elf {
         /// NSO files to convert
@@ -65,6 +74,7 @@ fn main() -> ExitCode {
         Command::Nso(NsoCommand::Info { nso, symbols }) => nso_info(&nso, symbols).map(|_| true),
         Command::Nso2elf { inputs, out } => nso2elf(&inputs, &out).map(|_| true),
         Command::Link { exefs, verbose } => link(&exefs, verbose),
+        Command::Functions { nso, compare } => functions(&nso, compare.as_deref()).map(|_| true),
         Command::Capture { title, out } => capture::window(&title, &out).map(|_| true),
     };
     match result {
@@ -174,6 +184,45 @@ fn link(exefs: &Path, verbose: bool) -> Result<bool> {
         println!("  {} {:#x} type {} {}", p.modules[i.module].name, i.slot, i.kind, i.name);
     }
     Ok(unresolved.len() == tls)
+}
+
+fn functions(path: &Path, compare: Option<&Path>) -> Result<()> {
+    use std::collections::BTreeMap;
+    let m = Module::parse_nso(&std::fs::read(path)?)?;
+    let name = path.file_name().ok_or("input has no file name")?.to_string_lossy();
+    let base = gyroship_loader::link::base_of(&name).ok_or_else(|| format!("no guest base for module {name:?}"))?;
+    let ranges = gyroship_analysis::eh_frame::function_ranges(&m.image, m.mod0.eh_frame_hdr_start)?;
+    let covered: u64 = ranges.iter().map(|r| r.len).sum();
+    let outside = ranges.iter().filter(|r| r.start + r.len > m.text.end()).count();
+    println!("eh_frame     {} functions, {covered:#x} bytes = {:.1}% of text ({outside} outside text)", ranges.len(), 100.0 * covered as f64 / m.text.size as f64);
+    let Some(compare) = compare else { return Ok(()) };
+
+    let mut ghidra = BTreeMap::new();
+    for line in std::fs::read_to_string(compare)?.lines() {
+        let mut f = line.split('\t');
+        let (Some(addr), Some(size)) = (f.next(), f.next()) else { continue };
+        let addr = u64::from_str_radix(addr, 16)?.wrapping_sub(base);
+        if addr < m.text.end() {
+            ghidra.insert(addr, size.parse::<u64>()?);
+        }
+    }
+    let fde: BTreeMap<u64, u64> = ranges.iter().map(|r| (r.start, r.len)).collect();
+    let both = fde.keys().filter(|a| ghidra.contains_key(a)).count();
+    let same_len = fde.iter().filter(|(a, l)| ghidra.get(a) == Some(l)).count();
+    let ghidra_only: Vec<_> = ghidra.iter().filter(|(a, _)| !fde.contains_key(a)).collect();
+    let fde_only: Vec<_> = fde.iter().filter(|(a, _)| !ghidra.contains_key(a)).collect();
+    let inside = ghidra_only.iter().filter(|(a, _)| fde.range(..=**a).next_back().is_some_and(|(s, l)| **a < s + l)).count();
+    println!("ghidra       {} functions in text", ghidra.len());
+    println!("same start   {both} ({same_len} also with the same length)");
+    println!("ghidra only  {} ({inside} of them inside an FDE range)", ghidra_only.len());
+    println!("eh_frame only {}", fde_only.len());
+    let show = |label: &str, list: &[(&u64, &u64)]| {
+        let sample: Vec<String> = list.iter().take(8).map(|(a, l)| format!("{name}+{a:#x}/{l}")).collect();
+        println!("  {label}: {}", sample.join(" "));
+    };
+    show("ghidra only, first", &ghidra_only);
+    show("eh_frame only, first", &fde_only);
+    Ok(())
 }
 
 fn nso_info(path: &Path, symbols: bool) -> Result<()> {

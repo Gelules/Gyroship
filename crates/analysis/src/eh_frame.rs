@@ -1,0 +1,189 @@
+//! Function ranges from the unwind tables: `.eh_frame_hdr` lists every FDE
+//! sorted by start address, and each FDE gives its function's length.
+//!
+//! Only the encodings that compilers emit for these tables are accepted;
+//! anything else is reported, never guessed.
+
+use std::fmt;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Range {
+    /// Module-relative start address.
+    pub start: u64,
+    pub len: u64,
+}
+
+#[derive(Debug)]
+pub struct Error(pub String);
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Error {}
+
+type Result<T> = std::result::Result<T, Error>;
+
+struct Reader<'a> {
+    image: &'a [u8],
+    at: u64,
+}
+
+impl Reader<'_> {
+    fn bytes<const N: usize>(&mut self) -> Result<[u8; N]> {
+        let start = usize::try_from(self.at).map_err(|_| self.oob())?;
+        let b = self.image.get(start..start + N).ok_or_else(|| self.oob())?;
+        self.at += N as u64;
+        Ok(b.try_into().expect("slice has length N"))
+    }
+    fn oob(&self) -> Error {
+        Error(format!("unwind table read at {:#x} is out of bounds", self.at))
+    }
+    fn u8(&mut self) -> Result<u8> {
+        self.bytes::<1>().map(|b| b[0])
+    }
+    fn uleb(&mut self) -> Result<u64> {
+        let (mut v, mut shift) = (0u64, 0);
+        loop {
+            let b = self.u8()?;
+            if shift < 64 {
+                v |= u64::from(b & 0x7F) << shift;
+            }
+            shift += 7;
+            if b & 0x80 == 0 {
+                return Ok(v);
+            }
+        }
+    }
+    fn sleb(&mut self) -> Result<i64> {
+        let (mut v, mut shift) = (0i64, 0);
+        loop {
+            let b = self.u8()?;
+            if shift < 64 {
+                v |= i64::from(b & 0x7F) << shift;
+            }
+            shift += 7;
+            if b & 0x80 == 0 {
+                if shift < 64 && b & 0x40 != 0 {
+                    v |= -1 << shift;
+                }
+                return Ok(v);
+            }
+        }
+    }
+    /// A DW_EH_PE-encoded pointer. `datarel` is the base for 0x30 encodings.
+    fn encoded(&mut self, enc: u8, datarel: u64) -> Result<u64> {
+        let here = self.at;
+        let raw = match enc & 0x0F {
+            0x00 | 0x04 => u64::from_le_bytes(self.bytes()?),
+            0x01 => self.uleb()?,
+            0x02 => u64::from(u16::from_le_bytes(self.bytes()?)),
+            0x03 => u64::from(u32::from_le_bytes(self.bytes()?)),
+            0x09 => self.sleb()? as u64,
+            0x0A => i64::from(i16::from_le_bytes(self.bytes()?)) as u64,
+            0x0B => i64::from(i32::from_le_bytes(self.bytes()?)) as u64,
+            0x0C => u64::from_le_bytes(self.bytes()?),
+            _ => return Err(Error(format!("pointer encoding {enc:#04x} at {here:#x} is not supported"))),
+        };
+        Ok(match enc & 0x70 {
+            0x00 => raw,
+            0x10 => here.wrapping_add(raw),
+            0x30 => datarel.wrapping_add(raw),
+            _ => return Err(Error(format!("pointer encoding {enc:#04x} at {here:#x} is not supported"))),
+        })
+    }
+}
+
+/// Reads the `.eh_frame_hdr` at `hdr` in `image` (both module-relative) and
+/// returns one range per FDE, sorted by start.
+pub fn function_ranges(image: &[u8], hdr: u64) -> Result<Vec<Range>> {
+    let mut r = Reader { image, at: hdr };
+    let [version, ptr_enc, count_enc, table_enc] = r.bytes::<4>()?;
+    if version != 1 {
+        return Err(Error(format!("eh_frame_hdr version {version}")));
+    }
+    if ptr_enc == 0xFF || count_enc == 0xFF || table_enc == 0xFF {
+        return Err(Error("eh_frame_hdr has no search table".into()));
+    }
+    r.encoded(ptr_enc, hdr)?;
+    let count = r.encoded(count_enc, hdr)?;
+    let mut ranges = Vec::with_capacity(count.min(1 << 24) as usize);
+    let mut prev = None;
+    for _ in 0..count {
+        let start = r.encoded(table_enc, hdr)?;
+        let fde = r.encoded(table_enc, hdr)?;
+        if prev.is_some_and(|p| p > start) {
+            return Err(Error(format!("eh_frame_hdr table is not sorted at {start:#x}")));
+        }
+        prev = Some(start);
+        let (begin, len) = fde_range(image, fde)?;
+        if begin != start {
+            return Err(Error(format!("FDE at {fde:#x} starts at {begin:#x}, the table says {start:#x}")));
+        }
+        ranges.push(Range { start, len });
+    }
+    Ok(ranges)
+}
+
+/// (pc_begin, pc_range) of the FDE at `fde`.
+fn fde_range(image: &[u8], fde: u64) -> Result<(u64, u64)> {
+    let mut r = Reader { image, at: fde };
+    let len = u32::from_le_bytes(r.bytes()?);
+    if len == 0 || len == u32::MAX {
+        return Err(Error(format!("FDE at {fde:#x} has length {len:#x}")));
+    }
+    let id_at = r.at;
+    let cie_delta = u32::from_le_bytes(r.bytes()?);
+    if cie_delta == 0 {
+        return Err(Error(format!("{fde:#x} is a CIE, not an FDE")));
+    }
+    let enc = cie_fde_encoding(image, id_at.wrapping_sub(u64::from(cie_delta)))?;
+    let begin = r.encoded(enc, 0)?;
+    let range = r.encoded(enc & 0x0F, 0)?;
+    Ok((begin, range))
+}
+
+/// The FDE pointer encoding of the CIE at `cie` (augmentation "zR...").
+fn cie_fde_encoding(image: &[u8], cie: u64) -> Result<u8> {
+    let mut r = Reader { image, at: cie };
+    let _len = u32::from_le_bytes(r.bytes()?);
+    if u32::from_le_bytes(r.bytes()?) != 0 {
+        return Err(Error(format!("no CIE at {cie:#x}")));
+    }
+    let version = r.u8()?;
+    let mut aug = Vec::new();
+    loop {
+        match r.u8()? {
+            0 => break,
+            c => aug.push(c),
+        }
+    }
+    r.uleb()?; // code alignment
+    r.sleb()?; // data alignment
+    if version == 1 {
+        r.u8()?;
+    } else {
+        r.uleb()?;
+    }
+    if aug.first() != Some(&b'z') {
+        return Ok(0x00); // no augmentation data: absolute pointers
+    }
+    r.uleb()?;
+    for c in &aug[1..] {
+        match c {
+            b'R' => return r.u8(),
+            b'L' => {
+                r.u8()?;
+            }
+            b'P' => {
+                let enc = r.u8()?;
+                r.encoded(enc, 0)?;
+            }
+            b'S' | b'B' => {}
+            _ => return Err(Error(format!("CIE at {cie:#x}: unknown augmentation {:?}", String::from_utf8_lossy(&aug)))),
+        }
+    }
+    Ok(0x00)
+}
