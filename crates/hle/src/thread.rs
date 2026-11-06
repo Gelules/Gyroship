@@ -51,6 +51,8 @@ pub enum Object {
     Session(usize),
     /// An index into `Kernel::shared`.
     SharedMemory(usize),
+    /// An index into `Kernel::transfers`.
+    TransferMemory(usize),
 }
 
 /// What a waiting thread waits for.

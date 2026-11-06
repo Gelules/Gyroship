@@ -7,6 +7,17 @@ use crate::thread::Object;
 use crate::{Kernel, layout};
 use gyroship_runtime::mem::{Block, PAGE, perm, state};
 
+/// Memory a process lends to a service (CreateTransferMemory): its pages
+/// stay locked, with the permission the owner keeps, until the last
+/// reference goes away (handles, and services that hold it).
+#[derive(Debug)]
+pub struct TransferMemory {
+    pub addr: u64,
+    pub size: u64,
+    pub perm: u32,
+    pub refs: u32,
+}
+
 #[derive(Debug)]
 pub struct SharedMemory {
     pub data: Vec<u8>,
@@ -63,6 +74,49 @@ impl Kernel {
         }
         self.shared[m] = SharedMemory { data, mapped: None };
         SUCCESS
+    }
+
+    /// CreateTransferMemory: locks the owner's pages with permission `p`
+    /// (what the owner keeps: none, R or RW); returns its handle.
+    pub fn create_transfer(&mut self, addr: u64, size: u64, p: u32) -> Result<u32, u32> {
+        if !addr.is_multiple_of(PAGE) || !size.is_multiple_of(PAGE) || size == 0 {
+            return Err(INVALID_SIZE);
+        }
+        if !matches!(p, 0 | perm::R | perm::RW) {
+            return Err(INVALID_NEW_MEMORY_PERMISSION);
+        }
+        let lendable = |b: &gyroship_runtime::mem::Block| b.perm == perm::RW && b.attr & gyroship_runtime::mem::attr::LOCKED == 0;
+        let mut at = addr;
+        while at < addr + size {
+            let q = self.mem.query(at);
+            if q.block.state == state::FREE || !lendable(&q.block) {
+                return Err(INVALID_CURRENT_MEMORY);
+            }
+            at = q.base + q.size;
+        }
+        self.mem.set_attr(addr, size, gyroship_runtime::mem::attr::LOCKED, gyroship_runtime::mem::attr::LOCKED).map_err(|_| INVALID_CURRENT_MEMORY)?;
+        self.mem.protect(addr, size, p).map_err(|_| INVALID_CURRENT_MEMORY)?;
+        self.transfers.push(TransferMemory { addr, size, perm: p, refs: 1 });
+        let t = self.transfers.len() - 1;
+        self.handles.add(Object::TransferMemory(t)).ok_or(OUT_OF_HANDLES)
+    }
+
+    /// A service keeps the transfer memory a client handle names.
+    pub fn retain_transfer(&mut self, h: u32) -> Option<usize> {
+        let Object::TransferMemory(t) = self.handles.get(h)? else { return None };
+        self.transfers[t].refs += 1;
+        Some(t)
+    }
+
+    /// One reference less; the last gives the pages back to their owner.
+    pub fn release_transfer(&mut self, t: usize) {
+        let tm = &mut self.transfers[t];
+        tm.refs -= 1;
+        if tm.refs == 0 {
+            let (addr, size) = (tm.addr, tm.size);
+            let _ = self.mem.protect(addr, size, perm::RW);
+            let _ = self.mem.set_attr(addr, size, gyroship_runtime::mem::attr::LOCKED, 0);
+        }
     }
 
     /// Writes `bytes` at `offset` of shared memory `m`.

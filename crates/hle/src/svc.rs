@@ -173,6 +173,13 @@ impl Kernel {
                 None => (INVALID_HANDLE, 0, format!("{:#x}", a[1] as u32)),
             },
             0x36 => (SUCCESS, 0, String::new()),
+            0x15 => match self.create_transfer(a[1], a[2], a[3] as u32) {
+                Ok(h) => {
+                    cpu.x[1] = u64::from(h);
+                    (SUCCESS, 0, format!("{:#x}+{:#x} owner keeps perm {} -> {h:#x}", a[1], a[2], a[3] as u32))
+                }
+                Err(e) => (e, 0, format!("{:#x}+{:#x} perm {}", a[1], a[2], a[3] as u32)),
+            },
             0x13 => (self.map_shared(a[0] as u32, a[1], a[2], a[3] as u32), 0, format!("{:#x} at {:#x}+{:#x} perm {}", a[0] as u32, a[1], a[2], a[3] as u32)),
             0x14 => (self.unmap_shared(a[0] as u32, a[1], a[2]), 0, format!("{:#x} at {:#x}+{:#x}", a[0] as u32, a[1], a[2])),
             0x1F => match self.connect_to_named_port(a[1]) {

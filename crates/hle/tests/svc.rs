@@ -185,3 +185,23 @@ fn stops_are_logged() {
         assert!(stderr.contains(line), "{mode}: {stderr}");
     }
 }
+
+#[test]
+fn transfer_memory_locks_until_its_last_handle_closes() {
+    let (mut k, mut cpu) = kernel(Config::default());
+    let alias = layout::ALIAS.0;
+    svc(&mut k, &mut cpu, 0x2C, &[alias, 0x2000]);
+    assert_eq!(svc(&mut k, &mut cpu, 0x15, &[0, alias, 0x2000, u64::from(perm::R)]), SUCCESS);
+    let h = cpu.x[1];
+    assert_eq!(k.mem.query(alias).block, Block { state: state::NORMAL, perm: perm::R, attr: attr::LOCKED });
+    // A service that keeps it holds a reference of its own.
+    let t = k.retain_transfer(h as u32).unwrap();
+    assert_eq!(svc(&mut k, &mut cpu, 0x16, &[h]), SUCCESS);
+    assert_eq!(k.mem.query(alias).block.attr, attr::LOCKED, "still held by the service");
+    k.release_transfer(t);
+    assert_eq!(k.mem.query(alias).block, Block::new(state::NORMAL, perm::RW));
+    // Memory already lent cannot be lent again, nor can unmapped memory.
+    svc(&mut k, &mut cpu, 0x15, &[0, alias, 0x1000, 0]);
+    assert_eq!(svc(&mut k, &mut cpu, 0x15, &[0, alias, 0x1000, 0]), INVALID_CURRENT_MEMORY);
+    assert_eq!(svc(&mut k, &mut cpu, 0x15, &[0, alias + 0x10_0000, 0x1000, 0]), INVALID_CURRENT_MEMORY);
+}

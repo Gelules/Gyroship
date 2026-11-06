@@ -54,7 +54,7 @@ impl Kernel {
         match o {
             Object::Thread(t) => self.sched.threads[t].state == State::Done,
             Object::ReadableEvent(e) => self.events[e].signaled,
-            Object::WritableEvent(_) | Object::Session(_) | Object::SharedMemory(_) => false,
+            Object::WritableEvent(_) | Object::Session(_) | Object::SharedMemory(_) | Object::TransferMemory(_) => false,
         }
     }
 
@@ -160,7 +160,14 @@ impl Kernel {
     /// CloseHandle. ponytail: the object itself lives on (threads, events);
     /// add reference counts when an object must die with its last handle.
     pub fn close_handle(&mut self, h: u32) -> u32 {
-        if self.handles.close(h).is_some() { SUCCESS } else { INVALID_HANDLE }
+        match self.handles.close(h) {
+            Some(Object::TransferMemory(t)) => {
+                self.release_transfer(t);
+                SUCCESS
+            }
+            Some(_) => SUCCESS,
+            None => INVALID_HANDLE,
+        }
     }
 
     /// ArbitrateLock: waits for the mutex at `addr`, unless its word is no
