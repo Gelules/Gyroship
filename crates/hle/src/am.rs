@@ -110,6 +110,12 @@ impl Applet {
             // SetPerformanceModeChangedNotification, SetFocusHandlingMode,
             // SetOutOfFocusSuspendingEnabled, Switch 2 2400.
             (Applet::SelfController, 10..=13 | 16 | 19 | 100 | 2400) => Reply::ok(),
+            // GetGraphicsSupervisor: a session of its own, even from a domain, as a copied handle
+            // (the client finds no moved one).
+            (Applet::SelfController, 2000) => match k.open_session(Service::Gs(crate::gs::Gs::Supervisor)) {
+                Ok(h) => Reply { copy_handles: vec![h], ..Reply::ok() },
+                Err(e) => Reply::error(e),
+            },
             // GetAccumulatedSuspendedTickChangedEvent.
             (Applet::SelfController, 91) => Reply { copy_handles: vec![k.new_event_handle()?], ..Reply::ok() },
             // GetAppletResourceUserId, AcquireForegroundRights.

@@ -45,6 +45,10 @@ pub enum Service {
     Nifm(crate::account::Nifm),
     /// `ldr:ro`.
     Ldr,
+    /// The graphics supervisor and its sessions.
+    Gs(crate::gs::Gs),
+    /// The nvdrv-like session of the graphics supervisor.
+    Nvdrv(crate::nvdrv::Nvdrv),
     /// `bsd:s` and `bsd:u`, offline.
     Bsd(crate::bsd::Bsd),
     /// `aoc:u` and `ectx:aw`: no command seen yet.
@@ -70,6 +74,8 @@ impl Service {
             Service::Time(t) => t.label(),
             Service::Fs(f) => f.label(),
             Service::Bsd(b) => b.name.clone(),
+            Service::Gs(g) => g.label(),
+            Service::Nvdrv(n) => n.label(),
             Service::Account(a) => a.label(),
             Service::Nifm(n) => n.label(),
             Service::Ldr => "ldr:ro".to_string(),
@@ -86,6 +92,8 @@ impl Service {
             Service::Time(t) => t.request(k, req),
             Service::Fs(f) => f.request(k, req),
             Service::Bsd(b) => b.request(k, req),
+            Service::Gs(g) => g.request(k, req),
+            Service::Nvdrv(n) => n.request(k, req),
             Service::Account(a) => a.request(k, req),
             Service::Nifm(n) => n.request(k, req),
             _ => None,

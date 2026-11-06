@@ -9,8 +9,10 @@ pub mod am;
 pub mod boot;
 pub mod bsd;
 pub mod fs;
+pub mod gs;
 pub mod ipc;
 pub mod journal;
+pub mod nvdrv;
 pub mod service;
 pub mod shared;
 pub mod svc;
@@ -115,6 +117,8 @@ pub struct Kernel {
     pub symbols: Vec<(u64, String)>,
     /// The game's RomFS, served by fsp-srv.
     pub romfs: Option<fs::RomFs>,
+    /// State the graphics sessions share.
+    pub gs: gs::State,
 }
 
 /// Exit code of a run the HLE stops (an unknown or forbidden SVC, a guest
@@ -125,7 +129,7 @@ impl Kernel {
     pub fn new(mem: Memory, mut journal: Journal, config: Config) -> Kernel {
         let mode = if config.explore { "exploration (not a validation run)" } else { "strict" };
         journal.line(0, 0, &format!("gyroship hle: mode {mode}, seed {:#x}, non-system memory {:#x}", config.seed, config.non_system_memory));
-        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None, sessions: Vec::new(), objects: Vec::new(), domains: Vec::new(), allowed_services: Vec::new(), shared: Vec::new(), transfers: Vec::new(), time_shared: None, frame: (0, 0, 0), symbols: Vec::new(), romfs: None }
+        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None, sessions: Vec::new(), objects: Vec::new(), domains: Vec::new(), allowed_services: Vec::new(), shared: Vec::new(), transfers: Vec::new(), time_shared: None, frame: (0, 0, 0), symbols: Vec::new(), romfs: None, gs: gs::State::default() }
     }
 
     /// Logs a line for the running thread (0 when none runs).
