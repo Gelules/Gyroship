@@ -25,6 +25,16 @@ pub enum Service {
     Logger,
     /// Exploration mode only: a service with no implementation yet.
     Stub(String),
+    /// `appletOE` and the interfaces it hands out.
+    Applet(crate::am::Applet),
+    /// `time:u` and its clocks.
+    Time(crate::time::Time),
+    /// `pctl` (IParentalControlServiceFactory) and IParentalControlService.
+    Pctl,
+    ParentalControl,
+    /// `aoc:u` and `ectx:aw`: no command seen yet.
+    Aoc,
+    Ectx,
 }
 
 #[derive(Debug, Default)]
@@ -41,11 +51,28 @@ impl Service {
             Service::Lm => "lm".to_string(),
             Service::Logger => "lm ILogger".to_string(),
             Service::Stub(name) => format!("{name} (stub)"),
+            Service::Applet(a) => a.label(),
+            Service::Time(t) => t.label(),
+            Service::Pctl => "pctl".to_string(),
+            Service::ParentalControl => "pctl IParentalControlService".to_string(),
+            Service::Aoc => "aoc:u".to_string(),
+            Service::Ectx => "ectx:aw".to_string(),
         }
     }
 
     pub fn request(&mut self, k: &mut Kernel, req: &Request) -> Reply {
+        let answer = match self {
+            Service::Applet(a) => a.request(k, req),
+            Service::Time(t) => t.request(k, req),
+            _ => None,
+        };
+        if let Some(reply) = answer {
+            return reply;
+        }
         match (self, req.command) {
+            // CreateService, CreateServiceWithoutInitialize; Initialize.
+            (Service::Pctl, 0 | 1) => Reply::object(Service::ParentalControl),
+            (Service::ParentalControl, 1) => Reply::ok(),
             (Service::Sm(sm), 0) => {
                 sm.registered = true;
                 Reply::ok()
@@ -99,6 +126,11 @@ impl Kernel {
         }
         let svc = match name.as_str() {
             "lm" => Service::Lm,
+            "appletOE" => Service::Applet(crate::am::Applet::Service),
+            "time:u" => Service::Time(crate::time::Time::Static),
+            "pctl" => Service::Pctl,
+            "aoc:u" => Service::Aoc,
+            "ectx:aw" => Service::Ectx,
             _ if self.config.explore => Service::Stub(name.clone()),
             _ => self.stop(crate::STOP_EXIT, &format!("sm: service {name:?} is not implemented")),
         };

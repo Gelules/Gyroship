@@ -105,6 +105,7 @@ impl Kernel {
     /// Handles `svc #imm` at `pc`.
     pub fn svc(&mut self, cpu: &mut Cpu, pc: u64, imm: u32) {
         let a: [u64; 8] = cpu.x[..8].try_into().expect("8 registers");
+        self.frame = (pc, cpu.x[30], cpu.x[29]);
         let call = format!("svc {imm:#04x} {}", name(imm));
         if FORBIDDEN.contains(&imm) {
             self.stop(STOP_EXIT, &format!("forbidden {call} at {pc:#x}: the KAC does not grant it;{}", args(&a)));
@@ -172,6 +173,8 @@ impl Kernel {
                 None => (INVALID_HANDLE, 0, format!("{:#x}", a[1] as u32)),
             },
             0x36 => (SUCCESS, 0, String::new()),
+            0x13 => (self.map_shared(a[0] as u32, a[1], a[2], a[3] as u32), 0, format!("{:#x} at {:#x}+{:#x} perm {}", a[0] as u32, a[1], a[2], a[3] as u32)),
+            0x14 => (self.unmap_shared(a[0] as u32, a[1], a[2]), 0, format!("{:#x} at {:#x}+{:#x}", a[0] as u32, a[1], a[2])),
             0x1F => match self.connect_to_named_port(a[1]) {
                 Ok(h) => {
                     cpu.x[1] = u64::from(h);

@@ -4,13 +4,16 @@
 //! host thread (D19), and each test thread gets a kernel of its own. A borrow
 //! of it must never stay open across a guest fiber switch.
 
+pub mod am;
 pub mod boot;
 pub mod ipc;
 pub mod journal;
 pub mod service;
+pub mod shared;
 pub mod svc;
 pub mod sync;
 pub mod thread;
+pub mod time;
 
 use gyroship_runtime::{Cpu, Hooks};
 use gyroship_runtime::mem::Memory;
@@ -94,6 +97,13 @@ pub struct Kernel {
     pub sessions: Vec<Option<ipc::Session>>,
     /// The services the NPDM grants (its service access control).
     pub allowed_services: Vec<String>,
+    pub shared: Vec<shared::SharedMemory>,
+    /// time's shared memory, once a client asked for it.
+    pub time_shared: Option<usize>,
+    /// (pc, lr, fp) of the last SVC, for backtraces.
+    pub frame: (u64, u64, u64),
+    /// Exported function symbols of every module, sorted: (address, name).
+    pub symbols: Vec<(u64, String)>,
 }
 
 /// Exit code of a run the HLE stops (an unknown or forbidden SVC, a guest
@@ -104,7 +114,7 @@ impl Kernel {
     pub fn new(mem: Memory, mut journal: Journal, config: Config) -> Kernel {
         let mode = if config.explore { "exploration (not a validation run)" } else { "strict" };
         journal.line(0, 0, &format!("gyroship hle: mode {mode}, seed {:#x}, non-system memory {:#x}", config.seed, config.non_system_memory));
-        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None, sessions: Vec::new(), allowed_services: Vec::new() }
+        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None, sessions: Vec::new(), allowed_services: Vec::new(), shared: Vec::new(), time_shared: None, frame: (0, 0, 0), symbols: Vec::new() }
     }
 
     /// Logs a line for the running thread (0 when none runs).
@@ -116,9 +126,44 @@ impl Kernel {
     /// Ends the run: logs why, flushes the journal, exits with `code`.
     pub fn stop(&mut self, code: i32, why: &str) -> ! {
         self.log(why);
+        for line in self.backtrace() {
+            self.log(&line);
+        }
         self.journal.flush();
         eprintln!("gyroship: {why}");
         std::process::exit(code);
+    }
+
+    /// The guest call stack at the last SVC: its pc, its lr, then the frame
+    /// chain (x29 -> [previous x29, return address]), each with the nearest
+    /// exported symbol.
+    pub fn backtrace(&self) -> Vec<String> {
+        let (pc, lr, mut fp) = self.frame;
+        let mut addrs = vec![pc, lr];
+        for _ in 0..24 {
+            let mut b = [0; 16];
+            if fp == 0 || self.mem.read(fp, &mut b).is_err() {
+                break;
+            }
+            let (next, ret) = (u64::from_le_bytes(b[0..8].try_into().unwrap()), u64::from_le_bytes(b[8..16].try_into().unwrap()));
+            addrs.push(ret);
+            if next <= fp {
+                break;
+            }
+            fp = next;
+        }
+        addrs.iter().enumerate().map(|(i, &a)| format!("  #{i} {a:#x} {}", self.symbolize(a))).collect()
+    }
+
+    /// `module+offset (symbol+offset)` for a guest address.
+    pub fn symbolize(&self, a: u64) -> String {
+        let module = gyroship_loader::link::LOAD_ORDER.iter().filter_map(|n| Some((*n, gyroship_loader::link::base_of(n)?))).filter(|(_, b)| *b <= a).max_by_key(|(_, b)| *b);
+        let place = module.map_or(String::new(), |(n, b)| format!("{n}+{:#x}", a - b));
+        let i = self.symbols.partition_point(|(s, _)| *s <= a);
+        match i.checked_sub(1).map(|i| &self.symbols[i]) {
+            Some((s, name)) if a - s < 0x10000 => format!("{place} ({name}+{:#x})", a - s),
+            _ => place,
+        }
     }
 }
 

@@ -49,6 +49,8 @@ pub enum Object {
     WritableEvent(usize),
     /// A client session (an index into `Kernel::sessions`).
     Session(usize),
+    /// An index into `Kernel::shared`.
+    SharedMemory(usize),
 }
 
 /// What a waiting thread waits for.

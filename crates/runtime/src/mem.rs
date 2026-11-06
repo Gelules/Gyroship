@@ -249,6 +249,36 @@ impl Memory {
         Ok(())
     }
 
+    /// Writes memory the HLE owns (shared memory, locked pages): the guest
+    /// may only have R there, but the host pages are writable.
+    pub fn write_object(&mut self, addr: u64, data: &[u8]) -> Result<(), Error> {
+        self.host_accessible(addr, data.len() as u64, PAGE_READWRITE)?;
+        // SAFETY: checked just above.
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), self.base.add(addr as usize), data.len()) };
+        Ok(())
+    }
+
+    /// Reads memory the HLE owns, whatever the guest's permission.
+    pub fn read_object(&self, addr: u64, out: &mut [u8]) -> Result<(), Error> {
+        self.host_accessible(addr, out.len() as u64, PAGE_READWRITE)?;
+        // SAFETY: checked just above.
+        unsafe { std::ptr::copy_nonoverlapping(self.base.add(addr as usize), out.as_mut_ptr(), out.len()) };
+        Ok(())
+    }
+
+    fn host_accessible(&self, addr: u64, len: u64, protection: PAGE_PROTECTION_FLAGS) -> Result<(), Error> {
+        let end = addr.checked_add(len).filter(|&e| e <= SPACE).ok_or(Error::InvalidRange)?;
+        let mut at = addr;
+        while at < end {
+            let info = self.query(at);
+            if info.block.state == state::FREE || info.block.host_protection() != protection {
+                return Err(Error::InvalidState);
+            }
+            at = info.base + info.size;
+        }
+        Ok(())
+    }
+
     /// The mapped blocks, in address order.
     pub fn blocks(&self) -> impl Iterator<Item = Info> + '_ {
         self.blocks.iter().map(|(&base, &(end, block))| Info { base, size: end - base, block })

@@ -170,3 +170,53 @@ fn the_npdm_s_service_list() {
     npdm[0x140..0x140 + sac.len()].copy_from_slice(&sac);
     assert_eq!(boot::npdm_services(&npdm), Some(vec!["lm".to_string(), "fsp-srv".to_string()]));
 }
+
+/// A CMIF reply's single moved handle (a new sub-interface session).
+fn moved(w: &[u32]) -> u32 {
+    assert_eq!((w[1] >> 31, w[2]), (1, 0x20), "one moved handle: {w:x?}");
+    w[3]
+}
+
+#[test]
+fn the_applet_says_it_has_the_focus() {
+    let (mut k, mut cpu) = kernel();
+    k.allowed_services.push("appletOE".to_string());
+    let sm = connect_sm(&mut k, &mut cpu);
+    let (_, oe) = get_service(&mut k, &mut cpu, sm, "appletOE");
+    let (_, w) = send(&mut k, &mut cpu, oe, &cmif(&[4], 10, &[0, 0], None));
+    let proxy = moved(&w);
+    let (_, w) = send(&mut k, &mut cpu, proxy, &cmif(&[4], 0, &[], None));
+    let state = moved(&w);
+    // GetEventHandle: a copied handle to a signaled event.
+    let (_, w) = send(&mut k, &mut cpu, state, &cmif(&[4], 0, &[], None));
+    assert_eq!((w[1] >> 31, w[2]), (1, 0x2), "one copied handle: {w:x?}");
+    let e = k.event_of(w[3]).expect("a readable event");
+    assert!(k.events[e].signaled);
+    // ReceiveMessage: the focus change, then nothing.
+    let (_, w) = send(&mut k, &mut cpu, state, &cmif(&[4], 1, &[], None));
+    assert_eq!((cmif_result(&w, 2), w[8]), (SUCCESS, 15), "{w:x?}");
+    let (_, w) = send(&mut k, &mut cpu, state, &cmif(&[4], 1, &[], None));
+    assert_eq!(cmif_result(&w, 2), gyroship_hle::am::NO_MESSAGE);
+    // GetCurrentFocusState: in focus.
+    let (_, w) = send(&mut k, &mut cpu, state, &cmif(&[4], 9, &[], None));
+    assert_eq!(w[8] & 0xFF, 1);
+}
+
+#[test]
+fn time_s_shared_memory_has_a_steady_clock_source() {
+    let (mut k, mut cpu) = kernel();
+    k.allowed_services.push("time:u".to_string());
+    let sm = connect_sm(&mut k, &mut cpu);
+    let (_, time) = get_service(&mut k, &mut cpu, sm, "time:u");
+    let (_, w) = send(&mut k, &mut cpu, time, &cmif(&[4], 20, &[], None));
+    assert_eq!((w[1] >> 31, w[2]), (1, 0x2), "one copied handle: {w:x?}");
+    let at = 0x50_0000_0000;
+    (cpu.x[0], cpu.x[1], cpu.x[2], cpu.x[3]) = (u64::from(w[3]), at, 0x1000, 1);
+    k.svc(&mut cpu, PC, 0x13);
+    assert_eq!(cpu.x[0], 0, "MapSharedMemory");
+    assert_eq!(k.mem.query(at).block, Block::new(state::SHARED, perm::R));
+    // The continuous adjustment's source id, which the SDK requires to be non-zero.
+    let mut id = [0; 16];
+    k.mem.read(at + 0xD8 + 0x28, &mut id).unwrap();
+    assert_ne!(id, [0; 16]);
+}

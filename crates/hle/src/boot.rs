@@ -107,7 +107,10 @@ pub fn boot(exefs: &Path, journal: Journal, config: Config) -> Result<Kernel, St
     k.log(&services);
     let rtld = link::base_of("rtld").expect("rtld's base");
     k.create_main(rtld, MAIN_STACK.0 + MAIN_STACK.1);
-    k.oracle = Some(Program::link(modules).map_err(|e| format!("link: {}", e.0))?);
+    let program = Program::link(modules).map_err(|e| format!("link: {}", e.0))?;
+    k.symbols = program.modules.iter().flat_map(|p| p.module.symbols.iter().filter(|s| s.is_defined() && s.is_function()).map(move |s| (p.base + s.value, s.name.clone()))).collect();
+    k.symbols.sort();
+    k.oracle = Some(program);
     Ok(k)
 }
 
@@ -156,9 +159,12 @@ fn hex(b: &[u8]) -> String {
 }
 
 /// The probe hook: the first pass is journaled; the oracle runs at `nn::init::Start`.
-pub(crate) unsafe fn on_probe(_cpu: *mut Cpu, pc: u64, name: &str) {
+pub(crate) unsafe fn on_probe(cpu: *mut Cpu, pc: u64, name: &str) {
+    // SAFETY: the running thread's context, read before anything else runs.
+    let (x, lr) = unsafe { ((*cpu).x, (*cpu).x[30]) };
     crate::with(|k| {
-        k.log(&format!("probe {name} at {pc:#x}"));
+        let caller = k.symbolize(lr);
+        k.log(&format!("probe {name} at {pc:#x}: x0={:#x} x1={:#x} x2={:#x} x3={:#x}, called from {lr:#x} {caller}", x[0], x[1], x[2], x[3]));
         if name == ORACLE_PROBE {
             k.check_oracle();
         }
