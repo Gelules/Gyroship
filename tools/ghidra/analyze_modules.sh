@@ -29,10 +29,14 @@ for module in "$@"; do
         sdk) base=7240000000 ;;
         *) echo "unknown module $module" >&2; exit 1 ;;
     esac
+    # main holds 94% of the code: skip the heaviest analyzers there (16 GB machine).
+    light=""
+    [ "$module" = main ] && light="-preScript DisableHeavyAnalyzers.java"
     echo "=== $module at 0x$base"
+    # shellcheck disable=SC2086
     "$headless" "$project_dir" "$project" \
         -import "$elf_dir/$module.elf" -overwrite \
-        -loader ElfLoader -loader-imagebase "$base" \
+        -loader ElfLoader -loader-imagebase "$base" $light \
         -scriptPath "$script_dir" -postScript ExportInventory.java "$out_dir" \
         -log "$out_dir/$module.ghidra.log"
 done
