@@ -1,0 +1,13 @@
+[package]
+name = "gyroship"
+description = "Gyroship: native PC port runtime (window, main loop, config, frame capture)"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+gyroship-gpu = { path = "../gpu" }
+clap.workspace = true
+pollster = "1"
+wgpu = "30"
+winit = "0.30"

@@ -1,0 +1,11 @@
+[package]
+name = "gyroship-gpu"
+description = "Rendering on wgpu (Vulkan, DX12 fallback); later the NVN translation and shader cache"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+wgpu = "30"
+pollster = "1"
+png = "0.18"

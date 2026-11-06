@@ -8,3 +8,6 @@ publish.workspace = true
 [dependencies]
 clap.workspace = true
 gyroship-loader = { version = "0.1.0", path = "../loader" }
+
+[target."cfg(windows)".dependencies]
+windows-capture = "2"
