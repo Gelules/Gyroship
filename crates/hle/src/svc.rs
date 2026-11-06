@@ -8,7 +8,7 @@
 //! GetThreadContext3) write guest memory directly.
 
 use crate::result::*;
-use crate::thread::{CORES, PRIORITIES, State, THREAD_LIMIT};
+use crate::thread::{CORES, PRIORITIES, State, THREAD_LIMIT, Wait};
 use crate::{Kernel, STOP_EXIT, layout};
 use gyroship_runtime::Cpu;
 use gyroship_runtime::mem::{self, Block, attr, perm, state};
@@ -172,6 +172,21 @@ impl Kernel {
                 None => (INVALID_HANDLE, 0, format!("{:#x}", a[1] as u32)),
             },
             0x36 => (SUCCESS, 0, String::new()),
+            0x11 => (self.signal_event_handle(a[0] as u32), 0, format!("{:#x}", a[0] as u32)),
+            0x12 => (self.clear_event(a[0] as u32), 0, format!("{:#x}", a[0] as u32)),
+            0x16 => (self.close_handle(a[0] as u32), 0, format!("{:#x}", a[0] as u32)),
+            0x17 => (self.reset_signal(a[0] as u32), 0, format!("{:#x}", a[0] as u32)),
+            0x18 => (self.wait_synchronization(cpu, a[1], a[2] as u32, a[3] as i64), 0, format!("{} handles at {:#x} timeout {}", a[2] as u32, a[1], a[3] as i64)),
+            0x19 => (self.cancel_synchronization(a[0] as u32), 0, format!("{:#x}", a[0] as u32)),
+            0x1A => (self.arbitrate_lock(a[0] as u32, a[1], a[2] as u32), 0, format!("owner {:#x} at {:#x} tag {:#x}", a[0] as u32, a[1], a[2] as u32)),
+            0x1B => (self.arbitrate_unlock(a[0]), 0, format!("{:#x}", a[0])),
+            0x1C => (self.wait_key(a[0], a[1], a[2] as u32, a[3] as i64), 0, format!("mutex {:#x} key {:#x} tag {:#x} timeout {}", a[0], a[1], a[2] as u32, a[3] as i64)),
+            0x1D => {
+                self.signal_key(a[0], a[1] as i32);
+                (SUCCESS, 0, format!("key {:#x} count {}", a[0], a[1] as i32))
+            }
+            0x34 => (self.wait_address(a[0], a[1] as u32, a[2], a[3] as i64), u64::from(a[1] as u32), format!("{:#x} type {} value {:#x} timeout {}", a[0], a[1] as u32, a[2], a[3] as i64)),
+            0x35 => (self.signal_address(a[0], a[1] as u32, a[2] as i32, a[3] as i32), u64::from(a[1] as u32), format!("{:#x} type {} value {} count {}", a[0], a[1] as u32, a[2] as i32, a[3] as i32)),
             0x26 => {
                 let reason = a[0] as u32;
                 if reason & 0x8000_0000 == 0 {
@@ -203,9 +218,11 @@ impl Kernel {
             }
         };
         cpu.x[0] = u64::from(result);
-        // OutputDebugString (kind u64::MAX) is always logged, like every failure.
-        let key = format!("{imm:#x} {kind:#x}");
-        if result != SUCCESS || kind == u64::MAX || self.journal.all_svcs || self.journal.first(&key) {
+        // OutputDebugString (kind u64::MAX) is always logged, like every
+        // failure but those the SDK expects of futexes and waits.
+        let expected = matches!(result, SUCCESS | INVALID_STATE | TIMED_OUT | CANCELLED);
+        let key = format!("{imm:#x} {kind:#x} {result:#x}");
+        if !expected || kind == u64::MAX || self.journal.all_svcs || self.journal.first(&key) {
             let status = if result == SUCCESS { String::new() } else { format!(" -> {result:#x}") };
             self.log(&format!("{call} {detail}{status}"));
         }
@@ -233,7 +250,7 @@ impl Kernel {
             // ponytail: -1 and -2 behave as 0; an idle core takes waiting threads anyway.
             self.ready(t, now);
         } else {
-            self.block(Some(now + (ns as u64).div_ceil(32)), SUCCESS);
+            self.block(Wait::Sleep, Some(now + ns_to_ticks(ns)), SUCCESS);
         }
     }
 
@@ -388,4 +405,9 @@ fn splitmix(x: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
+}
+
+/// Nanoseconds to ticks of 31.25 MHz (32 ns each), rounded up.
+pub fn ns_to_ticks(ns: i64) -> u64 {
+    (ns as u64).div_ceil(32)
 }

@@ -44,6 +44,25 @@ pub enum State {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Object {
     Thread(usize),
+    /// The two ends of an event (an index into `Kernel::events`).
+    ReadableEvent(usize),
+    WritableEvent(usize),
+}
+
+/// What a waiting thread waits for.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub enum Wait {
+    #[default]
+    None,
+    Sleep,
+    /// WaitSynchronization: the first of these objects to be signaled.
+    Sync(Vec<Object>),
+    /// ArbitrateLock: the mutex word at `addr`, to be handed over with `tag`.
+    Lock { addr: u64, tag: u32 },
+    /// WaitProcessWideKeyAtomic: a signal on `key`, then the mutex at `addr`.
+    CondVar { key: u64, addr: u64, tag: u32 },
+    /// WaitForAddress.
+    Address(u64),
 }
 
 /// The process's handle table: 512 entries, numbered the same in every run.
@@ -115,6 +134,11 @@ pub struct Thread {
     /// Ticks spent running, for `GetThreadTickCount` (TLR + 0x108).
     pub cpu_time: u64,
     pub fiber: Option<Fiber>,
+    pub wait: Wait,
+    /// Arrival order among waiters of equal priority.
+    pub wait_seq: u64,
+    /// CancelSynchronization came while the thread was not waiting.
+    pub cancel: bool,
 }
 
 /// How a run of the threads ended.
@@ -172,6 +196,7 @@ impl Kernel {
         }
         match self.handles.get(h)? {
             Object::Thread(i) => Some(i),
+            _ => None,
         }
     }
 
@@ -209,6 +234,9 @@ impl Kernel {
             on_timeout: 0,
             cpu_time: 0,
             fiber: None,
+            wait: Wait::None,
+            wait_seq: 0,
+            cancel: false,
         });
         Ok(handle)
     }
@@ -237,15 +265,38 @@ impl Kernel {
     pub fn ready(&mut self, t: usize, at: u64) {
         self.sched.seq += 1;
         let th = &mut self.sched.threads[t];
-        (th.state, th.ready_at, th.seq, th.deadline) = (State::Ready, at, self.sched.seq, None);
+        (th.state, th.ready_at, th.seq, th.deadline, th.wait) = (State::Ready, at, self.sched.seq, None, Wait::None);
     }
 
-    /// The running thread waits until woken, or until `deadline`, when w0 gets `on_timeout`.
-    pub fn block(&mut self, deadline: Option<u64>, on_timeout: u32) {
+    /// The running thread waits for `wait` until woken, or until
+    /// `deadline`, when w0 gets `on_timeout`.
+    pub fn block(&mut self, wait: Wait, deadline: Option<u64>, on_timeout: u32) {
         let t = self.sched.current.expect("a running thread");
         self.leave_core(t);
+        self.sched.seq += 1;
         let th = &mut self.sched.threads[t];
-        (th.state, th.deadline, th.on_timeout) = (State::Waiting, deadline, on_timeout);
+        (th.state, th.wait, th.wait_seq, th.deadline, th.on_timeout) = (State::Waiting, wait, self.sched.seq, deadline, on_timeout);
+    }
+
+    /// Wakes waiting thread `t` now, with Result `result` (and x1 = `x1`).
+    pub fn wake(&mut self, t: usize, result: u32, x1: Option<u64>) {
+        let cpu = self.sched.threads[t].cpu;
+        // SAFETY: a waiting thread is parked at a switch point; nothing else uses its context.
+        unsafe {
+            (*cpu).x[0] = u64::from(result);
+            if let Some(v) = x1 {
+                (*cpu).x[1] = v;
+            }
+        }
+        let now = self.now();
+        self.ready(t, now);
+    }
+
+    /// Waiting threads whose wait matches, highest priority first, then in arrival order.
+    pub fn waiters(&self, matches: impl Fn(&Wait) -> bool) -> Vec<usize> {
+        let mut w: Vec<usize> = (0..self.sched.threads.len()).filter(|&t| self.sched.threads[t].state == State::Waiting && matches(&self.sched.threads[t].wait)).collect();
+        w.sort_by_key(|&t| (self.sched.threads[t].priority, self.sched.threads[t].wait_seq));
+        w
     }
 
     /// The running thread ends; returns the fiber to switch to.
@@ -260,6 +311,8 @@ impl Kernel {
         let t = self.sched.current.expect("a running thread");
         self.leave_core(t);
         self.sched.threads[t].state = State::Done;
+        // Threads waiting for this one's end wake up.
+        self.signal(Object::Thread(t));
         if let Some(f) = self.sched.threads[t].fiber.take() {
             self.sched.dead.push(f);
         }

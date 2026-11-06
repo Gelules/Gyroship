@@ -6,6 +6,7 @@
 
 pub mod journal;
 pub mod svc;
+pub mod sync;
 pub mod thread;
 
 use gyroship_runtime::{Cpu, Hooks};
@@ -37,6 +38,7 @@ pub mod result {
     pub const INVALID_ENUM_VALUE: u32 = kernel(120);
     pub const NOT_FOUND: u32 = kernel(121);
     pub const SESSION_CLOSED: u32 = kernel(123);
+    pub const OUT_OF_RANGE: u32 = kernel(119);
     pub const INVALID_STATE: u32 = kernel(125);
 }
 
@@ -83,6 +85,7 @@ pub struct Kernel {
     pub config: Config,
     pub handles: thread::Handles,
     pub sched: thread::Sched,
+    pub events: Vec<sync::Event>,
 }
 
 /// Exit code of a run the HLE stops (an unknown or forbidden SVC, a guest
@@ -93,7 +96,7 @@ impl Kernel {
     pub fn new(mem: Memory, mut journal: Journal, config: Config) -> Kernel {
         let mode = if config.explore { "exploration (not a validation run)" } else { "strict" };
         journal.line(0, 0, &format!("gyroship hle: mode {mode}, seed {:#x}, non-system memory {:#x}", config.seed, config.non_system_memory));
-        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default() }
+        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new() }
     }
 
     /// Logs a line for the running thread (0 when none runs).

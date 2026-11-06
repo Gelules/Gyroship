@@ -1,61 +1,15 @@
-//! Guest threads and the scheduler. The "guest code" here is Rust with the
-//! generated signature, installed in the dispatch table; it makes SVCs
-//! through the runtime, so each test goes through the real hooks and fiber
-//! switches.
+//! Guest threads and the scheduler.
 
-use gyroship_hle::journal::Journal;
+mod common;
+
+use common::*;
 use gyroship_hle::svc::CURRENT_THREAD;
-use gyroship_hle::thread::{self, Outcome, STEP};
-use gyroship_hle::{Config, Kernel};
-use gyroship_runtime::mem::Memory;
+use gyroship_hle::thread::{Outcome, STEP};
 use gyroship_runtime::{self as rt, Cpu};
-use std::cell::{Cell, RefCell};
-use std::sync::Once;
-
-const PC: u64 = 0x1000;
+use std::cell::Cell;
 
 thread_local! {
-    /// What the guest threads did: (who, virtual time).
-    static EVENTS: RefCell<Vec<(&'static str, u64)>> = const { RefCell::new(Vec::new()) };
     static FLAG: Cell<bool> = const { Cell::new(false) };
-}
-
-/// svc #imm with x0.. = args; returns x0 (and leaves x1, x2 in the context).
-unsafe fn svc(cpu: *mut Cpu, imm: u32, args: &[u64]) -> u64 {
-    unsafe {
-        for (i, a) in args.iter().enumerate() {
-            (*cpu).x[i] = *a;
-        }
-        rt::gyroship_svc(cpu, PC, imm);
-        (*cpu).x[0]
-    }
-}
-
-unsafe fn now(cpu: *mut Cpu) -> u64 {
-    unsafe {
-        rt::gyroship_counter(cpu, PC, 9);
-        (*cpu).x[9]
-    }
-}
-
-unsafe fn event(cpu: *mut Cpu, who: &'static str) {
-    let t = unsafe { now(cpu) };
-    EVENTS.with(|e| e.borrow_mut().push((who, t)));
-}
-
-/// RET: the thread's first function returns to EXIT, and the thread ends.
-unsafe fn ret(cpu: *mut Cpu) {
-    unsafe { (*cpu).pc = (*cpu).x[30] };
-}
-
-/// Creates and starts a thread at `entry`; returns its handle.
-unsafe fn spawn(cpu: *mut Cpu, entry: u64, arg: u64, priority: u64, core: u64) -> u64 {
-    unsafe {
-        assert_eq!(svc(cpu, 0x08, &[0, entry, arg, 0, priority, core]), 0, "CreateThread");
-        let h = (*cpu).x[1];
-        assert_eq!(svc(cpu, 0x09, &[h]), 0, "StartThread");
-        h
-    }
 }
 
 // Case 1: two threads that sleep.
@@ -131,7 +85,7 @@ unsafe extern "C" fn busy(cpu: *mut Cpu, _: u64) {
     unsafe {
         assert_eq!(svc(cpu, 0x08, &[0, MIGRANT, 0, 0, 44, 0]), 0);
         let h = (*cpu).x[1];
-        assert_eq!(svc(cpu, 0x0F, &[h, u64::MAX - 1 /* -2 */, 0x3F]), 0, "SetThreadCoreMask");
+        assert_eq!(svc(cpu, 0x0F, &[h, (-2i64) as u64, 0x3F]), 0, "SetThreadCoreMask");
         svc(cpu, 0x09, &[h]);
         for _ in 0..200 {
             now(cpu);
@@ -142,7 +96,7 @@ unsafe extern "C" fn busy(cpu: *mut Cpu, _: u64) {
 unsafe extern "C" fn migrant(cpu: *mut Cpu, _: u64) {
     unsafe {
         let core = svc(cpu, 0x10, &[]);
-        EVENTS.with(|e| e.borrow_mut().push(("migrant core", core)));
+        record("migrant core", core);
         ret(cpu);
     }
 }
@@ -156,46 +110,31 @@ unsafe extern "C" fn ticks(cpu: *mut Cpu, _: u64) {
         let before = tick_count(cpu);
         svc(cpu, 0x0B, &[100_000]);
         let after = tick_count(cpu);
-        EVENTS.with(|e| e.borrow_mut().push(("cpu ticks", after.wrapping_sub(before))));
-        EVENTS.with(|e| e.borrow_mut().push(("id", svc(cpu, 0x25, &[0, u64::from(CURRENT_THREAD as u32)]) | (*cpu).x[1] << 8)));
+        record("cpu ticks", after.wrapping_sub(before));
+        let r = svc(cpu, 0x25, &[0, u64::from(CURRENT_THREAD as u32)]);
+        record("id", r | (*cpu).x[1] << 8);
         ret(cpu);
     }
 }
 
-fn setup() {
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        let f: [(u64, rt::Guest); 9] = [
-            (SLEEPERS, sleepers),
-            (SLEEPER, sleeper),
-            (HIGH, high),
-            (LOW, low),
-            (SPINNER, spinner),
-            (SETTER, setter),
-            (BUSY, busy),
-            (MIGRANT, migrant),
-            (TICKS, ticks),
-        ];
-        rt::install(f.iter().map(|&(addr, function)| rt::Entry { addr, len: 0x100, function }).collect());
-    });
-}
-
-/// Runs the main thread at `entry` to the end; returns how it ended and the events.
-fn run(entry: u64) -> (Outcome, Vec<(&'static str, u64)>, String) {
-    setup();
-    EVENTS.with(|e| e.borrow_mut().clear());
-    let mut k = Kernel::new(Memory::new().unwrap(), Journal::memory(), Config::default());
-    k.journal.all_svcs = true;
-    k.create_main(entry, 0);
-    gyroship_hle::install(k);
-    let outcome = thread::run();
-    let k = gyroship_hle::uninstall().unwrap();
-    (outcome, EVENTS.with(|e| e.borrow().clone()), k.journal.text().to_string())
+fn go(entry: u64) -> (Outcome, Vec<(&'static str, u64)>, String) {
+    install(&[
+        (SLEEPERS, sleepers),
+        (SLEEPER, sleeper),
+        (HIGH, high),
+        (LOW, low),
+        (SPINNER, spinner),
+        (SETTER, setter),
+        (BUSY, busy),
+        (MIGRANT, migrant),
+        (TICKS, ticks),
+    ]);
+    run(entry)
 }
 
 #[test]
 fn sleeping_threads_follow_virtual_time() {
-    let (outcome, events, journal) = run(SLEEPERS);
+    let (outcome, events, journal) = go(SLEEPERS);
     assert_eq!(outcome, Outcome::Finished, "{journal}");
     assert_eq!(events.len(), 6, "{events:?}");
     // Execution order is time order: each thread ran only between two sleeps.
@@ -207,12 +146,12 @@ fn sleeping_threads_follow_virtual_time() {
     // Both threads are interleaved, not one after the other.
     assert_ne!(events[1].0, events[2].0, "{events:?}");
     // The same run gives the same journal.
-    assert_eq!(journal, run(SLEEPERS).2);
+    assert_eq!(journal, go(SLEEPERS).2);
 }
 
 #[test]
 fn a_yield_gives_way_to_the_same_priority_only() {
-    let (outcome, events, journal) = run(HIGH);
+    let (outcome, events, journal) = go(HIGH);
     assert_eq!(outcome, Outcome::Finished, "{journal}");
     let names: Vec<_> = events.iter().map(|e| e.0).collect();
     assert_eq!(names, ["high after yield", "low", "high after sleep"]);
@@ -220,7 +159,7 @@ fn a_yield_gives_way_to_the_same_priority_only() {
 
 #[test]
 fn a_spinning_thread_lets_another_core_run() {
-    let (outcome, events, journal) = run(SPINNER);
+    let (outcome, events, journal) = go(SPINNER);
     assert_eq!(outcome, Outcome::Finished, "{journal}");
     let names: Vec<_> = events.iter().map(|e| e.0).collect();
     assert_eq!(names, ["setter", "spinner saw the flag"]);
@@ -228,14 +167,14 @@ fn a_spinning_thread_lets_another_core_run() {
 
 #[test]
 fn an_idle_core_takes_a_waiting_thread() {
-    let (outcome, events, journal) = run(BUSY);
+    let (outcome, events, journal) = go(BUSY);
     assert_eq!(outcome, Outcome::Finished, "{journal}");
     assert_eq!(events, [("migrant core", 1)], "{journal}");
 }
 
 #[test]
 fn thread_tick_count_leaves_out_sleep() {
-    let (outcome, events, journal) = run(TICKS);
+    let (outcome, events, journal) = go(TICKS);
     assert_eq!(outcome, Outcome::Finished, "{journal}");
     let ticks = events[0].1;
     // 100 µs of sleep are 3125 ticks; the thread itself ran a few steps.
