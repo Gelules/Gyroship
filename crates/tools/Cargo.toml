@@ -1,0 +1,9 @@
+[package]
+name = "gyroship-tools"
+description = "Gyroship developer tools"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+clap.workspace = true
