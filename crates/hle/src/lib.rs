@@ -95,11 +95,13 @@ pub struct Config {
     pub save_dir: Option<std::path::PathBuf>,
     /// vi2 presents wait for the display's next vsync (60 Hz); `--no-vsync` turns it off.
     pub vsync: bool,
+    /// `--dump-gpfifo DIR`: the first submits' pushbuffer segments go to DIR, raw.
+    pub gpfifo_dump: Option<std::path::PathBuf>,
 }
 
 impl Default for Config {
     fn default() -> Config {
-        Config { seed: 0x5EED, explore: false, non_system_memory: 0x2_6410_0000, time_limit: None, frames: None, save_dir: None, vsync: true }
+        Config { seed: 0x5EED, explore: false, non_system_memory: 0x2_6410_0000, time_limit: None, frames: None, save_dir: None, vsync: true, gpfifo_dump: None }
     }
 }
 

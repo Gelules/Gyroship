@@ -354,6 +354,13 @@ impl Nvdrv {
                 continue;
             }
             let words: Vec<u32> = raw.as_chunks::<4>().0.iter().map(|w| u32::from_le_bytes(*w)).collect();
+            // Raw segments of the first submits, for study (never committed: game data).
+            if let Some(dir) = &k.config.gpfifo_dump
+                && self.submits <= 300
+            {
+                let _ = std::fs::create_dir_all(dir);
+                let _ = std::fs::write(dir.join(format!("submit-{:04}-{gpu:010x}.bin", self.submits)), &raw);
+            }
             for effect in channel.run(&words) {
                 match effect {
                     crate::pushbuf::Effect::Release(r) => {

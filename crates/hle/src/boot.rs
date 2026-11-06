@@ -215,8 +215,9 @@ pub fn main(table: Vec<rt::Entry>) {
     // A virtual time limit, 60 s unless --seconds says otherwise.
     let seconds: u64 = args.iter().position(|a| a == "--seconds").and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()).unwrap_or(60);
     let frames: Option<u64> = args.iter().position(|a| a == "--frames").and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok());
-    let save_dir = args.iter().position(|a| a == "--save").and_then(|i| args.get(i + 1)).map(std::path::PathBuf::from);
-    let config = Config { explore: flag("--explore"), time_limit: Some(seconds * 31_250_000), frames, save_dir, vsync: !flag("--no-vsync"), ..Config::default() };
+    let value = |f: &str| args.iter().position(|a| a == f).and_then(|i| args.get(i + 1)).cloned();
+    let save_dir = value("--save").map(std::path::PathBuf::from);
+    let config = Config { explore: flag("--explore"), time_limit: Some(seconds * 31_250_000), frames, save_dir, vsync: !flag("--no-vsync"), gpfifo_dump: value("--dump-gpfifo").map(std::path::PathBuf::from), ..Config::default() };
     let installed = table.len();
     rt::install(table);
     mem::install_fault_handler();
