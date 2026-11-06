@@ -1,0 +1,33 @@
+# Build output
+/target/
+
+# Generated from the player's own game files: never committed
+/generated/
+/artifacts/
+
+# Game data and console files must never be inside the repo; belt and braces
+/game/
+/gamedata/
+exefs/
+romfs/
+*.nso
+*.nro
+*.nca
+*.nsp
+*.nsz
+*.xci
+*.xcz
+*.npdm
+*.keys
+
+# Analysis projects
+/ghidra/
+*.gpr
+*.rep/
+
+# OS and editors
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/
