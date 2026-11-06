@@ -27,6 +27,16 @@ enum Command {
         #[arg(long, short)]
         out: PathBuf,
     },
+    /// Load every module of an exefs folder at its guest base, apply the
+    /// relocations, resolve imports, and report (exit code 1 if any import
+    /// stays unresolved)
+    Link {
+        /// exefs folder (main, rtld, sdk, subsdk0...)
+        exefs: PathBuf,
+        /// Also print every unresolved import
+        #[arg(long)]
+        verbose: bool,
+    },
     /// Convert NSO executables to AArch64 ELF files for disassemblers
     Nso2elf {
         /// NSO files to convert
@@ -54,6 +64,7 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Command::Nso(NsoCommand::Info { nso, symbols }) => nso_info(&nso, symbols).map(|_| true),
         Command::Nso2elf { inputs, out } => nso2elf(&inputs, &out).map(|_| true),
+        Command::Link { exefs, verbose } => link(&exefs, verbose),
         Command::Capture { title, out } => capture::window(&title, &out).map(|_| true),
     };
     match result {
@@ -139,6 +150,30 @@ fn nso2elf(inputs: &[PathBuf], out: &Path) -> Result<()> {
         println!("{} -> {} ({} bytes in memory)", input.display(), target.display(), m.mem_end());
     }
     Ok(())
+}
+
+fn link(exefs: &Path, verbose: bool) -> Result<bool> {
+    use gyroship_loader::link::{LOAD_ORDER, Program};
+    let mut modules = Vec::new();
+    for name in LOAD_ORDER {
+        let path = exefs.join(name);
+        if path.is_file() {
+            let m = Module::parse_nso(&std::fs::read(&path)?).map_err(|e| format!("{}: {e}", path.display()))?;
+            modules.push((name.to_string(), m));
+        }
+    }
+    let p = Program::link(modules)?;
+    println!("{:<8} {:>14} {:>12} {:>9} {:>9} {:>9}", "module", "base", "size", "relr", "relative", "symbolic");
+    for (m, s) in p.modules.iter().zip(&p.stats) {
+        println!("{:<8} {:#14x} {:#12x} {:>9} {:>9} {:>9}", m.name, m.base, m.module.image.len(), s.relr, s.relative, s.symbolic);
+    }
+    let unresolved: Vec<_> = p.unresolved().collect();
+    let tls = unresolved.iter().filter(|i| i.kind == gyroship_loader::link::R_AARCH64_TLS_TPREL).count();
+    println!("imports  {} by name, {} unresolved ({tls} TLS, left to the runtime)", p.imports.len(), unresolved.len());
+    for i in unresolved.iter().filter(|_| verbose) {
+        println!("  {} {:#x} type {} {}", p.modules[i.module].name, i.slot, i.kind, i.name);
+    }
+    Ok(unresolved.len() == tls)
 }
 
 fn nso_info(path: &Path, symbols: bool) -> Result<()> {

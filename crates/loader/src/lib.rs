@@ -9,6 +9,8 @@
 use sha2::{Digest, Sha256};
 use std::fmt;
 
+pub mod link;
+
 const NSO_MAGIC: &[u8; 4] = b"NSO0";
 const MOD0_MAGIC: &[u8; 4] = b"MOD0";
 const HEADER_SIZE: usize = 0x100;
