@@ -26,6 +26,7 @@ Requires a recent stable Rust toolchain (MSVC on Windows).
     gyroship-tools nso2elf -o <dir> <exefs/main> ...      # ELF files for disassemblers
     gyroship-tools link    <exefs>                        # place, relocate and link all modules
     gyroship-tools discover <exefs>                       # functions, PLT stubs, CFGs and jump tables
+    gyroship-tools recompile <exefs> -o generated/game     # every function, Cranelift, plus a linkable harness
     gyroship-tools experiment <exefs> -o generated/exp/x  # recompile a sample (--backend rust|clif)
     gyroship-tools measure <command> ...                  # wall time and peak memory of a process tree
     gyroship-tools capture --title Gyroship -o shot.png   # capture a window (Windows)

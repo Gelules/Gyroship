@@ -52,6 +52,23 @@ impl Cpu {
 /// A recompiled guest function.
 pub type Guest = unsafe extern "C" fn(*mut Cpu);
 
+/// One entry of a dispatch table emitted by the generator.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Entry {
+    pub addr: u64,
+    pub function: Guest,
+}
+
+/// The entries of a generated table.
+///
+/// # Safety
+/// `table` must point to `len` entries that live for the whole program.
+pub unsafe fn entries(table: *const Entry, len: u64) -> impl Iterator<Item = (u64, Guest)> {
+    // SAFETY: guaranteed by the caller.
+    unsafe { std::slice::from_raw_parts(table, len as usize) }.iter().map(|e| (e.addr, e.function))
+}
+
 static DISPATCH: OnceLock<Vec<(u64, Guest)>> = OnceLock::new();
 
 /// Installs the dispatch table: guest entry address -> host function.

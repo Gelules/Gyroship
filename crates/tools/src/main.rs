@@ -8,6 +8,7 @@ use std::time::Instant;
 
 mod experiment;
 mod measure;
+mod recompile;
 
 #[derive(Parser)]
 #[command(name = "gyroship-tools", version, about = "Gyroship developer tools")]
@@ -49,6 +50,21 @@ enum Command {
         /// Print up to this many examples of each unusual case
         #[arg(long, default_value_t = 0)]
         examples: usize,
+    },
+    /// Recompile every function of an exefs with Cranelift: one object per
+    /// thread plus a harness crate that links them with the runtime
+    Recompile {
+        /// exefs folder
+        exefs: PathBuf,
+        /// Output folder (under generated/, which Git ignores)
+        #[arg(long, short)]
+        out: PathBuf,
+        /// Compiler threads, one object file each
+        #[arg(long, default_value_t = 6)]
+        threads: usize,
+        /// Run the Cranelift verifier on every function
+        #[arg(long)]
+        verify: bool,
     },
     /// Backend experiment: generate every N-th function of main (or chosen
     /// functions) as a project ready to build and measure
@@ -101,6 +117,7 @@ fn main() -> ExitCode {
         Command::Functions { nso, compare } => functions(&nso, compare.as_deref()).map(|_| true),
         Command::Capture { title, out } => capture::window(&title, &out).map(|_| true),
         Command::Experiment(args) => run_experiment(&args).map(|_| true),
+        Command::Recompile { exefs, out, threads, verify } => recompile::run(&exefs, &out, threads, verify).map(|_| true),
         Command::Measure { program, args } => measure::run(&program, &args).map(|u| {
             let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
             println!("measure     {:.1} s, peak {:.2} GiB for the process tree, {:.2} GiB for one process", u.seconds, gib(u.peak_total), gib(u.peak_process));

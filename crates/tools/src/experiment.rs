@@ -74,15 +74,15 @@ fn picked_sample<'a>(program: &'a Program, d: &'a discover::Discovery, picked: V
     Ok(Sample { program, functions, stubs, set })
 }
 
-/// The harness: installs the table; with arguments, runs a function as
-/// `adler32(1, buf, len)` over a pseudo-random buffer and checks the result.
-fn harness_main(decls: &str, table: &str) -> String {
+/// The harness: installs the dispatch table (`table`, an expression of
+/// type `Vec<(u64, rt::Guest)>` that `prelude` may define); with arguments,
+/// runs a function as `adler32(1, buf, len)` over a pseudo-random buffer and
+/// checks the result.
+pub fn harness_main(prelude: &str, table: &str) -> String {
     format!(
         r#"use gyroship_runtime as rt;
 use std::time::Instant;
-{decls}
-static TABLE: &[(u64, rt::Guest)] = &[
-{table}];
+{prelude}
 
 fn adler32(data: &[u8]) -> u64 {{
     let (mut a, mut b) = (1u32, 0u32);
@@ -94,10 +94,12 @@ fn adler32(data: &[u8]) -> u64 {{
 }}
 
 fn main() {{
-    rt::install(TABLE.to_vec());
+    let table: Vec<(u64, rt::Guest)> = {table};
+    let installed = table.len();
+    rt::install(table);
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {{
-        println!("{{}} functions installed", TABLE.len());
+        println!("{{installed}} functions installed");
         return;
     }}
     let target = u64::from_str_radix(args[1].trim_start_matches("0x"), 16).expect("hex address");
@@ -168,11 +170,11 @@ pub fn coverage(s: &Sample) -> (u64, u64, Vec<(String, u64)>) {
 }
 
 /// A path as Cargo manifests and linker arguments accept it: forward slashes, no `\\?\` prefix.
-fn plain(p: &Path) -> String {
+pub fn plain(p: &Path) -> String {
     p.display().to_string().replace('\\', "/").trim_start_matches("//?/").to_string()
 }
 
-fn runtime_path() -> String {
+pub fn runtime_path() -> String {
     // The runtime crate next to this one; generated projects are never committed.
     let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../runtime");
     plain(&p.canonicalize().unwrap_or(p))
@@ -238,7 +240,7 @@ pub fn write_rust(s: &Sample, out: &Path, per_file: usize, files_per_crate: usiz
     )?;
     std::fs::write(
         out.join("harness/src/main.rs"),
-        harness_main("", &table),
+        harness_main(&format!("\nstatic TABLE: &[(u64, rt::Guest)] = &[\n{table}];\n"), "TABLE.to_vec()"),
     )?;
     Ok(bytes)
 }
@@ -283,7 +285,7 @@ pub fn write_clif(s: &Sample, out: &Path, verify: bool) -> super::Result<(u64, f
     }
     std::fs::write(
         out.join("harness/src/main.rs"),
-        harness_main(&format!("\nunsafe extern \"C\" {{\n{decls}}}\n"), &table),
+        harness_main(&format!("\nunsafe extern \"C\" {{\n{decls}}}\n\nstatic TABLE: &[(u64, rt::Guest)] = &[\n{table}];\n"), "TABLE.to_vec()"),
     )?;
     Ok((bytes.len() as u64, seconds))
 }

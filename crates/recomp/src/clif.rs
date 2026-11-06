@@ -16,7 +16,7 @@ use cranelift_codegen::ir::{
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch};
-use cranelift_module::{FuncId, Linkage, Module, default_libcall_names};
+use cranelift_module::{DataDescription, FuncId, Linkage, Module, default_libcall_names};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use std::collections::HashMap;
 
@@ -41,14 +41,17 @@ struct Runtime {
 pub struct Object {
     module: ObjectModule,
     sig: Signature,
+    /// Every guest function this object refers to: its own (exported), others (imported).
     ids: HashMap<u64, FuncId>,
+    defined: Vec<u64>,
     rt: Runtime,
     ctx: Context,
     fbc: FunctionBuilderContext,
 }
 
 impl Object {
-    /// An object that will define the functions at `defined`.
+    /// An object that will define the functions at `defined`; direct calls to
+    /// any other guest function become imports, resolved when linking.
     pub fn new(defined: &[u64], verify: bool) -> Result<Object> {
         let mut flags = settings::builder();
         flags.set("opt_level", "speed").map_err(|e| e.to_string())?;
@@ -76,7 +79,32 @@ impl Object {
         for &a in defined {
             ids.insert(a, module.declare_function(&crate::rust::name(a), Linkage::Export, &sig).map_err(|e| e.to_string())?);
         }
-        Ok(Object { module, sig, ids, rt, ctx: Context::new(), fbc: FunctionBuilderContext::new() })
+        Ok(Object { module, sig, ids, defined: defined.to_vec(), rt, ctx: Context::new(), fbc: FunctionBuilderContext::new() })
+    }
+
+    /// Defines `symbol`, the dispatch table of this object: for each defined
+    /// function, its guest address then its host address (16 bytes), and
+    /// `<symbol>_len`, the entry count.
+    pub fn table(&mut self, symbol: &str) -> Result<()> {
+        let err = |e: cranelift_module::ModuleError| e.to_string();
+        let mut contents = vec![0u8; 16 * self.defined.len()];
+        for (i, a) in self.defined.iter().enumerate() {
+            contents[16 * i..16 * i + 8].copy_from_slice(&a.to_le_bytes());
+        }
+        let mut table = DataDescription::new();
+        table.define(contents.into_boxed_slice());
+        table.set_align(8);
+        for (i, a) in self.defined.iter().enumerate() {
+            let f = self.module.declare_func_in_data(self.ids[a], &mut table);
+            table.write_function_addr((16 * i + 8) as u32, f);
+        }
+        let id = self.module.declare_data(symbol, Linkage::Export, false, false).map_err(err)?;
+        self.module.define_data(id, &table).map_err(err)?;
+        let mut len = DataDescription::new();
+        len.define(Box::new((self.defined.len() as u64).to_le_bytes()));
+        len.set_align(8);
+        let id = self.module.declare_data(&format!("{symbol}_len"), Linkage::Export, false, false).map_err(err)?;
+        self.module.define_data(id, &len).map_err(err)
     }
 
     pub fn function(&mut self, input: &Input) -> Result<()> {
@@ -87,7 +115,8 @@ impl Object {
         let config = self.module.target_config();
         let module = &mut self.module;
         let rt = &self.rt;
-        let ids = &self.ids;
+        let ids = &mut self.ids;
+        let sig = &self.sig;
         let mut b = FunctionBuilder::new(&mut self.ctx.func, &mut self.fbc);
         let cpu_region = b.func.dfg.alias_regions.insert(AliasRegionData { user_id: 1, description: "cpu".into() });
         let heap_region = b.func.dfg.alias_regions.insert(AliasRegionData { user_id: 2, description: "guest".into() });
@@ -103,7 +132,7 @@ impl Object {
         let index = |a: u64| input.cfg.blocks.binary_search_by_key(&a, |b| b.start).ok();
         let first = blocks[index(f.start).unwrap_or(0)];
         b.ins().jump(first, &[]);
-        let mut e = Emit { b, cpu, mem, cpu_flags, heap_flags, module, rt, ids, refs: &mut refs, callee: input.callee };
+        let mut e = Emit { b, cpu, mem, cpu_flags, heap_flags, module, rt, ids, sig, refs: &mut refs, callee: input.callee };
         for (bi, block) in input.cfg.blocks.iter().enumerate() {
             e.b.switch_to_block(blocks[bi]);
             let end = block.start + block.len;
@@ -201,7 +230,8 @@ struct Emit<'a, 'b> {
     heap_flags: MemFlagsData,
     module: &'a mut ObjectModule,
     rt: &'a Runtime,
-    ids: &'a HashMap<u64, FuncId>,
+    ids: &'a mut HashMap<u64, FuncId>,
+    sig: &'a Signature,
     refs: &'a mut HashMap<FuncId, FuncRef>,
     callee: &'a dyn Fn(u64) -> Callee,
 }
@@ -615,7 +645,15 @@ impl Emit<'_, '_> {
     fn call(&mut self, t: u64) {
         match (self.callee)(t) {
             Callee::Direct(t) => {
-                let f = self.func(self.ids[&t]);
+                let id = match self.ids.get(&t) {
+                    Some(&id) => id,
+                    None => {
+                        let id = self.module.declare_function(&crate::rust::name(t), Linkage::Import, self.sig).expect("a fresh import");
+                        self.ids.insert(t, id);
+                        id
+                    }
+                };
+                let f = self.func(id);
                 self.b.ins().call(f, &[self.cpu]);
             }
             Callee::Dispatch(t) => {
