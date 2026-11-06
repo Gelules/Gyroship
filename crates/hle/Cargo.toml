@@ -1,0 +1,8 @@
+[package]
+name = "gyroship-hle"
+description = "High-level emulation of OS services: SVCs, IPC services, fs (romfs), hid, audio, time; network always offline"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]

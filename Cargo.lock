@@ -149,12 +149,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "gyroship-analysis"
+version = "0.1.0"
+
+[[package]]
+name = "gyroship-hle"
+version = "0.1.0"
+
+[[package]]
 name = "gyroship-loader"
 version = "0.1.0"
 dependencies = [
  "lz4_flex",
  "sha2",
 ]
+
+[[package]]
+name = "gyroship-practice"
+version = "0.1.0"
+
+[[package]]
+name = "gyroship-recomp"
+version = "0.1.0"
+
+[[package]]
+name = "gyroship-research"
+version = "0.1.0"
+
+[[package]]
+name = "gyroship-runtime"
+version = "0.1.0"
 
 [[package]]
 name = "gyroship-tools"

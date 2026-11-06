@@ -1,0 +1,8 @@
+[package]
+name = "gyroship-practice"
+description = "Speedrun practice tools: save states, mission teleport with chosen starting state, practice menu"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
