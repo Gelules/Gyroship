@@ -27,6 +27,7 @@ Requires a recent stable Rust toolchain (MSVC on Windows).
     gyroship-tools link    <exefs>                        # place, relocate and link all modules
     gyroship-tools discover <exefs>                       # functions, PLT stubs, CFGs and jump tables
     gyroship-tools recompile <exefs> -o generated/game     # every function, Cranelift, plus a linkable harness
+                                                          #   (--probes FILE: log the first pass at listed addresses)
     gyroship-tools experiment <exefs> -o generated/exp/x  # recompile a sample (--backend rust|clif)
     gyroship-tools measure <command> ...                  # wall time and peak memory of a process tree
     gyroship-tools capture --title Gyroship -o shot.png   # capture a window (Windows)

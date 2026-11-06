@@ -50,6 +50,9 @@ struct Runtime {
     trap: FuncId,
     svc: FuncId,
     miss: FuncId,
+    counter: FuncId,
+    yield_: FuncId,
+    probe: FuncId,
 }
 
 /// The functions of one output: an object file (`ObjectModule`), or JIT
@@ -61,6 +64,8 @@ pub struct Object<M: Module = ObjectModule> {
     ids: HashMap<u64, FuncId>,
     /// Start and size of each function this object defines.
     defined: Vec<(u64, u64)>,
+    /// Resume points of the functions generated so far.
+    resume_points: usize,
     rt: Runtime,
     ctx: Context,
     fbc: FunctionBuilderContext,
@@ -106,12 +111,15 @@ impl<M: Module> Object<M> {
             trap: import("gyroship_trap", &[ptr, I64, I32])?,
             svc: import("gyroship_svc", &[ptr, I64, I32])?,
             miss: import("gyroship_miss", &[ptr, I64])?,
+            counter: import("gyroship_counter", &[ptr, I64, I32])?,
+            yield_: import("gyroship_yield", &[ptr, I64, I32])?,
+            probe: import("gyroship_probe", &[ptr, I64])?,
         };
         let mut ids = HashMap::new();
         for &(a, _) in defined {
             ids.insert(a, module.declare_function(&crate::rust::name(a), Linkage::Export, &sig).map_err(|e| e.to_string())?);
         }
-        Ok(Object { module, sig, ids, defined: defined.to_vec(), rt, ctx: Context::new(), fbc: FunctionBuilderContext::new() })
+        Ok(Object { module, sig, ids, defined: defined.to_vec(), resume_points: 0, rt, ctx: Context::new(), fbc: FunctionBuilderContext::new() })
     }
 
     /// Defines `symbol`, the dispatch table of this object: for each defined
@@ -181,6 +189,11 @@ impl<M: Module> Object<M> {
             for pc in (block.start..end).step_by(4) {
                 let word = (input.word)(pc);
                 let op = crate::lift::lift(word, pc);
+                if (input.probe)(pc) {
+                    let f = e.func(e.rt.probe);
+                    let at = e.b.ins().iconst(I64, pc as i64);
+                    e.b.ins().call(f, &[cpu, at]);
+                }
                 // After a call or an SVC, execution goes on in a block of its own,
                 // so that the continuation is a resume point.
                 let mut continuation = |e: &mut Emit<M>, ended: &mut bool| -> Block {
@@ -196,6 +209,11 @@ impl<M: Module> Object<M> {
                     cont
                 };
                 match op {
+                    Op::Jump(t) if t == pc => {
+                        ended = true;
+                        e.runtime(e.rt.trap, pc, gyroship_runtime::TRAP_SELF_LOOP);
+                        e.b.ins().return_(&[]);
+                    }
                     Op::Jump(t) => {
                         ended = true;
                         e.goto(t, index(t).map(|i| blocks[i]));
@@ -266,8 +284,14 @@ impl<M: Module> Object<M> {
                         e.runtime(e.rt.trap, pc, u32::from(imm));
                         e.b.ins().return_(&[]);
                     }
-                    Op::Svc(imm) => {
-                        e.runtime(e.rt.svc, pc, u32::from(imm));
+                    Op::Svc(_) | Op::Counter(_) | Op::Yield(_) => {
+                        let (id, imm) = match op {
+                            Op::Svc(imm) => (e.rt.svc, u32::from(imm)),
+                            Op::Counter(r) => (e.rt.counter, reg_number(r)),
+                            Op::Yield(kind) => (e.rt.yield_, u32::from(kind)),
+                            _ => unreachable!(),
+                        };
+                        e.runtime(id, pc, imm);
                         if pc + 4 < end {
                             let cont = continuation(&mut e, &mut ended);
                             e.b.ins().jump(cont, &[]);
@@ -286,11 +310,18 @@ impl<M: Module> Object<M> {
         }
         e.fill_pending();
         e.rescue(rescue, &points);
+        let resume_points = points.len();
         e.b.seal_all_blocks();
         e.b.finalize(config);
         self.module.define_function(id, &mut self.ctx).map_err(|e| format!("{e:?}"))?;
         self.module.clear_context(&mut self.ctx);
+        self.resume_points += resume_points;
         Ok(())
+    }
+
+    /// Resume points of the functions generated so far.
+    pub fn resume_points(&self) -> usize {
+        self.resume_points
     }
 
     /// The module, and the id of each guest function it declares.
@@ -1052,6 +1083,14 @@ impl<M: Module> Emit<'_, '_, M> {
             self.b.switch_to_block(tail);
             self.tail_call(t);
         }
+    }
+}
+
+/// The register number the runtime writes (31 for XZR: nothing).
+fn reg_number(r: Reg) -> u32 {
+    match r {
+        Reg::X(n) => u32::from(n),
+        Reg::Zr | Reg::Sp => 31,
     }
 }
 

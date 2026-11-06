@@ -173,7 +173,7 @@ pub fn write_rust(s: &Sample, out: &Path, per_file: usize, files_per_crate: usiz
                 src.push_str("}\n\n");
             }
             for (f, g) in file.iter() {
-                rust::function(&mut src, &Input { function: f, cfg: g, word: &word, callee: &callee });
+                rust::function(&mut src, &Input { function: f, cfg: g, word: &word, callee: &callee, probe: &|_| false });
                 let _ = writeln!(table, "    rt::Entry {{ addr: {:#x}, len: {:#x}, function: g{ci}::f{fi}::{} }},", f.start, f.len, rust::name(f.start));
             }
             bytes += src.len() as u64;
@@ -214,7 +214,7 @@ pub fn write_clif(s: &Sample, out: &Path, verify: bool) -> super::Result<(u64, f
     let word = |a: u64| s.word(a);
     let callee = |t: u64| s.callee(t);
     for (f, g) in &s.functions {
-        obj.function(&Input { function: f, cfg: g, word: &word, callee: &callee }).map_err(|e| format!("{:#x}: {e}", f.start))?;
+        obj.function(&Input { function: f, cfg: g, word: &word, callee: &callee, probe: &|_| false }).map_err(|e| format!("{:#x}: {e}", f.start))?;
     }
     let bytes = obj.finish()?;
     let seconds = start.elapsed().as_secs_f64();

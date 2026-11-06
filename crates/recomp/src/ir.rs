@@ -166,6 +166,10 @@ pub enum Op {
     Return,
     Trap(u16),
     Svc(u16),
+    /// mrs xN, CNTPCT_EL0 (or CNTVCT_EL0): the runtime's virtual counter.
+    Counter(Reg),
+    /// yield (1), wfe (2) or wfi (3): the guest waits, so the runtime may switch threads.
+    Yield(u8),
     /// Not translated: the runtime gets the PC and the word.
     Unhandled,
 }

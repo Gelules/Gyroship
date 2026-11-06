@@ -203,9 +203,66 @@ pub unsafe extern "C" fn gyroship_unhandled(cpu: *mut Cpu, pc: u64, word: u32) {
     }
 }
 
+/// `imm` of [`gyroship_trap`] for a branch to itself (`b .`), the idiom of
+/// a fatal error: the generator stops there instead of spinning.
+pub const TRAP_SELF_LOOP: u32 = 0x1_0000;
+
 #[unsafe(no_mangle)]
 pub extern "C" fn gyroship_trap(_cpu: *mut Cpu, pc: u64, imm: u32) {
+    if imm == TRAP_SELF_LOOP {
+        panic!("guest branches to itself at {pc:#x} (a fatal-error loop)");
+    }
     panic!("guest trap #{imm:#x} at {pc:#x}");
+}
+
+/// The virtual counter (`CNTPCT_EL0`), in ticks of 31.25 MHz.
+///
+/// ponytail: one global clock that each read advances by [`COUNTER_STEP`];
+/// the kernel's per-core clocks (D19) replace it with the scheduler.
+pub static COUNTER: AtomicU64 = AtomicU64::new(0);
+/// Ticks one counter read costs: 1.024 µs.
+pub const COUNTER_STEP: u64 = 32;
+
+/// `mrs x<rt>, CNTPCT_EL0`.
+///
+/// # Safety
+/// `cpu` must point to a valid context.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gyroship_counter(cpu: *mut Cpu, _pc: u64, rt: u32) {
+    let v = COUNTER.fetch_add(COUNTER_STEP, Ordering::Relaxed) + COUNTER_STEP;
+    if rt < 31 {
+        // SAFETY: guaranteed by the caller.
+        unsafe { (*cpu).x[rt as usize] = v };
+    }
+}
+
+/// `yield` (1), `wfe` (2) or `wfi` (3): a point where the scheduler may switch
+/// threads. Nothing to do while there is a single guest thread.
+#[unsafe(no_mangle)]
+pub extern "C" fn gyroship_yield(_cpu: *mut Cpu, _pc: u64, _kind: u32) {}
+
+/// Named guest addresses whose passes are counted (D21: sondes).
+static PROBES: OnceLock<Vec<(u64, String, AtomicU64)>> = OnceLock::new();
+
+pub fn install_probes(mut probes: Vec<(u64, String)>) {
+    probes.sort_unstable_by_key(|p| p.0);
+    let _ = PROBES.set(probes.into_iter().map(|(a, n)| (a, n, AtomicU64::new(0))).collect());
+}
+
+/// Each probe with the number of times guest code passed it.
+pub fn probe_counts() -> Vec<(u64, &'static str, u64)> {
+    PROBES.get().map_or_else(Vec::new, |p| p.iter().map(|(a, n, c)| (*a, n.as_str(), c.load(Ordering::Relaxed))).collect())
+}
+
+/// Generated code passes a probed address; the first pass is logged.
+#[unsafe(no_mangle)]
+pub extern "C" fn gyroship_probe(_cpu: *mut Cpu, pc: u64) {
+    let Some(p) = PROBES.get() else { return };
+    if let Ok(i) = p.binary_search_by_key(&pc, |e| e.0)
+        && p[i].2.fetch_add(1, Ordering::Relaxed) == 0
+    {
+        eprintln!("gyroship: probe {} at {pc:#x}", p[i].1);
+    }
 }
 
 #[unsafe(no_mangle)]

@@ -436,7 +436,14 @@ pub fn function(out: &mut String, input: &Input) {
         for pc in (block.start..end).step_by(4) {
             let word = (input.word)(pc);
             let op = crate::lift::lift(word, pc);
+            if (input.probe)(pc) {
+                let _ = writeln!(out, "                rt::gyroship_probe(c, {pc:#x});");
+            }
             let s = match op {
+                Op::Jump(t) if t == pc => {
+                    ended = true;
+                    format!("rt::gyroship_trap(c, {pc:#x}, rt::TRAP_SELF_LOOP); return;")
+                }
                 Op::Jump(t) => {
                     ended = true;
                     goto(t)
@@ -469,6 +476,14 @@ pub fn function(out: &mut String, input: &Input) {
                     format!("rt::gyroship_trap(c, {pc:#x}, {imm}); return;")
                 }
                 Op::Svc(imm) => format!("rt::gyroship_svc(c, {pc:#x}, {imm});"),
+                Op::Counter(r) => {
+                    let n = match r {
+                        Reg::X(n) => u32::from(n),
+                        Reg::Zr | Reg::Sp => 31,
+                    };
+                    format!("unsafe {{ rt::gyroship_counter(c, {pc:#x}, {n}) }};")
+                }
+                Op::Yield(kind) => format!("rt::gyroship_yield(c, {pc:#x}, {kind});"),
                 Op::Unhandled => format!("rt::gyroship_unhandled(c, {pc:#x}, {word:#x});"),
                 ref op => data(op),
             };

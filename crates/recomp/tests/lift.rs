@@ -82,7 +82,7 @@ fn both_backends_emit_a_loop_with_a_call() {
     let (words, f, cfg) = counted_loop();
     let word = |a: u64| words[((a - 0x1000) / 4) as usize];
     let callee = |t: u64| if t == 0x2000 { Callee::Direct(t) } else { Callee::Dispatch(t) };
-    let input = Input { function: &f, cfg: &cfg, word: &word, callee: &callee };
+    let input = Input { function: &f, cfg: &cfg, word: &word, callee: &callee, probe: &|_| false };
     let mut src = String::new();
     rust::function(&mut src, &input);
     assert!(src.contains("pub unsafe extern \"C\" fn f_1000(c: *mut Cpu, resume: u64)"));

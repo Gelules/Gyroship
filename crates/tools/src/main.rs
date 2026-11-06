@@ -65,6 +65,9 @@ enum Command {
         /// Run the Cranelift verifier on every function
         #[arg(long)]
         verify: bool,
+        /// Probe list: one `<hex address> <name>` per line ('#' starts a comment)
+        #[arg(long)]
+        probes: Option<PathBuf>,
     },
     /// Backend experiment: generate every N-th function of main (or chosen
     /// functions) as a project ready to build and measure
@@ -117,7 +120,7 @@ fn main() -> ExitCode {
         Command::Functions { nso, compare } => functions(&nso, compare.as_deref()).map(|_| true),
         Command::Capture { title, out } => capture::window(&title, &out).map(|_| true),
         Command::Experiment(args) => run_experiment(&args).map(|_| true),
-        Command::Recompile { exefs, out, threads, verify } => recompile::run(&exefs, &out, threads, verify).map(|_| true),
+        Command::Recompile { exefs, out, threads, verify, probes } => recompile::run(&exefs, &out, threads, verify, probes.as_deref()).map(|_| true),
         Command::Measure { program, args } => measure::run(&program, &args).map(|u| {
             let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
             println!("measure     {:.1} s, peak {:.2} GiB for the process tree, {:.2} GiB for one process", u.seconds, gib(u.peak_total), gib(u.peak_process));

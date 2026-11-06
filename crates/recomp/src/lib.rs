@@ -27,4 +27,6 @@ pub struct Input<'a> {
     pub word: &'a dyn Fn(u64) -> u32,
     /// Where a direct call to an address goes (PLT stubs already resolved).
     pub callee: &'a dyn Fn(u64) -> Callee,
+    /// Addresses that get a `gyroship_probe` call before their instruction.
+    pub probe: &'a dyn Fn(u64) -> bool,
 }

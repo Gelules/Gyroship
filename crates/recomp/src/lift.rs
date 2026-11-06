@@ -6,8 +6,14 @@ use gyroship_analysis::decode::{decode, Instruction, Opcode, Operand as O, SIMDS
 /// MRS/MSR encodings of TPIDR_EL0 and TPIDRRO_EL0 as yaxpeax numbers them.
 const TPIDR_EL0: u16 = 0x5E82;
 const TPIDRRO_EL0: u16 = 0x5E83;
+const CNTPCT_EL0: u16 = 0x5F01;
+const CNTVCT_EL0: u16 = 0x5F02;
 
 pub fn lift(word: u32, pc: u64) -> Op {
+    // yield, wfe, wfi: hints for the decoder, waits for the runtime.
+    if let 0xD503_203F | 0xD503_205F | 0xD503_207F = word {
+        return Op::Yield(((word >> 5) & 7) as u8);
+    }
     match decode(word) {
         Some(i) => lift_decoded(&i, pc).unwrap_or(Op::Unhandled),
         None => Op::Unhandled,
@@ -248,6 +254,7 @@ fn lift_decoded(i: &Instruction, pc: u64) -> Option<Op> {
         C::MRS => match o[1] {
             O::SystemReg(TPIDR_EL0) => Op::ReadThread { dst: r(&o[0])?, ro: false },
             O::SystemReg(TPIDRRO_EL0) => Op::ReadThread { dst: r(&o[0])?, ro: true },
+            O::SystemReg(CNTPCT_EL0 | CNTVCT_EL0) => Op::Counter(r(&o[0])?),
             _ => return None,
         },
         // Hints, barriers and pointer authentication: the host needs none of them

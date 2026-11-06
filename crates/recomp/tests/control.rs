@@ -101,6 +101,8 @@ const U2: u64 = 0x6300;
 // Case 8: a call as the last word of a function.
 const V: u64 = 0x7000;
 const W: u64 = 0x7100;
+// Case 9: counter reads around a yield, with a probe on the yield.
+const CT: u64 = 0x7200;
 
 struct Program {
     words: BTreeMap<u64, u32>,
@@ -152,6 +154,9 @@ fn program() -> Program {
     p.function(V, &[PUSH, bl(V + 4, W)], &[]);
     p.function(V + 8, &[POP, add(0, 0, 1), RET], &[]);
     p.function(W, &[movz(0, 41), RET], &[]);
+
+    // mrs x0, cntpct_el0; yield; mrs x1, cntpct_el0; ret
+    p.function(CT, &[0xD53B_E020, 0xD503_203F, 0xD53B_E021, RET], &[]);
     p
 }
 
@@ -161,7 +166,10 @@ fn setup() {
     ONCE.call_once(|| {
         let p = program();
         let mut jb = JITBuilder::with_isa(clif::isa(true).unwrap(), cranelift_module::default_libcall_names());
-        let runtime: [(&str, *const u8); 5] = [
+        let runtime: [(&str, *const u8); 8] = [
+            ("gyroship_counter", rt::gyroship_counter as *const () as *const u8),
+            ("gyroship_yield", rt::gyroship_yield as *const () as *const u8),
+            ("gyroship_probe", rt::gyroship_probe as *const () as *const u8),
             ("gyroship_call", rt::gyroship_call as *const () as *const u8),
             ("gyroship_unhandled", rt::gyroship_unhandled as *const () as *const u8),
             ("gyroship_trap", rt::gyroship_trap as *const () as *const u8),
@@ -184,7 +192,7 @@ fn setup() {
         let callee = |t: u64| if starts.contains(&t) { Callee::Direct(t) } else { Callee::Dispatch(t) };
         for f in &p.functions {
             let g = cfg::build(&image, lo, f);
-            obj.function(&Input { function: f, cfg: &g, word: &word, callee: &callee }).unwrap_or_else(|e| panic!("{:#x}: {e}", f.start));
+            obj.function(&Input { function: f, cfg: &g, word: &word, callee: &callee, probe: &|a| a == CT + 4 }).unwrap_or_else(|e| panic!("{:#x}: {e}", f.start));
         }
         let (mut module, ids) = obj.into_parts();
         module.finalize_definitions().unwrap();
@@ -198,6 +206,7 @@ fn setup() {
             })
             .collect();
         rt::install(table);
+        rt::install_probes(vec![(CT + 4, "yield".to_string())]);
         // The code must outlive every test of this process.
         std::mem::forget(module);
     });
@@ -312,4 +321,13 @@ fn resume_on_an_unknown_address_is_fatal() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success(), "{stderr}");
     assert!(stderr.contains("guest address 0x520c is neither a known block nor a resume point"), "{stderr}");
+}
+
+#[test]
+fn counter_reads_advance_the_virtual_clock_and_probes_count() {
+    let (_m, mut cpu) = machine(CT);
+    run(&mut cpu);
+    // No other test reads the counter: two reads are exactly one step apart.
+    assert_eq!(cpu.x[1] - cpu.x[0], rt::COUNTER_STEP);
+    assert_eq!(rt::probe_counts(), [(CT + 4, "yield", 1)]);
 }
