@@ -17,10 +17,10 @@ enum Command {
     /// Inspect NSO executables (segments, MOD0, symbols, relocations)
     #[command(subcommand)]
     Nso(NsoCommand),
-    /// Capture one frame of a window by its exact title (Windows Graphics
-    /// Capture; works without focus) and save it as PNG
+    /// Capture one frame of the first window whose title contains the given
+    /// text (Windows Graphics Capture; works without focus) and save it as PNG
     Capture {
-        /// Window title, for example "Gyroship"
+        /// Part of the window title, for example "Gyroship"
         #[arg(long)]
         title: String,
         /// Output PNG file
@@ -104,7 +104,8 @@ mod capture {
     }
 
     pub fn window(title: &str, out: &Path) -> super::Result<()> {
-        let window = Window::from_name(title).map_err(|e| format!("no window titled {title:?}: {e}"))?;
+        let window = Window::from_contains_name(title)
+            .map_err(|e| format!("no window whose title contains {title:?}: {e}"))?;
         let settings = Settings::new(
             window,
             CursorCaptureSettings::WithoutCursor,
