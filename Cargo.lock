@@ -999,6 +999,9 @@ dependencies = [
 [[package]]
 name = "gyroship-hle"
 version = "0.1.0"
+dependencies = [
+ "gyroship-runtime",
+]
 
 [[package]]
 name = "gyroship-loader"

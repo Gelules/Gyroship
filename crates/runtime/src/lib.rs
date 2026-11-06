@@ -265,9 +265,27 @@ pub extern "C" fn gyroship_probe(_cpu: *mut Cpu, pc: u64) {
     }
 }
 
+/// Handles `svc #imm` at `pc`: arguments in x0..x7, Result in w0, outputs
+/// in x1 and x2. `gyroship-hle` registers it; the runtime does not depend on
+/// the HLE, so harnesses without one still link.
+pub type SvcHandler = fn(&mut Cpu, u64, u32);
+
+static SVC: OnceLock<SvcHandler> = OnceLock::new();
+
+/// Registers the SVC handler; the first registration wins.
+pub fn set_svc_handler(handler: SvcHandler) {
+    let _ = SVC.set(handler);
+}
+
+/// # Safety
+/// `cpu` must point to a valid context.
 #[unsafe(no_mangle)]
-pub extern "C" fn gyroship_svc(_cpu: *mut Cpu, pc: u64, imm: u32) {
-    panic!("guest svc #{imm:#x} at {pc:#x} (no HLE yet)");
+pub unsafe extern "C" fn gyroship_svc(cpu: *mut Cpu, pc: u64, imm: u32) {
+    match SVC.get() {
+        // SAFETY: guaranteed by the caller.
+        Some(handler) => handler(unsafe { &mut *cpu }, pc, imm),
+        None => panic!("guest svc #{imm:#x} at {pc:#x} and no SVC handler"),
+    }
 }
 
 /// A computed jump or a resume landed on an address its function does not

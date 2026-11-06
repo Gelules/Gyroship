@@ -475,7 +475,7 @@ pub fn function(out: &mut String, input: &Input) {
                     ended = true;
                     format!("rt::gyroship_trap(c, {pc:#x}, {imm}); return;")
                 }
-                Op::Svc(imm) => format!("rt::gyroship_svc(c, {pc:#x}, {imm});"),
+                Op::Svc(imm) => format!("unsafe {{ rt::gyroship_svc(c, {pc:#x}, {imm}) }};"),
                 Op::Counter(r) => {
                     let n = match r {
                         Reg::X(n) => u32::from(n),

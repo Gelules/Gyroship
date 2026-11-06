@@ -6,3 +6,4 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+gyroship-runtime = { version = "0.1.0", path = "../runtime" }
