@@ -315,6 +315,9 @@ struct ExperimentArgs {
     /// Generate the functions at these guest addresses instead (hex, comma-separated)
     #[arg(long, value_delimiter = ',')]
     functions: Vec<String>,
+    /// With --functions, also every function they call or jump to, transitively
+    #[arg(long)]
+    callees: bool,
     /// Functions per generated file
     #[arg(long, default_value_t = 256)]
     per_file: usize,
@@ -338,7 +341,7 @@ fn run_experiment(a: &ExperimentArgs) -> Result<()> {
         experiment::sample(&p, &d, a.every)?
     } else {
         let addrs = a.functions.iter().map(|x| u64::from_str_radix(x.trim_start_matches("0x"), 16)).collect::<std::result::Result<Vec<_>, _>>()?;
-        experiment::chosen(&p, &d, &addrs)?
+        experiment::chosen(&p, &d, &addrs, a.callees)?
     };
     let (total, unhandled, top) = experiment::coverage(&s);
     println!("sample      {} functions, {total} instructions, {unhandled} untranslated ({:.2}%)", s.functions.len(), 100.0 * unhandled as f64 / total as f64);

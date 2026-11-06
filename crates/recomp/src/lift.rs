@@ -1,7 +1,7 @@
 //! From a decoded instruction to one IR operation.
 
-use crate::ir::{Addr, Alu, Cond, Op, Operand, Reg, Shift, Unary, Writeback, W};
-use gyroship_analysis::decode::{decode, Instruction, Opcode, Operand as O, ShiftStyle, SizeCode};
+use crate::ir::{Addr, Alu, Cond, FBin, FUn, Op, Operand, Reg, Select, Shift, Unary, Writeback, W};
+use gyroship_analysis::decode::{decode, Instruction, Opcode, Operand as O, SIMDSizeCode, ShiftStyle, SizeCode};
 
 /// MRS/MSR encodings of TPIDR_EL0 and TPIDRRO_EL0 as yaxpeax numbers them.
 const TPIDR_EL0: u16 = 0x5E82;
@@ -133,6 +133,9 @@ fn lift_decoded(i: &Instruction, pc: u64) -> Option<Op> {
         let size = size.unwrap_or(if w == W::W64 { 3 } else { 2 });
         Some(Op::Store { src, size, addr: addr(&o[1])? })
     };
+    if let Some(op) = lift_simd(i) {
+        return Some(op);
+    }
     Some(match i.opcode {
         C::ADD => alu(Alu::Add, false)?,
         C::ADDS => alu(Alu::Add, true)?,
@@ -267,6 +270,212 @@ fn lift_decoded(i: &Instruction, pc: u64) -> Option<Op> {
         C::RETAB | C::RETAA => Op::Return,
         C::UDF | C::BRK | C::HLT => Op::Trap(imm(&o[0])? as u16),
         C::SVC => Op::Svc(imm(&o[0])? as u16),
+        _ => return None,
+    })
+}
+
+fn simd_size(s: SIMDSizeCode) -> u8 {
+    match s {
+        SIMDSizeCode::B => 0,
+        SIMDSizeCode::H => 1,
+        SIMDSizeCode::S => 2,
+        SIMDSizeCode::D => 3,
+        SIMDSizeCode::Q => 4,
+    }
+}
+
+/// A scalar FP/SIMD register: (number, log2 bytes).
+fn vreg(o: &O) -> Option<(u8, u8)> {
+    match *o {
+        O::SIMDRegister(s, n) => Some((n as u8, simd_size(s))),
+        _ => None,
+    }
+}
+
+/// A single or double precision register: (number, is double).
+fn freg(o: &O) -> Option<(u8, bool)> {
+    match vreg(o)? {
+        (n, 2) => Some((n, false)),
+        (n, 3) => Some((n, true)),
+        _ => None,
+    }
+}
+
+/// A whole vector: (number, 16 bytes, log2 of the element bytes).
+fn vector(o: &O) -> Option<(u8, bool, u8)> {
+    match *o {
+        O::SIMDRegisterElements(v, n, e) => Some((n as u8, v == SIMDSizeCode::Q, simd_size(e))),
+        _ => None,
+    }
+}
+
+/// `lane` (of `esize` log2 bytes) repeated over 8 or 16 bytes.
+fn replicate(lane: u64, esize: u8, q: bool) -> u128 {
+    let bits = 8u32 << esize;
+    let lane = u128::from(if bits == 64 { lane } else { lane & ((1u64 << bits) - 1) });
+    let total = if q { 128 } else { 64 };
+    (0..total / bits).fold(0u128, |v, k| v | lane << (k * bits))
+}
+
+/// FP and SIMD forms the backends translate; None for everything else.
+fn lift_simd(i: &Instruction) -> Option<Op> {
+    use Opcode as C;
+    let o = &i.operands;
+    let f2 = |op: FBin| -> Option<Op> {
+        let ((dst, d), (a, da), (b, db)) = (freg(&o[0])?, freg(&o[1])?, freg(&o[2])?);
+        (d == da && d == db).then_some(Op::FBin { op, f64: d, dst, a, b })
+    };
+    let f1 = |op: FUn| -> Option<Op> {
+        let ((dst, d), (src, ds)) = (freg(&o[0])?, freg(&o[1])?);
+        (d == ds).then_some(Op::FUn { op, f64: d, dst, src })
+    };
+    let fma = |neg_acc: bool, neg_product: bool| -> Option<Op> {
+        let ((dst, d), (a, _), (b, _), (acc, _)) = (freg(&o[0])?, freg(&o[1])?, freg(&o[2])?, freg(&o[3])?);
+        Some(Op::FMulAdd { f64: d, dst, a, b, acc, neg_acc, neg_product })
+    };
+    Some(match i.opcode {
+        C::LDR | C::LDUR | C::STR | C::STUR => {
+            let (n, size) = vreg(&o[0])?;
+            let a = addr(&o[1])?;
+            if matches!(i.opcode, C::LDR | C::LDUR) { Op::LoadV { dst: n, size, addr: a } } else { Op::StoreV { src: n, size, addr: a } }
+        }
+        C::LDP | C::LDNP | C::STP | C::STNP => {
+            let ((a, size), (b, _)) = (vreg(&o[0])?, vreg(&o[1])?);
+            let at = addr(&o[2])?;
+            if matches!(i.opcode, C::LDP | C::LDNP) { Op::LoadPairV { a, b, size, addr: at } } else { Op::StorePairV { a, b, size, addr: at } }
+        }
+        C::FMOV => match (&o[0], &o[1]) {
+            (O::SIMDRegister(..), O::SIMDRegister(..)) => {
+                let ((dst, size), (src, _)) = (vreg(&o[0])?, vreg(&o[1])?);
+                Op::VMov { dst, src, size }
+            }
+            (O::SIMDRegister(..), O::Register(..)) => {
+                let (dst, size) = vreg(&o[0])?;
+                (size >= 2).then_some(Op::ToV { dst, src: r(&o[1])?, size })?
+            }
+            (O::Register(..), O::SIMDRegister(..)) => {
+                let (src, size) = vreg(&o[1])?;
+                (size >= 2).then_some(Op::FromV { dst: r(&o[0])?, src, size, lane: 0 })?
+            }
+            (O::Register(..), O::SIMDRegisterElementsLane(_, src, SIMDSizeCode::D, lane)) => {
+                Op::FromV { dst: r(&o[0])?, src: *src as u8, size: 3, lane: *lane }
+            }
+            (O::SIMDRegister(..), O::ImmediateDouble(x)) => {
+                let (dst, d) = freg(&o[0])?;
+                let bits = if d { x.to_bits() } else { u64::from((*x as f32).to_bits()) };
+                Op::VConst { dst, value: u128::from(bits) }
+            }
+            (O::SIMDRegisterElements(..), O::ImmediateDouble(x)) => {
+                let (dst, q, e) = vector(&o[0])?;
+                let lane = match e {
+                    3 => x.to_bits(),
+                    2 => u64::from((*x as f32).to_bits()),
+                    _ => return None,
+                };
+                Op::VConst { dst, value: replicate(lane, e, q) }
+            }
+            _ => return None,
+        },
+        C::MOVI | C::MVNI => {
+            let invert = i.opcode == C::MVNI;
+            let (dst, value) = match (&o[0], &o[1]) {
+                (O::SIMDRegister(SIMDSizeCode::D, n), O::Imm64(v)) => (*n as u8, u128::from(*v)),
+                (O::SIMDRegisterElements(..), imm) => {
+                    let (dst, q, e) = vector(&o[0])?;
+                    let lane = match *imm {
+                        O::Imm64(v) => v,
+                        O::Immediate(v) => u64::from(v),
+                        O::ImmShift(v, s) => u64::from(v) << s,
+                        O::ImmShiftMSL(v, s) => (u64::from(v) << s) | ((1u64 << s) - 1),
+                        _ => return None,
+                    };
+                    (dst, replicate(if invert { !lane } else { lane }, e, q))
+                }
+                _ => return None,
+            };
+            Op::VConst { dst, value }
+        }
+        C::UMOV => {
+            let O::SIMDRegisterElementsLane(_, src, e, lane) = o[1] else { return None };
+            Op::FromV { dst: r(&o[0])?, src: src as u8, size: simd_size(e), lane }
+        }
+        C::ORR | C::AND | C::EOR | C::BIC | C::ORN => {
+            let ((dst, q, _), (a, _, _), (b, _, _)) = (vector(&o[0])?, vector(&o[1])?, vector(&o[2])?);
+            let op = match i.opcode {
+                C::ORR => Alu::Orr,
+                C::AND => Alu::And,
+                C::EOR => Alu::Eor,
+                C::BIC => Alu::Bic,
+                _ => Alu::Orn,
+            };
+            if op == Alu::Orr && a == b { Op::VMov { dst, src: a, size: if q { 4 } else { 3 } } } else { Op::VLogic { op, q, dst, a, b } }
+        }
+        C::FADD => f2(FBin::Add)?,
+        C::FSUB => f2(FBin::Sub)?,
+        C::FMUL => f2(FBin::Mul)?,
+        C::FDIV => f2(FBin::Div)?,
+        C::FMAX => f2(FBin::Max)?,
+        C::FMIN => f2(FBin::Min)?,
+        C::FMAXNM => f2(FBin::MaxNm)?,
+        C::FMINNM => f2(FBin::MinNm)?,
+        C::FNMUL => f2(FBin::Nmul)?,
+        C::FABD => f2(FBin::Abd)?,
+        C::FNEG => f1(FUn::Neg)?,
+        C::FABS => f1(FUn::Abs)?,
+        C::FSQRT => f1(FUn::Sqrt)?,
+        C::FRINTM => f1(FUn::Floor)?,
+        C::FRINTP => f1(FUn::Ceil)?,
+        C::FRINTZ => f1(FUn::Trunc)?,
+        C::FRINTN | C::FRINTX | C::FRINTI => f1(FUn::Nearest)?,
+        C::FRINTA => f1(FUn::Round)?,
+        C::BSL | C::BIT | C::BIF => {
+            let ((dst, q, _), (a, _, _), (b, _, _)) = (vector(&o[0])?, vector(&o[1])?, vector(&o[2])?);
+            let kind = match i.opcode {
+                C::BSL => Select::Bsl,
+                C::BIT => Select::Bit,
+                _ => Select::Bif,
+            };
+            Op::VSelect { kind, q, dst, a, b }
+        }
+        C::FMADD => fma(false, false)?,
+        C::FMSUB => fma(false, true)?,
+        C::FNMADD => fma(true, true)?,
+        C::FNMSUB => fma(true, false)?,
+        C::FCMP | C::FCMPE => {
+            let (a, d) = freg(&o[0])?;
+            match o[1] {
+                O::ImmediateDouble(_) => Op::FCmp { f64: d, a, b: None }, // FCMP #imm only encodes +0.0
+                _ => Op::FCmp { f64: d, a, b: Some(freg(&o[1])?.0) },
+            }
+        }
+        C::FCCMP | C::FCCMPE => {
+            let ((a, d), (b, _)) = (freg(&o[0])?, freg(&o[1])?);
+            Op::FCondCmp { f64: d, a, b, nzcv: imm(&o[2])? as u8, cond: cond(&o[3])? }
+        }
+        C::FCSEL => {
+            let ((dst, d), (a, _), (b, _)) = (freg(&o[0])?, freg(&o[1])?, freg(&o[2])?);
+            Op::FCondSel { f64: d, dst, a, b, cond: cond(&o[3])? }
+        }
+        C::FCVT => {
+            let ((dst, d), (src, s)) = (freg(&o[0])?, freg(&o[1])?);
+            (d != s).then_some(Op::FCvt { dst, src, to_f64: d })?
+        }
+        C::SCVTF | C::UCVTF => {
+            if !matches!(o[2], O::Nothing) {
+                return None; // fixed-point form
+            }
+            let (dst, d) = freg(&o[0])?;
+            let (src, w) = reg(&o[1])?;
+            Op::IntToF { dst, src, w, f64: d, signed: i.opcode == C::SCVTF }
+        }
+        C::FCVTZS | C::FCVTZU => {
+            if !matches!(o[2], O::Nothing) {
+                return None;
+            }
+            let (dst, w) = reg(&o[0])?;
+            let (src, d) = freg(&o[1])?;
+            Op::FToInt { dst, w, src, f64: d, signed: i.opcode == C::FCVTZS }
+        }
         _ => return None,
     })
 }

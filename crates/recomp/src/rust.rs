@@ -2,7 +2,7 @@
 //! `pub unsafe extern "C" fn f_<addr>(cpu: *mut Cpu)`; its blocks are the
 //! arms of a `loop { match b { .. } }`.
 
-use crate::ir::{Addr, Alu, Cond, Op, Operand, Reg, Shift, Unary, Writeback, W};
+use crate::ir::{Addr, Alu, Cond, FBin, FUn, Op, Operand, Reg, Select, Shift, Unary, Writeback, W};
 use crate::{Callee, Input};
 use std::fmt::Write as _;
 
@@ -97,6 +97,34 @@ fn condition(c: Cond) -> String {
         Cond::Zero { reg, w, nonzero } => format!("{} {} 0", rd(reg, w), if nonzero { "!=" } else { "==" }),
         Cond::Bit { reg, bit, set } => format!("({} >> {bit}) & 1 {} 0", rd(reg, W::W64), if set { "!=" } else { "==" }),
     }
+}
+
+/// `& mask` keeping the low 1 << size bytes of a u128 (nothing for 16 bytes).
+fn low_mask(size: u8) -> String {
+    if size >= 4 { String::new() } else { format!(" & {:#x}u128", (1u128 << (8u32 << size)) - 1) }
+}
+
+fn vload(size: u8, at: &str) -> String {
+    match size {
+        4 => format!("rt::ld128(c, {at})"),
+        s => format!("rt::ld{}(c, {at}) as u128", 8u32 << s),
+    }
+}
+
+fn vstore(size: u8, at: &str, src: u8) -> String {
+    match size {
+        4 => format!("rt::st128(c, {at}, c.vr[{src}])"),
+        s => format!("rt::st{}(c, {at}, c.vr[{src}] as u64)", 8u32 << s),
+    }
+}
+
+fn fread(n: u8, f64: bool) -> String {
+    if f64 { format!("f64::from_bits(c.vr[{n}] as u64)") } else { format!("f32::from_bits(c.vr[{n}] as u32)") }
+}
+
+/// Writes a scalar float; the rest of the register becomes zero.
+fn fwrite(n: u8, v: &str) -> String {
+    format!("c.vr[{n}] = {v}.to_bits() as u128;")
 }
 
 /// A data operation as one statement block.
@@ -243,6 +271,125 @@ fn data(op: &Op) -> String {
             )
         }
         Op::ReadThread { dst, ro } => wr(dst, W::W64, if ro { "c.tpidrro" } else { "c.tpidr" }),
+        Op::LoadV { dst, size, addr: a } => {
+            let (at, wb) = addr(&a);
+            format!("{{ let a = {at}; let v = {}; {wb} c.vr[{dst}] = v; }}", vload(size, "a"))
+        }
+        Op::StoreV { src, size, addr: a } => {
+            let (at, wb) = addr(&a);
+            format!("{{ let a = {at}; {}; {wb} }}", vstore(size, "a", src))
+        }
+        Op::LoadPairV { a: r1, b: r2, size, addr: a } => {
+            let (at, wb) = addr(&a);
+            let second = format!("a.wrapping_add({})", 1u32 << size);
+            format!("{{ let a = {at}; let v1 = {}; let v2 = {}; {wb} c.vr[{r1}] = v1; c.vr[{r2}] = v2; }}", vload(size, "a"), vload(size, &second))
+        }
+        Op::StorePairV { a: r1, b: r2, size, addr: a } => {
+            let (at, wb) = addr(&a);
+            let second = format!("a.wrapping_add({})", 1u32 << size);
+            format!("{{ let a = {at}; {}; {}; {wb} }}", vstore(size, "a", r1), vstore(size, &second, r2))
+        }
+        Op::VConst { dst, value } => format!("c.vr[{dst}] = {value:#x}u128;"),
+        Op::VMov { dst, src, size } => format!("c.vr[{dst}] = c.vr[{src}]{};", low_mask(size)),
+        Op::ToV { dst, src, size } => format!("c.vr[{dst}] = {} as u128;", rd(src, if size == 3 { W::W64 } else { W::W32 })),
+        Op::FromV { dst, src, size, lane } => {
+            let bits = 8u32 << size;
+            let w = if size == 3 { W::W64 } else { W::W32 };
+            wr(dst, w, &format!("((c.vr[{src}] >> {}){}) as u64", u32::from(lane) * bits, low_mask(size)))
+        }
+        Op::VLogic { op, q, dst, a, b } => {
+            let e = match op {
+                Alu::And => "a & b",
+                Alu::Orr => "a | b",
+                Alu::Eor => "a ^ b",
+                Alu::Bic => "a & !b",
+                _ => "a | !b",
+            };
+            format!("{{ let (a, b) = (c.vr[{a}], c.vr[{b}]); c.vr[{dst}] = ({e}){}; }}", low_mask(if q { 4 } else { 3 }))
+        }
+        Op::VSelect { kind, q, dst, a, b } => {
+            let e = match kind {
+                Select::Bsl => "(d & a) | (!d & b)",
+                Select::Bit => "(d & !b) | (a & b)",
+                Select::Bif => "(d & b) | (a & !b)",
+            };
+            format!("{{ let (d, a, b) = (c.vr[{dst}], c.vr[{a}], c.vr[{b}]); c.vr[{dst}] = ({e}){}; }}", low_mask(if q { 4 } else { 3 }))
+        }
+        Op::FBin { op, f64, dst, a, b } => {
+            let t = if f64 { "64" } else { "32" };
+            let e = match op {
+                FBin::Add => "a + b".to_string(),
+                FBin::Sub => "a - b".to_string(),
+                FBin::Mul => "a * b".to_string(),
+                FBin::Div => "a / b".to_string(),
+                FBin::Max => format!("rt::fmax{t}(a, b)"),
+                FBin::Min => format!("rt::fmin{t}(a, b)"),
+                FBin::MaxNm => format!("if a.is_nan() {{ b }} else if b.is_nan() {{ a }} else {{ rt::fmax{t}(a, b) }}"),
+                FBin::MinNm => format!("if a.is_nan() {{ b }} else if b.is_nan() {{ a }} else {{ rt::fmin{t}(a, b) }}"),
+                FBin::Nmul => "-(a * b)".to_string(),
+                FBin::Abd => "(a - b).abs()".to_string(),
+            };
+            format!("{{ let (a, b) = ({}, {}); let r: f{t} = {e}; {} }}", fread(a, f64), fread(b, f64), fwrite(dst, "r"))
+        }
+        Op::FUn { op, f64, dst, src } => {
+            let e = match op {
+                FUn::Neg => "-a",
+                FUn::Abs => "a.abs()",
+                FUn::Sqrt => "a.sqrt()",
+                FUn::Floor => "a.floor()",
+                FUn::Ceil => "a.ceil()",
+                FUn::Trunc => "a.trunc()",
+                FUn::Nearest => "a.round_ties_even()",
+                FUn::Round => "a.round()",
+            };
+            format!("{{ let a = {}; let r = {e}; {} }}", fread(src, f64), fwrite(dst, "r"))
+        }
+        Op::FMulAdd { f64, dst, a, b, acc, neg_acc, neg_product } => {
+            let neg = |x: bool| if x { "-" } else { "" };
+            format!(
+                "{{ let r = ({}{}).mul_add({}, {}{}); {} }}",
+                neg(neg_product),
+                fread(a, f64),
+                fread(b, f64),
+                neg(neg_acc),
+                fread(acc, f64),
+                fwrite(dst, "r")
+            )
+        }
+        Op::FCmp { f64, a, b } => {
+            let y = b.map_or_else(|| "0.0".to_string(), |b| fread(b, f64));
+            format!("rt::fcmp(c, {} as f64, {y} as f64);", fread(a, f64))
+        }
+        Op::FCondCmp { f64, a, b, nzcv, cond } => {
+            format!("if rt::cond(c, {cond}) {{ rt::fcmp(c, {} as f64, {} as f64); }} else {{ rt::set_nzcv(c, {nzcv}); }}", fread(a, f64), fread(b, f64))
+        }
+        Op::FCondSel { f64, dst, a, b, cond } => {
+            let m = low_mask(if f64 { 3 } else { 2 });
+            format!("c.vr[{dst}] = if rt::cond(c, {cond}) {{ c.vr[{a}]{m} }} else {{ c.vr[{b}]{m} }};")
+        }
+        Op::FCvt { dst, src, to_f64 } => {
+            let e = if to_f64 { format!("{} as f64", fread(src, false)) } else { format!("{} as f32", fread(src, true)) };
+            format!("{{ let r = {e}; {} }}", fwrite(dst, "r"))
+        }
+        Op::IntToF { dst, src, w, f64, signed } => {
+            let t = if f64 { "f64" } else { "f32" };
+            let v = match (signed, w) {
+                (true, W::W32) => format!("({} as u32 as i32)", rd(src, W::W32)),
+                (true, W::W64) => format!("({} as i64)", rd(src, W::W64)),
+                (false, W::W32) => format!("({} as u32)", rd(src, W::W32)),
+                (false, W::W64) => rd(src, W::W64),
+            };
+            format!("{{ let r = {v} as {t}; {} }}", fwrite(dst, "r"))
+        }
+        Op::FToInt { dst, w, src, f64, signed } => {
+            let t = match (signed, w) {
+                (true, W::W32) => "i32",
+                (true, W::W64) => "i64",
+                (false, W::W32) => "u32",
+                (false, W::W64) => "u64",
+            };
+            wr(dst, w, &format!("({} as {t}) as u64", fread(src, f64)))
+        }
         Op::Nop => String::new(),
         _ => unreachable!("control flow is emitted by the block"),
     }

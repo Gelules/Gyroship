@@ -57,9 +57,31 @@ pub fn sample<'a>(program: &'a Program, d: &'a discover::Discovery, every: usize
     picked_sample(program, d, picked)
 }
 
-/// The functions that contain the given guest addresses.
-pub fn chosen<'a>(program: &'a Program, d: &'a discover::Discovery, addrs: &[u64]) -> super::Result<Sample<'a>> {
-    let picked = addrs.iter().map(|&a| d.function_at(a).ok_or_else(|| format!("no function at {a:#x}"))).collect::<Result<_, _>>()?;
+/// The functions that contain the given guest addresses, and with `callees`
+/// every function they reach by direct calls and jumps, transitively.
+pub fn chosen<'a>(program: &'a Program, d: &'a discover::Discovery, addrs: &[u64], callees: bool) -> super::Result<Sample<'a>> {
+    let mut picked: Vec<&discover::Function> =
+        addrs.iter().map(|&a| d.function_at(a).ok_or_else(|| format!("no function at {a:#x}"))).collect::<Result<_, _>>()?;
+    if callees {
+        let stubs: HashMap<u64, u64> = d.stubs.iter().map(|s| (s.addr, s.target)).collect();
+        let mut seen: HashSet<u64> = picked.iter().map(|f| f.start).collect();
+        let mut i = 0;
+        while i < picked.len() {
+            let f = picked[i];
+            i += 1;
+            let m = program.module_at(f.start).ok_or("function outside every module")?;
+            for b in &cfg::build(&m.module.image, m.base, f).blocks {
+                for pc in (b.start..b.start + b.len).step_by(4) {
+                    let w = program.read(pc, 4).map_or(0, |b| u32::from_le_bytes(b.try_into().expect("4 bytes")));
+                    let (Op::Call(t) | Op::Jump(t) | Op::Branch(_, t)) = lift::lift(w, pc) else { continue };
+                    let t = stubs.get(&t).copied().unwrap_or(t);
+                    if let Some(g) = d.function_at(t).filter(|g| g.start == t && seen.insert(t)) {
+                        picked.push(g);
+                    }
+                }
+            }
+        }
+    }
     picked_sample(program, d, picked)
 }
 
@@ -74,76 +96,11 @@ fn picked_sample<'a>(program: &'a Program, d: &'a discover::Discovery, picked: V
     Ok(Sample { program, functions, stubs, set })
 }
 
-/// The harness: installs the dispatch table (`table`, an expression of
-/// type `Vec<(u64, rt::Guest)>` that `prelude` may define); with arguments,
-/// runs a function as `adler32(1, buf, len)` over a pseudo-random buffer and
-/// checks the result.
+/// The harness `main`: installs the dispatch table (`table`, an expression
+/// of type `Vec<(u64, rt::Guest)>` that `prelude` may define), then runs the
+/// runtime's test modes (see `gyroship_runtime::harness`).
 pub fn harness_main(prelude: &str, table: &str) -> String {
-    format!(
-        r#"use gyroship_runtime as rt;
-use std::time::Instant;
-{prelude}
-
-fn adler32(data: &[u8]) -> u64 {{
-    let (mut a, mut b) = (1u32, 0u32);
-    for &x in data {{
-        a = (a + u32::from(x)) % 65521;
-        b = (b + a) % 65521;
-    }}
-    u64::from(b << 16 | a)
-}}
-
-fn main() {{
-    let table: Vec<(u64, rt::Guest)> = {table};
-    let installed = table.len();
-    rt::install(table);
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 3 {{
-        println!("{{installed}} functions installed");
-        return;
-    }}
-    let target = u64::from_str_radix(args[1].trim_start_matches("0x"), 16).expect("hex address");
-    let len: usize = args[2].parse().expect("length");
-    let rounds: usize = args.get(3).map_or(10, |r| r.parse().expect("rounds"));
-    const GUEST: u64 = 0x1000_0000;
-    let mut mem = vec![0u8; len + (1 << 20)];
-    let mut s = 0x1234_5678u32;
-    for b in mem[..len].iter_mut() {{
-        s ^= s << 13;
-        s ^= s >> 17;
-        s ^= s << 5;
-        *b = s as u8;
-    }}
-    let host = Instant::now();
-    let expected = (0..rounds).map(|_| adler32(&mem[..len])).last().unwrap_or(0);
-    let host = host.elapsed().as_secs_f64();
-    let base = mem.as_mut_ptr().wrapping_sub(GUEST as usize);
-    let top = GUEST + mem.len() as u64 - 64;
-    let mut cpu = rt::Cpu::new(base);
-    let f = rt::lookup(target).expect("no such function");
-    let start = Instant::now();
-    let mut result = 0;
-    for _ in 0..rounds {{
-        cpu.x[0] = 1;
-        cpu.x[1] = GUEST;
-        cpu.x[2] = len as u64;
-        cpu.x[31] = top;
-        cpu.x[30] = 0;
-        unsafe {{ f(&mut cpu) }};
-        result = cpu.x[0];
-    }}
-    let guest = start.elapsed().as_secs_f64();
-    let mb = (len * rounds) as f64 / 1e6;
-    println!(
-        "result {{result:#x}} expected {{expected:#x}} ({{}}); recompiled {{:.0}} MB/s, host Rust {{:.0}} MB/s, {{}} untranslated",
-        if result == expected {{ "same" }} else {{ "DIFFERENT" }},
-        mb / guest,
-        mb / host,
-        rt::UNHANDLED.load(std::sync::atomic::Ordering::Relaxed)
-    );
-}}
-"#
-    )
+    format!("use gyroship_runtime as rt;\n{prelude}\nfn main() {{\n    rt::harness::main({table});\n}}\n")
 }
 
 /// Instruction count, untranslated count, and the most frequent untranslated opcodes.

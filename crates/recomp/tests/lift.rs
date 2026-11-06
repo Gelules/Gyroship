@@ -55,7 +55,18 @@ fn lifts_the_common_integer_forms() {
     assert_eq!(lift(0xd65f0fff, pc), Op::Return, "retab");
     assert_eq!(lift(0xd503237f, pc), Op::Nop, "pacibsp");
     assert_eq!(lift(0xd53bd040, pc), Op::ReadThread { dst: Reg::X(0), ro: false }, "mrs x0, tpidr_el0");
-    assert_eq!(lift(0xbd400040, pc), Op::Unhandled, "ldr s0, [x2]: FP is not translated yet");
+    assert_eq!(
+        lift(0xbd400040, pc),
+        Op::LoadV { dst: 0, size: 2, addr: Addr { base: Reg::X(2), offset: 0, index: None, writeback: Writeback::None } },
+        "ldr s0, [x2]"
+    );
+    assert_eq!(lift(0x1f0218a5, pc), Op::FMulAdd { f64: false, dst: 5, a: 5, b: 2, acc: 6, neg_acc: false, neg_product: false }, "fmadd");
+    assert_eq!(lift(0x1e212000, pc), Op::FCmp { f64: false, a: 0, b: Some(1) }, "fcmp s0, s1");
+    assert_eq!(lift(0x2f07e600, pc), Op::VConst { dst: 0, value: 0xffff_ffff_0000_0000 }, "movi d0");
+    assert_eq!(lift(0x0f0007e1, pc), Op::VConst { dst: 1, value: 0x1f_0000_001f }, "movi v1.2s, #0x1f");
+    assert_eq!(lift(0x1e2e1000, pc), Op::VConst { dst: 0, value: u128::from(1.0f32.to_bits()) }, "fmov s0, #1.0");
+    assert_eq!(lift(0x4ea01c01, pc), Op::VMov { dst: 1, src: 0, size: 4 }, "mov v1.16b, v0.16b");
+    assert_eq!(lift(0x6e042486, pc), Op::Unhandled, "ins: vector lanes are not translated yet");
 }
 
 /// `loop: subs x1, x1, #1; add x0, x0, x2; b.ne loop; bl 0x2000; ret` at 0x1000.

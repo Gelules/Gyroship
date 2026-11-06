@@ -6,10 +6,10 @@
 //! load or store; caching them in SSA values between calls is the upgrade if
 //! this backend wins.
 
-use crate::ir::{Addr, Alu, Cond, Op, Operand, Reg, Shift, Unary, Writeback, W};
+use crate::ir::{Addr, Alu, Cond, FBin, FUn, Op, Operand, Reg, Select, Shift, Unary, Writeback, W};
 use crate::{Callee, Input};
-use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::types::{I8, I16, I32, I64, Type};
+use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
+use cranelift_codegen::ir::types::{F32, F32X4, F64, F64X2, I8, I8X16, I16, I16X8, I32, I32X4, I64, I64X2, Type};
 use cranelift_codegen::ir::{
     AbiParam, AliasRegionData, Block, FuncRef, Function, InstBuilder, MemFlagsData, Signature, UserFuncName, Value,
 };
@@ -25,7 +25,7 @@ pub type Result<T> = std::result::Result<T, String>;
 /// Field offsets of the runtime's `Cpu`, which checks them at compile time.
 mod layout {
     pub use gyroship_runtime::{
-        OFFSET_C as C, OFFSET_MEM as MEM, OFFSET_N as N, OFFSET_TPIDR as TPIDR, OFFSET_TPIDRRO as TPIDRRO, OFFSET_V as V,
+        OFFSET_C as C, OFFSET_MEM as MEM, OFFSET_N as N, OFFSET_TPIDR as TPIDR, OFFSET_TPIDRRO as TPIDRRO, OFFSET_V as V, OFFSET_VR as VR,
         OFFSET_X as X, OFFSET_Z as Z,
     };
 }
@@ -631,8 +631,220 @@ impl Emit<'_, '_> {
                 self.set(dst, W::W64, v);
             }
             Op::Nop => {}
+            Op::LoadV { dst, size, addr } => {
+                let (_, host) = self.address(&addr);
+                let v = self.b.ins().load(vtype(size), self.heap_flags, host, 0);
+                self.vset(dst, v);
+            }
+            Op::StoreV { src, size, addr } => {
+                let v = self.vget(src, size);
+                let (_, host) = self.address(&addr);
+                self.b.ins().store(self.heap_flags, v, host, 0);
+            }
+            Op::LoadPairV { a, b, size, addr } => {
+                let (_, host) = self.address(&addr);
+                let t = vtype(size);
+                let v1 = self.b.ins().load(t, self.heap_flags, host, 0);
+                let v2 = self.b.ins().load(t, self.heap_flags, host, 1 << size);
+                self.vset(a, v1);
+                self.vset(b, v2);
+            }
+            Op::StorePairV { a, b, size, addr } => {
+                let (v1, v2) = (self.vget(a, size), self.vget(b, size));
+                let (_, host) = self.address(&addr);
+                self.b.ins().store(self.heap_flags, v1, host, 0);
+                self.b.ins().store(self.heap_flags, v2, host, 1 << size);
+            }
+            Op::VConst { dst, value } => {
+                let lo = self.b.ins().iconst(I64, value as u64 as i64);
+                let hi = self.b.ins().iconst(I64, (value >> 64) as u64 as i64);
+                let off = vr_offset(dst);
+                self.b.ins().store(self.cpu_flags, lo, self.cpu, off);
+                self.b.ins().store(self.cpu_flags, hi, self.cpu, off + 8);
+            }
+            Op::VMov { dst, src, size } => {
+                let v = self.vget(src, size);
+                self.vset(dst, v);
+            }
+            Op::ToV { dst, src, size } => {
+                let v = self.get(src, if size == 3 { W::W64 } else { W::W32 });
+                self.vset(dst, v);
+            }
+            Op::FromV { dst, src, size, lane } => {
+                let off = vr_offset(src) + (i32::from(lane) << size);
+                let v = self.b.ins().load(vtype(size), self.cpu_flags, self.cpu, off);
+                let w = if size == 3 { W::W64 } else { W::W32 };
+                let v = if size < 2 { self.b.ins().uextend(I32, v) } else { v };
+                self.set(dst, w, v);
+            }
+            Op::VLogic { op, q, dst, a, b } => {
+                let size = if q { 4 } else { 3 };
+                let (x, y) = (self.vget(a, size), self.vget(b, size));
+                let i = self.b.ins();
+                let r = match op {
+                    Alu::And => i.band(x, y),
+                    Alu::Orr => i.bor(x, y),
+                    Alu::Eor => i.bxor(x, y),
+                    Alu::Bic => i.band_not(x, y),
+                    _ => i.bor_not(x, y),
+                };
+                self.vset(dst, r);
+            }
+            Op::VSelect { kind, q, dst, a, b } => {
+                let size = if q { 4 } else { 3 };
+                let (d, x, y) = (self.vget(dst, size), self.vget(a, size), self.vget(b, size));
+                // bitselect(c, t, f) takes t where c is 1.
+                let r = match kind {
+                    Select::Bsl => self.b.ins().bitselect(d, x, y),
+                    Select::Bit => self.b.ins().bitselect(y, x, d),
+                    Select::Bif => self.b.ins().bitselect(y, d, x),
+                };
+                self.vset(dst, r);
+            }
+            Op::FBin { op, f64, dst, a, b } => {
+                let (x, y) = (self.fget(a, f64), self.fget(b, f64));
+                let r = match op {
+                    FBin::Add => self.b.ins().fadd(x, y),
+                    FBin::Sub => self.b.ins().fsub(x, y),
+                    FBin::Mul => self.b.ins().fmul(x, y),
+                    FBin::Div => self.b.ins().fdiv(x, y),
+                    FBin::Max => self.b.ins().fmax(x, y),
+                    FBin::Min => self.b.ins().fmin(x, y),
+                    FBin::MaxNm | FBin::MinNm => {
+                        let m = if op == FBin::MaxNm { self.b.ins().fmax(x, y) } else { self.b.ins().fmin(x, y) };
+                        let x_nan = self.b.ins().fcmp(FloatCC::Unordered, x, x);
+                        let y_nan = self.b.ins().fcmp(FloatCC::Unordered, y, y);
+                        let r = self.b.ins().select(y_nan, x, m);
+                        self.b.ins().select(x_nan, y, r)
+                    }
+                    FBin::Nmul => {
+                        let p = self.b.ins().fmul(x, y);
+                        self.b.ins().fneg(p)
+                    }
+                    FBin::Abd => {
+                        let d = self.b.ins().fsub(x, y);
+                        self.b.ins().fabs(d)
+                    }
+                };
+                self.vset(dst, r);
+            }
+            Op::FUn { op, f64, dst, src } => {
+                let x = self.fget(src, f64);
+                let r = match op {
+                    FUn::Neg => self.b.ins().fneg(x),
+                    FUn::Abs => self.b.ins().fabs(x),
+                    FUn::Sqrt => self.b.ins().sqrt(x),
+                    FUn::Floor => self.b.ins().floor(x),
+                    FUn::Ceil => self.b.ins().ceil(x),
+                    FUn::Trunc => self.b.ins().trunc(x),
+                    FUn::Nearest => self.b.ins().nearest(x),
+                    FUn::Round => {
+                        // |x| rounded half up, with the sign of x: exact, since |x| - floor(|x|) is.
+                        let a = self.b.ins().fabs(x);
+                        let fl = self.b.ins().floor(a);
+                        let frac = self.b.ins().fsub(a, fl);
+                        let (half, one) = if f64 {
+                            (self.b.ins().f64const(0.5), self.b.ins().f64const(1.0))
+                        } else {
+                            (self.b.ins().f32const(0.5), self.b.ins().f32const(1.0))
+                        };
+                        let up = self.b.ins().fcmp(FloatCC::GreaterThanOrEqual, frac, half);
+                        let bumped = self.b.ins().fadd(fl, one);
+                        let r = self.b.ins().select(up, bumped, fl);
+                        self.b.ins().fcopysign(r, x)
+                    }
+                };
+                self.vset(dst, r);
+            }
+            Op::FMulAdd { f64, dst, a, b, acc, neg_acc, neg_product } => {
+                let (x, y, z) = (self.fget(a, f64), self.fget(b, f64), self.fget(acc, f64));
+                let x = if neg_product { self.b.ins().fneg(x) } else { x };
+                let z = if neg_acc { self.b.ins().fneg(z) } else { z };
+                let r = self.b.ins().fma(x, y, z);
+                self.vset(dst, r);
+            }
+            Op::FCmp { f64, a, b } => {
+                let x = self.fget(a, f64);
+                let y = match b {
+                    Some(b) => self.fget(b, f64),
+                    None if f64 => self.b.ins().f64const(0.0),
+                    None => self.b.ins().f32const(0.0),
+                };
+                let [n, z, c, v] = self.fcmp_flags(x, y);
+                self.set_flags(n, z, c, v);
+            }
+            Op::FCondCmp { f64, a, b, nzcv, cond } => {
+                let c = self.flags_cond(cond);
+                let (x, y) = (self.fget(a, f64), self.fget(b, f64));
+                let flags = self.fcmp_flags(x, y);
+                let mut out = flags;
+                for (k, f) in flags.into_iter().enumerate() {
+                    let imm = self.b.ins().iconst(I8, i64::from((nzcv >> (3 - k)) & 1));
+                    out[k] = self.b.ins().select(c, f, imm);
+                }
+                self.set_flags(out[0], out[1], out[2], out[3]);
+            }
+            Op::FCondSel { f64, dst, a, b, cond } => {
+                let c = self.flags_cond(cond);
+                let (x, y) = (self.fget(a, f64), self.fget(b, f64));
+                let r = self.b.ins().select(c, x, y);
+                self.vset(dst, r);
+            }
+            Op::FCvt { dst, src, to_f64 } => {
+                let x = self.fget(src, !to_f64);
+                let r = if to_f64 { self.b.ins().fpromote(F64, x) } else { self.b.ins().fdemote(F32, x) };
+                self.vset(dst, r);
+            }
+            Op::IntToF { dst, src, w, f64, signed } => {
+                let x = self.get(src, w);
+                let t = if f64 { F64 } else { F32 };
+                let r = if signed { self.b.ins().fcvt_from_sint(t, x) } else { self.b.ins().fcvt_from_uint(t, x) };
+                self.vset(dst, r);
+            }
+            Op::FToInt { dst, w, src, f64, signed } => {
+                let x = self.fget(src, f64);
+                let r = if signed { self.b.ins().fcvt_to_sint_sat(ty(w), x) } else { self.b.ins().fcvt_to_uint_sat(ty(w), x) };
+                self.set(dst, w, r);
+            }
             _ => unreachable!("control flow is emitted by the block"),
         }
+    }
+
+    /// The low 1 << size bytes of a vector register, as an integer (or I8X16 for 16).
+    fn vget(&mut self, n: u8, size: u8) -> Value {
+        self.b.ins().load(vtype(size), self.cpu_flags, self.cpu, vr_offset(n))
+    }
+
+    fn fget(&mut self, n: u8, f64: bool) -> Value {
+        self.b.ins().load(if f64 { F64 } else { F32 }, self.cpu_flags, self.cpu, vr_offset(n))
+    }
+
+    /// Writes a value to a vector register; one narrower than 16 bytes zeroes the rest.
+    fn vset(&mut self, n: u8, v: Value) {
+        let t = self.b.func.dfg.value_type(v);
+        let v = if t.is_vector() {
+            v
+        } else {
+            let lanes = match t {
+                I8 => I8X16,
+                I16 => I16X8,
+                I32 => I32X4,
+                F32 => F32X4,
+                F64 => F64X2,
+                _ => I64X2,
+            };
+            self.b.ins().scalar_to_vector(lanes, v)
+        };
+        self.b.ins().store(self.cpu_flags, v, self.cpu, vr_offset(n));
+    }
+
+    /// NZCV of an FP compare: equal 0110, less 1000, greater 0010, unordered 0011.
+    fn fcmp_flags(&mut self, x: Value, y: Value) -> [Value; 4] {
+        let n = self.b.ins().fcmp(FloatCC::LessThan, x, y);
+        let z = self.b.ins().fcmp(FloatCC::Equal, x, y);
+        let c = self.b.ins().fcmp(FloatCC::UnorderedOrGreaterThanOrEqual, x, y);
+        let v = self.b.ins().fcmp(FloatCC::Unordered, x, y);
+        [n, z, c, v]
     }
 
     fn runtime(&mut self, id: FuncId, pc: u64, imm: u32) {
@@ -689,5 +901,20 @@ impl Emit<'_, '_> {
         self.b.ins().return_(&[]);
         self.b.switch_to_block(here);
         tail
+    }
+}
+
+fn vr_offset(n: u8) -> i32 {
+    layout::VR + 16 * i32::from(n)
+}
+
+/// The type that moves 1 << size bytes of a vector register.
+fn vtype(size: u8) -> Type {
+    match size {
+        0 => I8,
+        1 => I16,
+        2 => I32,
+        3 => I64,
+        _ => I8X16,
     }
 }

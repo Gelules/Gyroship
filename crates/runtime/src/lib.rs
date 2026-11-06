@@ -4,6 +4,8 @@
 //! generated them. They reach the rest of the runtime through the
 //! `gyroship_*` symbols below.
 
+pub mod harness;
+
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -21,6 +23,10 @@ pub struct Cpu {
     pub tpidrro: u64,
     /// Host address of guest address 0.
     pub mem: *mut u8,
+    /// v0..v31, little-endian lanes.
+    pub vr: [u128; 32],
+    pub fpcr: u64,
+    pub fpsr: u64,
 }
 
 pub const OFFSET_X: i32 = 0;
@@ -31,6 +37,7 @@ pub const OFFSET_V: i32 = 259;
 pub const OFFSET_TPIDR: i32 = 264;
 pub const OFFSET_TPIDRRO: i32 = 272;
 pub const OFFSET_MEM: i32 = 280;
+pub const OFFSET_VR: i32 = 288;
 
 const _: () = {
     assert!(std::mem::offset_of!(Cpu, x) == OFFSET_X as usize);
@@ -41,11 +48,12 @@ const _: () = {
     assert!(std::mem::offset_of!(Cpu, tpidr) == OFFSET_TPIDR as usize);
     assert!(std::mem::offset_of!(Cpu, tpidrro) == OFFSET_TPIDRRO as usize);
     assert!(std::mem::offset_of!(Cpu, mem) == OFFSET_MEM as usize);
+    assert!(std::mem::offset_of!(Cpu, vr) == OFFSET_VR as usize);
 };
 
 impl Cpu {
     pub fn new(mem: *mut u8) -> Cpu {
-        Cpu { x: [0; 32], n: false, z: false, c: false, v: false, tpidr: 0, tpidrro: 0, mem }
+        Cpu { x: [0; 32], n: false, z: false, c: false, v: false, tpidr: 0, tpidrro: 0, mem, vr: [0; 32], fpcr: 0, fpsr: 0 }
     }
 }
 
@@ -246,3 +254,76 @@ access!(ld8, st8, u8);
 access!(ld16, st16, u16);
 access!(ld32, st32, u32);
 access!(ld64, st64, u64);
+
+#[inline(always)]
+pub fn ld128(c: &Cpu, addr: u64) -> u128 {
+    // SAFETY: as for the other accesses.
+    unsafe { (c.mem.add(addr as usize) as *const u128).read_unaligned() }
+}
+
+#[inline(always)]
+pub fn st128(c: &Cpu, addr: u64, v: u128) {
+    // SAFETY: as for the other accesses.
+    unsafe { (c.mem.add(addr as usize) as *mut u128).write_unaligned(v) }
+}
+
+/// NZCV of an FCMP: equal 0110, less 1000, greater 0010, unordered 0011.
+#[inline(always)]
+pub fn fcmp(c: &mut Cpu, a: f64, b: f64) {
+    let unordered = a.is_nan() || b.is_nan();
+    (c.n, c.z, c.c, c.v) = (a < b, a == b, a >= b || unordered, unordered);
+}
+
+/// FMAX: NaN propagates, and +0 is larger than -0.
+#[inline(always)]
+pub fn fmax64(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        a + b
+    } else if a == b {
+        f64::from_bits(a.to_bits() & b.to_bits())
+    } else if a > b {
+        a
+    } else {
+        b
+    }
+}
+
+/// FMIN: NaN propagates, and -0 is smaller than +0.
+#[inline(always)]
+pub fn fmin64(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        a + b
+    } else if a == b {
+        f64::from_bits(a.to_bits() | b.to_bits())
+    } else if a < b {
+        a
+    } else {
+        b
+    }
+}
+
+#[inline(always)]
+pub fn fmax32(a: f32, b: f32) -> f32 {
+    if a.is_nan() || b.is_nan() {
+        a + b
+    } else if a == b {
+        f32::from_bits(a.to_bits() & b.to_bits())
+    } else if a > b {
+        a
+    } else {
+        b
+    }
+}
+
+#[inline(always)]
+pub fn fmin32(a: f32, b: f32) -> f32 {
+    if a.is_nan() || b.is_nan() {
+        a + b
+    } else if a == b {
+        f32::from_bits(a.to_bits() | b.to_bits())
+    } else if a < b {
+        a
+    } else {
+        b
+    }
+}

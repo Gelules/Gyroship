@@ -1011,6 +1011,9 @@ version = "0.1.0"
 [[package]]
 name = "gyroship-runtime"
 version = "0.1.0"
+dependencies = [
+ "gyroship-loader",
+]
 
 [[package]]
 name = "gyroship-tools"

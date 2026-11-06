@@ -124,6 +124,39 @@ pub enum Op {
     /// MRS of TPIDR_EL0 / TPIDRRO_EL0.
     ReadThread { dst: Reg, ro: bool },
     Nop,
+    // FP and SIMD registers. `size` is log2 of the bytes accessed (0 = B .. 4 = Q);
+    // writing fewer than 16 bytes zeroes the rest of the register.
+    LoadV { dst: u8, size: u8, addr: Addr },
+    StoreV { src: u8, size: u8, addr: Addr },
+    LoadPairV { a: u8, b: u8, size: u8, addr: Addr },
+    StorePairV { a: u8, b: u8, size: u8, addr: Addr },
+    /// MOVI/MVNI/FMOV #imm: the whole register.
+    VConst { dst: u8, value: u128 },
+    /// FMOV between FP registers, MOV of a whole vector: the low 1 << size bytes.
+    VMov { dst: u8, src: u8, size: u8 },
+    /// FMOV from a general register into the low 4 or 8 bytes (`size` 2 or 3).
+    ToV { dst: u8, src: Reg, size: u8 },
+    /// FMOV/UMOV of element `lane` (of 1 << size bytes) into a general register.
+    FromV { dst: Reg, src: u8, size: u8, lane: u8 },
+    /// AND/ORR/EOR/BIC/ORN on 8 (`q` false) or 16 bytes.
+    VLogic { op: Alu, q: bool, dst: u8, a: u8, b: u8 },
+    /// BSL/BIT/BIF on 8 or 16 bytes.
+    VSelect { kind: Select, q: bool, dst: u8, a: u8, b: u8 },
+    /// Scalar FP on single (`f64` false) or double precision.
+    FBin { op: FBin, f64: bool, dst: u8, a: u8, b: u8 },
+    FUn { op: FUn, f64: bool, dst: u8, src: u8 },
+    /// FMADD acc + a*b; FMSUB acc - a*b; FNMADD -acc - a*b; FNMSUB -acc + a*b (fused).
+    FMulAdd { f64: bool, dst: u8, a: u8, b: u8, acc: u8, neg_acc: bool, neg_product: bool },
+    /// FCMP/FCMPE against a register or (None) +0.0.
+    FCmp { f64: bool, a: u8, b: Option<u8> },
+    FCondCmp { f64: bool, a: u8, b: u8, nzcv: u8, cond: u8 },
+    FCondSel { f64: bool, dst: u8, a: u8, b: u8, cond: u8 },
+    /// FCVT between single and double.
+    FCvt { dst: u8, src: u8, to_f64: bool },
+    /// SCVTF/UCVTF from a general register.
+    IntToF { dst: u8, src: Reg, w: W, f64: bool, signed: bool },
+    /// FCVTZS/FCVTZU to a general register (saturating, NaN gives 0).
+    FToInt { dst: Reg, w: W, src: u8, f64: bool, signed: bool },
     // Control flow: the last operation of a block.
     Jump(u64),
     Branch(Cond, u64),
@@ -135,6 +168,49 @@ pub enum Op {
     Svc(u16),
     /// Not translated: the runtime gets the PC and the word.
     Unhandled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FBin {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    /// NaN propagates; +0 > -0.
+    Max,
+    Min,
+    /// A quiet NaN loses against a number.
+    MaxNm,
+    MinNm,
+    /// -(a * b)
+    Nmul,
+    /// |a - b|
+    Abd,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FUn {
+    Neg,
+    Abs,
+    Sqrt,
+    /// FRINTM, FRINTP, FRINTZ.
+    Floor,
+    Ceil,
+    Trunc,
+    /// FRINTN, and FRINTX/FRINTI in the default rounding mode: ties to even.
+    Nearest,
+    /// FRINTA: ties away from zero.
+    Round,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Select {
+    /// BSL: dst selects between a (1 bits) and b (0 bits).
+    Bsl,
+    /// BIT: a goes into dst where b is 1.
+    Bit,
+    /// BIF: a goes into dst where b is 0.
+    Bif,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
