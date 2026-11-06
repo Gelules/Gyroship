@@ -6,6 +6,7 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+gyroship-loader = { version = "0.1.0", path = "../loader" }
 # Pinned: decode.rs corrects defects of this exact version (DECISIONS D13).
 # Without default features the enums are exhaustive, so a new variant breaks the build.
 yaxpeax-arm = { version = "=0.5.0", default-features = false, features = ["std", "fmt"] }

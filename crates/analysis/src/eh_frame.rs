@@ -11,6 +11,8 @@ pub struct Range {
     /// Module-relative start address.
     pub start: u64,
     pub len: u64,
+    /// Module-relative address of the function's exception table (LSDA).
+    pub lsda: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -87,6 +89,9 @@ impl Reader<'_> {
             0x0C => u64::from_le_bytes(self.bytes()?),
             _ => return Err(Error(format!("pointer encoding {enc:#04x} at {here:#x} is not supported"))),
         };
+        if raw == 0 {
+            return Ok(0); // a null pointer stays null, as in the unwinder
+        }
         Ok(match enc & 0x70 {
             0x00 => raw,
             0x10 => here.wrapping_add(raw),
@@ -118,17 +123,16 @@ pub fn function_ranges(image: &[u8], hdr: u64) -> Result<Vec<Range>> {
             return Err(Error(format!("eh_frame_hdr table is not sorted at {start:#x}")));
         }
         prev = Some(start);
-        let (begin, len) = fde_range(image, fde)?;
-        if begin != start {
-            return Err(Error(format!("FDE at {fde:#x} starts at {begin:#x}, the table says {start:#x}")));
+        let range = read_fde(image, fde)?;
+        if range.start != start {
+            return Err(Error(format!("FDE at {fde:#x} starts at {:#x}, the table says {start:#x}", range.start)));
         }
-        ranges.push(Range { start, len });
+        ranges.push(range);
     }
     Ok(ranges)
 }
 
-/// (pc_begin, pc_range) of the FDE at `fde`.
-fn fde_range(image: &[u8], fde: u64) -> Result<(u64, u64)> {
+fn read_fde(image: &[u8], fde: u64) -> Result<Range> {
     let mut r = Reader { image, at: fde };
     let len = u32::from_le_bytes(r.bytes()?);
     if len == 0 || len == u32::MAX {
@@ -139,14 +143,27 @@ fn fde_range(image: &[u8], fde: u64) -> Result<(u64, u64)> {
     if cie_delta == 0 {
         return Err(Error(format!("{fde:#x} is a CIE, not an FDE")));
     }
-    let enc = cie_fde_encoding(image, id_at.wrapping_sub(u64::from(cie_delta)))?;
-    let begin = r.encoded(enc, 0)?;
-    let range = r.encoded(enc & 0x0F, 0)?;
-    Ok((begin, range))
+    let cie = read_cie(image, id_at.wrapping_sub(u64::from(cie_delta)))?;
+    let start = r.encoded(cie.fde_enc, 0)?;
+    let len = r.encoded(cie.fde_enc & 0x0F, 0)?;
+    let mut lsda = None;
+    if cie.augmented {
+        r.uleb()?;
+        if let Some(enc) = cie.lsda_enc {
+            lsda = Some(r.encoded(enc, 0)?).filter(|&p| p != 0);
+        }
+    }
+    Ok(Range { start, len, lsda })
 }
 
-/// The FDE pointer encoding of the CIE at `cie` (augmentation "zR...").
-fn cie_fde_encoding(image: &[u8], cie: u64) -> Result<u8> {
+struct Cie {
+    fde_enc: u8,
+    lsda_enc: Option<u8>,
+    /// Has augmentation data ("z"), so FDEs carry it too.
+    augmented: bool,
+}
+
+fn read_cie(image: &[u8], cie: u64) -> Result<Cie> {
     let mut r = Reader { image, at: cie };
     let _len = u32::from_le_bytes(r.bytes()?);
     if u32::from_le_bytes(r.bytes()?) != 0 {
@@ -167,16 +184,15 @@ fn cie_fde_encoding(image: &[u8], cie: u64) -> Result<u8> {
     } else {
         r.uleb()?;
     }
-    if aug.first() != Some(&b'z') {
-        return Ok(0x00); // no augmentation data: absolute pointers
+    let mut out = Cie { fde_enc: 0x00, lsda_enc: None, augmented: aug.first() == Some(&b'z') };
+    if !out.augmented {
+        return Ok(out); // no augmentation data: absolute pointers
     }
     r.uleb()?;
     for c in &aug[1..] {
         match c {
-            b'R' => return r.u8(),
-            b'L' => {
-                r.u8()?;
-            }
+            b'R' => out.fde_enc = r.u8()?,
+            b'L' => out.lsda_enc = Some(r.u8()?).filter(|&e| e != 0xFF),
             b'P' => {
                 let enc = r.u8()?;
                 r.encoded(enc, 0)?;
@@ -185,5 +201,38 @@ fn cie_fde_encoding(image: &[u8], cie: u64) -> Result<u8> {
             _ => return Err(Error(format!("CIE at {cie:#x}: unknown augmentation {:?}", String::from_utf8_lossy(&aug)))),
         }
     }
-    Ok(0x00)
+    Ok(out)
+}
+
+/// Landing pads of the function at `start` from its LSDA (the call-site
+/// table of `.gcc_except_table`), sorted and deduplicated. Module-relative.
+pub fn landing_pads(image: &[u8], start: u64, lsda: u64) -> Result<Vec<u64>> {
+    let mut r = Reader { image, at: lsda };
+    let lp_enc = r.u8()?;
+    let lp_start = if lp_enc == 0xFF { start } else { r.encoded(lp_enc, 0)? };
+    if r.u8()? != 0xFF {
+        r.uleb()?; // type table offset
+    }
+    let cs_enc = r.u8()?;
+    if cs_enc & 0x70 != 0 {
+        return Err(Error(format!("LSDA at {lsda:#x}: call-site encoding {cs_enc:#04x} is not supported")));
+    }
+    let len = r.uleb()?;
+    let end = r.at.checked_add(len).ok_or_else(|| r.oob())?;
+    let mut pads = Vec::new();
+    while r.at < end {
+        r.encoded(cs_enc, 0)?; // call-site start
+        r.encoded(cs_enc, 0)?; // call-site length
+        let pad = r.encoded(cs_enc, 0)?;
+        r.uleb()?; // action
+        if pad != 0 {
+            pads.push(lp_start.wrapping_add(pad));
+        }
+    }
+    if r.at != end {
+        return Err(Error(format!("LSDA at {lsda:#x}: call-site table overruns its length")));
+    }
+    pads.sort_unstable();
+    pads.dedup();
+    Ok(pads)
 }

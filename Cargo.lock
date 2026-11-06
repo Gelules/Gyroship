@@ -762,6 +762,7 @@ dependencies = [
 name = "gyroship-analysis"
 version = "0.1.0"
 dependencies = [
+ "gyroship-loader",
  "yaxpeax-arch",
  "yaxpeax-arm",
 ]

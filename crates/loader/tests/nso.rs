@@ -218,6 +218,8 @@ fn links_imports_and_applies_every_relocation_kind() {
     assert_eq!(p.module_at(sdk_base + 0x10).map(|m| m.name.as_str()), Some("sdk"));
     assert_eq!(p.read(main_base + 0x22FC, 8), None, "crosses the end of main");
     assert!(p.module_at(main_base + 0x2300).is_none());
+    let slots: Vec<u64> = [0x2100, 0x2108, 0x2110, 0x2118, 0x2120, 0x2130].iter().map(|o| main_base + o).collect();
+    assert_eq!(p.slots, slots, "every pointer a relocation wrote, sorted");
 }
 
 #[test]

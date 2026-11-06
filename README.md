@@ -25,6 +25,7 @@ Requires a recent stable Rust toolchain (MSVC on Windows).
     gyroship-tools nso info    <exefs/main>               # segments, symbols, relocations
     gyroship-tools nso2elf -o <dir> <exefs/main> ...      # ELF files for disassemblers
     gyroship-tools link    <exefs>                        # place, relocate and link all modules
+    gyroship-tools discover <exefs>                       # functions, PLT stubs, CFGs and jump tables
     gyroship-tools capture --title Gyroship -o shot.png   # capture a window (Windows)
 
 `tools/ghidra/analyze_modules.sh` imports the exported ELF files into a headless Ghidra

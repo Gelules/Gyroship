@@ -68,6 +68,8 @@ pub struct Program {
     pub modules: Vec<Placed>,
     pub stats: Vec<Stats>,
     pub imports: Vec<Import>,
+    /// Guest address of every 64-bit pointer a relocation wrote, sorted.
+    pub slots: Vec<u64>,
 }
 
 impl Program {
@@ -103,10 +105,12 @@ impl Program {
 
         let mut stats = Vec::new();
         let mut imports = Vec::new();
+        let mut slots = Vec::new();
         for (index, p) in placed.iter_mut().enumerate() {
-            stats.push(relocate(index, p, &scope, &mut imports)?);
+            stats.push(relocate(index, p, &scope, &mut imports, &mut slots)?);
         }
-        Ok(Program { modules: placed, stats, imports })
+        slots.sort_unstable();
+        Ok(Program { modules: placed, stats, imports, slots })
     }
 
     pub fn unresolved(&self) -> impl Iterator<Item = &Import> {
@@ -126,7 +130,7 @@ impl Program {
     }
 }
 
-fn relocate(index: usize, p: &mut Placed, scope: &HashMap<String, u64>, imports: &mut Vec<Import>) -> Result<Stats> {
+fn relocate(index: usize, p: &mut Placed, scope: &HashMap<String, u64>, imports: &mut Vec<Import>, slots: &mut Vec<u64>) -> Result<Stats> {
     let base = p.base;
     let m = &mut p.module;
     let mut stats = Stats::default();
@@ -139,6 +143,7 @@ fn relocate(index: usize, p: &mut Placed, scope: &HashMap<String, u64>, imports:
             let word = u64_at(&m.image, relr + 8 * i)?;
             let mut fix = |at: u64| -> Result<()> {
                 let v = u64_at(&m.image, at)?;
+                slots.push(base + at);
                 write(&mut m.image, at, v.wrapping_add(base))
             };
             if word & 1 == 0 {
@@ -190,6 +195,7 @@ fn relocate(index: usize, p: &mut Placed, scope: &HashMap<String, u64>, imports:
             other => return bad(format!("unsupported relocation type {other} at {:#x}", r.offset)),
         };
         write(&mut m.image, r.offset, value)?;
+        slots.push(base + r.offset);
     }
     Ok(stats)
 }
