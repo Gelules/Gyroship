@@ -103,6 +103,8 @@ pub struct Symbol {
     pub value: u64,
     pub size: u64,
     pub info: u8,
+    /// st_other: the visibility in bits 0..2 (2 hidden, 3 protected).
+    pub other: u8,
     pub shndx: u16,
 }
 
@@ -267,6 +269,7 @@ impl Module {
                 self.symbols.push(Symbol {
                     name: string(u64::from(u32_at(&self.image, s)?)),
                     info: self.image[s as usize + 4],
+                    other: self.image[s as usize + 5],
                     shndx: u16_at(&self.image, s + 6)?,
                     value: u64_at(&self.image, s + 8)?,
                     size: u64_at(&self.image, s + 16)?,

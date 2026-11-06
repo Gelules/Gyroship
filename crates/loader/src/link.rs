@@ -181,7 +181,8 @@ fn relocate(index: usize, p: &mut Placed, scope: &HashMap<String, u64>, imports:
                 }
                 let target = if r.symbol == 0 {
                     Some(0)
-                } else if sym.is_defined() && sym.info >> 4 == 0 {
+                } else if sym.is_defined() && (sym.info >> 4 == 0 || matches!(sym.other & 3, 2 | 3)) {
+                    // Local, hidden or protected: the module's own definition, as rtld does.
                     Some(base + sym.value)
                 } else {
                     scope.get(&sym.name).copied().or(if sym.info >> 4 == 2 { Some(0) } else { None })
