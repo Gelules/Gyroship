@@ -132,8 +132,12 @@ pub fn plain(p: &Path) -> String {
 }
 
 pub fn runtime_path() -> String {
-    // The runtime crate next to this one; generated projects are never committed.
-    let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../runtime");
+    crate_path("runtime")
+}
+
+/// A crate next to this one, for generated projects (never committed).
+pub fn crate_path(name: &str) -> String {
+    let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join(name);
     plain(&p.canonicalize().unwrap_or(p))
 }
 

@@ -437,7 +437,7 @@ pub fn function(out: &mut String, input: &Input) {
             let word = (input.word)(pc);
             let op = crate::lift::lift(word, pc);
             if (input.probe)(pc) {
-                let _ = writeln!(out, "                rt::gyroship_probe(c, {pc:#x});");
+                let _ = writeln!(out, "                unsafe {{ rt::gyroship_probe(c, {pc:#x}) }};");
             }
             let s = match op {
                 Op::Jump(t) if t == pc => {

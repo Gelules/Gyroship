@@ -4,6 +4,7 @@
 //! host thread (D19), and each test thread gets a kernel of its own. A borrow
 //! of it must never stay open across a guest fiber switch.
 
+pub mod boot;
 pub mod journal;
 pub mod svc;
 pub mod sync;
@@ -86,6 +87,8 @@ pub struct Kernel {
     pub handles: thread::Handles,
     pub sched: thread::Sched,
     pub events: Vec<sync::Event>,
+    /// `link()`'s view of memory, compared at the oracle probe (boot).
+    pub oracle: Option<gyroship_loader::link::Program>,
 }
 
 /// Exit code of a run the HLE stops (an unknown or forbidden SVC, a guest
@@ -96,7 +99,7 @@ impl Kernel {
     pub fn new(mem: Memory, mut journal: Journal, config: Config) -> Kernel {
         let mode = if config.explore { "exploration (not a validation run)" } else { "strict" };
         journal.line(0, 0, &format!("gyroship hle: mode {mode}, seed {:#x}, non-system memory {:#x}", config.seed, config.non_system_memory));
-        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new() }
+        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None }
     }
 
     /// Logs a line for the running thread (0 when none runs).
@@ -121,7 +124,7 @@ thread_local! {
 /// Makes `kernel` the one this thread's guest code talks to.
 pub fn install(kernel: Kernel) {
     KERNEL.with(|k| *k.borrow_mut() = Some(kernel));
-    gyroship_runtime::set_hooks(Hooks { svc: on_svc, counter: on_counter, wait: on_wait });
+    gyroship_runtime::set_hooks(Hooks { svc: on_svc, counter: on_counter, wait: on_wait, probe: boot::on_probe });
 }
 
 /// Takes this thread's kernel back.

@@ -7,7 +7,7 @@
 //! indirect jump to one runs the real code, which reads its GOT slot. A slot
 //! that rtld binds lazily points at PLT0 until then.
 
-use crate::experiment::{harness_main, plain, runtime_path};
+use crate::experiment::{crate_path, plain, runtime_path};
 use gyroship_analysis::{cfg, decode, discover};
 use gyroship_recomp::ir::Op;
 use gyroship_recomp::{Callee, Input, clif, lift};
@@ -157,12 +157,14 @@ pub fn run(exefs: &Path, out: &Path, threads: usize, verify: bool, probes: Optio
     std::fs::write(
         out.join("harness/Cargo.toml"),
         format!(
-            "[package]\nname = \"harness\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n[dependencies]\ngyroship-runtime = {{ path = \"{}\" }}\n",
-            runtime_path()
+            "[package]\nname = \"harness\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n[dependencies]\ngyroship-runtime = {{ path = \"{}\" }}\ngyroship-hle = {{ path = \"{}\" }}\n",
+            runtime_path(),
+            crate_path("hle")
         ),
     )?;
     std::fs::write(out.join("harness/build.rs"), build)?;
-    std::fs::write(out.join("harness/src/main.rs"), harness_main(&decls, &table))?;
+    // The game's harness boots through the HLE (`boot <exefs>`); its other modes are the runtime's.
+    std::fs::write(out.join("harness/src/main.rs"), format!("use gyroship_runtime as rt;\n{decls}\nfn main() {{\n    gyroship_hle::boot::main({table});\n}}\n"))?;
     Ok(())
 }
 

@@ -229,6 +229,8 @@ pub struct Hooks {
     pub counter: unsafe fn(*mut Cpu, u32),
     /// `yield` (1), `wfe` (2) or `wfi` (3).
     pub wait: unsafe fn(*mut Cpu, u32),
+    /// The first pass at a probe (`pc`, its name).
+    pub probe: unsafe fn(*mut Cpu, u64, &str),
 }
 
 static HOOKS: OnceLock<Hooks> = OnceLock::new();
@@ -286,14 +288,22 @@ pub fn probe_counts() -> Vec<(u64, &'static str, u64)> {
     PROBES.get().map_or_else(Vec::new, |p| p.iter().map(|(a, n, c)| (*a, n.as_str(), c.load(Ordering::Relaxed))).collect())
 }
 
-/// Generated code passes a probed address; the first pass is logged.
+/// Generated code passes a probed address; the first pass goes to the
+/// HLE's hook, or to stderr without one.
+///
+/// # Safety
+/// `cpu` must point to a valid context.
 #[unsafe(no_mangle)]
-pub extern "C" fn gyroship_probe(_cpu: *mut Cpu, pc: u64) {
+pub unsafe extern "C" fn gyroship_probe(cpu: *mut Cpu, pc: u64) {
     let Some(p) = PROBES.get() else { return };
     if let Ok(i) = p.binary_search_by_key(&pc, |e| e.0)
         && p[i].2.fetch_add(1, Ordering::Relaxed) == 0
     {
-        eprintln!("gyroship: probe {} at {pc:#x}", p[i].1);
+        match HOOKS.get() {
+            // SAFETY: guaranteed by the caller.
+            Some(h) => unsafe { (h.probe)(cpu, pc, &p[i].1) },
+            None => eprintln!("gyroship: probe {} at {pc:#x}", p[i].1),
+        }
     }
 }
 
