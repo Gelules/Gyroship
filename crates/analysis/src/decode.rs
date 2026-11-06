@@ -9,9 +9,8 @@ use yaxpeax_arm::armv8::a64::InstDecoder;
 /// Decodes one instruction word. `None` means "do not translate this":
 /// unallocated, or an instruction this decoder gets wrong.
 pub fn decode(word: u32) -> Option<Instruction> {
-    let mut inst = Instruction::default();
     // decode_into can return Ok without writing the opcode.
-    inst.opcode = Opcode::Invalid;
+    let mut inst = Instruction { opcode: Opcode::Invalid, ..Instruction::default() };
     InstDecoder::default().decode_into(&mut inst, &mut U8Reader::new(&word.to_le_bytes())).ok()?;
     match inst.opcode {
         Opcode::Invalid => return None,
