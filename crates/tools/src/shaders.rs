@@ -94,6 +94,65 @@ pub fn run(zip: &Path, samples: Option<&Path>) -> super::Result<bool> {
     Ok(no_end.is_empty() && clean)
 }
 
+/// Lists a dumped graphics program (SPH then SASS): the SPH words, then each
+/// instruction, decoded.
+pub fn list(path: &Path) -> super::Result<()> {
+    let code = std::fs::read(path)?;
+    let sph: Vec<String> = code.get(..sass::SPH_SIZE).unwrap_or_default().as_chunks::<4>().0.iter().map(|w| format!("{:08x}", u32::from_le_bytes(*w))).collect();
+    println!("sph {}", sph.join(" "));
+    let program = sass::program(code.get(sass::SPH_SIZE..).unwrap_or_default()).ok_or("no closing self-branch")?;
+    for (i, w) in sass::words(program).enumerate() {
+        let (p, not) = w.guard();
+        let guard = if w.always() { String::new() } else { format!("@{}P{p} ", if not { "!" } else { "" }) };
+        match sass::decode(w) {
+            Some(op) => println!("{:#06x} {guard}{op:?}", i * 16),
+            None => println!("{:#06x} {guard}unknown {:032x}", i * 16, w.0),
+        }
+    }
+    Ok(())
+}
+
+/// Translates dumped graphics programs to WGSL, validates each with naga,
+/// and writes `{key}.wgsl` into `out` (game-derived: keep it under Data).
+pub fn translate(files: &[std::path::PathBuf], out: Option<&Path>) -> super::Result<bool> {
+    let mut all_ok = true;
+    for path in files {
+        let code = std::fs::read(path)?;
+        let name = path.display();
+        match gyroship_gpu::shader::translate(&code) {
+            Err(e) => {
+                all_ok = false;
+                println!("{name}: not translated: {e}");
+            }
+            Ok(t) => {
+                let valid = gyroship_gpu::shader::validate(&t.wgsl);
+                let i = &t.interface;
+                println!(
+                    "{name}: {:?} {:016x}: {} lines of WGSL, {}; cbufs {:?}, textures {:?}, attributes {:?}, varyings {:?}, targets {:?}",
+                    t.stage,
+                    t.key,
+                    t.wgsl.lines().count(),
+                    if valid.is_ok() { "valid" } else { "INVALID" },
+                    i.cbufs,
+                    i.textures.iter().map(|x| x.handle).collect::<Vec<_>>(),
+                    i.attributes,
+                    i.varyings,
+                    i.targets
+                );
+                if let Err(e) = &valid {
+                    all_ok = false;
+                    println!("{e}");
+                }
+                if let Some(dir) = out {
+                    std::fs::create_dir_all(dir)?;
+                    std::fs::write(dir.join(format!("{:016x}.wgsl", t.key)), &t.wgsl)?;
+                }
+            }
+        }
+    }
+    Ok(all_ok)
+}
+
 fn hex(w: Word) -> String {
     format!("{:032x}", w.0)
 }

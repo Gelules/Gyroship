@@ -115,6 +115,22 @@ enum Command {
         #[arg(long)]
         samples: Option<PathBuf>,
     },
+    /// List a dumped graphics program (--dump-shaders): its SPH and each
+    /// decoded instruction
+    Sass {
+        /// A program file: SPH then SASS
+        file: PathBuf,
+    },
+    /// Translate dumped graphics programs to WGSL and validate them (exit
+    /// code 1 if one fails)
+    Translate {
+        /// Program files: SPH then SASS
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+        /// Write each module as {key}.wgsl into this folder
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Convert NSO executables to AArch64 ELF files for disassemblers
     Nso2elf {
         /// NSO files to convert
@@ -144,6 +160,8 @@ fn main() -> ExitCode {
         Command::Nso2elf { inputs, out } => nso2elf(&inputs, &out).map(|_| true),
         Command::Gpfifo { dir, first, last, methods } => gpfifo::run(&dir, first, last, methods).map(|_| true),
         Command::Shaders { zip, samples } => shaders::run(&zip, samples.as_deref()),
+        Command::Sass { file } => shaders::list(&file).map(|_| true),
+        Command::Translate { files, out } => shaders::translate(&files, out.as_deref()),
         Command::Link { exefs, verbose } => link(&exefs, verbose),
         Command::Discover { exefs, examples } => discover(&exefs, examples).map(|_| true),
         Command::Functions { nso, compare } => functions(&nso, compare.as_deref()).map(|_| true),

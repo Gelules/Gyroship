@@ -118,21 +118,26 @@ impl<'a> Blob<'a> {
 
     /// The stage, from the SPH (compute code has none).
     pub fn stage(&self) -> Stage {
-        let w0 = self.code.get(0..4).map_or(0, |w| u32::from_le_bytes(w.try_into().expect("4 bytes")));
-        // SPH word 0: SphType 4:0 (1 VTG, 2 PS), Version 9:5, ShaderType 13:10.
-        match (w0 & 0x1f, w0 >> 5 & 0x1f, w0 >> 10 & 0xf) {
-            (1, 4, 1) => Stage::Vertex,
-            (1, 4, 2) => Stage::TessControl,
-            (1, 4, 3) => Stage::TessEval,
-            (1, 4, 4) => Stage::Geometry,
-            (2, 4, 5) => Stage::Pixel,
-            _ => Stage::Compute,
-        }
+        stage(self.code)
     }
 
     /// The SASS: after the SPH for graphics stages.
     pub fn sass(&self) -> &'a [u8] {
         if self.stage() == Stage::Compute { self.code } else { self.code.get(SPH_SIZE..).unwrap_or_default() }
+    }
+}
+
+/// The stage of a code section, from its SPH word 0 (SphType 4:0: 1 VTG,
+/// 2 PS; Version 9:5; ShaderType 13:10); code without an SPH is compute.
+pub fn stage(code: &[u8]) -> Stage {
+    let w0 = code.get(0..4).map_or(0, |w| u32::from_le_bytes(w.try_into().expect("4 bytes")));
+    match (w0 & 0x1f, w0 >> 5 & 0x1f, w0 >> 10 & 0xf) {
+        (1, 4, 1) => Stage::Vertex,
+        (1, 4, 2) => Stage::TessControl,
+        (1, 4, 3) => Stage::TessEval,
+        (1, 4, 4) => Stage::Geometry,
+        (2, 4, 5) => Stage::Pixel,
+        _ => Stage::Compute,
     }
 }
 
