@@ -148,10 +148,12 @@ pub enum TextureOp {
     /// TEX (0xb60, 0xf60, bindless 0x361): sample. `scr` bit 60, `aoffi`
     /// bit 76, `ndv` bit 77 (non-divergent derivatives), `dc` bit 78 (depth
     /// compare).
-    Tex { io: TexIo, dim: TexDim, lod: LodMode, scr: bool, aoffi: bool, ndv: bool, dc: bool },
+    /// `f16` bit 79: the results are packed halves, (c0, c1) in the first destination
+    /// and (c2, c3) in the second (NAK notes bits 79..81 as .F16; only 79 is seen).
+    Tex { io: TexIo, dim: TexDim, lod: LodMode, scr: bool, aoffi: bool, ndv: bool, dc: bool, f16: bool },
     /// TLD (0xb66): texel fetch. `scr` bit 60, `aoffi` bit 76, `ms` bit 78
     /// (multisampled: sample index in `b`).
-    Tld { io: TexIo, dim: TexDim, lod: LodMode, scr: bool, aoffi: bool, ms: bool },
+    Tld { io: TexIo, dim: TexDim, lod: LodMode, scr: bool, aoffi: bool, ms: bool, f16: bool },
     /// TLD4 (0xb63, 0xf63): gather. `comp` bits 87..89 (0 = R .. 3 = A),
     /// `scr` bit 60, `dc` bit 78.
     Tld4 { io: TexIo, dim: TexDim, comp: u8, offset: Tld4Offset, scr: bool, dc: bool },
@@ -232,8 +234,8 @@ pub fn decode(w: Word) -> Option<TextureOp> {
     }
     let scr = w.bit(60);
     Some(match op & 0x1ff {
-        0x160 | 0x161 => TextureOp::Tex { io: io(w), dim: dim(w), lod: lod(w), scr, aoffi: w.bit(76), ndv: w.bit(77), dc: w.bit(78) },
-        0x166 => TextureOp::Tld { io: io(w), dim: dim(w), lod: lod(w), scr, aoffi: w.bit(76), ms: w.bit(78) },
+        0x160 | 0x161 => TextureOp::Tex { io: io(w), dim: dim(w), lod: lod(w), scr, aoffi: w.bit(76), ndv: w.bit(77), dc: w.bit(78), f16: w.bit(79) },
+        0x166 => TextureOp::Tld { io: io(w), dim: dim(w), lod: lod(w), scr, aoffi: w.bit(76), ms: w.bit(78), f16: w.bit(79) },
         0x163 => {
             let offset = match w.field(76, 2) as u8 {
                 0 => Tld4Offset::None,
@@ -272,8 +274,8 @@ pub fn explained(opcode: u16) -> u128 {
     };
     handle
         | match opcode & 0x1ff {
-            0x160 | 0x161 => IO | bits(60, 4) | bits(76, 3) | bits(87, 3),
-            0x166 => IO | bits(60, 4) | bits(76, 1) | bits(78, 1) | bits(87, 3),
+            0x160 | 0x161 => IO | bits(60, 4) | bits(76, 4) | bits(87, 3),
+            0x166 => IO | bits(60, 4) | bits(76, 1) | bits(78, 2) | bits(87, 3),
             0x163 => IO | bits(60, 4) | bits(76, 3) | bits(87, 2),
             0x16c => IO | bits(61, 3) | bits(76, 1),
             _ => bits(16, 16) | bits(62, 2) | bits(64, 12) | bits(90, 1),
@@ -323,9 +325,9 @@ mod tests {
 
     #[test]
     fn tex() {
-        // scr, Array2D, aoffi, ndv, dc, LodMode::Clamp.
-        let mods = [(60, 1, 1), (61, 3, 5), (76, 1, 1), (77, 1, 1), (78, 1, 1), (87, 3, 4)];
-        let want = |handle| TextureOp::Tex { io: io_with(handle), dim: TexDim::Array2D, lod: LodMode::Clamp, scr: true, aoffi: true, ndv: true, dc: true };
+        // scr, Array2D, aoffi, ndv, dc, .F16, LodMode::Clamp.
+        let mods = [(60, 1, 1), (61, 3, 5), (76, 1, 1), (77, 1, 1), (78, 1, 1), (79, 1, 1), (87, 3, 4)];
+        let want = |handle| TextureOp::Tex { io: io_with(handle), dim: TexDim::Array2D, lod: LodMode::Clamp, scr: true, aoffi: true, ndv: true, dc: true, f16: true };
         check(0xb60, &[&mods[..], &CB].concat(), true, want(CB_HANDLE));
         check(0xf60, &[&mods[..], &UR].concat(), true, want(UR_HANDLE));
         check(0x361, &[&mods[..], &[(59, 1, 1)]].concat(), true, want(TexHandle::Bindless));
@@ -333,15 +335,15 @@ mod tests {
         assert_eq!(decode(word(&[(0, 12, 0x361)])), None);
         // Defaults: 1D, auto lod, no modifiers, eviction First.
         let w = word(&[(0, 12, 0xb60)]);
-        let Some(TextureOp::Tex { io, dim, lod, scr, aoffi, ndv, dc }) = decode(w) else { panic!() };
+        let Some(TextureOp::Tex { io, dim, lod, scr, aoffi, ndv, dc, f16: false }) = decode(w) else { panic!() };
         assert_eq!((io.eviction, dim, lod, scr, aoffi, ndv, dc), (Eviction::First, TexDim::D1, LodMode::Auto, false, false, false, false));
     }
 
     #[test]
     fn tld() {
-        // scr, 3D, aoffi, ms, LodMode::Lod.
-        let mods = [(60, 1, 1), (61, 3, 2), (76, 1, 1), (78, 1, 1), (87, 3, 3)];
-        let want = TextureOp::Tld { io: io_with(CB_HANDLE), dim: TexDim::D3, lod: LodMode::Lod, scr: true, aoffi: true, ms: true };
+        // scr, 3D, aoffi, ms, .F16, LodMode::Lod.
+        let mods = [(60, 1, 1), (61, 3, 2), (76, 1, 1), (78, 1, 1), (79, 1, 1), (87, 3, 3)];
+        let want = TextureOp::Tld { io: io_with(CB_HANDLE), dim: TexDim::D3, lod: LodMode::Lod, scr: true, aoffi: true, ms: true, f16: true };
         check(0xb66, &[&mods[..], &CB].concat(), true, want);
     }
 

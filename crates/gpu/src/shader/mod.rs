@@ -572,6 +572,32 @@ impl Cx {
             return Ok(out);
         }
         let starts: Vec<usize> = leaders.into_iter().collect();
+        // Without backward or indirect jumps, the blocks run in order, each under its
+        // `if`: lanes that branched over a block wait for the others, and the warp is
+        // whole again at the next block, as SASS's BSSY/BSYNC expect before its shuffles
+        // and barriers. A loop over a switch would let lanes run blocks apart.
+        let backward = ops.iter().enumerate().any(|(i, op)| matches!(op, Op::Control(ControlOp::Bra { offset, .. } | ControlOp::Call { offset, .. }) if *offset != -16 && target(i, *offset).is_none_or(|t| t <= i)));
+        if !indirect && !backward {
+            out.push_str("var pc: u32 = 0u;\n");
+            for (b, &start) in starts.iter().enumerate() {
+                let end = starts.get(b + 1).copied().unwrap_or(ops.len());
+                let mut block = String::new();
+                let mut done = false;
+                for i in start..end {
+                    if self.instruction(&mut block, i, words[i], &ops[i], Some(&target)).map_err(at(i))? {
+                        done = true;
+                        break;
+                    }
+                }
+                if !done {
+                    let _ = writeln!(block, "pc = {end}u;");
+                }
+                let _ = write!(out, "if (pc == {start}u) {{\n{block}}}\n");
+            }
+            let exit = self.exit();
+            out.push_str(&exit);
+            return Ok(out);
+        }
         out.push_str("var pc: u32 = 0u;\nloop {\nswitch pc {\n");
         for (b, &start) in starts.iter().enumerate() {
             let end = starts.get(b + 1).copied().unwrap_or(ops.len());
@@ -1110,11 +1136,18 @@ impl Cx {
                 self.set(out, *dst, &format!("{x} * {y} + {z}"));
                 self.root_from(*dst, &[c]);
             }
-            // IMAD.HI: the high word of the 64-bit product, plus c.
-            IntOp::IMad { dst, a, b, c, hi: true, signed, x: false, pdst, .. } if *pdst == PT => {
+            // IMAD.HI: the high word of a × b + c, c being the 64-bit pair c + 1 : c
+            // (a constant c is its low word).
+            IntOp::IMad { dst, a, b, c, hi: true, signed, x: false, pdst, .. } if *pdst == PT && !c.neg => {
                 self.helpers.insert(MUL_HI);
-                let (x, y, z) = (self.i(a, false)?, self.i(b, false)?, self.i(c, false)?);
-                self.set(out, *dst, &format!("mul_hi({x}, {y}, {signed}) + {z}"));
+                let (x, y) = (self.i(a, false)?, self.i(b, false)?);
+                let (lo, hi) = match c.src {
+                    Src::Reg(r) if r != RZ => (self.r(r), self.r(r.saturating_add(1))),
+                    _ => (self.raw(c)?, "0u".to_string()),
+                };
+                let p = self.temp();
+                let _ = writeln!(out, "let {p} = {x} * {y};");
+                self.set(out, *dst, &format!("mul_hi({x}, {y}, {signed}) + {hi} + select(0u, 1u, {p} + {lo} < {p})"));
             }
             IntOp::IMnMx { dst, a, b, signed, min } => {
                 let (x, y, m) = (self.raw(a)?, self.raw(b)?, self.p(*min));
@@ -1632,9 +1665,24 @@ impl Cx {
 
     /// The enabled components of `v` (a vec4 or, with `scalar`, one value), in
     /// order, to dst, dst + 1, dst2, dst2 + 1.
-    fn tex_results(&mut self, out: &mut String, v: &str, scalar: bool, mask: u8, dst: u8, dst2: u8) -> R<()> {
-        let dsts = [Some(dst), Some(dst).filter(|d| *d != RZ).map(|d| d + 1), Some(dst2), Some(dst2).filter(|d| *d != RZ).map(|d| d + 1)];
+    fn tex_results(&mut self, out: &mut String, v: &str, scalar: bool, mask: u8, (dst, dst2): (u8, u8), f16: bool) -> R<()> {
         let comps: Vec<usize> = (0..4).filter(|c| mask >> c & 1 != 0).collect();
+        // .F16: the enabled components as halves, two per register: the first pair to
+        // dst, the second to dst2 (dst + 1 when there is no dst2); nothing else is written.
+        if f16 {
+            let value = |c: Option<&usize>| match c {
+                Some(_) if scalar => format!("f({v})"),
+                Some(c) => format!("f({v}[{c}])"),
+                None => "0.0".to_string(),
+            };
+            let pairs: Vec<String> = comps.chunks(2).map(|p| format!("pack2x16float(vec2<f32>({}, {}))", value(p.first()), value(p.get(1)))).collect();
+            let second = if dst2 != RZ { dst2 } else { dst.saturating_add(1) };
+            for (d, e) in [dst, second].into_iter().zip(&pairs) {
+                self.set(out, d, e);
+            }
+            return Ok(());
+        }
+        let dsts = [Some(dst), Some(dst).filter(|d| *d != RZ).map(|d| d + 1), Some(dst2), Some(dst2).filter(|d| *d != RZ).map(|d| d + 1)];
         for (k, c) in comps.iter().enumerate() {
             let Some(Some(d)) = dsts.get(k) else { return Err("texture destination".into()) };
             let value = if scalar { v.to_string() } else { format!("{v}[{c}]") };
@@ -1644,9 +1692,9 @@ impl Cx {
     }
 
     fn texture(&mut self, out: &mut String, op: &TextureOp) -> R<()> {
-        let (io, dim, fetch, lod, scr, aoffi, dc) = match op {
-            TextureOp::Tex { io, dim, lod, scr, aoffi, dc, .. } => (io, *dim, false, *lod, *scr, *aoffi, *dc),
-            TextureOp::Tld { io, dim, lod, scr, aoffi, ms: false } => (io, *dim, true, *lod, *scr, *aoffi, false),
+        let (io, dim, fetch, lod, scr, aoffi, dc, f16) = match op {
+            TextureOp::Tex { io, dim, lod, scr, aoffi, dc, f16, .. } => (io, *dim, false, *lod, *scr, *aoffi, *dc, *f16),
+            TextureOp::Tld { io, dim, lod, scr, aoffi, ms: false, f16 } => (io, *dim, true, *lod, *scr, *aoffi, false, *f16),
             TextureOp::Txd { io, dim, aoffi } => return self.txd(out, io, *dim, *aoffi),
             // The size of a level (the texture is taken as 2D): width, height, 1, levels.
             // TXQ: the texture declared as the type its header has (`Options::queried`).
@@ -1658,7 +1706,7 @@ impl Cx {
                 let level = self.raw(src)?;
                 let t = self.temp();
                 let _ = writeln!(out, "let {t} = vec4<u32>(textureDimensions(tex{slot}, {level}){depth}, textureNumLevels(tex{slot}));");
-                return self.tex_results(out, &t, false, *mask, *dst, *dst2);
+                return self.tex_results(out, &t, false, *mask, (*dst, *dst2), false);
             }
             other => return Err(format!("unsupported: {other:?}")),
         };
@@ -1801,7 +1849,7 @@ impl Cx {
         } else {
             let _ = writeln!(out, "let {t} = {};", self.swizzled(slot, &format!("bitcast<vec4<u32>>({call})")));
         }
-        self.tex_results(out, &t, dc, io.mask, io.dst, io.dst2)
+        self.tex_results(out, &t, dc, io.mask, (io.dst, io.dst2), f16)
     }
 
     /// A sampled or fetched value with its texture header's swizzle applied.
@@ -1842,7 +1890,7 @@ impl Cx {
         let t = self.temp();
         let v = self.swizzled(slot, &format!("bitcast<vec4<u32>>(textureSampleGrad(tex{slot}, smp{slot}, {uv}{arr}, {ddx}, {ddy}))"));
         let _ = writeln!(out, "let {t} = {v};");
-        self.tex_results(out, &t, false, io.mask, io.dst, io.dst2)
+        self.tex_results(out, &t, false, io.mask, (io.dst, io.dst2), false)
     }
 }
 
@@ -2045,7 +2093,19 @@ mod tests {
         let t = ok(&code);
         assert_eq!(t.interface.textures, vec![Texture { handle: Handle::CBuf { bank: 2, offset: 0x70 }, dim: TexDim::D2, compare: false, fetch: false, query: false }]);
         assert_eq!(t.interface.targets, BTreeMap::from([(0, 1)]));
-        assert!(t.wgsl.contains("switch pc"), "{}", t.wgsl);
+        // A forward branch only: blocks in order, no loop.
+        assert!(t.wgsl.contains("if (pc == ") && !t.wgsl.contains("switch pc"), "{}", t.wgsl);
+    }
+
+    #[test]
+    fn a_tex_with_half_results_packs_two_components_per_register() {
+        // TEX.F16 R18, R19 (mask RGB) at (R1, R2): (R, G) to R18, (B, 0) to R19, nothing to R20.
+        let ipa = |dst: u128, attr: u128| w(0x326, &[(16, dst), (64, attr / 4), (32, 255), (81, 7)]);
+        let tex = w(0xb60, &[(16, 18), (24, 1), (32, 2), (64, 19), (40, 0x70 / 4), (54, 2), (61, 1), (72, 7), (79, 1), (81, 7), (84, 1), (60, 1)]);
+        let t = ok(&program(&[(0, 0x000c_5482), (6, 0xa), (18, 1)], &[ipa(1, 0x80), ipa(2, 0x84), tex, exit()]));
+        assert!(t.wgsl.contains("r18 = pack2x16float(vec2<f32>(f(") && t.wgsl.contains("[1]))"), "{}", t.wgsl);
+        assert!(t.wgsl.contains("r19 = pack2x16float(vec2<f32>(f(") && t.wgsl.contains("[2]), 0.0))"), "{}", t.wgsl);
+        assert!(!t.wgsl.contains("r20 ="), "{}", t.wgsl);
     }
 
     #[test]
