@@ -36,11 +36,14 @@ pub fn characteristics() -> [u8; 0xd0] {
     // SM and SPA versions: NVN's precompiled blobs exist for SM 8.8 only.
     put(0x3c, &0x808u32.to_le_bytes());
     put(0x40, &0x808u32.to_le_bytes());
-    // Flags: TSG (8), read-only syncpoint map (26), and the engine classes the
-    // chip has: 2D (40), 3D (41, which also brings ZCULL), compute (42) and
-    // inline-to-memory (43). nvrm builds the class list from these bits; NVN
-    // needs a compute class.
-    put(0x50, &(1u64 << 8 | 1 << 26 | 0xf << 40).to_le_bytes());
+    // Flags: TSG (8), read-only syncpoint map (26), mapping modify (34), and
+    // the engine classes the chip has: 2D (40), 3D (41, which also brings
+    // ZCULL), compute (42) and inline-to-memory (43). nvrm builds the class
+    // list from these bits; NVN needs a compute class. Without bit 34 (and the
+    // as-gpu ioctl 12, below), nvrm refuses to change a mapping's kind, so NVN
+    // cannot make a texture compressible and its initialisation fails,
+    // leaving the texture at GPU address 0.
+    put(0x50, &(1u64 << 8 | 1 << 26 | 1 << 34 | 0xf << 40).to_le_bytes());
     // Classes: 2D, 3D, compute, GPFIFO, inline-to-memory, DMA copy (NVIDIA's
     // public ids, Ampere B). NVN only accepts a known compute class; Lichii's
     // channel gets the 3D class 0xc797.
@@ -49,8 +52,8 @@ pub fn characteristics() -> [u8; 0xd0] {
     }
     // Highest ioctl number per device: ctrl-gpu, tsg, dbg, channel, as, ..., prof.
     // dbg at least 2: below, nvrm leaves a string of the device info null that
-    // NVN (subsdk1) always reads.
-    for (i, n) in [0x1fu16, 0x0c, 2, 0x20, 0x0b, 0, 0, 0, 0].iter().enumerate() {
+    // NVN (subsdk1) always reads. as at least 12: MAPPING_MODIFY.
+    for (i, n) in [0x1fu16, 0x0c, 2, 0x20, 0x0c, 0, 0, 0, 0].iter().enumerate() {
         put(0x70 + 2 * i, &n.to_le_bytes());
     }
     put(0x88, &1u32.to_le_bytes());
@@ -271,6 +274,16 @@ impl Nvdrv {
                 }
                 put32(&mut out, 8, (regions.len() * 0x18) as u32);
             }
+            // MAPPING_MODIFY: a range of a mapping takes another kind (compressed
+            // kind, fallback kind, buffer offset, size, map address). Kinds change
+            // nothing for us: it succeeds.
+            (Device::AsGpu, 0xc020410c) => {
+                if k.journal.few("as mapping modify", 4) {
+                    let at = |o: usize| u64::from_le_bytes(input.get(o..o + 8).and_then(|s| s.try_into().ok()).unwrap_or([0; 8]));
+                    let kind = |o: usize| i16::from_le_bytes([input.get(o).copied().unwrap_or(0), input.get(o + 1).copied().unwrap_or(0)]);
+                    k.log(&format!("nvsrv: fd {fd} mapping modify: kind {} (fallback {}), offset {:#x}, size {:#x}, at {:#x}", kind(0), kind(2), at(8), at(0x10), at(0x18)));
+                }
+            }
             // Bind a channel (its fd) to this address space.
             (Device::AsGpu, 0x40044101) => {
                 if let Some(&space) = self.as_space.get(&fd) {
@@ -414,9 +427,11 @@ mod tests {
         assert_eq!(s16(0x70), 0x1f);
         assert!(s16(0x72) >= 0xb);
         assert_eq!(s16(0x76), 0x20);
-        assert!(s16(0x78) >= 6 && s16(0x78) <= 0xb);
+        // as-gpu: nvrm needs ioctl 11 (sdk+0x62694c) and 12, MAPPING_MODIFY (sdk+0x627678).
+        assert!(s16(0x78) >= 0xc);
         let flags = u64::from_le_bytes(c[0x50..0x58].try_into().unwrap());
         assert_ne!(flags & 1 << 8, 0, "TSG");
+        assert_ne!(flags & 1 << 34, 0, "mapping modify");
         assert_eq!(flags & (1 << 22 | 1 << 30), 0);
     }
 }
