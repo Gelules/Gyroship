@@ -4,6 +4,8 @@
 
 use std::path::Path;
 
+pub mod mme;
+
 pub const WIDTH: u32 = 640;
 pub const HEIGHT: u32 = 360;
 
