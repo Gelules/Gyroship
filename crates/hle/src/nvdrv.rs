@@ -586,7 +586,7 @@ impl Gpu {
                     }
                 }
                 // A compute dispatch: its QMD's releases (the program is not run yet).
-                Effect::Dispatch(at) => {
+                Effect::Dispatch(at, headers) => {
                     use gyroship_gpu::state::qmd;
                     self.dispatches += 1;
                     let mut q = [0u8; qmd::SIZE];
@@ -605,7 +605,17 @@ impl Gpu {
                         let _ = std::fs::write(dir.join(format!("{key:016x}.bin")), code);
                     }
                     if k.journal.few("gpu dispatch", 8) {
-                        k.log(&format!("gpu: compute dispatch {}: QMD {at:#x} version {:?}, program {key} at {:#x}, grid {:?} block {:?} shared {:#x} cbufs {:x?}; not run; releases {releases:x?}", self.dispatches, qmd::version(&q), launch.program, launch.grid, launch.block, launch.shared, launch.cbufs));
+                        k.log(&format!("gpu: compute dispatch {}: QMD {at:#x} version {:?}, program {key} at {:#x}, grid {:?} block {:?} shared {:#x} cbufs {:x?}; releases {releases:x?}", self.dispatches, qmd::version(&q), launch.program, launch.grid, launch.block, launch.shared, launch.cbufs));
+                    }
+                    // The program runs before its releases signal it done.
+                    if let Some(mut s) = k.surfaces.take() {
+                        let result = s.dispatch(&launch, headers, &mut |gpu, buf| k.read_gpu(space, gpu, buf));
+                        k.surfaces = Some(s);
+                        if let Err(e) = result
+                            && k.journal.few(&format!("gpu compute {e}"), 2)
+                        {
+                            k.log(&format!("gpu: compute dispatch {}: not run: {e}", self.dispatches));
+                        }
                     }
                     for r in releases {
                         semaphore(k, space, &r);

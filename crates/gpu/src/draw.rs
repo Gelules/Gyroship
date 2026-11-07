@@ -61,7 +61,12 @@ type Module = Result<(Translation, wgpu::ShaderModule), String>;
 pub struct Cache {
     /// Program key by GPU address, and code by key.
     programs: HashMap<u64, Option<u64>>,
-    code: HashMap<u64, Vec<u8>>,
+    pub(crate) code: HashMap<u64, Vec<u8>>,
+    /// Compute program keys by GPU address, compiled compute programs, and the
+    /// images compute programs wrote, by GPU address (see `compute.rs`).
+    pub(crate) compute_programs: HashMap<u64, Option<u64>>,
+    pub(crate) compute: HashMap<String, Result<(Translation, wgpu::ComputePipeline, wgpu::BindGroupLayout), String>>,
+    pub(crate) images: HashMap<u64, wgpu::Texture>,
     /// Translations by (program key, key of the pixel program it pairs with).
     modules: HashMap<(u64, Option<u64>), Module>,
     pipelines: HashMap<String, (wgpu::RenderPipeline, Vec<wgpu::BindGroupLayout>)>,
@@ -395,7 +400,7 @@ impl Surfaces {
         .ok_or("program not readable")?;
         let pair = pixel.map(|p| p.key);
         if !self.cache.modules.contains_key(&(key, pair)) {
-            let options = Options { varyings: pixel.map(|p| p.interface.varyings.clone()).unwrap_or_default() };
+            let options = Options { varyings: pixel.map(|p| p.interface.varyings.clone()).unwrap_or_default(), ..Default::default() };
             let made = shader::translate_with(&self.cache.code[&key], &options).map_err(|e| format!("program {key:016x}: {e}")).and_then(|t| {
                 if let Err(e) = shader::validate(&t.wgsl) {
                     self.error(format!("program {key:016x}: {e}"));
@@ -462,8 +467,9 @@ impl Surfaces {
             if want != tic.texture_type && !(want == TextureType::TwoD && tic.texture_type == TextureType::TwoDNoMipmap) {
                 return Err(format!("{:?} texture read as {:?}", tic.texture_type, x.dim));
             }
-            // A render target at that address: its host texture.
+            // An image a compute program wrote, or a render target at that address: its host texture.
             let (view, depth) = match self.map.values().find(|e| e.surface.addr == tic.address) {
+                _ if self.cache.images.contains_key(&tic.address) => (self.cache.images[&tic.address].create_view(&Default::default()), false),
                 Some(e) => {
                     let depth = e.texture.format().is_depth_stencil_format();
                     let aspect = if depth { wgpu::TextureAspect::DepthOnly } else { wgpu::TextureAspect::All };

@@ -4,6 +4,7 @@
 
 use std::path::Path;
 
+pub mod compute;
 pub mod datazip;
 pub mod draw;
 pub mod mme;

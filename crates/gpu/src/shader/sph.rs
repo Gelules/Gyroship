@@ -24,6 +24,11 @@ pub struct Sph {
 }
 
 impl Sph {
+    /// No header: compute programs (their QMD describes them).
+    pub fn empty(stage: Stage) -> Sph {
+        Sph { stage, words: [0; 32] }
+    }
+
     pub fn new(stage: Stage, code: &[u8]) -> Option<Sph> {
         let mut words = [0u32; 32];
         for (w, b) in words.iter_mut().zip(code.get(..128)?.as_chunks::<4>().0) {

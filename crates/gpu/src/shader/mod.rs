@@ -31,7 +31,7 @@ use crate::sass::control::ControlOp;
 use crate::sass::fp16::Fp16Op;
 use crate::sass::fp32::{self, Fp32Op, MufuFn, Rnd};
 use crate::sass::int::{self, IntOp};
-use crate::sass::memory::{InterpFreq, InterpLoc, LdcMode, MemType, MemoryOp};
+use crate::sass::memory::{ImageDim, InterpFreq, InterpLoc, LdcMode, MemType, MemoryOp};
 use crate::sass::moves::{self, MovesOp};
 use crate::sass::operand::{Operand, PT, Pred, RZ, Src, URZ};
 use crate::sass::texture::{LodMode, TexDim, TexHandle, TexQuery, TextureOp};
@@ -66,7 +66,19 @@ pub struct Interface {
     pub textures: Vec<Texture>,
     /// The swizzle codes are read (at `SWIZZLE_BINDING`).
     pub swizzles: bool,
+    /// Compute: images written (SUST), in binding order (`IMAGE_BINDING` + i).
+    pub images: Vec<Image>,
 }
+
+/// A storage image a program writes: where its handle is, and its dimension.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Image {
+    pub handle: Handle,
+    pub dim: ImageDim,
+}
+
+/// The binding of image slot 0; slot i is at `IMAGE_BINDING + i`.
+pub const IMAGE_BINDING: u32 = 512;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Texture {
@@ -118,6 +130,11 @@ pub struct Options {
     /// The pixel shader's varyings: a vertex shader declares each with this
     /// interpolation (a varying it never writes stays (0, 0, 0, 1)).
     pub varyings: BTreeMap<u8, Interp>,
+    /// Compute: the block size (the QMD's CTA_THREAD_DIMENSION).
+    pub workgroup: [u32; 3],
+    /// Compute: the WGSL storage format of each image slot (from its texture
+    /// header); a missing one is `rgba16float`.
+    pub images: Vec<String>,
 }
 
 /// Translates a graphics program on its own.
@@ -128,18 +145,26 @@ pub fn translate(code: &[u8]) -> Result<Translation, Error> {
 /// Translates a graphics program for a given pairing.
 pub fn translate_with(code: &[u8], options: &Options) -> Result<Translation, Error> {
     let fail = |what: &str| Error { at: None, what: what.to_string() };
-    let (key, len) = sass::program_key(code).ok_or_else(|| fail("no program (SPH and closing self-branch)"))?;
     let stage = sass::stage(code);
-    if !matches!(stage, Stage::Vertex | Stage::Pixel) {
-        return Err(fail(&format!("{stage:?} programs are not supported")));
-    }
-    let sph = Sph::new(stage, code).ok_or_else(|| fail("short SPH"))?;
-    let words: Vec<Word> = sass::words(&code[SPH_SIZE..len]).collect();
+    let (key, len, sph, sass) = match stage {
+        Stage::Compute => {
+            let (key, len) = sass::compute_key(code).ok_or_else(|| fail("no program (closing self-branch)"))?;
+            (key, len, Sph::empty(stage), &code[..len])
+        }
+        Stage::Vertex | Stage::Pixel => {
+            let (key, len) = sass::program_key(code).ok_or_else(|| fail("no program (SPH and closing self-branch)"))?;
+            (key, len, Sph::new(stage, code).ok_or_else(|| fail("short SPH"))?, &code[SPH_SIZE..len])
+        }
+        _ => return Err(fail(&format!("{stage:?} programs are not supported"))),
+    };
+    let _ = len;
+    let words: Vec<Word> = sass::words(sass).collect();
     let mut ops = Vec::with_capacity(words.len());
     for (i, w) in words.iter().enumerate() {
         ops.push(sass::decode(*w).ok_or(Error { at: Some(16 * i), what: format!("undecoded opcode {:#05x}", w.opcode()) })?);
     }
     let mut cx = Cx::new(sph);
+    cx.images = options.images.clone();
     let body = cx.program(&words, &ops)?;
     Ok(Translation { key, stage, wgsl: cx.module(&body, options), interface: cx.iface })
 }
@@ -177,15 +202,17 @@ struct Cx {
     // the handle computations seen (they come first); branchy ones would
     // need the flow graph.
     uexpr: BTreeMap<u8, UExpr>,
+    /// Compute: the storage format of each image slot (`Options::images`).
+    images: Vec<String>,
 }
 
 impl Cx {
     fn new(sph: Sph) -> Cx {
-        Cx { sph, regs: BTreeSet::new(), preds: BTreeSet::new(), uregs: BTreeSet::new(), upreds: BTreeSet::new(), iface: Interface::default(), decls: String::new(), helpers: BTreeSet::new(), temps: 0, uexpr: BTreeMap::new() }
+        Cx { sph, regs: BTreeSet::new(), preds: BTreeSet::new(), uregs: BTreeSet::new(), upreds: BTreeSet::new(), iface: Interface::default(), decls: String::new(), helpers: BTreeSet::new(), temps: 0, uexpr: BTreeMap::new(), images: Vec::new() }
     }
 
     fn group(&self) -> u32 {
-        if self.sph.stage == Stage::Vertex { 0 } else { 1 }
+        if self.sph.stage == Stage::Pixel { 1 } else { 0 }
     }
 
     fn temp(&mut self) -> String {
@@ -454,8 +481,10 @@ impl Cx {
 
     /// The code that ends the shader: return the outputs.
     fn exit(&mut self) -> String {
-        if self.sph.stage == Stage::Vertex {
-            return "return o;\n".into();
+        match self.sph.stage {
+            Stage::Vertex => return "return o;\n".into(),
+            Stage::Compute => return "return;\n".into(),
+            _ => {}
         }
         let mut out = String::new();
         let mut k = 0u8;
@@ -510,7 +539,10 @@ impl Cx {
         for p in &self.upreds {
             let _ = writeln!(locals, "var up{p}: bool;");
         }
-        if self.sph.stage == Stage::Vertex {
+        if self.sph.stage == Stage::Compute {
+            let [x, y, z] = options.workgroup.map(|n| n.max(1));
+            let _ = write!(m, "\n@compute @workgroup_size({x}, {y}, {z})\nfn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {{\n{locals}{body}}}\n");
+        } else if self.sph.stage == Stage::Vertex {
             let mut vin = String::from("struct VsIn {\n@builtin(vertex_index) vid: u32,\n@builtin(instance_index) iid: u32,\n");
             for (v, mask) in self.sph.inputs().into_iter().enumerate() {
                 if mask != 0 {
@@ -865,6 +897,12 @@ impl Cx {
                     }
                 }
             }
+            // S2R: SR_TID.XYZ (0x21..0x23) and SR_CTAID.XYZ (0x25..0x27) in compute.
+            MovesOp::S2r { dst, sr: sr @ (0x21..=0x23 | 0x25..=0x27) } if self.sph.stage == Stage::Compute => {
+                let v = if *sr < 0x25 { "lid" } else { "wid" };
+                let c = ["x", "y", "z"][usize::from((sr - 1) % 4)];
+                self.set(out, *dst, &format!("{v}.{c}"));
+            }
             MovesOp::Cs2r { dst, sr: 0xff, wide } => {
                 self.set(out, *dst, "0u");
                 if *wide {
@@ -1017,6 +1055,24 @@ impl Cx {
                         _ => return Err(format!("AST to attribute {a:#x}")),
                     }
                 }
+            }
+            MemoryOp::Sust { coord, data, handle, dim, mask: 0xf, .. } if self.sph.stage == Stage::Compute => {
+                let (coords, ty) = match dim {
+                    ImageDim::D1 => (1, "texture_storage_1d"),
+                    ImageDim::D2 => (2, "texture_storage_2d"),
+                    ImageDim::D3 => (3, "texture_storage_3d"),
+                    d => return Err(format!("SUST to a {d:?} image")),
+                };
+                let slot = self.iface.images.len();
+                self.iface.images.push(Image { handle: Handle::CBuf { bank: handle.bank, offset: handle.offset }, dim: *dim });
+                let format = self.images.get(slot).cloned().unwrap_or_else(|| "rgba16float".into());
+                let g = self.group();
+                let _ = writeln!(self.decls, "@group({g}) @binding({}) var img{slot}: {ty}<{format}, write>;", IMAGE_BINDING + slot as u32);
+                let reg = |cx: &mut Cx, base: u8, k: u8| if base == RZ { "0u".to_string() } else { cx.r(base + k) };
+                let cs: Vec<String> = (0..coords).map(|k| format!("i32({})", reg(self, *coord, k))).collect();
+                let at = if coords == 1 { cs[0].clone() } else { format!("vec{coords}<i32>({})", cs.join(", ")) };
+                let v: Vec<String> = (0..4).map(|k| format!("f({})", reg(self, *data, k))).collect();
+                let _ = writeln!(out, "textureStore(img{slot}, {at}, vec4<f32>({}));", v.join(", "));
             }
             MemoryOp::Ldc { dst, index, bank, offset, mode: LdcMode::Indexed, ty } => {
                 let small = match ty {
@@ -1488,7 +1544,7 @@ mod tests {
         let ast = w(0x322, &[(24, 255), (32, 0), (64, 255), (40, 0x80), (74, 1)]);
         let code = program(&[(0, 0x020c_0481), (6, 0x3), (13, 0x3_0000)], &[ald, ast, exit()]);
         // The pixel shader reads varying 0 linearly and varying 1, which this stage never writes.
-        let options = Options { varyings: BTreeMap::from([(0, Interp::ScreenLinear), (1, Interp::Constant)]) };
+        let options = Options { varyings: BTreeMap::from([(0, Interp::ScreenLinear), (1, Interp::Constant)]), ..Default::default() };
         let t = translate_with(&code, &options).unwrap();
         validate(&t.wgsl).unwrap_or_else(|e| panic!("{e}\n{}", t.wgsl));
         assert!(t.wgsl.contains("@location(0) @interpolate(linear) v0"), "{}", t.wgsl);
@@ -1505,6 +1561,26 @@ mod tests {
         let shfl = w(0xf89, &[(16, 0), (24, 0), (53, 1), (40, 0x1c03), (58, 3), (81, 7)]);
         let t = ok(&program(&[(0, 0x000c_5482), (18, 1)], &[ipa, r2p, shfl, exit()]));
         for want in ["select(0u, 0xffffffffu, i.front)", "p1 = ((r0 >> 1u) & 1u) != 0u;", "r0 = quadSwapX(r0);"] {
+            assert!(t.wgsl.contains(want), "{want}\n{}", t.wgsl);
+        }
+    }
+
+    #[test]
+    fn a_compute_program_stores_to_an_image_by_thread_id() {
+        // No SPH. S2R R0..R2 = tid.x, tid.y, ctaid.z; SUST R4..R7 at (R0, R1, R2) to the
+        // 3D image whose handle is c[0][0x20]; EXIT.
+        let s2r = |dst: u128, sr: u128| w(0x919, &[(16, dst), (72, sr)]);
+        let sust = w(0xb9b, &[(24, 0), (32, 4), (40, 0x20 / 4), (54, 0), (61, 5), (72, 0xf), (84, 1)]);
+        let mut code = Vec::new();
+        for i in [s2r(0, 0x21), s2r(1, 0x22), s2r(2, 0x27), sust, exit(), bra(-16)] {
+            code.extend(i);
+        }
+        let options = Options { workgroup: [8, 8, 1], images: vec!["rgba16float".into()], ..Default::default() };
+        let t = translate_with(&code, &options).unwrap_or_else(|e| panic!("{e}"));
+        validate(&t.wgsl).unwrap_or_else(|e| panic!("{e}\n{}", t.wgsl));
+        assert_eq!(t.stage, Stage::Compute);
+        assert_eq!(t.interface.images, vec![Image { handle: Handle::CBuf { bank: 0, offset: 0x20 }, dim: ImageDim::D3 }]);
+        for want in ["@workgroup_size(8, 8, 1)", "r0 = lid.x;", "r2 = wid.z;", "texture_storage_3d<rgba16float, write>", "textureStore(img0, vec3<i32>(i32(r0), i32(r1), i32(r2))"] {
             assert!(t.wgsl.contains(want), "{want}\n{}", t.wgsl);
         }
     }
