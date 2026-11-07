@@ -971,10 +971,9 @@ dependencies = [
 name = "gyroship"
 version = "0.1.0"
 dependencies = [
- "clap",
  "gyroship-gpu",
- "pollster",
- "wgpu",
+ "gyroship-hle",
+ "gyroship-runtime",
  "winit",
 ]
 

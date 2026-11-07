@@ -203,6 +203,24 @@ pub(crate) unsafe fn on_probe(cpu: *mut Cpu, pc: u64, name: &str) {
 /// seconds: 60 when neither is given); any other mode is the runtime's. A
 /// GPU that lacks what the game needs ends the run with exit code 3.
 pub fn main(table: Vec<rt::Entry>) {
+    run(table, None)
+}
+
+/// What a host window gives the HLE (D28): where to draw, its size, and the
+/// pace. The HLE itself has no window, wall clock or input device.
+pub struct HostWindow {
+    /// The window's surface, and the instance it was made from (on the window's thread).
+    pub instance: gyroship_gpu::wgpu::Instance,
+    pub surface: gyroship_gpu::wgpu::Surface<'static>,
+    pub size: (u32, u32),
+    /// Called after each frame shown, with its virtual time (ticks): waits for
+    /// that time on the wall clock (D27), then gives the window's size, or
+    /// None once the window is closed.
+    pub pace: crate::Pace,
+}
+
+/// [`main`], showing the frames in a host window when one is given.
+pub fn run(table: Vec<rt::Entry>, window: Option<HostWindow>) {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) != Some("boot") {
         return rt::harness::main(table);
@@ -217,8 +235,8 @@ pub fn main(table: Vec<rt::Entry>) {
     journal.all_svcs = flag("--all-svcs");
     let value = |f: &str| args.iter().position(|a| a == f).and_then(|i| args.get(i + 1)).cloned();
     let frames: Option<u64> = value("--frames").and_then(|s| s.parse().ok());
-    // A virtual time limit: --seconds, else 60 s unless --frames bounds the run.
-    let seconds: Option<u64> = value("--seconds").and_then(|s| s.parse().ok()).or(if frames.is_some() { None } else { Some(60) });
+    // A virtual time limit: --seconds, else 60 s unless --frames bounds the run or a window does.
+    let seconds: Option<u64> = value("--seconds").and_then(|s| s.parse().ok()).or(if frames.is_some() || window.is_some() { None } else { Some(60) });
     let save_dir = value("--save").map(std::path::PathBuf::from);
     let config = Config {
         explore: flag("--explore"),
@@ -252,7 +270,7 @@ pub fn main(table: Vec<rt::Entry>) {
     });
     k.log(&format!("{installed} recompiled functions installed"));
     // The host GPU runs the game's work when frames are dumped or measured, or with --gpu.
-    if k.config.frames_dump.is_some() || k.config.perf.is_some() || k.config.hashes.is_some() || flag("--gpu") {
+    if window.is_some() || k.config.frames_dump.is_some() || k.config.perf.is_some() || k.config.hashes.is_some() || flag("--gpu") {
         let backend = match value("--backend").as_deref() {
             None | Some("auto") => gyroship_gpu::Backend::Auto,
             Some("vulkan") => gyroship_gpu::Backend::Vulkan,
@@ -262,7 +280,14 @@ pub fn main(table: Vec<rt::Entry>) {
                 std::process::exit(2);
             }
         };
-        match gyroship_gpu::surfaces::Surfaces::headless(backend) {
+        let surfaces = match window {
+            Some(w) => {
+                k.window = Some((w.pace, w.size));
+                gyroship_gpu::surfaces::Surfaces::windowed(&w.instance, w.surface, w.size)
+            }
+            None => gyroship_gpu::surfaces::Surfaces::headless(backend),
+        };
+        match surfaces {
             Ok(s) => {
                 k.log(&format!("gpu: host renderer {}", s.describe()));
                 k.surfaces = Some(s);

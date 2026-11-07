@@ -170,7 +170,12 @@ pub struct Kernel {
     pub anomalies: std::collections::BTreeMap<&'static str, u64>,
     /// `--hashes`: one CSV line per present.
     pub frame_hashes: Vec<String>,
+    /// The host window's pace hook and its last size (`boot::HostWindow`).
+    pub window: Option<(Pace, (u32, u32))>,
 }
+
+/// A host window's pace hook (`boot::HostWindow::pace`).
+pub type Pace = Box<dyn FnMut(u64) -> Option<(u32, u32)> + Send>;
 
 /// Exit code of a run the HLE stops (an unknown or forbidden SVC, a guest
 /// abort, an anomaly in strict mode).
@@ -183,7 +188,7 @@ impl Kernel {
     pub fn new(mem: Memory, mut journal: Journal, config: Config) -> Kernel {
         let mode = if config.explore { "exploration (not a validation run)" } else { "strict" };
         journal.line(0, 0, &format!("gyroship hle: mode {mode}, seed {:#x}, non-system memory {:#x}", config.seed, config.non_system_memory));
-        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None, sessions: Vec::new(), objects: Vec::new(), domains: Vec::new(), allowed_services: Vec::new(), shared: Vec::new(), transfers: Vec::new(), time_shared: None, frame: (0, 0, 0), symbols: Vec::new(), romfs: None, gs: gs::State::default(), hid_shared: None, input: Default::default(), spin: Vec::new(), saves: Default::default(), timers: Vec::new(), surfaces: None, gpu: Default::default(), counts: Default::default(), anomalies: Default::default(), frame_hashes: Vec::new() }
+        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None, sessions: Vec::new(), objects: Vec::new(), domains: Vec::new(), allowed_services: Vec::new(), shared: Vec::new(), transfers: Vec::new(), time_shared: None, frame: (0, 0, 0), symbols: Vec::new(), romfs: None, gs: gs::State::default(), hid_shared: None, input: Default::default(), spin: Vec::new(), saves: Default::default(), timers: Vec::new(), surfaces: None, gpu: Default::default(), counts: Default::default(), anomalies: Default::default(), frame_hashes: Vec::new(), window: None }
     }
 
     /// Counts one more `name` (normal activity); returns the new count.

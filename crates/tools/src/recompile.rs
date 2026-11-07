@@ -157,14 +157,14 @@ pub fn run(exefs: &Path, out: &Path, threads: usize, verify: bool, probes: Optio
     std::fs::write(
         out.join("harness/Cargo.toml"),
         format!(
-            "[package]\nname = \"harness\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n[dependencies]\ngyroship-runtime = {{ path = \"{}\" }}\ngyroship-hle = {{ path = \"{}\" }}\n",
+            "[package]\nname = \"harness\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n[dependencies]\ngyroship-runtime = {{ path = \"{}\" }}\ngyroship = {{ path = \"{}\" }}\n",
             runtime_path(),
-            crate_path("hle")
+            crate_path("gyroship")
         ),
     )?;
     std::fs::write(out.join("harness/build.rs"), build)?;
-    // The game's harness boots through the HLE (`boot <exefs>`); its other modes are the runtime's.
-    std::fs::write(out.join("harness/src/main.rs"), format!("use gyroship_runtime as rt;\n{decls}\nfn main() {{\n    gyroship_hle::boot::main({table});\n}}\n"))?;
+    // The game's harness: `boot <exefs>` in a window, or --headless (D28); its other modes are the runtime's.
+    std::fs::write(out.join("harness/src/main.rs"), format!("use gyroship_runtime as rt;\n{decls}\nfn main() {{\n    gyroship::main({table});\n}}\n"))?;
     Ok(())
 }
 

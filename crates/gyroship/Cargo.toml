@@ -7,7 +7,6 @@ publish.workspace = true
 
 [dependencies]
 gyroship-gpu = { path = "../gpu" }
-clap.workspace = true
-pollster = "1"
-wgpu = "30"
+gyroship-hle = { path = "../hle" }
+gyroship-runtime = { path = "../runtime" }
 winit = "0.30"

@@ -448,6 +448,16 @@ impl Kernel {
             };
             self.frame_hashes.push(line);
         }
+        // The host window: show the frame, then wait for its time on the wall clock.
+        let now = self.now();
+        let area = ((self.gs.drawn_area & 0xffff) + 1, (self.gs.drawn_area >> 16) + 1);
+        if let (Some(s), Some((pace, size))) = (self.surfaces.as_mut(), self.window.as_mut()) {
+            s.show(area, *size);
+            match pace(now) {
+                Some(new) => *size = new,
+                None => self.stop(0, "window closed"),
+            }
+        }
         // The render targets this frame touched, as PNG files (game output: never committed).
         let every = self.config.dump_every;
         if let (Some(dir), Some(s)) = (self.config.frames_dump.clone(), self.surfaces.as_mut())

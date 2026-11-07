@@ -130,6 +130,77 @@ pub struct Surfaces {
     arena: (wgpu::Buffer, Vec<u8>),
     /// The color target written last (the presented image at a present).
     last_color: Option<(u64, u32)>,
+    /// The window the presented images go to, if any.
+    window: Option<Window>,
+}
+
+/// A window's surface and the pipeline that copies an image into it.
+struct Window {
+    surface: wgpu::Surface<'static>,
+    config: wgpu::SurfaceConfiguration,
+    pipeline: wgpu::RenderPipeline,
+    layout: wgpu::BindGroupLayout,
+}
+
+/// Copies the drawn area of a target into the window, scaled with point
+/// sampling: the raw texel values, as the console's display sends them.
+const SHOW: &str = r#"
+struct Params { area: vec2<u32>, size: vec2<u32> };
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var<uniform> params: Params;
+
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let p = vec2(f32(i & 1u) * 4.0 - 1.0, f32(i >> 1u) * 4.0 - 1.0);
+    return vec4(p, 0.0, 1.0);
+}
+
+@fragment
+fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+    let at = vec2<u32>(floor(p.xy * vec2<f32>(params.area) / vec2<f32>(params.size)));
+    return vec4(textureLoad(src, min(at, params.area - 1u), 0).rgb, 1.0);
+}
+"#;
+
+impl Window {
+    fn new(adapter: &wgpu::Adapter, device: &wgpu::Device, surface: wgpu::Surface<'static>, size: (u32, u32)) -> Window {
+        let caps = surface.get_capabilities(adapter);
+        // Not sRGB: the image's bytes are already encoded (no second gamma).
+        let format = caps.formats.iter().copied().find(|f| !f.is_srgb()).unwrap_or(caps.formats[0]);
+        // D27: no tearing and no queue of old frames; virtual time sets the pace.
+        let present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) { wgpu::PresentMode::Mailbox } else { wgpu::PresentMode::AutoVsync };
+        let mut config = surface.get_default_config(adapter, size.0.max(1), size.1.max(1)).expect("a surface the adapter can present to");
+        config.format = format;
+        config.present_mode = present_mode;
+        config.desired_maximum_frame_latency = 1;
+        surface.configure(device, &config);
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("show"), source: wgpu::ShaderSource::Wgsl(SHOW.into()) });
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&layout)], ..Default::default() });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("show"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState { module: &module, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[] },
+            fragment: Some(wgpu::FragmentState { module: &module, entry_point: Some("fs"), compilation_options: Default::default(), targets: &[Some(format.into())] }),
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        Window { surface, config, pipeline, layout }
+    }
 }
 
 /// Offsets in the upload arena: the uniform binding alignment wgpu allows at most.
@@ -170,10 +241,20 @@ impl Surfaces {
     /// formats, filterable f32 textures, border-color clamping and subgroup
     /// (quad) operations.
     pub fn headless(backend: crate::Backend) -> Result<Surfaces, String> {
-        let instance = crate::Renderer::instance_for(backend);
+        Surfaces::open(&crate::Renderer::instance_for(backend), None)
+    }
+
+    /// The same, also presenting into a window's `surface` (made from
+    /// `instance` on the window's thread; `size` in pixels): each present
+    /// shows the image there ([`Surfaces::show`]).
+    pub fn windowed(instance: &wgpu::Instance, surface: wgpu::Surface<'static>, size: (u32, u32)) -> Result<Surfaces, String> {
+        Surfaces::open(instance, Some((surface, size)))
+    }
+
+    fn open(instance: &wgpu::Instance, window: Option<(wgpu::Surface<'static>, (u32, u32))>) -> Result<Surfaces, String> {
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: None,
+            compatible_surface: window.as_ref().map(|w| &w.0),
             force_fallback_adapter: false,
             apply_limit_buckets: false,
         }))
@@ -235,7 +316,55 @@ impl Surfaces {
         });
         let fill = (fill_module, fill_layout, Default::default());
         let arena = (arena_buffer(&device, 16 << 20), Vec::new());
-        Ok(Surfaces { adapter, device, queue, map: BTreeMap::new(), touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pending: None, arena, last_color: None })
+        let window = window.map(|(surface, size)| Window::new(&adapter, &device, surface, size));
+        Ok(Surfaces { adapter, device, queue, map: BTreeMap::new(), touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pending: None, arena, last_color: None, window })
+    }
+
+    /// Shows the presented image (the color target written last, its top-left
+    /// `area`) in the window, scaled to `size` with point sampling. Nothing
+    /// happens without a window, with nothing written, or while minimized.
+    pub fn show(&mut self, area: (u32, u32), size: (u32, u32)) {
+        self.flush();
+        let (Some(w), Some(key)) = (self.window.as_mut(), self.last_color) else { return };
+        let Some(e) = self.map.get(&key) else { return };
+        if size.0 == 0 || size.1 == 0 || area.0 == 0 || area.1 == 0 {
+            return;
+        }
+        if (w.config.width, w.config.height) != size {
+            (w.config.width, w.config.height) = size;
+            w.surface.configure(&self.device, &w.config);
+        }
+        let frame = match w.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+            // Resized or lost under us: configure again, show the next frame.
+            _ => {
+                w.surface.configure(&self.device, &w.config);
+                return;
+            }
+        };
+        let area = (area.0.min(e.surface.width), area.1.min(e.surface.height));
+        let words: Vec<u8> = [area.0, area.1, size.0, size.1].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let params = wgpu::util::DeviceExt::create_buffer_init(&self.device, &wgpu::util::BufferInitDescriptor { label: Some("show"), contents: &words, usage: wgpu::BufferUsages::UNIFORM });
+        let src = e.texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2), array_layer_count: Some(1), ..Default::default() });
+        let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &w.layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src) }, wgpu::BindGroupEntry { binding: 1, resource: params.as_entire_binding() }],
+        });
+        let view = frame.texture.create_view(&Default::default());
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("show"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &view, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })],
+                ..Default::default()
+            });
+            pass.set_pipeline(&w.pipeline);
+            pass.set_bind_group(0, &group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        self.queue.submit([encoder.finish()]);
+        self.queue.present(frame);
     }
 
     /// The encoder that collects a frame's passes: one submit per frame
