@@ -779,13 +779,12 @@ pub enum GobLayout {
 }
 
 impl GobLayout {
-    /// The layout [`deswizzle`] and [`level_offsets`] assume. Not established
-    /// for the Switch 2 (T239, Ampere): NIL's class rule gives Turing2D but
-    /// NIL never ran on a Turing+ SoC, while its only SoC rule (Tegra) is the
-    /// Switch 1 layout. Tegra is the default; check on the first real texture
-    /// which one gives a coherent image. Depth formats may use yet another
-    /// layout (NIL `FermiZS`, undocumented).
-    pub const DEFAULT: GobLayout = GobLayout::Tegra;
+    /// The layout [`deswizzle`] and [`level_offsets`] assume: Turing2D, the
+    /// rule NIL gives Turing and later classes, and the one a reference
+    /// emulator uses for Switch 2 titles (bits 5 and 6 of the GOB offset
+    /// swapped against the Switch 1's Tegra layout). Depth formats may use yet
+    /// another layout (NIL `FermiZS`, undocumented).
+    pub const DEFAULT: GobLayout = GobLayout::Turing2D;
 
     /// Byte offset inside the GOB of byte `x` (0..64) of row `y` (0..8).
     pub fn offset(self, x: u32, y: u32) -> u32 {
@@ -1189,7 +1188,7 @@ mod tests {
         }
         // The fixed-signature entry points use the default layout, 1-GOB-wide tiles.
         let linear: Vec<u8> = (0..4 * 37 * 21).map(|i| (i % 251) as u8).collect();
-        let tiled = reference_swizzle(&TEGRA_LINES, &linear, 4 * 37, 21, 1, 0, 1, 0);
+        let tiled = reference_swizzle(&TURING_LINES, &linear, 4 * 37, 21, 1, 0, 1, 0);
         assert_eq!(deswizzle(&tiled, 4, 37, 21, 1, 1, 0), linear);
         assert_eq!(level_size(4, 37, 21, 1, 1, 0), tiled.len() as u64);
     }
@@ -1198,7 +1197,7 @@ mod tests {
     fn deswizzle_clamps_tile_height_to_the_level() {
         // 16 rows = 2 GOBs: a requested 32-GOB tile behaves as a 2-GOB tile.
         let linear: Vec<u8> = (0..64 * 16).map(|i| (i % 251) as u8).collect();
-        let tiled = reference_swizzle(&TEGRA_LINES, &linear, 64, 16, 1, 0, 1, 0);
+        let tiled = reference_swizzle(&TURING_LINES, &linear, 64, 16, 1, 0, 1, 0);
         assert_eq!(deswizzle(&tiled, 4, 16, 16, 1, 5, 0), linear);
         assert_eq!(level_size(4, 16, 16, 1, 5, 0), 1024);
         assert_eq!(level_size(4, 1, 1, 1, 5, 0), 512); // one GOB at least
