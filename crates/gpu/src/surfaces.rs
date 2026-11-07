@@ -133,6 +133,23 @@ pub struct Surfaces {
 /// Offsets in the upload arena: the uniform binding alignment wgpu allows at most.
 const ARENA_ALIGN: usize = 256;
 
+/// What the game's programs cannot run without (D32): subgroup operations,
+/// on subgroups of exactly 32 lanes, since the translated warp code (shuffles,
+/// the upscaler's matrix fragments) assumes the console's warp size.
+const NEEDED: wgpu::Features = wgpu::Features::SUBGROUP;
+
+/// Refuses an adapter that lacks what the game needs, with the reason.
+pub fn check_adapter(features: wgpu::Features, subgroup_min: u32, subgroup_max: u32) -> Result<(), String> {
+    let missing = NEEDED - features;
+    if !missing.is_empty() {
+        return Err(format!("this GPU lacks {missing:?}, which the game's shaders need"));
+    }
+    if (subgroup_min, subgroup_max) != (32, 32) {
+        return Err(format!("this GPU runs subgroups of {subgroup_min} to {subgroup_max} lanes; the game's shaders need exactly 32"));
+    }
+    Ok(())
+}
+
 /// A uniform binding of a range of the upload arena.
 pub(crate) fn uniform((buffer, at, size): &(wgpu::Buffer, u64, u64)) -> wgpu::BindingResource<'_> {
     wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer, offset: *at, size: wgpu::BufferSize::new(*size) })
@@ -169,7 +186,9 @@ impl Surfaces {
             | wgpu::Features::FLOAT32_FILTERABLE
             | wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER
             | wgpu::Features::SUBGROUP;
-        let descriptor = wgpu::DeviceDescriptor { required_features: adapter.features() & wanted, required_limits: adapter.limits(), ..Default::default() };
+        let info = adapter.get_info();
+        check_adapter(adapter.features(), info.subgroup_min_size, info.subgroup_max_size).map_err(|e| format!("{} ({:?}): {e}", info.name, info.backend))?;
+        let descriptor = wgpu::DeviceDescriptor { required_features: (adapter.features() & wanted) | NEEDED, required_limits: adapter.limits(), ..Default::default() };
         let (device, queue) = pollster::block_on(adapter.request_device(&descriptor)).map_err(|e| format!("cannot open the GPU device: {e}"))?;
         let errors = Arc::new(Mutex::new(Vec::new()));
         let sink = errors.clone();
@@ -260,6 +279,12 @@ impl Surfaces {
         data.extend_from_slice(bytes);
         data.resize(at + size, 0);
         (self.arena.0.clone(), at as u64, size as u64)
+    }
+
+    /// The GPU and backend in use, for the journal.
+    pub fn describe(&self) -> String {
+        let info = self.adapter.get_info();
+        format!("{} ({:?}, driver {} {})", info.name, info.backend, info.driver, info.driver_info)
     }
 
     /// Whether this device can render to `format` (and read it back).
@@ -512,6 +537,17 @@ impl Surfaces {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Synthetic adapter descriptions: subgroups of 32 pass; none, or other
+    /// sizes (AMD's 64, Intel's 8 to 32), are refused with a reason.
+    #[test]
+    fn adapters_without_32_lane_subgroups_are_refused() {
+        let sub = wgpu::Features::SUBGROUP;
+        assert_eq!(check_adapter(sub | wgpu::Features::TEXTURE_COMPRESSION_BC, 32, 32), Ok(()));
+        assert!(check_adapter(wgpu::Features::empty(), 32, 32).unwrap_err().contains("SUBGROUP"));
+        assert!(check_adapter(sub, 64, 64).unwrap_err().contains("64 to 64"));
+        assert!(check_adapter(sub, 8, 32).unwrap_err().contains("exactly 32"));
+    }
 
     /// A clear reaches the texture: 4x2 targets in RF16_GF16_BF16_AF16 and in
     /// R16_G16_B16_A16 (the game's violet target) cleared to (0.5, 0, 0.5, 0)

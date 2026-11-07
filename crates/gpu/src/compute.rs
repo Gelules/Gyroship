@@ -167,8 +167,11 @@ impl Surfaces {
             // offsets if a buffer ever runs past it.
             let address = u64::from(hi) << 32 | u64::from(lo);
             let mut data = Vec::new();
+            // The device's own bounds (DX12's are lower than Vulkan's here).
+            let limits = self.device.limits();
+            let max = (1u64 << 30).min(limits.max_storage_buffer_binding_size).min(limits.max_buffer_size);
             for bytes in [size.max(1 << 20), size] {
-                if bytes == 0 || bytes > 1 << 30 {
+                if bytes == 0 || u64::from(bytes.next_multiple_of(4)) > max {
                     continue;
                 }
                 data = vec![0u8; bytes.next_multiple_of(4) as usize];
@@ -180,7 +183,10 @@ impl Surfaces {
             if data.is_empty() {
                 return Err(format!("global memory at c[{bank}][{at:#x}] ({address:#x}, size word {size:#x}) not readable"));
             }
-            globals.push(wgpu::util::DeviceExt::create_buffer_init(&self.device, &wgpu::util::BufferInitDescriptor { label: Some("global"), contents: &data, usage: wgpu::BufferUsages::STORAGE }));
+            // Not create_buffer_init: an invalid buffer must come out as a wgpu error, not a panic.
+            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("global"), size: data.len() as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+            self.queue.write_buffer(&buffer, 0, &data);
+            globals.push(buffer);
         }
 
         // Bindings: constant banks, textures and swizzles as for draws, then the images.

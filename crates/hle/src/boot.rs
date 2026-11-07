@@ -198,9 +198,10 @@ pub(crate) unsafe fn on_probe(cpu: *mut Cpu, pc: u64, name: &str) {
 }
 
 /// The generated harness's `main`: `boot <exefs> [--log FILE] [--explore]
-/// [--all-svcs] [--seconds N] [--frames N]` runs the game (until N frames
-/// are presented, or for N virtual seconds: 60 when neither is given); any
-/// other mode is the runtime's.
+/// [--all-svcs] [--seconds N] [--frames N] [--gpu] [--backend auto|vulkan|dx12]
+/// ...` runs the game (until N frames are presented, or for N virtual
+/// seconds: 60 when neither is given); any other mode is the runtime's. A
+/// GPU that lacks what the game needs ends the run with exit code 3.
 pub fn main(table: Vec<rt::Entry>) {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) != Some("boot") {
@@ -249,10 +250,28 @@ pub fn main(table: Vec<rt::Entry>) {
         std::process::exit(2);
     });
     k.log(&format!("{installed} recompiled functions installed"));
-    if k.config.frames_dump.is_some() {
-        match gyroship_gpu::surfaces::Surfaces::headless(gyroship_gpu::Backend::Auto) {
-            Ok(s) => k.surfaces = Some(s),
-            Err(e) => k.log(&format!("gpu: no host renderer, frames are not dumped: {e}")),
+    // The host GPU runs the game's work when frames are dumped or measured, or with --gpu.
+    if k.config.frames_dump.is_some() || k.config.perf.is_some() || flag("--gpu") {
+        let backend = match value("--backend").as_deref() {
+            None | Some("auto") => gyroship_gpu::Backend::Auto,
+            Some("vulkan") => gyroship_gpu::Backend::Vulkan,
+            Some("dx12") => gyroship_gpu::Backend::Dx12,
+            Some(other) => {
+                eprintln!("gyroship: --backend {other}: expected auto, vulkan or dx12");
+                std::process::exit(2);
+            }
+        };
+        match gyroship_gpu::surfaces::Surfaces::headless(backend) {
+            Ok(s) => {
+                k.log(&format!("gpu: host renderer {}", s.describe()));
+                k.surfaces = Some(s);
+            }
+            Err(e) => {
+                k.log(&format!("gpu: no host renderer: {e}"));
+                k.journal.flush();
+                eprintln!("gyroship: this GPU cannot run the game: {e}");
+                std::process::exit(3);
+            }
         }
     }
     crate::install(k);
