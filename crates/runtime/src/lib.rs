@@ -14,6 +14,7 @@
 pub mod harness;
 pub mod interp;
 pub mod mem;
+pub mod profile;
 #[cfg(windows)]
 pub mod fiber;
 
@@ -190,6 +191,7 @@ pub unsafe extern "C" fn gyroship_unhandled(cpu: *mut Cpu, pc: u64, word: u32) {
     static LOGGED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
     // SAFETY: guaranteed by the caller.
     let c = unsafe { &mut *cpu };
+    profile::count_interpreted(word);
     match interp::execute(c, pc, word) {
         Ok(()) => {
             INTERPRETED.fetch_add(1, Ordering::Relaxed);

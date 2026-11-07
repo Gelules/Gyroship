@@ -393,6 +393,14 @@ impl Kernel {
     fn present(&mut self, req: &Request) {
         self.gs.presents += 1;
         let n = self.gs.presents;
+        if let Some((path, from)) = &self.config.profile
+            && n == (*from).max(1)
+        {
+            gyroship_runtime::profile::start(path.clone());
+        }
+        if self.config.perf.is_some() {
+            gyroship_runtime::profile::mark_frame();
+        }
         if n <= 3 || n.is_multiple_of(60) {
             let (layer, image) = (req.u64_at(0).unwrap_or(0), req.u32_at(0xc).unwrap_or(0));
             let (fence_id, fence) = (req.u32_at(0x50).unwrap_or(0), req.u64_at(0x58).unwrap_or(0));

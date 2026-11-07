@@ -237,6 +237,8 @@ pub fn main(table: Vec<rt::Entry>) {
                 std::process::exit(2);
             })
         }),
+        profile: value("--profile").map(|f| (f.into(), value("--profile-from").and_then(|n| n.parse().ok()).unwrap_or(600))),
+        perf: value("--perf").map(Into::into),
         ..Config::default()
     };
     let installed = table.len();
@@ -261,6 +263,7 @@ pub fn main(table: Vec<rt::Entry>) {
             let summary = k.summary();
             k.log(&summary);
             k.journal.flush();
+            k.host_reports();
         }
         thread::Outcome::Deadlock(who) => k.stop(STOP_EXIT, &format!("deadlock: {who}")),
     });

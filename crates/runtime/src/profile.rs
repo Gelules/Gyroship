@@ -1,0 +1,208 @@
+//! A sampling profiler for the host thread that runs the guest (`--profile`):
+//! every millisecond another thread suspends it, reads its instruction
+//! pointer and resumes it. At the end, dbghelp names each address from the
+//! executable's PDB (recompiled functions are `f_<guest address>`), and a
+//! report lists the samples by symbol, most first.
+//!
+//! The sampler never allocates nor locks while the thread is suspended (it
+//! could hold the allocator's lock).
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
+
+struct Profiler {
+    path: PathBuf,
+    stop: &'static AtomicBool,
+    sampler: JoinHandle<HashMap<u64, u64>>,
+}
+
+static PROFILER: Mutex<Option<Profiler>> = Mutex::new(None);
+static ACTIVE: AtomicBool = AtomicBool::new(false);
+
+thread_local! {
+    /// Interpreted instruction words and how often each ran (guest thread only).
+    static WORDS: std::cell::RefCell<HashMap<u32, u64>> = std::cell::RefCell::new(HashMap::new());
+}
+
+/// Host wall-clock time of each present (`--perf`), never in the journal.
+static FRAMES: Mutex<Vec<std::time::Instant>> = Mutex::new(Vec::new());
+
+/// Marks a present.
+pub fn mark_frame() {
+    FRAMES.lock().unwrap_or_else(|e| e.into_inner()).push(std::time::Instant::now());
+}
+
+/// Writes each frame's wall time to `path` (CSV: present, ms) and prints
+/// the median and 95th percentile from present `from` on.
+pub fn write_perf(path: &std::path::Path, from: usize) {
+    let marks = std::mem::take(&mut *FRAMES.lock().unwrap_or_else(|e| e.into_inner()));
+    let ms: Vec<f64> = marks.windows(2).map(|w| (w[1] - w[0]).as_secs_f64() * 1e3).collect();
+    let mut csv = String::from("present,ms\n");
+    for (i, t) in ms.iter().enumerate() {
+        csv += &format!("{},{t:.3}\n", i + 2);
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Err(e) = std::fs::write(path, csv) {
+        eprintln!("gyroship: --perf {}: {e}", path.display());
+    }
+    let mut steady: Vec<f64> = ms.iter().copied().skip(from.saturating_sub(1)).collect();
+    if steady.is_empty() {
+        return;
+    }
+    steady.sort_by(f64::total_cmp);
+    let at = |q: f64| steady[((steady.len() - 1) as f64 * q) as usize];
+    let mean = steady.iter().sum::<f64>() / steady.len() as f64;
+    eprintln!("gyroship: perf from present {from}: {} frames, median {:.2} ms, p95 {:.2} ms, mean {mean:.2} ms", steady.len(), at(0.5), at(0.95));
+}
+
+/// Counts an instruction the interpreter runs, while a profile runs.
+#[inline]
+pub fn count_interpreted(word: u32) {
+    if ACTIVE.load(Ordering::Relaxed) {
+        WORDS.with(|w| *w.borrow_mut().entry(word).or_insert(0) += 1);
+    }
+}
+
+/// Starts sampling the calling thread; the report goes to `path` at [`finish`].
+#[cfg(windows)]
+pub fn start(path: PathBuf) {
+    use windows_sys::Win32::System::Diagnostics::Debug::{CONTEXT, CONTEXT_CONTROL_AMD64, GetThreadContext};
+    use windows_sys::Win32::System::Threading::{GetCurrentThreadId, OpenThread, ResumeThread, SuspendThread, THREAD_GET_CONTEXT, THREAD_SUSPEND_RESUME};
+    // SAFETY: opens a handle to this thread; it stays open for the process's life.
+    let handle = unsafe { OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, 0, GetCurrentThreadId()) } as usize;
+    if handle == 0 {
+        eprintln!("gyroship: --profile: cannot open the thread");
+        return;
+    }
+    let stop: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+    let sampler = std::thread::spawn(move || {
+        let mut samples = HashMap::new();
+        // GetThreadContext wants a 16-byte aligned CONTEXT.
+        #[repr(C, align(16))]
+        struct Aligned(CONTEXT);
+        // SAFETY: a zeroed CONTEXT is valid; only its control registers are asked for.
+        let mut aligned: Aligned = unsafe { std::mem::zeroed() };
+        let context = &mut aligned.0;
+        while !stop.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            context.ContextFlags = CONTEXT_CONTROL_AMD64;
+            // SAFETY: the handle is valid; the thread resumes right after the read.
+            let read = unsafe {
+                if SuspendThread(handle as _) == u32::MAX {
+                    eprintln!("gyroship: --profile: SuspendThread: {}", std::io::Error::last_os_error());
+                    break;
+                }
+                let ok = GetThreadContext(handle as _, context) != 0;
+                ResumeThread(handle as _);
+                ok
+            };
+            if read {
+                *samples.entry(context.Rip).or_insert(0u64) += 1;
+            } else if samples.is_empty() {
+                eprintln!("gyroship: --profile: GetThreadContext: {}", std::io::Error::last_os_error());
+                break;
+            }
+        }
+        samples
+    });
+    *PROFILER.lock().unwrap_or_else(|e| e.into_inner()) = Some(Profiler { path, stop, sampler });
+    ACTIVE.store(true, Ordering::Relaxed);
+}
+
+#[cfg(not(windows))]
+pub fn start(_path: PathBuf) {
+    eprintln!("gyroship: --profile is only implemented on Windows");
+}
+
+/// Stops sampling and writes the report; `guest` names a guest address
+/// (for `f_` symbols). Does nothing if no profile runs.
+pub fn finish(guest: &dyn Fn(u64) -> String) {
+    let Some(p) = PROFILER.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+    p.stop.store(true, Ordering::Relaxed);
+    ACTIVE.store(false, Ordering::Relaxed);
+    let Ok(samples) = p.sampler.join() else { return };
+    let total: u64 = samples.values().sum();
+    let mut by_symbol: HashMap<String, u64> = HashMap::new();
+    for (rip, n) in samples {
+        *by_symbol.entry(symbol(rip)).or_insert(0) += n;
+    }
+    let mut rows: Vec<(String, u64)> = by_symbol.into_iter().collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let mut out = format!("# gyroship profile: {total} samples of 1 ms of the guest's host thread\n# samples  percent  symbol\n");
+    for (name, n) in rows {
+        let guest = name.strip_prefix("f_").and_then(|a| u64::from_str_radix(a, 16).ok()).map_or(String::new(), |a| format!("  {}", guest(a)));
+        out += &format!("{n:9} {:7.2}%  {name}{guest}\n", 100.0 * n as f64 / total.max(1) as f64);
+    }
+    // The interpreter's instructions, by opcode, then the most frequent words.
+    let words: Vec<(u32, u64)> = WORDS.with(|w| w.borrow().iter().map(|(&w, &n)| (w, n)).collect());
+    let interpreted: u64 = words.iter().map(|w| w.1).sum();
+    let mut by_opcode: HashMap<String, u64> = HashMap::new();
+    for &(w, n) in &words {
+        let op = crate::interp::opcode_name(w);
+        *by_opcode.entry(op).or_insert(0) += n;
+    }
+    let mut ops: Vec<(String, u64)> = by_opcode.into_iter().collect();
+    ops.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    out += &format!("# interpreted instructions: {interpreted}\n# count  percent  opcode\n");
+    for (op, n) in ops {
+        out += &format!("{n:12} {:7.2}%  {op}\n", 100.0 * n as f64 / interpreted.max(1) as f64);
+    }
+    let mut top = words;
+    top.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    out += "# most frequent words\n";
+    for (w, n) in top.into_iter().take(80) {
+        out += &format!("{n:12}  {w:08x}  {}\n", crate::interp::disassemble(w));
+    }
+    if let Some(dir) = p.path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Err(e) = std::fs::write(&p.path, out) {
+        eprintln!("gyroship: --profile {}: {e}", p.path.display());
+    }
+}
+
+/// The name of the symbol at host address `rip`, from the PDB; `?` and the
+/// address when dbghelp has none.
+#[cfg(windows)]
+fn symbol(rip: u64) -> String {
+    use windows_sys::Win32::System::Diagnostics::Debug::{SYMBOL_INFO, SymFromAddr, SymInitialize};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    static INIT: std::sync::Once = std::sync::Once::new();
+    // SAFETY: dbghelp is initialized once for this process, before any lookup;
+    // it looks for the PDB next to the executable.
+    INIT.call_once(|| unsafe {
+        let dir = std::env::current_exe().ok().and_then(|e| Some(e.parent()?.to_string_lossy().into_owned() + "\0"));
+        SymInitialize(GetCurrentProcess(), dir.as_deref().map_or(std::ptr::null(), |d| d.as_ptr()), 1);
+    });
+    const MAX: usize = 512;
+    #[repr(C)]
+    struct Buffer {
+        info: SYMBOL_INFO,
+        name: [u8; MAX],
+    }
+    // SAFETY: a zeroed SYMBOL_INFO followed by MAX bytes for its name, as dbghelp asks.
+    let mut b: Buffer = unsafe { std::mem::zeroed() };
+    b.info.SizeOfStruct = size_of::<SYMBOL_INFO>() as u32;
+    b.info.MaxNameLen = MAX as u32;
+    let mut displacement = 0u64;
+    // SAFETY: the buffer is as large as MaxNameLen says.
+    if unsafe { SymFromAddr(GetCurrentProcess(), rip, &mut displacement, &mut b.info) } == 0 {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| eprintln!("gyroship: --profile: no symbol at {rip:#x}: {}", std::io::Error::last_os_error()));
+        return format!("? {rip:#x}");
+    }
+    let len = (b.info.NameLen as usize).min(MAX);
+    // SAFETY: Name is the first byte of a NameLen-byte string inside the buffer.
+    let name = unsafe { std::slice::from_raw_parts(b.info.Name.as_ptr().cast::<u8>(), len) };
+    String::from_utf8_lossy(name).into_owned()
+}
+
+#[cfg(not(windows))]
+fn symbol(rip: u64) -> String {
+    format!("? {rip:#x}")
+}

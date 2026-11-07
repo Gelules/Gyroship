@@ -13,8 +13,44 @@ pub type Result<T = ()> = std::result::Result<T, &'static str>;
 
 /// Executes one instruction; Err names what is not covered.
 pub fn execute(c: &mut Cpu, pc: u64, word: u32) -> Result {
-    let i = decode(word).ok_or("undecodable")?;
+    let i = decoded(pc, word).ok_or("undecodable")?;
     exec(c, pc, &i)
+}
+
+/// Decoded instructions by PC, direct-mapped: the same few thousand
+/// instructions run every frame, and decoding costs more than executing.
+const CACHE: usize = 1 << 14;
+
+fn decoded(pc: u64, word: u32) -> Option<Instruction> {
+    type Slot = Option<(u64, u32, Instruction)>;
+    thread_local! {
+        static SLOTS: std::cell::RefCell<Vec<Slot>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    SLOTS.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.is_empty() {
+            s.resize(CACHE, None);
+        }
+        let slot = &mut s[(pc >> 2) as usize % CACHE];
+        match slot {
+            Some((p, w, i)) if *p == pc && *w == word => Some(*i),
+            _ => {
+                let i = decode(word)?;
+                *slot = Some((pc, word, i));
+                Some(i)
+            }
+        }
+    })
+}
+
+/// The opcode of an instruction word, for reports.
+pub fn opcode_name(word: u32) -> String {
+    decode(word).map_or_else(|| "undecodable".into(), |i| format!("{:?}", i.opcode))
+}
+
+/// An instruction word in assembly, for reports.
+pub fn disassemble(word: u32) -> String {
+    decode(word).map_or_else(|| "undecodable".into(), |i| i.to_string())
 }
 
 /// Whether `execute` covers the instruction (it is run on a scratch context).

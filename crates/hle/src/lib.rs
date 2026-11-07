@@ -108,11 +108,16 @@ pub struct Config {
     pub shaders_dump: Option<std::path::PathBuf>,
     /// `--replay FILE`: the controller's states by hid sample (D29).
     pub replay: Option<Vec<(u64, hid::Step)>>,
+    /// `--profile FILE` and `--profile-from N`: sample the host thread from
+    /// present N on; the report goes to FILE when the run ends.
+    pub profile: Option<(std::path::PathBuf, u64)>,
+    /// `--perf FILE`: each present's host wall time, as CSV (never journaled).
+    pub perf: Option<std::path::PathBuf>,
 }
 
 impl Default for Config {
     fn default() -> Config {
-        Config { seed: 0x5EED, explore: false, non_system_memory: 0x2_6410_0000, time_limit: None, frames: None, save_dir: None, vsync: true, gpfifo_dump: None, frames_dump: None, dump_every: 1, dump_draws: None, shaders_dump: None, replay: None }
+        Config { seed: 0x5EED, explore: false, non_system_memory: 0x2_6410_0000, time_limit: None, frames: None, save_dir: None, vsync: true, gpfifo_dump: None, frames_dump: None, dump_every: 1, dump_draws: None, shaders_dump: None, replay: None, profile: None, perf: None }
     }
 }
 
@@ -242,8 +247,17 @@ impl Kernel {
             self.log(&line);
         }
         self.journal.flush();
+        self.host_reports();
         eprintln!("gyroship: {why}");
         std::process::exit(code);
+    }
+
+    /// Writes the host-side reports a run asked for (`--profile`, `--perf`).
+    pub fn host_reports(&self) {
+        gyroship_runtime::profile::finish(&|a| self.symbolize(a));
+        if let Some(path) = &self.config.perf {
+            gyroship_runtime::profile::write_perf(path, self.config.profile.as_ref().map_or(600, |p| p.1 as usize));
+        }
     }
 
     /// The guest call stack at the last SVC: its pc, its lr, then the frame
