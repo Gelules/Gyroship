@@ -418,6 +418,7 @@ impl Kernel {
         // The host GPU's refusals since the last present.
         // ponytail: checked once per frame; per operation if a stop needs the guest stack.
         if let Some(s) = self.surfaces.as_mut() {
+            s.flush();
             let skipped = std::mem::take(&mut s.skipped);
             let errors = s.errors.lock().map(|mut e| std::mem::take(&mut *e)).unwrap_or_default();
             for (why, count) in skipped {

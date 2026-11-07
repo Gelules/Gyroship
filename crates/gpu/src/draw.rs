@@ -345,7 +345,7 @@ impl Surfaces {
         // The pass.
         let color_views: Vec<Option<wgpu::TextureView>> = colors.iter().map(|c| c.map(|(s, f)| self.texture(&s, f))).collect();
         let depth_view = depth.map(|(s, f)| (self.texture(&s, f), f));
-        let mut encoder = self.device.create_command_encoder(&Default::default());
+        let mut encoder = self.encoder();
         {
             let load = wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store };
             let attachments: Vec<Option<wgpu::RenderPassColorAttachment>> = color_views.iter().map(|v| v.as_ref().map(|view| wgpu::RenderPassColorAttachment { view, depth_slice: None, resolve_target: None, ops: load })).collect();
@@ -379,7 +379,7 @@ impl Surfaces {
                 None => pass.draw(d.first..d.first + d.count, 0..1),
             }
         }
-        self.queue.submit([encoder.finish()]);
+        self.record(encoder);
         for (s, _) in colors.iter().flatten() {
             self.touched.insert((s.addr, s.format));
         }

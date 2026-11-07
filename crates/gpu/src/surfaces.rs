@@ -124,6 +124,8 @@ pub struct Surfaces {
     pub skipped: BTreeMap<String, u64>,
     /// wgpu validation errors (the first ones), which the HLE takes as anomalies.
     pub errors: Arc<Mutex<Vec<String>>>,
+    /// The work recorded since the last [`Surfaces::flush`], in order.
+    pending: Option<wgpu::CommandEncoder>,
 }
 
 use std::sync::{Arc, Mutex};
@@ -196,7 +198,26 @@ impl Surfaces {
             }],
         });
         let fill = (fill_module, fill_layout, Default::default());
-        Ok(Surfaces { adapter, device, queue, map: BTreeMap::new(), touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors })
+        Ok(Surfaces { adapter, device, queue, map: BTreeMap::new(), touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pending: None })
+    }
+
+    /// The encoder that collects a frame's passes: one submit per frame
+    /// instead of one per operation. Give it back with [`Surfaces::record`].
+    pub(crate) fn encoder(&mut self) -> wgpu::CommandEncoder {
+        self.pending.take().unwrap_or_else(|| self.device.create_command_encoder(&Default::default()))
+    }
+
+    pub(crate) fn record(&mut self, encoder: wgpu::CommandEncoder) {
+        self.pending = Some(encoder);
+    }
+
+    /// Submits the work recorded so far (at each present, and before any
+    /// readback). Uploads (`write_texture`) only ever go to new textures,
+    /// which nothing recorded before can use, so they need no flush.
+    pub fn flush(&mut self) {
+        if let Some(e) = self.pending.take() {
+            self.queue.submit([e.finish()]);
+        }
     }
 
     /// Whether this device can render to `format` (and read it back).
@@ -256,7 +277,6 @@ impl Surfaces {
         if c.layer != 0 {
             return self.skip("clear of a layer other than 0");
         }
-        let mut encoder = self.device.create_command_encoder(&Default::default());
         if let Some((s, value, mask)) = &c.color {
             match color_format(s.format) {
                 None => self.skip("color clear: unsupported format"),
@@ -269,6 +289,7 @@ impl Surfaces {
                 Some(format) => {
                     let view = self.texture(s, format);
                     let [r, g, b, a] = value.map(|v| f64::from(f32::from_bits(v)));
+                    let mut encoder = self.encoder();
                     encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("clear"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -279,6 +300,7 @@ impl Surfaces {
                         })],
                         ..Default::default()
                     });
+                    self.record(encoder);
                     self.touched.insert((s.addr, s.format));
                 }
             }
@@ -295,15 +317,16 @@ impl Surfaces {
                     let view = self.texture(s, format);
                     let depth_ops = Some(wgpu::Operations { load: z.map_or(wgpu::LoadOp::Load, |z| wgpu::LoadOp::Clear(f32::from_bits(z))), store: wgpu::StoreOp::Store });
                     let stencil_ops = format.has_stencil_aspect().then(|| wgpu::Operations { load: stencil.map_or(wgpu::LoadOp::Load, |v| wgpu::LoadOp::Clear(u32::from(v))), store: wgpu::StoreOp::Store });
+                    let mut encoder = self.encoder();
                     encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("clear"),
                         depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &view, depth_ops, stencil_ops }),
                         ..Default::default()
                     });
+                    self.record(encoder);
                 }
             }
         }
-        self.queue.submit([encoder.finish()]);
     }
 
     /// Fills `rect` (all of the target when None) of a target: a color
@@ -348,7 +371,7 @@ impl Surfaces {
         let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &self.fill.1, entries: &[wgpu::BindGroupEntry { binding: 0, resource: buffer.as_entire_binding() }] });
         let view = self.texture(s, format);
         let load = wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store };
-        let mut encoder = self.device.create_command_encoder(&Default::default());
+        let mut encoder = self.encoder();
         {
             let color_attachment = [Some(wgpu::RenderPassColorAttachment { view: &view, depth_slice: None, resolve_target: None, ops: load })];
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -367,13 +390,14 @@ impl Surfaces {
             pass.set_stencil_reference(u32::from(stencil));
             pass.draw(0..3, 0..1);
         }
-        self.queue.submit([encoder.finish()]);
+        self.record(encoder);
     }
 
     /// Writes every color target touched since the last call as
     /// `{prefix}-{address}-{format}-{w}x{h}.png` in `dir`; returns how many.
     pub fn dump(&mut self, dir: &Path, prefix: &str) -> Result<usize, String> {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        self.flush();
         let keys = std::mem::take(&mut self.touched);
         for key in &keys {
             let e = &self.map[key];
@@ -461,6 +485,7 @@ mod tests {
             let target = Surface { addr: 0x81_0000_2000, width: 4, height: 2, format, layers: 1 };
             s.clear(&Clear { layer: 0, color: Some((target, [half, 0, half, 0], 0xf)), depth: None, scissor: None });
             assert!(s.skipped.is_empty(), "format {format:#x}: {:?}", s.skipped);
+            s.flush();
             let rgba = s.rgba(&s.map[&(target.addr, target.format)]).unwrap();
             assert_eq!(rgba.len(), 4 * 2 * 4);
             assert!(rgba.chunks(4).all(|p| p[0].abs_diff(128) <= 1 && p[1] == 0 && p[2].abs_diff(128) <= 1 && p[3] == 255), "format {format:#x}: {rgba:?}");
@@ -481,6 +506,7 @@ mod tests {
         // Red only (mask R), on the left half.
         s.clear(&Clear { layer: 0, color: Some((target, [one, half, 0, one], 0x1)), depth: None, scissor: Some([0, 0, 2, 2]) });
         assert!(s.skipped.is_empty(), "{:?}", s.skipped);
+        s.flush();
         let rgba = s.rgba(&s.map[&(target.addr, target.format)]).unwrap();
         for (i, p) in rgba.chunks(4).enumerate() {
             let left = i % 4 < 2;

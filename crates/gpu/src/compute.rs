@@ -247,14 +247,14 @@ impl Surfaces {
             entries.push(wgpu::BindGroupEntry { binding: shader::BUFFER_BINDING + i as u32, resource: buffer.as_entire_binding() });
         }
         let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &layout, entries: &entries });
-        let mut encoder = self.device.create_command_encoder(&Default::default());
+        let mut encoder = self.encoder();
         {
             let mut pass = encoder.begin_compute_pass(&Default::default());
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &group, &[]);
             pass.dispatch_workgroups(l.grid[0], l.grid[1], l.grid[2]);
         }
-        self.queue.submit([encoder.finish()]);
+        self.record(encoder);
         Ok(())
     }
 
@@ -355,6 +355,7 @@ mod tests {
         let pools = Pools { headers: resources::header_pool(&reg), samplers: resources::sampler_pool(&reg), sampler_binding: resources::sampler_binding(&reg) };
         let launch = Launch { program: PROGRAM, grid: [1, 1, 1], block: [32, 1, 1], shared, cbufs: vec![(0, CBUF, 0x10000)] };
         s.dispatch(&launch, pools, &mut mem).unwrap_or_else(|e| panic!("{e}"));
+        s.flush();
         let image = &s.cache.images[&IMAGE];
         let size = u64::from(512 * rows);
         let buffer = s.device.create_buffer(&wgpu::BufferDescriptor { label: None, size, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
