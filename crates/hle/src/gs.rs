@@ -27,6 +27,10 @@ pub struct State {
     pub syncpts: [u32; 32],
     /// syncpt 22: the event of each wait index.
     pub syncpt_waits: Vec<Option<usize>>,
+    /// vi2 31: the native event of each index, which the change bindings signal.
+    pub vi2_events: std::collections::BTreeMap<u32, usize>,
+    /// vi2 229: the area the game says it drew, (height - 1) << 16 | (width - 1).
+    pub drawn_area: u32,
     /// Handles handed out: GPU address spaces (gpu 33), GPU memories (gpu 101),
     /// native memories (gsv 111, their sizes) and window images (gsv 429).
     pub spaces: u32,
@@ -276,8 +280,24 @@ impl Gs {
             // timestamp recorders (5, at most 7).
             (Gs::Vi2, 1 | 3) => Reply::with(&1u32.to_le_bytes()),
             (Gs::Vi2, 5) => Reply::with(&7u32.to_le_bytes()),
-            // The notification hub (11) and the native events (31): never signaled.
-            (Gs::Vi2, 11 | 31) => Reply { move_handles: vec![k.lone_event()?], ..Reply::ok() },
+            // The notification hub (11): never signaled. A native event (31), kept by its
+            // index for the change bindings below.
+            (Gs::Vi2, 11) => Reply { move_handles: vec![k.lone_event()?], ..Reply::ok() },
+            (Gs::Vi2, 31) => {
+                let n = req.u32_at(0).unwrap_or(0);
+                let (r, e) = k.numbered_event()?;
+                k.gs.vi2_events.insert(n, e);
+                Reply { move_handles: vec![r], ..Reply::ok() }
+            }
+            // Change bindings (refresh rate, dynamic range, paper white, maximum resolution,
+            // mode capability): the bound native event (index at +8) is signaled once, as a
+            // console does when it binds, so the game queries the current values.
+            (Gs::Vi2, 263 | 265 | 267 | 269 | 271) => {
+                if let Some(&e) = req.u32_at(8).and_then(|n| k.gs.vi2_events.get(&n)) {
+                    k.signal_event(e);
+                }
+                Reply::ok()
+            }
             // Signaled notification ids (21): none.
             (Gs::Vi2, 21) => {
                 if let Some(b) = req.out_buffer(0) {
@@ -286,12 +306,13 @@ impl Gs {
                 Reply::ok()
             }
             // Display, layer and event bindings, recorders, checkpoints.
-            (Gs::Vi2, 13 | 51 | 101 | 111 | 201 | 251 | 263 | 265 | 267 | 269 | 351) => Reply::ok(),
-            // Refresh rate: 60 Hz (1); dynamic range: SDR (1) and a u16; paper white (nits);
-            // maximum buffer resolution: 1080p (2).
-            (Gs::Vi2, 103) => Reply::with(&1i64.to_le_bytes()),
-            (Gs::Vi2, 104) => Reply::with(&[&1u64.to_le_bytes()[..], &[0, 0]].concat()),
-            (Gs::Vi2, 105) => Reply::with(&100u16.to_le_bytes()),
+            (Gs::Vi2, 13 | 51 | 101 | 111 | 201 | 251 | 351) => Reply::ok(),
+            // Refresh rate: 60 Hz ({60, 0}: the SDK accepts -1, 60 or 120); dynamic range:
+            // SDR (1) and a 400-nit peak; paper white 203 nits; maximum buffer
+            // resolution: 1080p (2). Values as a reference emulator answers them.
+            (Gs::Vi2, 103) => Reply::with(&[60u32.to_le_bytes(), 0u32.to_le_bytes()].concat()),
+            (Gs::Vi2, 104) => Reply::with(&[&1u64.to_le_bytes()[..], &400u16.to_le_bytes()].concat()),
+            (Gs::Vi2, 105) => Reply::with(&203u16.to_le_bytes()),
             (Gs::Vi2, 106) => Reply::with(&2u64.to_le_bytes()),
             // Free slots of a layer.
             (Gs::Vi2, 212) => Reply::with(&FREE_SLOTS.to_le_bytes()),
@@ -377,6 +398,12 @@ impl Kernel {
             let (fence_id, fence) = (req.u32_at(0x50).unwrap_or(0), req.u64_at(0x58).unwrap_or(0));
             let interval = req.u32_at(0x10 + 0x18).unwrap_or(0) >> 16;
             self.log(&format!("vi2: present #{n} layer {layer:#x} image {image} acquire fence ({fence_id}, {fence}) interval {interval}"));
+        }
+        // The drawn area (present word 7): logged when it changes.
+        let area = req.u32_at(0x14).unwrap_or(0);
+        if area != self.gs.drawn_area {
+            self.gs.drawn_area = area;
+            self.log(&format!("vi2: present #{n}: drawn area {}x{}", (area & 0xffff) + 1, (area >> 16) + 1));
         }
         // GPU work that waited for the CPU's semaphores runs before the frame is shown.
         crate::nvdrv::poll(self);
