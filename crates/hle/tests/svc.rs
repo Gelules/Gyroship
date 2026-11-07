@@ -172,17 +172,16 @@ fn stop_child() {
     };
 }
 
-/// Strict mode lets the tolerated anomaly pass; exploration counts every
-/// one; the summary names them apart from the activity.
+/// Exploration counts every anomaly; the summary names them apart from the
+/// activity. (Strict mode stops: `stops_are_logged`.)
 #[test]
 fn anomalies_are_counted_and_summarized() {
-    let (mut k, _) = kernel(Config::default());
-    k.anomaly("gpu release at 0", "method 0x1b0c releases 1 at 0x0");
+    let (mut k, _) = kernel(Config { explore: true, ..Config::default() });
+    assert_eq!(k.summary(), "summary: 0 presents; activity: ; anomalies: none");
+    k.anomaly("gpu release at 0", "method 0x1b0c releases 2 at 0x0");
     k.count("draws");
     k.count("draws");
     assert_eq!(k.summary(), "summary: 0 presents; activity: draws 2; anomalies: gpu release at 0 1");
-    let (mut k, _) = kernel(Config { explore: true, ..Config::default() });
-    assert_eq!(k.summary(), "summary: 0 presents; activity: ; anomalies: none");
     for _ in 0..6 {
         k.anomaly("gpu watchdog", "w");
     }

@@ -236,6 +236,7 @@ impl Gs {
                     && (threshold.wrapping_sub(*s) as i32) > 0
                 {
                     *s = threshold;
+                    k.count("syncpoint waits raised");
                 }
                 k.signal_wait(n);
                 Reply::ok()
@@ -415,6 +416,13 @@ impl Kernel {
         }
         // GPU work that waited for the CPU's semaphores runs before the frame is shown.
         crate::nvdrv::poll(self);
+        // The frame's acquire fence (syncpoint id inverted, value) must be reached by now.
+        let (fence_id, fence) = (req.u32_at(0x50).unwrap_or(0), req.u64_at(0x58).unwrap_or(0) as u32);
+        if let Some(&now) = self.gs.syncpts.get(!fence_id as usize)
+            && (fence.wrapping_sub(now) as i32) > 0
+        {
+            self.anomaly("present fence not reached", &format!("present #{n}: syncpoint {} at {now}, fence {fence}", !fence_id));
+        }
         // The host GPU's refusals since the last present.
         // ponytail: checked once per frame; per operation if a stop needs the guest stack.
         if let Some(s) = self.surfaces.as_mut() {

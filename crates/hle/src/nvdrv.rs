@@ -496,7 +496,14 @@ impl Gpu {
                         bytes.extend((k.now() * 32).to_le_bytes());
                     }
                     let what = format!("method {:#x} releases {} at {:#x} (cpu {at:#x}){}", r.method, r.value, r.addr, if r.timestamp { " with timestamp" } else { "" });
-                    if k.mem.write_object(at, &bytes).is_err() {
+                    // NVN releases 1 at GPU address 0 after each of its sync objects: that
+                    // increments the channel's syncpoint, whose value vi2's present fences
+                    // name (syncpoint !0xfffffffe = 1, value = the count of such releases).
+                    if r.addr == 0 && r.value == 1 && !r.timestamp {
+                        let s = &mut k.gs.syncpts[CHANNEL_SYNCPT as usize];
+                        *s = s.wrapping_add(1);
+                        k.count("syncpoint increments");
+                    } else if k.mem.write_object(at, &bytes).is_err() {
                         k.anomaly(if r.addr == 0 { "gpu release at 0" } else { "gpu release not writable" }, &what);
                     } else if k.journal.few("gpu release", 8) {
                         k.log(&format!("gpu: {what}"));

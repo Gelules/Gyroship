@@ -173,9 +173,7 @@ pub struct Kernel {
 pub const STOP_EXIT: i32 = 0x48;
 
 /// Anomalies strict mode lets pass for now, each until a known fix (D32).
-// ponytail: one entry; NVN's releases at GPU address 0 are syncpoint
-// increments we do not perform yet (M4 plan, step 4).
-const TOLERATED: &[&str] = &["gpu release at 0"];
+const TOLERATED: &[&str] = &[];
 
 impl Kernel {
     pub fn new(mem: Memory, mut journal: Journal, config: Config) -> Kernel {
