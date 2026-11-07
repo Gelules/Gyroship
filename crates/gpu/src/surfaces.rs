@@ -128,6 +128,8 @@ pub struct Surfaces {
     pending: Option<wgpu::CommandEncoder>,
     /// This frame's vertex, index and constant data: one buffer, written at flush.
     arena: (wgpu::Buffer, Vec<u8>),
+    /// The color target written last (the presented image at a present).
+    last_color: Option<(u64, u32)>,
 }
 
 /// Offsets in the upload arena: the uniform binding alignment wgpu allows at most.
@@ -233,7 +235,7 @@ impl Surfaces {
         });
         let fill = (fill_module, fill_layout, Default::default());
         let arena = (arena_buffer(&device, 16 << 20), Vec::new());
-        Ok(Surfaces { adapter, device, queue, map: BTreeMap::new(), touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pending: None, arena })
+        Ok(Surfaces { adapter, device, queue, map: BTreeMap::new(), touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pending: None, arena, last_color: None })
     }
 
     /// The encoder that collects a frame's passes: one submit per frame
@@ -279,6 +281,46 @@ impl Surfaces {
         data.extend_from_slice(bytes);
         data.resize(at + size, 0);
         (self.arena.0.clone(), at as u64, size as u64)
+    }
+
+    /// A color target was written.
+    pub(crate) fn wrote(&mut self, key: (u64, u32)) {
+        self.touched.insert(key);
+        self.last_color = Some(key);
+    }
+
+    /// A 64-bit FNV-1a hash of the image a present shows: the color target
+    /// written last, its top-left `width` × `height` texels, raw bytes. None
+    /// if nothing was written or the target is smaller.
+    pub fn presented_hash(&mut self, width: u32, height: u32) -> Option<(u64, u64)> {
+        self.flush();
+        let e = self.map.get(&self.last_color?)?;
+        if width == 0 || height == 0 || width > e.surface.width || height > e.surface.height {
+            return None;
+        }
+        let bpp = e.texture.format().block_copy_size(None)?;
+        let row = width * bpp;
+        let padded = row.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("hash"), size: u64::from(padded * height), usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        encoder.copy_texture_to_buffer(
+            e.texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo { buffer: &buffer, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(padded), rows_per_image: Some(height) } },
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        );
+        self.queue.submit([encoder.finish()]);
+        let slice = buffer.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| ());
+        self.device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
+        let mapped = slice.get_mapped_range().ok()?;
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for y in 0..height {
+            let start = (y * padded) as usize;
+            for &b in &mapped[start..start + row as usize] {
+                h = (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
+            }
+        }
+        Some((e.surface.addr, h))
     }
 
     /// The GPU and backend in use, for the journal.
@@ -351,7 +393,7 @@ impl Surfaces {
                 Some(format) if *mask != 0xf || !covers(s) => {
                     let color = value.map(f32::from_bits);
                     self.fill(s, format, Fill::Color { mask: *mask }, c.scissor, color, 0.0, 0);
-                    self.touched.insert((s.addr, s.format));
+                    self.wrote((s.addr, s.format));
                 }
                 Some(format) => {
                     let view = self.texture(s, format);
@@ -368,7 +410,7 @@ impl Surfaces {
                         ..Default::default()
                     });
                     self.record(encoder);
-                    self.touched.insert((s.addr, s.format));
+                    self.wrote((s.addr, s.format));
                 }
             }
         }

@@ -436,6 +436,18 @@ impl Kernel {
                 self.anomaly("wgpu error", &format!("frame {n}: {e}"));
             }
         }
+        // The presented image's hash, over the drawn area but its last row: the game's
+        // upscaler races on that row (two threads write it; M3 report, §6.1).
+        if self.config.hashes.is_some()
+            && let Some(s) = self.surfaces.as_mut()
+        {
+            let (w, h) = ((self.gs.drawn_area & 0xffff) + 1, (self.gs.drawn_area >> 16) + 1);
+            let line = match s.presented_hash(w, h.saturating_sub(1)) {
+                Some((target, hash)) => format!("{n},{target:#x},{hash:016x}"),
+                None => format!("{n},,"),
+            };
+            self.frame_hashes.push(line);
+        }
         // The render targets this frame touched, as PNG files (game output: never committed).
         let every = self.config.dump_every;
         if let (Some(dir), Some(s)) = (self.config.frames_dump.clone(), self.surfaces.as_mut())

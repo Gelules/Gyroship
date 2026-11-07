@@ -240,6 +240,7 @@ pub fn main(table: Vec<rt::Entry>) {
         }),
         profile: value("--profile").map(|f| (f.into(), value("--profile-from").and_then(|n| n.parse().ok()).unwrap_or(600))),
         perf: value("--perf").map(Into::into),
+        hashes: value("--hashes").map(Into::into),
         ..Config::default()
     };
     let installed = table.len();
@@ -251,7 +252,7 @@ pub fn main(table: Vec<rt::Entry>) {
     });
     k.log(&format!("{installed} recompiled functions installed"));
     // The host GPU runs the game's work when frames are dumped or measured, or with --gpu.
-    if k.config.frames_dump.is_some() || k.config.perf.is_some() || flag("--gpu") {
+    if k.config.frames_dump.is_some() || k.config.perf.is_some() || k.config.hashes.is_some() || flag("--gpu") {
         let backend = match value("--backend").as_deref() {
             None | Some("auto") => gyroship_gpu::Backend::Auto,
             Some("vulkan") => gyroship_gpu::Backend::Vulkan,

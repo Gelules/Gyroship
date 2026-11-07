@@ -113,11 +113,13 @@ pub struct Config {
     pub profile: Option<(std::path::PathBuf, u64)>,
     /// `--perf FILE`: each present's host wall time, as CSV (never journaled).
     pub perf: Option<std::path::PathBuf>,
+    /// `--hashes FILE`: a hash of each presented image, as CSV (never journaled).
+    pub hashes: Option<std::path::PathBuf>,
 }
 
 impl Default for Config {
     fn default() -> Config {
-        Config { seed: 0x5EED, explore: false, non_system_memory: 0x2_6410_0000, time_limit: None, frames: None, save_dir: None, vsync: true, gpfifo_dump: None, frames_dump: None, dump_every: 1, dump_draws: None, shaders_dump: None, replay: None, profile: None, perf: None }
+        Config { seed: 0x5EED, explore: false, non_system_memory: 0x2_6410_0000, time_limit: None, frames: None, save_dir: None, vsync: true, gpfifo_dump: None, frames_dump: None, dump_every: 1, dump_draws: None, shaders_dump: None, replay: None, profile: None, perf: None, hashes: None }
     }
 }
 
@@ -166,6 +168,8 @@ pub struct Kernel {
     pub counts: std::collections::BTreeMap<&'static str, u64>,
     /// Named anomalies seen (D32), for the summary line.
     pub anomalies: std::collections::BTreeMap<&'static str, u64>,
+    /// `--hashes`: one CSV line per present.
+    pub frame_hashes: Vec<String>,
 }
 
 /// Exit code of a run the HLE stops (an unknown or forbidden SVC, a guest
@@ -179,7 +183,7 @@ impl Kernel {
     pub fn new(mem: Memory, mut journal: Journal, config: Config) -> Kernel {
         let mode = if config.explore { "exploration (not a validation run)" } else { "strict" };
         journal.line(0, 0, &format!("gyroship hle: mode {mode}, seed {:#x}, non-system memory {:#x}", config.seed, config.non_system_memory));
-        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None, sessions: Vec::new(), objects: Vec::new(), domains: Vec::new(), allowed_services: Vec::new(), shared: Vec::new(), transfers: Vec::new(), time_shared: None, frame: (0, 0, 0), symbols: Vec::new(), romfs: None, gs: gs::State::default(), hid_shared: None, input: Default::default(), spin: Vec::new(), saves: Default::default(), timers: Vec::new(), surfaces: None, gpu: Default::default(), counts: Default::default(), anomalies: Default::default() }
+        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None, sessions: Vec::new(), objects: Vec::new(), domains: Vec::new(), allowed_services: Vec::new(), shared: Vec::new(), transfers: Vec::new(), time_shared: None, frame: (0, 0, 0), symbols: Vec::new(), romfs: None, gs: gs::State::default(), hid_shared: None, input: Default::default(), spin: Vec::new(), saves: Default::default(), timers: Vec::new(), surfaces: None, gpu: Default::default(), counts: Default::default(), anomalies: Default::default(), frame_hashes: Vec::new() }
     }
 
     /// Counts one more `name` (normal activity); returns the new count.
@@ -206,7 +210,8 @@ impl Kernel {
     pub fn summary(&self) -> String {
         let list = |m: &std::collections::BTreeMap<&str, u64>| m.iter().map(|(n, c)| format!("{n} {c}")).collect::<Vec<_>>().join(", ");
         let anomalies = if self.anomalies.is_empty() { "none".to_string() } else { list(&self.anomalies) };
-        format!("summary: {} presents; activity: {}; anomalies: {anomalies}", self.gs.presents, list(&self.counts))
+        let host = self.surfaces.as_ref().map_or(String::new(), |s| format!("; host: {}", s.cache_sizes()));
+        format!("summary: {} presents; activity: {}; anomalies: {anomalies}{host}", self.gs.presents, list(&self.counts))
     }
 
     /// Logs a line for the running thread (0 when none runs).
@@ -255,6 +260,12 @@ impl Kernel {
         gyroship_runtime::profile::finish(&|a| self.symbolize(a));
         if let Some(path) = &self.config.perf {
             gyroship_runtime::profile::write_perf(path, self.config.profile.as_ref().map_or(600, |p| p.1 as usize));
+        }
+        if let Some(path) = &self.config.hashes {
+            let csv = std::iter::once("present,target,hash".to_string()).chain(self.frame_hashes.iter().cloned()).collect::<Vec<_>>().join("\n") + "\n";
+            if let Err(e) = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::write(path, csv)) {
+                eprintln!("gyroship: --hashes {}: {e}", path.display());
+            }
         }
     }
 

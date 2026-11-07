@@ -122,6 +122,22 @@ impl Bindings {
 }
 
 impl Surfaces {
+    /// What the host keeps, by kind, for the summary line (growth shows a leak).
+    pub fn cache_sizes(&self) -> String {
+        let c = &self.cache;
+        format!(
+            "targets {}, textures {}, samplers {}, programs {}, modules {}, pipelines {}, compute pipelines {}, images {}",
+            self.map.len(),
+            c.textures.len(),
+            c.samplers.len(),
+            c.code.len(),
+            c.modules.len(),
+            c.pipelines.len(),
+            c.compute_pipelines.len(),
+            c.images.len()
+        )
+    }
+
     /// Runs a draw; one that cannot be done is counted in `skipped` by
     /// reason, and the reason returned.
     pub fn draw(&mut self, d: &Draw, mem: Mem) -> Result<(), String> {
@@ -376,7 +392,7 @@ impl Surfaces {
         }
         self.record(encoder);
         for (s, _) in colors.iter().flatten() {
-            self.touched.insert((s.addr, s.format));
+            self.wrote((s.addr, s.format));
         }
         Ok(())
     }
