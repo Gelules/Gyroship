@@ -25,6 +25,7 @@
 //! Anything not supported is an error naming the instruction, never a guess.
 
 pub mod sph;
+pub mod uexpr;
 
 use crate::sass::control::ControlOp;
 use crate::sass::fp16::Fp16Op;
@@ -33,9 +34,10 @@ use crate::sass::int::{self, IntOp};
 use crate::sass::memory::{InterpFreq, InterpLoc, LdcMode, MemType, MemoryOp};
 use crate::sass::moves::{self, MovesOp};
 use crate::sass::operand::{Operand, PT, Pred, RZ, Src, URZ};
-use crate::sass::texture::{LodMode, TexDim, TexHandle, TextureOp};
+use crate::sass::texture::{LodMode, TexDim, TexHandle, TexQuery, TextureOp};
 use crate::sass::{self, Op, SPH_SIZE, Stage, Word};
 use sph::{Interp, Sph};
+use uexpr::UExpr;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
@@ -62,9 +64,11 @@ pub struct Interface {
     pub cbufs: BTreeSet<u8>,
     /// Texture slots, in binding order.
     pub textures: Vec<Texture>,
+    /// The swizzle codes are read (at `SWIZZLE_BINDING`).
+    pub swizzles: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Texture {
     pub handle: Handle,
     pub dim: TexDim,
@@ -76,9 +80,12 @@ pub struct Texture {
 
 /// Where a texture instruction's 32-bit handle comes from (texture index in
 /// the low 20 bits, sampler index in the high 12).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Handle {
     CBuf { bank: u8, offset: u16 },
+    /// A uniform register whose value the uniform datapath computed from
+    /// constant-bank words (a texture handle or'ed with a sampler handle).
+    Uniform(UExpr),
     /// A uniform register (loaded from a constant bank by ULDC in practice).
     UReg(u8),
     /// A register: known only when the shader runs.
@@ -164,11 +171,17 @@ struct Cx {
     decls: String,
     helpers: BTreeSet<&'static str>,
     temps: u32,
+    /// Uniform registers whose value is known from constant-bank words, as
+    /// of the instruction being translated.
+    // ponytail: tracked in program order, which is the execution order for
+    // the handle computations seen (they come first); branchy ones would
+    // need the flow graph.
+    uexpr: BTreeMap<u8, UExpr>,
 }
 
 impl Cx {
     fn new(sph: Sph) -> Cx {
-        Cx { sph, regs: BTreeSet::new(), preds: BTreeSet::new(), uregs: BTreeSet::new(), upreds: BTreeSet::new(), iface: Interface::default(), decls: String::new(), helpers: BTreeSet::new(), temps: 0 }
+        Cx { sph, regs: BTreeSet::new(), preds: BTreeSet::new(), uregs: BTreeSet::new(), upreds: BTreeSet::new(), iface: Interface::default(), decls: String::new(), helpers: BTreeSet::new(), temps: 0, uexpr: BTreeMap::new() }
     }
 
     fn group(&self) -> u32 {
@@ -276,7 +289,33 @@ impl Cx {
         }
     }
 
+    /// A uniform operand's value, if known from constant-bank words.
+    fn uval(&self, o: &Operand) -> Option<UExpr> {
+        if o.neg || o.abs {
+            return None;
+        }
+        Some(match o.src {
+            Src::Imm(v) => UExpr::Imm(v),
+            Src::UReg(URZ) => UExpr::Imm(0),
+            Src::UReg(n) => self.uexpr.get(&n)?.clone(),
+            Src::CBuf { bank, offset } => UExpr::CBuf(bank, offset),
+            _ => return None,
+        })
+    }
+
+    fn uvals(&self, o: [&Operand; 3]) -> Option<[UExpr; 3]> {
+        Some([self.uval(o[0])?, self.uval(o[1])?, self.uval(o[2])?])
+    }
+
+    /// Records a uniform register's value after its write.
+    fn known(&mut self, d: u8, e: Option<UExpr>) {
+        if let (Some(e), true) = (e, d != URZ) {
+            self.uexpr.insert(d, e);
+        }
+    }
+
     fn set_ur(&mut self, out: &mut String, d: u8, e: &str) {
+        self.uexpr.remove(&d);
         if d != URZ {
             let r = self.ur(d);
             let _ = writeln!(out, "{r} = {e};");
@@ -455,6 +494,9 @@ impl Cx {
             let _ = writeln!(m, "@group({g}) @binding({b}) var<uniform> cb{b}: array<vec4<u32>, 4096>;");
         }
         m.push_str(&self.decls);
+        if self.iface.swizzles {
+            let _ = writeln!(m, "@group({g}) @binding({SWIZZLE_BINDING}) var<uniform> swizzles: array<vec4<u32>, {}>;", self.iface.textures.len().div_ceil(4));
+        }
         let mut locals = String::new();
         for r in &self.regs {
             let _ = writeln!(locals, "var r{r}: u32;");
@@ -491,7 +533,7 @@ impl Cx {
             vout.push_str("};\n");
             let _ = write!(m, "{vin}{vout}\n@vertex\nfn main(i: VsIn) -> VsOut {{\n{init}{locals}{body}}}\n");
         } else {
-            let mut pin = String::from("struct PsIn {\n@builtin(position) frag: vec4<f32>,\n");
+            let mut pin = String::from("struct PsIn {\n@builtin(position) frag: vec4<f32>,\n@builtin(front_facing) front: bool,\n");
             for (v, comps) in self.sph.interpolation().into_iter().enumerate() {
                 if let Some(mode) = comps.into_iter().find(|c| *c != Interp::Unused) {
                     self.iface.varyings.insert(v as u8, mode);
@@ -558,6 +600,24 @@ impl Cx {
 
     fn fp32(&mut self, out: &mut String, op: &Fp32Op) -> R<()> {
         match op {
+            // FSWZADD: per quad lane (2y + x, from the pixel's position), add (a + b),
+            // sub (a - b) or subr (b - a), as NAK lowers derivatives: a = the
+            // neighbour's value (SHFL.BFLY), b = this lane's.
+            Fp32Op::Fswzadd { dst, a, b, ops, .. } if self.sph.stage == Stage::Pixel => {
+                let (x, y) = (format!("f({})", self.r(*a)), format!("f({})", self.r(*b)));
+                let e: Vec<String> = ops
+                    .iter()
+                    .map(|o| match o {
+                        fp32::SwzOp::Add => Ok(format!("({x} + {y})")),
+                        fp32::SwzOp::Sub => Ok(format!("({x} - {y})")),
+                        fp32::SwzOp::Subr => Ok(format!("({y} - {x})")),
+                        fp32::SwzOp::Mov2 => Err("FSWZADD mov2".to_string()),
+                    })
+                    .collect::<R<_>>()?;
+                let lane = self.temp();
+                let _ = writeln!(out, "let {lane} = (u32(i.frag.x) & 1u) | ((u32(i.frag.y) & 1u) << 1u);");
+                self.set(out, *dst, &format!("u(select(select({}, {}, {lane} == 1u), select({}, {}, {lane} == 3u), {lane} >= 2u))", e[0], e[1], e[2], e[3]));
+            }
             Fp32Op::Fadd { dst, a, b, sat, .. } => {
                 let e = Self::sat(format!("{} + {}", self.f(a)?, self.f(b)?), *sat);
                 self.set(out, *dst, &format!("u({e})"));
@@ -773,8 +833,10 @@ impl Cx {
                 self.set(out, *dst, &e);
             }
             MovesOp::UMov { dst, src } => {
+                let known = self.uval(src);
                 let e = self.raw(src)?;
                 self.set_ur(out, *dst, &e);
+                self.known(*dst, known);
             }
             MovesOp::Uldc { dst, src: Src::CBuf { bank, offset }, mem } => {
                 let offset = u32::from(*offset);
@@ -797,6 +859,9 @@ impl Cx {
                     for k in 0..words {
                         let e = self.cb(*bank, offset + 4 * k)?;
                         self.set_ur(out, dst + k as u8, &e);
+                        if let Ok(at) = u16::try_from(offset + 4 * k) {
+                            self.uexpr.insert(dst + k as u8, UExpr::CBuf(*bank, at));
+                        }
                     }
                 }
             }
@@ -815,9 +880,70 @@ impl Cx {
                     self.set_p(out, *d, &e);
                 }
             }
+            // As SHF, on the uniform datapath.
+            MovesOp::UShf { dst, low, shift, high, ty, wrap, right, hi } => {
+                self.helpers.insert(SHF);
+                let (l, s, h) = (self.raw(low)?, self.raw(shift)?, self.raw(high)?);
+                let (wide, signed) = match ty {
+                    moves::ShfType::S64 => (true, true),
+                    moves::ShfType::U64 => (true, false),
+                    moves::ShfType::S32 => (false, true),
+                    moves::ShfType::U32 => (false, false),
+                };
+                let limit = if wide { 63 } else { 31 };
+                let amount = if *wrap { format!("({s} & {limit}u)") } else { format!("min({s}, {}u)", limit + 1) };
+                let call = if *right { format!("shf_r({l}, {h}, {amount}, {signed})") } else { format!("shf_l({l}, {h}, {amount})") };
+                let known = self.uvals([low, shift, high]).map(|parts| UExpr::Shf { parts: Box::new(parts), limit, wrap: *wrap, right: *right, signed, hi: *hi });
+                self.set_ur(out, *dst, &format!("{call}.{}", if *hi { "y" } else { "x" }));
+                self.known(*dst, known);
+            }
+            // R2P: predicate i takes bit i of the register, for the mask's bits.
+            MovesOp::R2p { src, mask } => {
+                let v = self.r(*src);
+                for i in 0..7u8 {
+                    if mask >> i & 1 != 0 {
+                        self.set_p(out, i, &format!("(({v} >> {i}u) & 1u) != 0u"));
+                    }
+                }
+            }
+            // As LOP3, on the uniform datapath.
+            MovesOp::ULop3 { dst, a, b, c, lut, pand, pdst, psrc } => {
+                let known = self.uvals([a, b, c]).map(|x| UExpr::Lop3(*lut, Box::new(x)));
+                let (x, y, z) = (self.raw(a)?, self.raw(b)?, self.raw(c)?);
+                let e = lop3(*lut, &x, &y, &z);
+                if *pdst == PT {
+                    self.set_ur(out, *dst, &e);
+                } else {
+                    let t = self.temp();
+                    let _ = writeln!(out, "let {t} = {e};");
+                    let p = self.up(*psrc);
+                    let pe = bool_op(if *pand { 0 } else { 1 }, &format!("({t} != 0u)"), &p);
+                    self.set_up(out, *pdst, &pe);
+                    self.set_ur(out, *dst, &t);
+                }
+                self.known(*dst, known);
+            }
+            // SHFL.BFLY: the value of lane (lane ^ n). In a quad segment
+            // (c = 0x1c03: segment mask 0x1c, last lane 3) these are the quad
+            // swaps (lanes 2y + x, as Vulkan's quads); over the whole warp
+            // (c = 0x1f), a subgroup shuffle.
+            MovesOp::Shfl { dst, src, lane: Src::Imm(n), c: Src::Imm(c), mode: moves::ShflMode::Bfly, in_bounds } => {
+                let v = self.r(*src);
+                let e = match (n, c) {
+                    (1, 0x1c03) => format!("quadSwapX({v})"),
+                    (2, 0x1c03) => format!("quadSwapY({v})"),
+                    (3, 0x1c03) => format!("quadSwapDiagonal({v})"),
+                    (n, 0x1f) => format!("subgroupShuffleXor({v}, {n}u)"),
+                    (n, c) => return Err(format!("SHFL.BFLY {n} with c {c:#x}")),
+                };
+                self.set(out, *dst, &e);
+                self.set_p(out, *in_bounds, "true");
+            }
             MovesOp::UIAdd3 { dst, a, b, c, x: false, overflow, .. } if overflow == &[PT, PT] => {
+                let known = self.uvals([a, b, c]).map(|x| UExpr::Add(Box::new(x)));
                 let (x, y, z) = (self.i(a, false)?, self.i(b, false)?, self.i(c, false)?);
                 self.set_ur(out, *dst, &format!("{x} + {y} + {z}"));
+                self.known(*dst, known);
             }
             MovesOp::UISetP { dst, a, b, cmp, set_op, signed, ex: false, accum, .. } => {
                 let (x, y) = (self.raw(a)?, self.raw(b)?);
@@ -850,6 +976,8 @@ impl Cx {
                             (m, f) => return Err(format!("IPA {f:?} of a {m:?} input")),
                         }
                     }
+                    // The front face (NAK_ATTR_FRONT_FACE): non-zero when front-facing.
+                    0x3fc => "select(0u, 0xffffffffu, i.front)".to_string(),
                     _ => return Err(format!("IPA of attribute {attr:#x}")),
                 };
                 self.set(out, *dst, &e);
@@ -883,6 +1011,9 @@ impl Cx {
                         }
                         // Point size: not a WGSL output.
                         0x6c => {}
+                        // ponytail: clip and cull distances (NAK_ATTR_CLIP_CULL_DIST_0..7) are
+                        // dropped; wgpu's CLIP_DISTANCES feature can carry them when a scene needs it.
+                        0x2c0..=0x2dc => {}
                         _ => return Err(format!("AST to attribute {a:#x}")),
                     }
                 }
@@ -925,10 +1056,53 @@ impl Cx {
         Ok(())
     }
 
+    /// A texture slot for an instruction's handle: its declaration, and its
+    /// sampler's unless it is fetched or queried.
+    fn texture_slot(&mut self, handle: TexHandle, dim: TexDim, ty: &str, compare: bool, fetch: bool) -> usize {
+        let slot = self.iface.textures.len();
+        let handle = match handle {
+            TexHandle::CBuf { bank, offset } => Handle::CBuf { bank, offset },
+            TexHandle::UReg { ureg, .. } => match self.uexpr.get(&ureg) {
+                Some(e) => Handle::Uniform(e.clone()),
+                None => Handle::UReg(ureg),
+            },
+            TexHandle::Bindless => Handle::Bindless,
+        };
+        self.iface.textures.push(Texture { handle, dim, compare, fetch });
+        let g = self.group();
+        let _ = writeln!(self.decls, "@group({g}) @binding({}) var tex{slot}: {ty};", 32 + 2 * slot);
+        if !fetch {
+            let _ = writeln!(self.decls, "@group({g}) @binding({}) var smp{slot}: {};", 33 + 2 * slot, if compare { "sampler_comparison" } else { "sampler" });
+        }
+        slot
+    }
+
+    /// The enabled components of `v` (a vec4 or, with `scalar`, one value), in
+    /// order, to dst, dst + 1, dst2, dst2 + 1.
+    fn tex_results(&mut self, out: &mut String, v: &str, scalar: bool, mask: u8, dst: u8, dst2: u8) -> R<()> {
+        let dsts = [Some(dst), Some(dst).filter(|d| *d != RZ).map(|d| d + 1), Some(dst2), Some(dst2).filter(|d| *d != RZ).map(|d| d + 1)];
+        let comps: Vec<usize> = (0..4).filter(|c| mask >> c & 1 != 0).collect();
+        for (k, c) in comps.iter().enumerate() {
+            let Some(Some(d)) = dsts.get(k) else { return Err("texture destination".into()) };
+            let value = if scalar { v.to_string() } else { format!("{v}[{c}]") };
+            self.set(out, *d, &value);
+        }
+        Ok(())
+    }
+
     fn texture(&mut self, out: &mut String, op: &TextureOp) -> R<()> {
         let (io, dim, fetch, lod, scr, aoffi, dc) = match op {
             TextureOp::Tex { io, dim, lod, scr, aoffi, dc, .. } => (io, *dim, false, *lod, *scr, *aoffi, *dc),
             TextureOp::Tld { io, dim, lod, scr, aoffi, ms: false } => (io, *dim, true, *lod, *scr, *aoffi, false),
+            TextureOp::Txd { io, dim, aoffi } => return self.txd(out, io, *dim, *aoffi),
+            // The size of a level (the texture is taken as 2D): width, height, 1, levels.
+            TextureOp::Txq { dst, dst2, handle, src, query: TexQuery::Dimension, mask, .. } => {
+                let slot = self.texture_slot(*handle, TexDim::D2, "texture_2d<f32>", false, true);
+                let level = self.raw(src)?;
+                let t = self.temp();
+                let _ = writeln!(out, "let {t} = vec4<u32>(textureDimensions(tex{slot}, {level}), 1u, textureNumLevels(tex{slot}));");
+                return self.tex_results(out, &t, false, *mask, *dst, *dst2);
+            }
             other => return Err(format!("unsupported: {other:?}")),
         };
         if io.fault != Pred::TRUE {
@@ -975,9 +1149,10 @@ impl Cx {
             b.push(Item::Dref);
         }
         if scr {
-            if !b.is_empty() {
-                return Err(".SCR texture with b sources".into());
-            }
+            // Up to four scalars, a's then b's, spread over the two vectors.
+            // ponytail: the split for sources beyond the coordinates (LOD,
+            // handle, reference) is the coordinates' rule extended, assumed.
+            a.append(&mut b);
             let keep = match a.len() {
                 4 | 3 => 2,
                 2 | 1 => 1,
@@ -1006,18 +1181,7 @@ impl Cx {
             }
         }
         let get = |item: Item| -> R<String> { regs.get(&key(item)).cloned().ok_or_else(|| "texture source missing".to_string()) };
-        let slot = self.iface.textures.len();
-        let handle = match io.handle {
-            TexHandle::CBuf { bank, offset } => Handle::CBuf { bank, offset },
-            TexHandle::UReg { ureg, .. } => Handle::UReg(ureg),
-            TexHandle::Bindless => Handle::Bindless,
-        };
-        self.iface.textures.push(Texture { handle, dim, compare: dc, fetch });
-        let g = self.group();
-        let _ = writeln!(self.decls, "@group({g}) @binding({}) var tex{slot}: {ty};", 32 + 2 * slot);
-        if !fetch {
-            let _ = writeln!(self.decls, "@group({g}) @binding({}) var smp{slot}: {};", 33 + 2 * slot, if dc { "sampler_comparison" } else { "sampler" });
-        }
+        let slot = self.texture_slot(io.handle, dim, ty, dc, fetch);
         let cs: Vec<String> = (0..coords).map(|c| get(Item::Coord(c))).collect::<R<_>>()?;
         let vec = |cast: &str, sc: &str| if coords == 1 { format!("{cast}({})", cs[0]) } else { format!("vec{coords}<{sc}>({})", cs.iter().map(|c| format!("{cast}({c})")).collect::<Vec<_>>().join(", ")) };
         let arr = if array { format!(", i32({})", get(Item::Array)?) } else { String::new() };
@@ -1039,10 +1203,22 @@ impl Cx {
                 return Err(format!("texel fetch of {dim:?}"));
             }
         } else {
+            let mut uv = vec("f", "f32");
             if aoffi {
-                return Err("texture sample with a register offset".into());
+                // ponytail: WGSL offsets are constants; the register's texel offset
+                // is added to the coordinates in level-0 texels instead (exact at
+                // level 0, approximate on smaller levels).
+                if matches!(dim, TexDim::Cube | TexDim::ArrayCube) {
+                    return Err("cube texture sample with an offset".into());
+                }
+                let off = get(Item::Offset)?;
+                let parts: Vec<String> = (0..coords).map(|c| format!("f32(extractBits(bitcast<i32>({off}), {}u, 4u))", 4 * c)).collect();
+                uv = if coords == 1 {
+                    format!("({uv} + {} / f32(textureDimensions(tex{slot}, 0)))", parts[0])
+                } else {
+                    format!("({uv} + vec{coords}<f32>({}) / vec{coords}<f32>(textureDimensions(tex{slot}, 0)))", parts.join(", "))
+                };
             }
-            let uv = vec("f", "f32");
             match (dc, lod) {
                 (false, LodMode::Auto) => format!("textureSample(tex{slot}, smp{slot}, {uv}{arr})"),
                 (false, LodMode::Zero) => format!("textureSampleLevel(tex{slot}, smp{slot}, {uv}{arr}, 0.0)"),
@@ -1054,16 +1230,53 @@ impl Cx {
             }
         };
         let t = self.temp();
-        let _ = writeln!(out, "let {t} = {call};");
-        // The enabled components, in order, go to dst, dst + 1, dst2, dst2 + 1.
-        let dsts = [Some(io.dst), Some(io.dst).filter(|d| *d != RZ).map(|d| d + 1), Some(io.dst2), Some(io.dst2).filter(|d| *d != RZ).map(|d| d + 1)];
-        let comps: Vec<usize> = (0..4).filter(|c| io.mask >> c & 1 != 0).collect();
-        for (k, c) in comps.iter().enumerate() {
-            let Some(Some(d)) = dsts.get(k) else { return Err("texture destination".into()) };
-            let value = if dc { format!("u({t})") } else { format!("u({t}[{c}])") };
-            self.set(out, *d, &value);
+        if dc {
+            let _ = writeln!(out, "let {t} = bitcast<u32>({call});");
+        } else {
+            let _ = writeln!(out, "let {t} = {};", self.swizzled(slot, &format!("bitcast<vec4<u32>>({call})")));
         }
-        Ok(())
+        self.tex_results(out, &t, dc, io.mask, io.dst, io.dst2)
+    }
+
+    /// A sampled or fetched value with its texture header's swizzle applied.
+    fn swizzled(&mut self, slot: usize, v: &str) -> String {
+        self.helpers.insert(SWZ);
+        self.iface.swizzles = true;
+        format!("swz({v}, swizzles[{}][{}])", slot / 4, slot % 4)
+    }
+
+    /// TXD: a = [bindless handle] coordinates [array index | offset << 16],
+    /// b = the derivatives interleaved (d/dx, d/dy per coordinate), as NAK
+    /// lowers it.
+    fn txd(&mut self, out: &mut String, io: &crate::sass::texture::TexIo, dim: TexDim, aoffi: bool) -> R<()> {
+        if io.fault != Pred::TRUE {
+            return Err("sparse texture access (fault predicate)".into());
+        }
+        let (coords, array, ty) = match dim {
+            TexDim::D2 => (2, false, "texture_2d<f32>"),
+            TexDim::Array2D => (2, true, "texture_2d_array<f32>"),
+            TexDim::D3 => (3, false, "texture_3d<f32>"),
+            TexDim::Cube => (3, false, "texture_cube<f32>"),
+            d => return Err(format!("TXD of {d:?}")),
+        };
+        if aoffi || io.handle == TexHandle::Bindless {
+            return Err("TXD with an offset or a bindless handle".into());
+        }
+        let (Src::Reg(ra), Src::Reg(rb)) = (io.a.src, io.b.src) else { return Err("TXD sources".into()) };
+        let slot = self.texture_slot(io.handle, dim, ty, false, false);
+        let reg = |cx: &mut Cx, base: u8, k: u8| if base == RZ { "0u".to_string() } else { cx.r(base + k) };
+        let vec = |cx: &mut Cx, base: u8, ks: &[u8]| {
+            let parts: Vec<String> = ks.iter().map(|&k| format!("f({})", reg(cx, base, k))).collect();
+            format!("vec{coords}<f32>({})", parts.join(", "))
+        };
+        let uv = vec(self, ra, &(0..coords).collect::<Vec<u8>>());
+        let arr = if array { format!(", i32({} & 0xffffu)", reg(self, ra, coords)) } else { String::new() };
+        let ddx = vec(self, rb, &(0..coords).map(|c| 2 * c).collect::<Vec<u8>>());
+        let ddy = vec(self, rb, &(0..coords).map(|c| 2 * c + 1).collect::<Vec<u8>>());
+        let t = self.temp();
+        let v = self.swizzled(slot, &format!("bitcast<vec4<u32>>(textureSampleGrad(tex{slot}, smp{slot}, {uv}{arr}, {ddx}, {ddy}))"));
+        let _ = writeln!(out, "let {t} = {v};");
+        self.tex_results(out, &t, false, io.mask, io.dst, io.dst2)
     }
 }
 
@@ -1171,6 +1384,22 @@ const PRMT: &str = "fn prmt(a: u32, s: u32, c: u32) -> u32 {
 }
 ";
 
+/// A texture header's component swizzle (`swizzle_code`: 3 bits per
+/// component, 0 zero, 2..5 R..A, 6 integer one, 7 float one) on a result.
+const SWZ: &str = "fn swz(v: vec4<u32>, s: u32) -> vec4<u32> {
+    var r = vec4<u32>(0u);
+    for (var c = 0u; c < 4u; c++) {
+        let k = (s >> (3u * c)) & 7u;
+        if (k >= 2u && k <= 5u) { r[c] = v[k - 2u]; } else if (k == 6u) { r[c] = 1u; } else if (k == 7u) { r[c] = 0x3f800000u; }
+    }
+    return r;
+}
+";
+
+/// The binding of the per-slot swizzle codes (`array<vec4<u32>, n>` for 4n
+/// slots, slot i at [i / 4][i % 4]), above every bank and texture binding.
+pub const SWIZZLE_BINDING: u32 = 999;
+
 const SHF: &str = "fn shf_r(lo: u32, hi: u32, s: u32, arith: bool) -> vec2<u32> {
     let fill = select(0u, select(0u, 0xffffffffu, bitcast<i32>(hi) < 0), arith);
     let h_s = select(hi >> (s & 31u), bitcast<u32>(bitcast<i32>(hi) >> (s & 31u)), arith);
@@ -1265,6 +1494,19 @@ mod tests {
         assert!(t.wgsl.contains("@location(0) @interpolate(linear) v0"), "{}", t.wgsl);
         assert!(t.wgsl.contains("@location(1) @interpolate(flat) v1"), "{}", t.wgsl);
         assert_eq!(t.interface.varyings, options.varyings);
+    }
+
+    #[test]
+    fn front_face_predicates_from_a_register_and_quad_swaps_translate_and_validate() {
+        // IPA R0 = front face; R2P P0, P1 = bits 0, 1 of R0; SHFL.BFLY R0 = R0 of lane ^ 1
+        // in its quad; EXIT (R0 to target 0).
+        let ipa = w(0x326, &[(16, 0), (64, 0x3fc / 4), (32, 255), (81, 7)]);
+        let r2p = w(0x804, &[(24, 0), (32, 3)]);
+        let shfl = w(0xf89, &[(16, 0), (24, 0), (53, 1), (40, 0x1c03), (58, 3), (81, 7)]);
+        let t = ok(&program(&[(0, 0x000c_5482), (18, 1)], &[ipa, r2p, shfl, exit()]));
+        for want in ["select(0u, 0xffffffffu, i.front)", "p1 = ((r0 >> 1u) & 1u) != 0u;", "r0 = quadSwapX(r0);"] {
+            assert!(t.wgsl.contains(want), "{want}\n{}", t.wgsl);
+        }
     }
 
     #[test]

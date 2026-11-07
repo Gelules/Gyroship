@@ -9,7 +9,11 @@
 //! method stream writes (constant-buffer loads, inline uploads) comes out
 //! in stream order.
 //!
-//! ponytail: copies (copy engine, 2D) are reported, not executed.
+//! The copy engine's pitch-to-pitch copies come out as effects, before the
+//! semaphore their LAUNCH_DMA may release.
+//!
+//! ponytail: block-linear and remapped copies, and the 2D class, are
+//! reported, not executed.
 
 use crate::mme::{self, Mme};
 use crate::state::raster::{self, RenderState};
@@ -41,6 +45,8 @@ pub enum Effect {
     Clear(Clear),
     /// DRAW_INDEX_BUFFER or DRAW_VERTEX_ARRAY.
     Draw(Box<Draw>),
+    /// A copy engine copy, pitch to pitch.
+    Copy(Copy),
     /// Bytes the 3D method stream writes to memory, before what follows reads it.
     Write(MemWrite),
     /// A 3D resource method whose effect is not applied.
@@ -73,6 +79,18 @@ pub struct Draw {
     pub headers: Pool,
     pub samplers: Pool,
     pub sampler_binding: SamplerBinding,
+}
+
+/// A pitch-to-pitch copy (clc7b5.h): `line_count` lines of `line_length`
+/// bytes, from `src` every `pitch_in` bytes to `dst` every `pitch_out`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Copy {
+    pub src: u64,
+    pub dst: u64,
+    pub pitch_in: u32,
+    pub pitch_out: u32,
+    pub line_length: u32,
+    pub line_count: u32,
 }
 
 /// A render target as the 3D class describes it.
@@ -124,6 +142,8 @@ const DMA_SEMAPHORE_A: u32 = 0x240;
 const DMA_SEMAPHORE_B: u32 = 0x244;
 const DMA_SEMAPHORE_PAYLOAD: u32 = 0x248;
 const DMA_LAUNCH: u32 = 0x300;
+const DMA_OFFSET_IN_UPPER: u32 = 0x400; // IN_LOWER + 4, OUT_UPPER + 8, OUT_LOWER + 0xc
+const DMA_PITCH_IN: u32 = 0x410; // PITCH_OUT + 4, LINE_LENGTH_IN + 8, LINE_COUNT + 0xc
 // The 3D class's macro unit.
 const LOAD_MME_INSTRUCTION_RAM_POINTER: u32 = 0x114;
 const LOAD_MME_INSTRUCTION_RAM: u32 = 0x118;
@@ -349,6 +369,9 @@ impl Channel {
             effects.extend(self.resources.method(method, value, &|m| regs.get((m / 4) as usize).copied().unwrap_or(0)).into_iter().map(Effect::Write));
             effects.extend(self.resources.unsupported.drain(..).map(Effect::Unsupported));
         }
+        if self.classes[subchannel] & 0xff == 0xb5 && method == DMA_LAUNCH {
+            effects.extend(self.copy(subchannel, value));
+        }
         if let Some(e) = self.engine_effect(subchannel, method, value) {
             effects.push(e);
         }
@@ -454,6 +477,28 @@ impl Channel {
         }
     }
 
+    /// LAUNCH_DMA's copy: DATA_TRANSFER_TYPE (1:0) 0 = none; SRC/DST_MEMORY_LAYOUT
+    /// (7, 8) 1 = pitch; MULTI_LINE_ENABLE (9); REMAP_ENABLE (10).
+    fn copy(&self, sub: usize, value: u32) -> Option<Effect> {
+        let reg = |m: u32| self.reg(sub, m);
+        let pitch = value >> 7 & 3 == 3;
+        if value & 3 == 0 {
+            return None;
+        }
+        if !pitch || value >> 10 & 1 != 0 {
+            return Some(Effect::Ignored { class: self.classes[sub], method: DMA_LAUNCH, value });
+        }
+        let at = |m: u32| u64::from(reg(m) & 0x1_ffff) << 32 | u64::from(reg(m + 4));
+        Some(Effect::Copy(Copy {
+            src: at(DMA_OFFSET_IN_UPPER),
+            dst: at(DMA_OFFSET_IN_UPPER + 8),
+            pitch_in: reg(DMA_PITCH_IN),
+            pitch_out: reg(DMA_PITCH_IN + 4),
+            line_length: reg(DMA_PITCH_IN + 8),
+            line_count: if value >> 9 & 1 != 0 { reg(DMA_PITCH_IN + 0xc) } else { 1 },
+        }))
+    }
+
     fn engine_effect(&self, subchannel: usize, method: u32, value: u32) -> Option<Effect> {
         let class = self.classes[subchannel];
         let ignored = Effect::Ignored { class, method, value };
@@ -472,7 +517,7 @@ impl Channel {
             (0x97, CLEAR_SURFACE) => Some(Effect::Clear(self.clear(subchannel, value))),
             (0x97, DRAW_INDEX_BUFFER | DRAW_VERTEX_ARRAY) => Some(Effect::Draw(Box::new(self.draw(subchannel, method, value)))),
             (0x97, m) if OTHER_DRAWS.contains(&m) => Some(ignored),
-            // Copy engine: a copy (ignored), then a semaphore by bits 4:3 (1 one word, 2 four).
+            // Copy engine: after the copy (`copy`), a semaphore by bits 4:3 (1 one word, 2 four).
             (0xb5, DMA_LAUNCH) => Some(match value >> 3 & 3 {
                 kind @ (1 | 2) => Effect::Release(Release {
                     method,
@@ -481,7 +526,7 @@ impl Channel {
                     width: 4,
                     timestamp: kind == 2,
                 }),
-                _ => ignored,
+                _ => return None,
             }),
             _ => None,
         }
@@ -546,6 +591,10 @@ mod tests {
         let mut c = Channel::default();
         let words = [header(1, 1, 4, SET_OBJECT), 0xc7b5, header(1, 3, 4, DMA_SEMAPHORE_A), 0x1, 0x2000, 5, header(1, 1, 4, DMA_LAUNCH), 1 << 3];
         assert_eq!(c.run(&words), vec![Effect::Release(Release { method: DMA_LAUNCH, addr: 0x1_0000_2000, value: 5, width: 4, timestamp: false })]);
+        // A pitch-to-pitch copy of two 0x40-byte lines, then its one-word semaphore.
+        let words = [header(1, 8, 4, DMA_OFFSET_IN_UPPER), 0x12, 0x3400, 0x12, 0x5600, 0x100, 0x80, 0x40, 2, header(1, 1, 4, DMA_LAUNCH), 2 | 3 << 7 | 1 << 9 | 1 << 3];
+        let copy = Copy { src: 0x12_0000_3400, dst: 0x12_0000_5600, pitch_in: 0x100, pitch_out: 0x80, line_length: 0x40, line_count: 2 };
+        assert_eq!(c.run(&words), vec![Effect::Copy(copy), Effect::Release(Release { method: DMA_LAUNCH, addr: 0x1_0000_2000, value: 5, width: 4, timestamp: false })]);
         // An acquire is reported as ignored, not executed.
         assert!(matches!(c.run(&[header(1, 1, 0, SEMAPHORE_D), 1])[..], [Effect::Ignored { method: SEMAPHORE_D, value: 1, .. }]));
     }

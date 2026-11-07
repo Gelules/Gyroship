@@ -489,6 +489,22 @@ pub fn wgpu_texture_format(t: &Tic) -> Option<T> {
     format_row(t).map(|r| if t.srgb { r.3.unwrap_or(r.2) } else { r.2 })
 }
 
+/// `X/Y/Z/W_SOURCE` as their raw 3-bit `IN_*` values, x in bits 2:0 (the
+/// translated programs apply them: 0 zero, 2..5 R..A, 6 integer one, 7 float one).
+pub fn swizzle_code(t: &Tic) -> u32 {
+    let raw = |s: Source| match s {
+        Source::Zero => 0,
+        Source::R => 2,
+        Source::G => 3,
+        Source::B => 4,
+        Source::A => 5,
+        Source::OneInt => 6,
+        Source::OneFloat => 7,
+        Source::Unknown(v) => v,
+    };
+    t.swizzle.iter().enumerate().map(|(i, s)| raw(*s) << (3 * i)).sum()
+}
+
 /// True when `X/Y/Z/W_SOURCE` differ from what sampling the wgpu format gives
 /// (R, G, B, A for its channels, then 0, 0, 1): wgpu 30 has no view swizzle,
 /// so the shader translation must apply it.

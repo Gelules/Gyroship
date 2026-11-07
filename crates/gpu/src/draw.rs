@@ -7,7 +7,7 @@
 //! ponytail: one encoder and fresh buffers per draw (ordering for free; a
 //! ring buffer when draw counts make it slow); level-0 2D textures cached
 //! by address and header, never invalidated; float vertex attributes; no
-//! depth-compare textures; auto pipeline layouts (filterable textures);
+//! depth-compare textures;
 //! pipelines keyed by a Debug string. Each draw not done counts its reason
 //! in `Surfaces::skipped`.
 
@@ -54,13 +54,54 @@ pub struct Cache {
     code: HashMap<u64, Vec<u8>>,
     /// Translations by (program key, key of the pixel program it pairs with).
     modules: HashMap<(u64, Option<u64>), Module>,
-    pipelines: HashMap<String, wgpu::RenderPipeline>,
+    pipelines: HashMap<String, (wgpu::RenderPipeline, Vec<wgpu::BindGroupLayout>)>,
     textures: HashMap<(u64, [u8; 32]), wgpu::Texture>,
-    samplers: HashMap<[u8; 32], wgpu::Sampler>,
+    samplers: HashMap<([u8; 32], bool), wgpu::Sampler>,
 }
 
-/// A stage's bindings: constant buffers by bank, then (view, sampler) per texture slot.
-type Bindings = (BTreeMap<u8, Vec<u8>>, Vec<(wgpu::TextureView, Option<wgpu::Sampler>)>);
+/// A stage's bindings.
+struct Bindings {
+    /// Constant buffers by bank.
+    cbufs: BTreeMap<u8, Vec<u8>>,
+    textures: Vec<Slot>,
+    /// Each slot's header swizzle, when the program reads them.
+    swizzles: Option<Vec<u32>>,
+}
+
+/// A texture slot: its view, its sampler unless fetched, and whether it is
+/// a depth target (read as unfilterable floats, with a non-filtering sampler).
+struct Slot {
+    view: wgpu::TextureView,
+    sampler: Option<wgpu::Sampler>,
+    depth: bool,
+    dimension: wgpu::TextureViewDimension,
+}
+
+impl Bindings {
+    /// The layout these bindings take in a stage.
+    fn layout(&self, visibility: wgpu::ShaderStages) -> Vec<wgpu::BindGroupLayoutEntry> {
+        let buffer = |binding: u32, size: u64| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility,
+            ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: wgpu::BufferSize::new(size) },
+            count: None,
+        };
+        let mut entries: Vec<_> = self.cbufs.keys().map(|bank| buffer(u32::from(*bank), CBUF_BYTES as u64)).collect();
+        if let Some(codes) = &self.swizzles {
+            entries.push(buffer(shader::SWIZZLE_BINDING, 4 * codes.len() as u64));
+        }
+        for (i, s) in self.textures.iter().enumerate() {
+            let filterable = s.sampler.is_some() && !s.depth;
+            let sample_type = wgpu::TextureSampleType::Float { filterable };
+            entries.push(wgpu::BindGroupLayoutEntry { binding: 32 + 2 * i as u32, visibility, ty: wgpu::BindingType::Texture { sample_type, view_dimension: s.dimension, multisampled: false }, count: None });
+            if s.sampler.is_some() {
+                let ty = if s.depth { wgpu::SamplerBindingType::NonFiltering } else { wgpu::SamplerBindingType::Filtering };
+                entries.push(wgpu::BindGroupLayoutEntry { binding: 33 + 2 * i as u32, visibility, ty: wgpu::BindingType::Sampler(ty), count: None });
+            }
+        }
+        entries
+    }
+}
 
 impl Surfaces {
     /// Runs a draw; one that cannot be done is counted in `skipped` by
@@ -230,14 +271,21 @@ impl Surfaces {
             cull_mode: r.raster.wgpu_cull()?,
             ..Default::default()
         };
-        let key = format!("{:x}/{:x?}/{layouts:?}/{primitive:?}/{color_states:?}/{depth_state:?}", vs.0.key, ps.as_ref().map(|p| p.0.key));
-        let pipeline = match self.cache.pipelines.get(&key) {
+        // Bind groups: 0 vertex, 1 pixel; constant banks at their bank, textures at 32 + 2i, samplers at 33 + 2i.
+        let visibility = [wgpu::ShaderStages::VERTEX, wgpu::ShaderStages::FRAGMENT];
+        let group_layouts: Vec<Vec<wgpu::BindGroupLayoutEntry>> = stages.iter().zip(visibility).map(|(b, v)| b.layout(v)).collect();
+        let groups = group_layouts.iter().rposition(|e| !e.is_empty()).map_or(0, |g| g + 1);
+        let key = format!("{:x}/{:x?}/{layouts:?}/{primitive:?}/{color_states:?}/{depth_state:?}/{:?}", vs.0.key, ps.as_ref().map(|p| p.0.key), &group_layouts[..groups]);
+        let (pipeline, bind_layouts) = match self.cache.pipelines.get(&key) {
             Some(p) => p.clone(),
             None => {
+                let bind_layouts: Vec<wgpu::BindGroupLayout> = group_layouts[..groups].iter().map(|entries| self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries })).collect();
+                let refs: Vec<Option<&wgpu::BindGroupLayout>> = bind_layouts.iter().map(Some).collect();
+                let layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &refs, ..Default::default() });
                 let buffers: Vec<Option<wgpu::VertexBufferLayout>> = layouts.iter().map(|(_, step, stride, attributes)| Some(wgpu::VertexBufferLayout { array_stride: *stride, step_mode: *step, attributes })).collect();
                 let p = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                     label: None,
-                    layout: None,
+                    layout: Some(&layout),
                     vertex: wgpu::VertexState { module: &vs.1, entry_point: Some("main"), compilation_options: Default::default(), buffers: &buffers },
                     fragment: ps.as_ref().map(|p| wgpu::FragmentState { module: &p.1, entry_point: Some("main"), compilation_options: Default::default(), targets: &color_states }),
                     primitive,
@@ -246,29 +294,27 @@ impl Surfaces {
                     multiview_mask: None,
                     cache: None,
                 });
-                self.cache.pipelines.insert(key, p.clone());
-                p
+                self.cache.pipelines.insert(key, (p.clone(), bind_layouts.clone()));
+                (p, bind_layouts)
             }
         };
 
-        // Bind groups: constant banks at their bank, textures at 32 + 2i, samplers at 33 + 2i.
-        let used = |t: &Translation| !t.interface.cbufs.is_empty() || !t.interface.textures.is_empty();
-        let groups = if ps.as_ref().is_some_and(|p| used(&p.0)) { 2 } else if used(&vs.0) { 1 } else { 0 };
         let mut bind_groups = Vec::new();
-        for g in 0..groups {
-            let Some((cbufs, textures)) = stages.get(g) else {
-                bind_groups.push(self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &pipeline.get_bind_group_layout(g as u32), entries: &[] }));
-                continue;
-            };
-            let buffers: Vec<(u32, wgpu::Buffer)> = cbufs.iter().map(|(b, data)| (u32::from(*b), self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: data, usage: wgpu::BufferUsages::UNIFORM }))).collect();
+        for (g, layout) in bind_layouts.iter().enumerate() {
+            let Bindings { cbufs, textures, swizzles } = &stages[g];
+            let mut buffers: Vec<(u32, wgpu::Buffer)> = cbufs.iter().map(|(b, data)| (u32::from(*b), self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: data, usage: wgpu::BufferUsages::UNIFORM }))).collect();
+            if let Some(codes) = swizzles {
+                let bytes: Vec<u8> = codes.iter().flat_map(|c| c.to_le_bytes()).collect();
+                buffers.push((shader::SWIZZLE_BINDING, self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: &bytes, usage: wgpu::BufferUsages::UNIFORM })));
+            }
             let mut entries: Vec<wgpu::BindGroupEntry> = buffers.iter().map(|(b, buffer)| wgpu::BindGroupEntry { binding: *b, resource: buffer.as_entire_binding() }).collect();
-            for (slot, (view, sampler)) in textures.iter().enumerate() {
+            for (slot, Slot { view, sampler, .. }) in textures.iter().enumerate() {
                 entries.push(wgpu::BindGroupEntry { binding: 32 + 2 * slot as u32, resource: wgpu::BindingResource::TextureView(view) });
                 if let Some(sampler) = sampler {
                     entries.push(wgpu::BindGroupEntry { binding: 33 + 2 * slot as u32, resource: wgpu::BindingResource::Sampler(sampler) });
                 }
             }
-            bind_groups.push(self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &pipeline.get_bind_group_layout(g as u32), entries: &entries }));
+            bind_groups.push(self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout, entries: &entries }));
         }
         let index_buffer = indices.as_ref().map(|(bytes, format)| {
             let mut padded = bytes.clone();
@@ -353,7 +399,16 @@ impl Surfaces {
 
     /// A stage's constant banks (64 KiB each, as bound) and textures.
     fn stage_bindings(&mut self, d: &Draw, stage: usize, t: &Translation, attached: &[u64], mem: Mem) -> Result<Bindings, String> {
-        let handle_banks = t.interface.textures.iter().filter_map(|x| if let Handle::CBuf { bank, .. } = x.handle { Some(bank) } else { None });
+        let mut handle_banks = BTreeSet::new();
+        for x in &t.interface.textures {
+            match &x.handle {
+                Handle::CBuf { bank, .. } => {
+                    handle_banks.insert(*bank);
+                }
+                Handle::Uniform(e) => e.banks(&mut handle_banks),
+                _ => {}
+            }
+        }
         let mut banks = BTreeMap::new();
         for b in t.interface.cbufs.iter().copied().chain(handle_banks) {
             let (addr, size) = d.cbufs[stage].get(usize::from(b)).copied().flatten().ok_or_else(|| format!("constant bank {b} not bound"))?;
@@ -365,11 +420,21 @@ impl Surfaces {
             banks.insert(b, data);
         }
         let mut textures = Vec::new();
-        for x in &t.interface.textures {
-            let Handle::CBuf { bank, offset } = x.handle else { return Err(format!("texture handle {:?}", x.handle)) };
-            let at = usize::from(offset);
-            let word = banks[&bank].get(at..at + 4).ok_or("texture handle offset")?;
-            let handle = TexHandle::new(u32::from_le_bytes([word[0], word[1], word[2], word[3]]));
+        let mut swizzles = vec![0u32; t.interface.textures.len().next_multiple_of(4)];
+        for (slot, x) in t.interface.textures.iter().enumerate() {
+            let word = |bank: u8, offset: u16| -> Option<u32> {
+                let at = usize::from(offset);
+                let w = banks.get(&bank)?.get(at..at + 4)?;
+                Some(u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+            };
+            let handle = TexHandle::new(
+                match &x.handle {
+                    Handle::CBuf { bank, offset } => word(*bank, *offset),
+                    Handle::Uniform(e) => e.eval(&word),
+                    other => return Err(format!("texture handle {other:?}")),
+                }
+                .ok_or("texture handle offset")?,
+            );
             if x.compare || !matches!(x.dim, TexDim::D2 | TexDim::D3) {
                 return Err(format!("texture {:?} (compare {})", x.dim, x.compare));
             }
@@ -386,14 +451,15 @@ impl Surfaces {
                 return Err(format!("{:?} texture read as {:?}", tic.texture_type, x.dim));
             }
             // A render target at that address: its host texture.
-            let view = match self.map.values().find(|e| e.surface.addr == tic.address) {
-                Some(e) if e.texture.format().is_depth_stencil_format() => return Err("depth target sampled as a texture".into()),
-                Some(e) => e.texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2), array_layer_count: Some(1), mip_level_count: Some(1), ..Default::default() }),
-                None => self.upload(&tic, header, mem)?.create_view(&Default::default()),
+            let (view, depth) = match self.map.values().find(|e| e.surface.addr == tic.address) {
+                Some(e) => {
+                    let depth = e.texture.format().is_depth_stencil_format();
+                    let aspect = if depth { wgpu::TextureAspect::DepthOnly } else { wgpu::TextureAspect::All };
+                    (e.texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2), aspect, array_layer_count: Some(1), mip_level_count: Some(1), ..Default::default() }), depth)
+                }
+                None => (self.upload(&tic, header, mem)?.create_view(&Default::default()), false),
             };
-            if textures::needs_swizzle(&tic) {
-                self.skip("texture swizzle not applied");
-            }
+            swizzles[slot] = textures::swizzle_code(&tic);
             let sampler = match x.fetch {
                 true => None,
                 false => {
@@ -405,13 +471,14 @@ impl Surfaces {
                     if !mem(d.samplers.entry(index).ok_or("sampler index past the pool")?, &mut bytes) {
                         return Err("sampler header not readable".into());
                     }
-                    Some(self.sampler(bytes))
+                    Some(self.sampler(bytes, !depth))
                 }
             };
-            textures.push((view, sampler));
+            let dimension = if x.dim == TexDim::D3 { wgpu::TextureViewDimension::D3 } else { wgpu::TextureViewDimension::D2 };
+            textures.push(Slot { view, sampler, depth, dimension });
         }
         let cbufs = banks.into_iter().filter(|(b, _)| t.interface.cbufs.contains(b)).collect();
-        Ok((cbufs, textures))
+        Ok(Bindings { cbufs, textures, swizzles: t.interface.swizzles.then_some(swizzles) })
     }
 
     /// A 2D or 3D texture from guest memory: the level the view starts at, layer 0.
@@ -473,8 +540,10 @@ impl Surfaces {
         Ok(texture)
     }
 
-    fn sampler(&mut self, bytes: [u8; 32]) -> wgpu::Sampler {
-        if let Some(s) = self.cache.samplers.get(&bytes) {
+    /// The sampler of a header; a non-filtering one (nearest everywhere) for
+    /// unfilterable textures.
+    fn sampler(&mut self, bytes: [u8; 32], filtering: bool) -> wgpu::Sampler {
+        if let Some(s) = self.cache.samplers.get(&(bytes, filtering)) {
             return s.clone();
         }
         let t = textures::tsc(&bytes);
@@ -485,7 +554,10 @@ impl Surfaces {
             None => wgpu::AddressMode::ClampToEdge,
         };
         let address = t.address.map(mode);
-        let (mag, min, mip) = (t.mag_filter.wgpu().unwrap_or(wgpu::FilterMode::Linear), t.min_filter.wgpu().unwrap_or(wgpu::FilterMode::Linear), t.mip_filter.wgpu().unwrap_or(wgpu::MipmapFilterMode::Nearest));
+        let (mag, min, mip) = match filtering {
+            true => (t.mag_filter.wgpu().unwrap_or(wgpu::FilterMode::Linear), t.min_filter.wgpu().unwrap_or(wgpu::FilterMode::Linear), t.mip_filter.wgpu().unwrap_or(wgpu::MipmapFilterMode::Nearest)),
+            false => (wgpu::FilterMode::Nearest, wgpu::FilterMode::Nearest, wgpu::MipmapFilterMode::Nearest),
+        };
         let linear = mag == wgpu::FilterMode::Linear && min == wgpu::FilterMode::Linear && mip == wgpu::MipmapFilterMode::Linear;
         let (lod_min_clamp, lod_max_clamp) = t.wgpu_lod_clamp();
         let s = self.device.create_sampler(&wgpu::SamplerDescriptor {
@@ -502,7 +574,7 @@ impl Surfaces {
             anisotropy_clamp: if linear { t.max_anisotropy.clamp(1, 16) } else { 1 },
             border_color: address.contains(&wgpu::AddressMode::ClampToBorder).then(|| t.wgpu_border_color().unwrap_or(wgpu::SamplerBorderColor::TransparentBlack)),
         });
-        self.cache.samplers.insert(bytes, s.clone());
+        self.cache.samplers.insert((bytes, filtering), s.clone());
         s
     }
 }

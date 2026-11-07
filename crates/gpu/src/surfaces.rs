@@ -66,6 +66,32 @@ fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// A clear bounded by a scissor or a channel mask: one triangle over the
+/// target at depth `value.depth`, of color `value.color`, drawn with the
+/// scissor and write masks.
+const FILL: &str = r#"
+struct Value { color: vec4<f32>, depth: f32 };
+@group(0) @binding(0) var<uniform> value: Value;
+
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let p = vec2(f32(i & 1u) * 4.0 - 1.0, f32(i >> 1u) * 4.0 - 1.0);
+    return vec4(p, value.depth, 1.0);
+}
+
+@fragment
+fn fs() -> @location(0) vec4<f32> {
+    return value.color;
+}
+"#;
+
+/// What a fill writes: a color target's channels, or depth and/or stencil.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum Fill {
+    Color { mask: u8 },
+    Depth { depth: bool, stencil: bool },
+}
+
 pub(crate) struct Entry {
     pub(crate) surface: Surface,
     pub(crate) texture: wgpu::Texture,
@@ -79,6 +105,7 @@ pub struct Surfaces {
     /// Color targets written since the last dump.
     pub(crate) touched: BTreeSet<(u64, u32)>,
     blit: (wgpu::RenderPipeline, wgpu::BindGroupLayout),
+    fill: (wgpu::ShaderModule, wgpu::BindGroupLayout, std::collections::HashMap<(wgpu::TextureFormat, Fill), wgpu::RenderPipeline>),
     pub(crate) cache: crate::draw::Cache,
     /// Draws done.
     pub drawn: u64,
@@ -93,7 +120,8 @@ use std::sync::{Arc, Mutex};
 impl Surfaces {
     /// A headless device with the adapter's own limits (targets reach 11264
     /// pixels) and, when available, the 16-bit normalized, D32S8 and BC
-    /// formats, filterable f32 textures and border-color clamping.
+    /// formats, filterable f32 textures, border-color clamping and subgroup
+    /// (quad) operations.
     pub fn headless(backend: crate::Backend) -> Result<Surfaces, String> {
         let instance = crate::Renderer::instance_for(backend);
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -111,7 +139,8 @@ impl Surfaces {
             | wgpu::Features::RG11B10UFLOAT_RENDERABLE
             | wgpu::Features::TEXTURE_COMPRESSION_BC
             | wgpu::Features::FLOAT32_FILTERABLE
-            | wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER;
+            | wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER
+            | wgpu::Features::SUBGROUP;
         let descriptor = wgpu::DeviceDescriptor { required_features: adapter.features() & wanted, required_limits: adapter.limits(), ..Default::default() };
         let (device, queue) = pollster::block_on(adapter.request_device(&descriptor)).map_err(|e| format!("cannot open the GPU device: {e}"))?;
         let errors = Arc::new(Mutex::new(Vec::new()));
@@ -145,7 +174,18 @@ impl Surfaces {
             multiview_mask: None,
             cache: None,
         });
-        Ok(Surfaces { adapter, device, queue, map: BTreeMap::new(), touched: BTreeSet::new(), blit: (pipeline, layout), cache: Default::default(), drawn: 0, skipped: BTreeMap::new(), errors })
+        let fill_module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("fill"), source: wgpu::ShaderSource::Wgsl(FILL.into()) });
+        let fill_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: wgpu::BufferSize::new(32) },
+                count: None,
+            }],
+        });
+        let fill = (fill_module, fill_layout, Default::default());
+        Ok(Surfaces { adapter, device, queue, map: BTreeMap::new(), touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, skipped: BTreeMap::new(), errors })
     }
 
     /// Whether this device can render to `format` (and read it back).
@@ -202,8 +242,11 @@ impl Surfaces {
             match color_format(s.format) {
                 None => self.skip("color clear: unsupported format"),
                 Some(f) if !self.renderable(f) => self.skip("color clear: format not renderable here"),
-                Some(_) if *mask != 0xf => self.skip("color clear: partial channel mask"),
-                Some(_) if !covers(s) => self.skip("color clear: scissor smaller than the target"),
+                Some(format) if *mask != 0xf || !covers(s) => {
+                    let color = value.map(f32::from_bits);
+                    self.fill(s, format, Fill::Color { mask: *mask }, c.scissor, color, 0.0, 0);
+                    self.touched.insert((s.addr, s.format));
+                }
                 Some(format) => {
                     let view = self.texture(s, format);
                     let [r, g, b, a] = value.map(|v| f64::from(f32::from_bits(v)));
@@ -225,7 +268,10 @@ impl Surfaces {
             match depth_format(s.format) {
                 None => self.skip("depth clear: unsupported format"),
                 Some(f) if !self.renderable(f) => self.skip("depth clear: format not renderable here"),
-                Some(_) if !covers(s) => self.skip("depth clear: scissor smaller than the target"),
+                Some(format) if !covers(s) => {
+                    let fill = Fill::Depth { depth: z.is_some(), stencil: stencil.is_some() && format.has_stencil_aspect() };
+                    self.fill(s, format, fill, c.scissor, [0.0; 4], z.map_or(0.0, f32::from_bits), stencil.unwrap_or(0));
+                }
                 Some(format) => {
                     let view = self.texture(s, format);
                     let depth_ops = Some(wgpu::Operations { load: z.map_or(wgpu::LoadOp::Load, |z| wgpu::LoadOp::Clear(f32::from_bits(z))), store: wgpu::StoreOp::Store });
@@ -237,6 +283,70 @@ impl Surfaces {
                     });
                 }
             }
+        }
+        self.queue.submit([encoder.finish()]);
+    }
+
+    /// Fills `rect` (all of the target when None) of a target: a color
+    /// with a channel mask, or a depth and/or stencil value.
+    #[allow(clippy::too_many_arguments)]
+    fn fill(&mut self, s: &Surface, format: wgpu::TextureFormat, fill: Fill, rect: Option<[u32; 4]>, color: [f32; 4], depth: f32, stencil: u8) {
+        let [x, y, w, h] = rect.unwrap_or([0, 0, s.width, s.height]);
+        let (x1, y1) = (x.saturating_add(w).min(s.width), y.saturating_add(h).min(s.height));
+        if x >= x1 || y >= y1 {
+            return;
+        }
+        let pipeline = match self.fill.2.get(&(format, fill)) {
+            Some(p) => p.clone(),
+            None => {
+                let layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&self.fill.1)], ..Default::default() });
+                let (targets, depth_stencil) = match fill {
+                    Fill::Color { mask } => (vec![Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::from_bits_truncate(u32::from(mask)) })], None),
+                    Fill::Depth { depth, stencil } => {
+                        let face = wgpu::StencilFaceState { compare: wgpu::CompareFunction::Always, fail_op: wgpu::StencilOperation::Replace, depth_fail_op: wgpu::StencilOperation::Replace, pass_op: wgpu::StencilOperation::Replace };
+                        let stencil = if stencil { wgpu::StencilState { front: face, back: face, read_mask: 0xff, write_mask: 0xff } } else { Default::default() };
+                        (Vec::new(), Some(wgpu::DepthStencilState { format, depth_write_enabled: Some(depth), depth_compare: Some(wgpu::CompareFunction::Always), stencil, bias: Default::default() }))
+                    }
+                };
+                let p = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("fill"),
+                    layout: Some(&layout),
+                    vertex: wgpu::VertexState { module: &self.fill.0, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[] },
+                    fragment: (!targets.is_empty()).then(|| wgpu::FragmentState { module: &self.fill.0, entry_point: Some("fs"), compilation_options: Default::default(), targets: &targets }),
+                    primitive: Default::default(),
+                    depth_stencil,
+                    multisample: Default::default(),
+                    multiview_mask: None,
+                    cache: None,
+                });
+                self.fill.2.insert((format, fill), p.clone());
+                p
+            }
+        };
+        let mut bytes: Vec<u8> = color.iter().chain(&[depth, 0.0, 0.0, 0.0]).flat_map(|v| v.to_le_bytes()).collect();
+        bytes.truncate(32);
+        let buffer = wgpu::util::DeviceExt::create_buffer_init(&self.device, &wgpu::util::BufferInitDescriptor { label: None, contents: &bytes, usage: wgpu::BufferUsages::UNIFORM });
+        let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &self.fill.1, entries: &[wgpu::BindGroupEntry { binding: 0, resource: buffer.as_entire_binding() }] });
+        let view = self.texture(s, format);
+        let load = wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store };
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        {
+            let color_attachment = [Some(wgpu::RenderPassColorAttachment { view: &view, depth_slice: None, resolve_target: None, ops: load })];
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("fill"),
+                color_attachments: if matches!(fill, Fill::Color { .. }) { &color_attachment } else { &[] },
+                depth_stencil_attachment: matches!(fill, Fill::Depth { .. }).then(|| wgpu::RenderPassDepthStencilAttachment {
+                    view: &view,
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                    stencil_ops: format.has_stencil_aspect().then_some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                }),
+                ..Default::default()
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &group, &[]);
+            pass.set_scissor_rect(x, y, x1 - x, y1 - y);
+            pass.set_stencil_reference(u32::from(stencil));
+            pass.draw(0..3, 0..1);
         }
         self.queue.submit([encoder.finish()]);
     }
@@ -335,6 +445,27 @@ mod tests {
             let rgba = s.rgba(&s.map[&(target.addr, target.format)]).unwrap();
             assert_eq!(rgba.len(), 4 * 2 * 4);
             assert!(rgba.chunks(4).all(|p| p[0].abs_diff(128) <= 1 && p[1] == 0 && p[2].abs_diff(128) <= 1 && p[3] == 255), "format {format:#x}: {rgba:?}");
+        }
+    }
+
+    /// A clear bounded by a scissor fills only its rectangle, and a channel
+    /// mask keeps the other channels. Needs a GPU adapter.
+    #[test]
+    fn a_scissored_masked_clear_fills_its_rectangle_only() {
+        let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
+            eprintln!("no GPU adapter: test skipped");
+            return;
+        };
+        let (one, half) = (1f32.to_bits(), 0.5f32.to_bits());
+        let target = Surface { addr: 0x81_0000_4000, width: 4, height: 2, format: 0xd5, layers: 1 };
+        s.clear(&Clear { layer: 0, color: Some((target, [0, 0, one, one], 0xf)), depth: None, scissor: None });
+        // Red only (mask R), on the left half.
+        s.clear(&Clear { layer: 0, color: Some((target, [one, half, 0, one], 0x1)), depth: None, scissor: Some([0, 0, 2, 2]) });
+        assert!(s.skipped.is_empty(), "{:?}", s.skipped);
+        let rgba = s.rgba(&s.map[&(target.addr, target.format)]).unwrap();
+        for (i, p) in rgba.chunks(4).enumerate() {
+            let left = i % 4 < 2;
+            assert_eq!(p, if left { [255, 0, 255, 255] } else { [0, 0, 255, 255] }, "pixel {i}: {rgba:?}");
         }
     }
 }

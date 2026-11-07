@@ -134,7 +134,7 @@ pub fn translate(files: &[std::path::PathBuf], out: Option<&Path>) -> super::Res
                     t.wgsl.lines().count(),
                     if valid.is_ok() { "valid" } else { "INVALID" },
                     i.cbufs,
-                    i.textures.iter().map(|x| x.handle).collect::<Vec<_>>(),
+                    i.textures.iter().map(|x| x.handle.clone()).collect::<Vec<_>>(),
                     i.attributes,
                     i.varyings,
                     i.targets

@@ -59,6 +59,7 @@ pub fn run(dir: &Path, first: u32, last: u32, methods: bool) -> super::Result<()
                 Effect::Draw(d) => println!("  draw {d:x?}"),
                 Effect::Write(w) => stats.written += w.data.len(),
                 Effect::Unsupported(u) => println!("  not applied: {u:x?}"),
+                Effect::Copy(c) => println!("  copy {c:x?}"),
                 Effect::Ignored { class, method, value } => *stats.ignored.entry((class, method, value)).or_default() += 1,
             }
         }

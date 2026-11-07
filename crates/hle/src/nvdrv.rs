@@ -435,13 +435,36 @@ impl Nvdrv {
                                 Ok(()) => " -> drawn".into(),
                                 Err(why) => format!(" -> not drawn: {why}"),
                             };
+                            // One frame, draw by draw (game output: never committed).
+                            if let (Some(dir), Some(n)) = (&k.config.frames_dump, k.config.dump_draws)
+                                && k.gs.presents + 1 == n
+                            {
+                                let _ = s.dump(dir, &format!("frame-{n:04}-draw-{:06}", self.draws));
+                            }
                             k.surfaces = Some(s);
                         }
                         // The first frames' draws, one line each.
-                        if k.gs.presents < 3 || self.draws <= 64 {
+                        let dumped = k.config.frames_dump.is_some() && (k.gs.presents + 1).is_multiple_of(k.config.dump_every);
+                        if k.gs.presents < 3 || self.draws <= 64 || dumped {
                             let index = d.index.as_ref().map(|i| (i.address, i.bytes_per_index, i.first));
                             let targets: Vec<String> = d.targets.iter().map(|t| format!("{:#x} {:#x} {}x{}", t.addr, t.format, t.width, t.height)).collect();
                             k.log(&format!("gpu: draw {}: topology {} count {} index {index:x?} first {}: {}; targets [{}]{outcome}", self.draws, d.topology, d.count, d.first, keys.join(", "), targets.join(", ")));
+                        }
+                    }
+                    // The copy engine, line by line (the GPU writes whatever the CPU's permissions).
+                    Effect::Copy(c) => {
+                        let mut line = vec![0u8; c.line_length.min(64 << 20) as usize];
+                        let mut ok = u64::from(c.line_length) * u64::from(c.line_count) <= 256 << 20;
+                        for i in 0..u64::from(c.line_count) {
+                            if !ok {
+                                break;
+                            }
+                            ok = k.read_gpu(space, c.src + i * u64::from(c.pitch_in), &mut line);
+                            let at = k.gpu_to_cpu(space, c.dst + i * u64::from(c.pitch_out));
+                            ok = ok && k.mem.write_object(at, &line).is_ok();
+                        }
+                        if !ok && k.journal.few("gpu copy", 4) {
+                            k.log(&format!("gpu: copy {c:x?} not done (memory not readable or writable)"));
                         }
                     }
                     // The GPU writes whatever the CPU's permissions.
