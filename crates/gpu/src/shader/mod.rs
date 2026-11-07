@@ -103,8 +103,23 @@ impl std::fmt::Display for Error {
 
 type R<T> = Result<T, String>;
 
-/// Translates a graphics program.
+/// How a vertex shader is paired with its pixel shader: wgpu needs both
+/// stages to agree on each varying's interpolation, and every varying the
+/// pixel shader reads must be written.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Options {
+    /// The pixel shader's varyings: a vertex shader declares each with this
+    /// interpolation (a varying it never writes stays (0, 0, 0, 1)).
+    pub varyings: BTreeMap<u8, Interp>,
+}
+
+/// Translates a graphics program on its own.
 pub fn translate(code: &[u8]) -> Result<Translation, Error> {
+    translate_with(code, &Options::default())
+}
+
+/// Translates a graphics program for a given pairing.
+pub fn translate_with(code: &[u8], options: &Options) -> Result<Translation, Error> {
     let fail = |what: &str| Error { at: None, what: what.to_string() };
     let (key, len) = sass::program_key(code).ok_or_else(|| fail("no program (SPH and closing self-branch)"))?;
     let stage = sass::stage(code);
@@ -119,7 +134,15 @@ pub fn translate(code: &[u8]) -> Result<Translation, Error> {
     }
     let mut cx = Cx::new(sph);
     let body = cx.program(&words, &ops)?;
-    Ok(Translation { key, stage, wgsl: cx.module(&body), interface: cx.iface })
+    Ok(Translation { key, stage, wgsl: cx.module(&body, options), interface: cx.iface })
+}
+
+fn interp_attribute(mode: Interp) -> &'static str {
+    match mode {
+        Interp::Constant => "flat",
+        Interp::ScreenLinear => "linear",
+        _ => "perspective",
+    }
 }
 
 /// Validates a WGSL module with naga.
@@ -422,7 +445,7 @@ impl Cx {
 
     // ---- the module ----
 
-    fn module(&mut self, body: &str) -> String {
+    fn module(&mut self, body: &str, options: &Options) -> String {
         let g = self.group();
         let mut m = String::from("diagnostic(off, derivative_uniformity);\n\nfn f(x: u32) -> f32 { return bitcast<f32>(x); }\nfn u(x: f32) -> u32 { return bitcast<u32>(x); }\n");
         for h in &self.helpers {
@@ -456,12 +479,14 @@ impl Cx {
             vin.push_str("};\n");
             let mut vout = String::from("struct VsOut {\n@builtin(position) pos: vec4<f32>,\n");
             let mut init = String::from("var o: VsOut;\no.pos = vec4<f32>(0.0, 0.0, 0.0, 1.0);\n");
-            for (v, mask) in self.sph.outputs().into_iter().enumerate() {
-                if mask != 0 {
-                    self.iface.varyings.insert(v as u8, Interp::Perspective);
-                    let _ = writeln!(vout, "@location({v}) v{v}: vec4<f32>,");
-                    let _ = writeln!(init, "o.v{v} = vec4<f32>(0.0, 0.0, 0.0, 1.0);");
-                }
+            // Written varyings, and those the paired pixel shader reads; the AST of an
+            // undeclared one is refused above, so every written one is here.
+            let written: BTreeSet<u8> = self.sph.outputs().into_iter().enumerate().filter(|(_, m)| *m != 0).map(|(v, _)| v as u8).collect();
+            for v in written.iter().chain(options.varyings.keys()).copied().collect::<BTreeSet<u8>>() {
+                let mode = options.varyings.get(&v).copied().unwrap_or(Interp::Perspective);
+                self.iface.varyings.insert(v, mode);
+                let _ = writeln!(vout, "@location({v}) @interpolate({}) v{v}: vec4<f32>,", interp_attribute(mode));
+                let _ = writeln!(init, "o.v{v} = vec4<f32>(0.0, 0.0, 0.0, 1.0);");
             }
             vout.push_str("};\n");
             let _ = write!(m, "{vin}{vout}\n@vertex\nfn main(i: VsIn) -> VsOut {{\n{init}{locals}{body}}}\n");
@@ -470,12 +495,7 @@ impl Cx {
             for (v, comps) in self.sph.interpolation().into_iter().enumerate() {
                 if let Some(mode) = comps.into_iter().find(|c| *c != Interp::Unused) {
                     self.iface.varyings.insert(v as u8, mode);
-                    let interp = match mode {
-                        Interp::Constant => "flat",
-                        Interp::ScreenLinear => "linear",
-                        _ => "perspective",
-                    };
-                    let _ = writeln!(pin, "@location({v}) @interpolate({interp}) v{v}: vec4<f32>,");
+                    let _ = writeln!(pin, "@location({v}) @interpolate({}) v{v}: vec4<f32>,", interp_attribute(mode));
                 }
             }
             pin.push_str("};\n");
@@ -1231,6 +1251,20 @@ mod tests {
         assert_eq!(t.interface.textures, vec![Texture { handle: Handle::CBuf { bank: 2, offset: 0x70 }, dim: TexDim::D2, compare: false, fetch: false }]);
         assert_eq!(t.interface.targets, BTreeMap::from([(0, 1)]));
         assert!(t.wgsl.contains("switch pc"), "{}", t.wgsl);
+    }
+
+    #[test]
+    fn a_vertex_shader_takes_its_pixel_shaders_interpolation() {
+        let ald = w(0x321, &[(16, 0), (24, 255), (32, 255), (40, 0x80), (74, 1)]);
+        let ast = w(0x322, &[(24, 255), (32, 0), (64, 255), (40, 0x80), (74, 1)]);
+        let code = program(&[(0, 0x020c_0481), (6, 0x3), (13, 0x3_0000)], &[ald, ast, exit()]);
+        // The pixel shader reads varying 0 linearly and varying 1, which this stage never writes.
+        let options = Options { varyings: BTreeMap::from([(0, Interp::ScreenLinear), (1, Interp::Constant)]) };
+        let t = translate_with(&code, &options).unwrap();
+        validate(&t.wgsl).unwrap_or_else(|e| panic!("{e}\n{}", t.wgsl));
+        assert!(t.wgsl.contains("@location(0) @interpolate(linear) v0"), "{}", t.wgsl);
+        assert!(t.wgsl.contains("@location(1) @interpolate(flat) v1"), "{}", t.wgsl);
+        assert_eq!(t.interface.varyings, options.varyings);
     }
 
     #[test]
