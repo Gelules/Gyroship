@@ -20,12 +20,17 @@ use std::collections::BTreeMap;
 /// The bytes of a constant bank as the translated programs declare it.
 const CBUF_BYTES: usize = 0x10000;
 
-/// The WGSL storage format of a wgpu format a compute program may write
-/// (float and normalized ones: SUST stores floats). Beyond WebGPU's own,
-/// they need the adapter's support (TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES).
-fn storage_format(f: wgpu::TextureFormat) -> Option<&'static str> {
+/// The storage format and its WGSL name for an image of format `f` (float and
+/// normalized ones: SUST stores floats). Beyond WebGPU's own, they need the
+/// adapter's support (TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES). An sRGB image
+/// is stored as its linear format, texels as they are (surface stores do not
+/// convert); views that sample it with its header still decode sRGB.
+fn storage_format(f: wgpu::TextureFormat) -> Option<(wgpu::TextureFormat, &'static str)> {
     use wgpu::TextureFormat as T;
-    Some(match f {
+    if f == T::Rgba8UnormSrgb {
+        return Some((T::Rgba8Unorm, "rgba8unorm"));
+    }
+    Some((f, match f {
         T::Rgba16Float => "rgba16float",
         T::Rgba32Float => "rgba32float",
         T::R32Float => "r32float",
@@ -42,7 +47,7 @@ fn storage_format(f: wgpu::TextureFormat) -> Option<&'static str> {
         T::Rgb10a2Unorm => "rgb10a2unorm",
         T::Rg11b10Ufloat => "rg11b10ufloat",
         _ => return None,
-    })
+    }))
 }
 
 /// A translated compute program for one block size and set of image formats.
@@ -97,12 +102,12 @@ impl Surfaces {
         let mut images = Vec::new();
         for img in &first.interface.images {
             let tic = tic_of(&img.handle)?;
-            let format = textures::wgpu_texture_format(&tic).ok_or_else(|| format!("image format {:?}", tic.components))?;
-            let name = storage_format(format).ok_or_else(|| format!("image format {format:?} as storage"))?;
+            let header = textures::wgpu_texture_format(&tic).ok_or_else(|| format!("image format {:?}", tic.components))?;
+            let (format, name) = storage_format(header).ok_or_else(|| format!("image format {header:?} as storage"))?;
             if img.read && !self.adapter.get_texture_format_features(format).flags.contains(wgpu::TextureFormatFeatureFlags::STORAGE_READ_WRITE) {
                 return Err(format!("image format {format:?} both read and written"));
             }
-            images.push((tic, format, name.to_string()));
+            images.push((tic, format, name.to_string(), header));
         }
         let mut queried = BTreeMap::new();
         for (slot, x) in first.interface.textures.iter().enumerate().filter(|(_, x)| x.query) {
@@ -118,7 +123,7 @@ impl Surfaces {
         // Host storage textures, by address: a render target's own texture when the image is
         // one (the game draws glyphs, then filters them in place), else one kept for images.
         let mut views = Vec::new();
-        for (tic, format, _) in &images {
+        for (tic, format, _, header) in &images {
             let three_d = tic.texture_type == TextureType::ThreeD;
             let size = wgpu::Extent3d { width: tic.width, height: tic.height, depth_or_array_layers: if three_d { tic.depth } else { 1 } };
             let target = self.map.values().find(|e| {
@@ -140,11 +145,29 @@ impl Surfaces {
                     dimension: if three_d { wgpu::TextureDimension::D3 } else { wgpu::TextureDimension::D2 },
                     format: *format,
                     usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
-                    view_formats: &[],
+                    view_formats: if header == format { &[] } else { std::slice::from_ref(header) },
                 });
                 self.cache.images.insert(tic.address, texture);
             }
             views.push(self.cache.images[&tic.address].create_view(&Default::default()));
+        }
+
+        // Global memory (LDG): each pointer's buffer, read from guest memory. The constant
+        // bank holds a storage-buffer descriptor there: the 64-bit address, then the size.
+        // ponytail: read again at every dispatch; cache by address if it shows in profiles.
+        let mut globals = Vec::new();
+        for &(bank, at) in &t.interface.buffers {
+            let word = |o: usize| banks.get(&bank).and_then(|b| b.get(o..o + 4)).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]));
+            let at = usize::from(at);
+            let (Some(lo), Some(hi), Some(size)) = (word(at), word(at + 4), word(at + 8)) else { return Err("global memory descriptor out of its bank".into()) };
+            if size == 0 || size > 1 << 30 {
+                return Err(format!("global memory buffer at c[{bank}][{at:#x}] of {size:#x} bytes"));
+            }
+            let mut data = vec![0u8; size.next_multiple_of(4) as usize];
+            if !mem(u64::from(hi) << 32 | u64::from(lo), &mut data) {
+                return Err("global memory buffer not readable".into());
+            }
+            globals.push(wgpu::util::DeviceExt::create_buffer_init(&self.device, &wgpu::util::BufferInitDescriptor { label: Some("global"), contents: &data, usage: wgpu::BufferUsages::STORAGE }));
         }
 
         // Bindings: constant banks, textures and swizzles as for draws, then the images.
@@ -152,7 +175,7 @@ impl Surfaces {
         let cbufs: BTreeMap<u8, Vec<u8>> = banks.into_iter().filter(|(b, _)| t.interface.cbufs.contains(b)).collect();
         let bindings = Bindings { cbufs, textures, swizzles: t.interface.swizzles.then_some(swizzles) };
         let mut layout_entries = bindings.layout(wgpu::ShaderStages::COMPUTE);
-        for (i, (img, (_, format, _))) in t.interface.images.iter().zip(&images).enumerate() {
+        for (i, (img, (_, format, _, _))) in t.interface.images.iter().zip(&images).enumerate() {
             let view_dimension = match img.dim {
                 crate::sass::memory::ImageDim::D3 => wgpu::TextureViewDimension::D3,
                 crate::sass::memory::ImageDim::D1 => wgpu::TextureViewDimension::D1,
@@ -162,6 +185,14 @@ impl Surfaces {
                 binding: IMAGE_BINDING + i as u32,
                 visibility: wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::StorageTexture { access: if img.read { wgpu::StorageTextureAccess::ReadWrite } else { wgpu::StorageTextureAccess::WriteOnly }, format: *format, view_dimension },
+                count: None,
+            });
+        }
+        for i in 0..globals.len() as u32 {
+            layout_entries.push(wgpu::BindGroupLayoutEntry {
+                binding: shader::BUFFER_BINDING + i,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
                 count: None,
             });
         }
@@ -198,6 +229,9 @@ impl Surfaces {
         }
         for (i, view) in views.iter().enumerate() {
             entries.push(wgpu::BindGroupEntry { binding: IMAGE_BINDING + i as u32, resource: wgpu::BindingResource::TextureView(view) });
+        }
+        for (i, buffer) in globals.iter().enumerate() {
+            entries.push(wgpu::BindGroupEntry { binding: shader::BUFFER_BINDING + i as u32, resource: buffer.as_entire_binding() });
         }
         let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &layout, entries: &entries });
         let mut encoder = self.device.create_command_encoder(&Default::default());

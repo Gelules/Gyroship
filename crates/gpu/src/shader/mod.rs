@@ -28,7 +28,7 @@ pub mod sph;
 pub mod uexpr;
 
 use crate::sass::control::{BarMode, ControlOp};
-use crate::sass::fp16::Fp16Op;
+use crate::sass::fp16::{self, Fp16Op};
 use crate::sass::fp32::{self, Fp32Op, MufuFn, Rnd};
 use crate::sass::int::{self, IntOp};
 use crate::sass::memory::{Addr, AtomOp, AtomType, CbHandle, ImageDim, InterpFreq, InterpLoc, LdcMode, MemType, MemoryOp, Stride};
@@ -68,7 +68,14 @@ pub struct Interface {
     pub swizzles: bool,
     /// Compute: images written (SUST), in binding order (`IMAGE_BINDING` + i).
     pub images: Vec<Image>,
+    /// Global memory the program loads (LDG), one buffer per pointer it
+    /// derives addresses from: the constant-bank word (bank, byte offset)
+    /// holding the buffer's 64-bit address, in binding order (`BUFFER_BINDING` + i).
+    pub buffers: Vec<(u8, u16)>,
 }
+
+/// The binding of global-memory buffer 0; buffer i is at `BUFFER_BINDING + i`.
+pub const BUFFER_BINDING: u32 = 600;
 
 /// A storage image a program writes: where its handle is, and its dimension.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -211,6 +218,35 @@ fn mem_words(ty: MemType) -> Result<u32, String> {
     }
 }
 
+/// Every instruction the translator refuses, each alone and with its byte
+/// offset (for study: `translate_with` stops at the first).
+pub fn gaps(code: &[u8], options: &Options) -> Vec<Error> {
+    let stage = sass::stage(code);
+    let (sph, sass) = match stage {
+        Stage::Compute => match sass::compute_key(code) {
+            Some((_, len)) => (Sph::empty(stage), &code[..len]),
+            None => return vec![Error { at: None, what: "no program".into() }],
+        },
+        _ => match (sass::program_key(code), Sph::new(stage, code)) {
+            (Some((_, len)), Some(sph)) => (sph, &code[SPH_SIZE..len]),
+            _ => return vec![Error { at: None, what: "no program".into() }],
+        },
+    };
+    let mut cx = Cx::new(sph);
+    cx.images = options.images.clone();
+    let mut errors = Vec::new();
+    for (i, w) in sass::words(sass).enumerate() {
+        let result = match sass::decode(w) {
+            Some(op) => cx.instruction(&mut String::new(), i, w, &op, Some(&|_, _| Some(0))).map(|_| ()),
+            None => Err(format!("undecoded opcode {:#05x}", w.opcode())),
+        };
+        if let Err(what) = result {
+            errors.push(Error { at: Some(16 * i), what });
+        }
+    }
+    errors
+}
+
 fn interp_attribute(mode: Interp) -> &'static str {
     match mode {
         Interp::Constant => "flat",
@@ -256,7 +292,27 @@ struct Cx {
     /// Compute: the program uses shared memory (`shm`, words as atomics so
     /// that ATOMS and plain accesses can share it).
     shm: bool,
+    /// Registers holding a global address derived from a pointer in a
+    /// constant bank (bank, offset): `Interface::buffers`.
+    roots: BTreeMap<u8, (u8, u16)>,
+    /// Compute: the program reads its lane in the warp (SR_LANEID).
+    lane: bool,
 }
+
+/// The high word of a 32 × 32-bit product, unsigned or signed (WGSL has no
+/// 64-bit integers): the four 16-bit partial products, then the sign fix-up.
+const MUL_HI: &str = "fn mul_hi(a: u32, b: u32, signed: bool) -> u32 {
+    let ll = (a & 0xffffu) * (b & 0xffffu);
+    let lh = (a & 0xffffu) * (b >> 16u);
+    let hl = (a >> 16u) * (b & 0xffffu);
+    let mid = (ll >> 16u) + (lh & 0xffffu) + (hl & 0xffffu);
+    var hi = (a >> 16u) * (b >> 16u) + (lh >> 16u) + (hl >> 16u) + (mid >> 16u);
+    if signed {
+        hi = hi - select(0u, b, bitcast<i32>(a) < 0) - select(0u, a, bitcast<i32>(b) < 0);
+    }
+    return hi;
+}
+";
 
 /// Shared memory read-modify-writes WGSL has no atomic for, by `op`: signed
 /// min (0) and max (1), wrapping increment (2) and decrement (3).
@@ -279,7 +335,7 @@ const SHM_CAS: &str = "fn shm_cas(i: u32, op: u32, v: u32) -> u32 {
 
 impl Cx {
     fn new(sph: Sph) -> Cx {
-        Cx { sph, regs: BTreeSet::new(), preds: BTreeSet::new(), uregs: BTreeSet::new(), upreds: BTreeSet::new(), iface: Interface::default(), decls: String::new(), helpers: BTreeSet::new(), temps: 0, uexpr: BTreeMap::new(), gexpr: BTreeMap::new(), images: Vec::new(), queried: BTreeMap::new(), read_write: BTreeSet::new(), shm: false }
+        Cx { sph, regs: BTreeSet::new(), preds: BTreeSet::new(), uregs: BTreeSet::new(), upreds: BTreeSet::new(), iface: Interface::default(), decls: String::new(), helpers: BTreeSet::new(), temps: 0, uexpr: BTreeMap::new(), gexpr: BTreeMap::new(), images: Vec::new(), queried: BTreeMap::new(), read_write: BTreeSet::new(), shm: false, lane: false, roots: BTreeMap::new() }
     }
 
     /// A shared memory access's byte address, `reg × stride + ureg + offset`, as a new `let`.
@@ -399,6 +455,7 @@ impl Cx {
 
     fn set(&mut self, out: &mut String, d: u8, e: &str) {
         self.gexpr.remove(&d);
+        self.roots.remove(&d);
         if d != RZ {
             let r = self.r(d);
             let _ = writeln!(out, "{r} = {e};");
@@ -429,6 +486,21 @@ impl Cx {
     fn known(&mut self, d: u8, e: Option<UExpr>) {
         if let (Some(e), true) = (e, d != URZ) {
             self.uexpr.insert(d, e);
+        }
+    }
+
+    /// After a write of `d` from `srcs` (an add or a move): the pointer it derives
+    /// from, a constant-bank word at an 8-byte boundary or a register holding one.
+    // ponytail: in program order, as `uexpr`; an address built across branches
+    // from two pointers would need the flow graph.
+    fn root_from(&mut self, d: u8, srcs: &[&Operand]) {
+        let root = srcs.iter().find_map(|o| match o.src {
+            Src::CBuf { bank, offset } if offset % 8 == 0 => Some((bank, offset)),
+            Src::Reg(r) => self.roots.get(&r).copied(),
+            _ => None,
+        });
+        if let (Some(root), true) = (root, d != RZ) {
+            self.roots.insert(d, root);
         }
     }
 
@@ -667,7 +739,8 @@ impl Cx {
                 let _ = writeln!(m, "var<workgroup> shm: array<atomic<u32>, {}>;", options.shared.div_ceil(4).max(1));
             }
             let [x, y, z] = options.workgroup.map(|n| n.max(1));
-            let _ = write!(m, "\n@compute @workgroup_size({x}, {y}, {z})\nfn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {{\n{locals}{body}}}\n");
+            let lane = if self.lane { ", @builtin(subgroup_invocation_id) lane: u32" } else { "" };
+            let _ = write!(m, "\n@compute @workgroup_size({x}, {y}, {z})\nfn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>{lane}) {{\n{locals}{body}}}\n");
         } else if self.sph.stage == Stage::Vertex {
             let mut vin = String::from("struct VsIn {\n@builtin(vertex_index) vid: u32,\n@builtin(instance_index) iid: u32,\n");
             for (v, mask) in self.sph.inputs().into_iter().enumerate() {
@@ -725,11 +798,7 @@ impl Cx {
     fn emit(&mut self, out: &mut String, op: &Op) -> R<()> {
         match op {
             Op::Fp32(o) => self.fp32(out, o),
-            Op::Fp16(Fp16Op::I2fp { dst, src, signed, dst_bits: 32, src_bits: 32, .. }) => {
-                let e = self.i2f(src, *signed, 32, 0)?;
-                self.set(out, *dst, &e);
-                Ok(())
-            }
+            Op::Fp16(o) => self.fp16(out, o),
             Op::Int(o) => self.int(out, o),
             Op::Moves(o) => self.moves(out, o),
             Op::Memory(o) => self.memory(out, o),
@@ -753,8 +822,104 @@ impl Cx {
                 }
                 other => Err(format!("unsupported: {other:?}")),
             },
-            other => Err(format!("unsupported: {other:?}")),
         }
+    }
+
+    /// A packed-half operand as `vec2<f32>` (x the low half), after its lane
+    /// selector, abs and neg.
+    fn h2(&mut self, o: &Operand) -> R<String> {
+        let raw = self.raw(o)?;
+        let mut v = match o.swizzle {
+            fp16::SWZ_H1_H0 => format!("unpack2x16float({raw})"),
+            fp16::SWZ_H0_H0 => format!("unpack2x16float({raw}).xx"),
+            fp16::SWZ_H1_H1 => format!("unpack2x16float({raw}).yy"),
+            // .F32: the operand is one f32, for both lanes.
+            _ => format!("vec2<f32>(f({raw}))"),
+        };
+        if o.abs {
+            v = format!("abs({v})");
+        }
+        if o.neg {
+            v = format!("(-{v})");
+        }
+        Ok(v)
+    }
+
+    // ponytail: half denormals are not flushed (.FTZ), and results round as
+    // pack2x16float does (to nearest on the GPUs seen).
+    fn fp16(&mut self, out: &mut String, op: &Fp16Op) -> R<()> {
+        let pack = |v: String, sat: bool| format!("pack2x16float({})", if sat { format!("clamp({v}, vec2<f32>(0.0), vec2<f32>(1.0))") } else { v });
+        match op {
+            Fp16Op::I2fp { dst, src, signed, dst_bits: 32, src_bits: 32, .. } => {
+                let e = self.i2f(src, *signed, 32, 0)?;
+                self.set(out, *dst, &e);
+            }
+            // .F32: one f32 result, the low lane's (the game converts a half with
+            // `HADD2.F32 R, -RZ, R.H0_H0`).
+            Fp16Op::Hadd2 { dst, a, b, sat, f32, .. } => {
+                let e = format!("{} + {}", self.h2(a)?, self.h2(b)?);
+                let e = if *f32 { format!("u(({e}).x)") } else { pack(e, *sat) };
+                self.set(out, *dst, &e);
+            }
+            Fp16Op::Hmul2 { dst, a, b, sat, relu: false, .. } => {
+                let e = format!("{} * {}", self.h2(a)?, self.h2(b)?);
+                self.set(out, *dst, &pack(e, *sat));
+            }
+            Fp16Op::Hfma2 { dst, a, b, c, sat, f32: false, relu: false, bf16: false, .. } => {
+                let e = format!("fma({}, {}, {})", self.h2(a)?, self.h2(b)?, self.h2(c)?);
+                self.set(out, *dst, &pack(e, *sat));
+            }
+            Fp16Op::Hmnmx2 { dst, a, b, min, f32: false, nan: false, xorsign: false, bf16: false, .. } => {
+                let (x, y, m) = (self.h2(a)?, self.h2(b)?, self.p(*min));
+                self.set(out, *dst, &format!("pack2x16float(select(max({x}, {y}), min({x}, {y}), {m}))"));
+            }
+            // MOVM.16.MT88: lane t gets row t / 4, columns 2 (t % 4) and + 1 of the
+            // transpose, i.e. rows 2 (t % 4) and + 1, column t / 4 of the source, which
+            // lanes 8 (t % 4) + t / 8 and + 4 hold in their half (t / 4) % 2.
+            Fp16Op::Movm { dst, src, shape: 0 } if self.sph.stage == Stage::Compute => {
+                self.lane = true;
+                let s = self.r(*src);
+                let (s0, s1, h) = (self.temp(), self.temp(), self.temp());
+                let _ = writeln!(out, "let {s0} = subgroupShuffle({s}, 8u * (lane % 4u) + lane / 8u);");
+                let _ = writeln!(out, "let {s1} = subgroupShuffle({s}, 8u * (lane % 4u) + 4u + lane / 8u);");
+                let _ = writeln!(out, "let {h} = ((lane / 4u) % 2u) * 16u;");
+                self.set(out, *dst, &format!("(extractBits({s0}, {h}, 16u) | (extractBits({s1}, {h}, 16u) << 16u))"));
+            }
+            // HMMA.1688/.16816.F16, D = A × B + C over the warp, in PTX mma's fragments:
+            // lane t (g = t / 4, q = t % 4) holds rows g and g + 8 of A (k = 2q, 2q + 1,
+            // and + 8 in the next registers), column g of B (k = 2q, 2q + 1, + 8), and
+            // rows g and g + 8, columns 2q and 2q + 1 of C and D. Products add in f32 and
+            // round to half after each K = 8 step (the 16816 shape as two 1688 ones).
+            // ponytail: the tensor cores' exact accumulation precision is not known.
+            Fp16Op::Hmma { dst, a, b, c, k: k @ (8 | 16), f32: false, src_type: 0 } if self.sph.stage == Stage::Compute => {
+                self.lane = true;
+                let reg = |cx: &mut Cx, r: u8, k: u8| if r == RZ { "0u".to_string() } else { cx.r(r + k) };
+                let acc = self.temp();
+                let (c0, c1) = (reg(self, *c, 0), reg(self, *c, 1));
+                let _ = writeln!(out, "var {acc} = mat2x2<f32>(unpack2x16float({c0}), unpack2x16float({c1}));");
+                for step in 0..k / 8 {
+                    let (ag, ag8, bk) = (reg(self, *a, 2 * step), reg(self, *a, 2 * step + 1), reg(self, *b, step));
+                    for j in 0..4 {
+                        let (x, x8, y0, y1) = (self.temp(), self.temp(), self.temp(), self.temp());
+                        let _ = writeln!(out, "let {x} = unpack2x16float(subgroupShuffle({ag}, 4u * (lane / 4u) + {j}u));");
+                        let _ = writeln!(out, "let {x8} = unpack2x16float(subgroupShuffle({ag8}, 4u * (lane / 4u) + {j}u));");
+                        let _ = writeln!(out, "let {y0} = unpack2x16float(subgroupShuffle({bk}, 8u * (lane % 4u) + {j}u));");
+                        let _ = writeln!(out, "let {y1} = unpack2x16float(subgroupShuffle({bk}, 8u * (lane % 4u) + 4u + {j}u));");
+                        let _ = writeln!(out, "{acc}[0] += vec2<f32>(dot({x}, {y0}), dot({x}, {y1}));\n{acc}[1] += vec2<f32>(dot({x8}, {y0}), dot({x8}, {y1}));");
+                    }
+                    let _ = writeln!(out, "{acc} = mat2x2<f32>(unpack2x16float(pack2x16float({acc}[0])), unpack2x16float(pack2x16float({acc}[1])));");
+                }
+                self.set(out, *dst, &format!("pack2x16float({acc}[0])"));
+                self.set(out, dst.saturating_add(1), &format!("pack2x16float({acc}[1])"));
+            }
+            // F2FP.PACK_AB: a to the high half, b to the low one.
+            Fp16Op::F2fp { dst, a, b, c: RZ, merge_c: false, rnd: fp16::Round::NearestEven, .. } => {
+                let (x, y) = (self.f(a)?, self.f(b)?);
+                self.set(out, *dst, &format!("pack2x16float(vec2<f32>({y}, {x}))"));
+            }
+            other => return Err(format!("unsupported: Fp16({other:?})")),
+        }
+        Ok(())
     }
 
     fn sat(e: String, sat: bool) -> String {
@@ -903,6 +1068,9 @@ impl Cx {
                 } else {
                     self.set(out, *dst, &sum);
                 }
+                if !*x {
+                    self.root_from(*dst, &[a, b, c]);
+                }
             }
             IntOp::ISetP { dst, dst1, a, b, cmp, op, signed, ex: false, accum, .. } => {
                 let (x, y) = (self.raw(a)?, self.raw(b)?);
@@ -940,6 +1108,13 @@ impl Cx {
             IntOp::IMad { dst, a, b, c, hi: false, x: false, pdst, .. } if *pdst == PT => {
                 let (x, y, z) = (self.i(a, false)?, self.i(b, false)?, self.i(c, false)?);
                 self.set(out, *dst, &format!("{x} * {y} + {z}"));
+                self.root_from(*dst, &[c]);
+            }
+            // IMAD.HI: the high word of the 64-bit product, plus c.
+            IntOp::IMad { dst, a, b, c, hi: true, signed, x: false, pdst, .. } if *pdst == PT => {
+                self.helpers.insert(MUL_HI);
+                let (x, y, z) = (self.i(a, false)?, self.i(b, false)?, self.i(c, false)?);
+                self.set(out, *dst, &format!("mul_hi({x}, {y}, {signed}) + {z}"));
             }
             IntOp::IMnMx { dst, a, b, signed, min } => {
                 let (x, y, m) = (self.raw(a)?, self.raw(b)?, self.p(*min));
@@ -969,7 +1144,8 @@ impl Cx {
                 let call = if *right { format!("shf_r({l}, {h}, {amount}, {signed})") } else { format!("shf_l({l}, {h}, {amount})") };
                 self.set(out, *dst, &format!("{call}.{}", if *dst_hi { "y" } else { "x" }));
             }
-            IntOp::Lea { dst, a, b, c, shift, hi, x: false, neg_shifted, overflow, carry } if *overflow == PT && *carry == (Pred { reg: PT, not: true }) => {
+            // LEA, with the carry out of the add when asked (the low half of a 64-bit address).
+            IntOp::Lea { dst, a, b, c, shift, hi, x: false, neg_shifted, overflow, carry } if *carry == (Pred { reg: PT, not: true }) => {
                 let (lo, add, high) = (self.raw(a)?, self.i(b, false)?, self.raw(c)?);
                 let s = u32::from(*shift);
                 let shifted = match (*hi, s) {
@@ -978,7 +1154,13 @@ impl Cx {
                     (true, _) => format!("(({high} << {s}u) | ({lo} >> {}u))", 32 - s),
                 };
                 let shifted = if *neg_shifted { format!("(0u - {shifted})") } else { shifted };
-                self.set(out, *dst, &format!("{shifted} + {add}"));
+                let (t, sum) = (self.temp(), self.temp());
+                let _ = writeln!(out, "let {t} = {shifted};\nlet {sum} = {t} + {add};");
+                self.set_p(out, *overflow, &format!("{sum} < {t}"));
+                self.set(out, *dst, &sum);
+                if !*hi {
+                    self.root_from(*dst, &[b]);
+                }
             }
             IntOp::Sgxt { dst, a, bits, signed, wrap } => {
                 let (x, n) = (self.raw(a)?, self.raw(bits)?);
@@ -998,6 +1180,7 @@ impl Cx {
                 let e = self.raw(src)?;
                 self.set(out, *dst, &e);
                 self.gknown(*dst, known);
+                self.root_from(*dst, &[src]);
             }
             MovesOp::UMov { dst, src } => {
                 let known = self.uval(src);
@@ -1037,6 +1220,11 @@ impl Cx {
                 let v = if *sr < 0x25 { "lid" } else { "wid" };
                 let c = ["x", "y", "z"][usize::from((sr - 1) % 4)];
                 self.set(out, *dst, &format!("{v}.{c}"));
+            }
+            // SR_LANEID: the thread's lane in its warp (a 32-wide subgroup on NVIDIA).
+            MovesOp::S2r { dst, sr: 0 } if self.sph.stage == Stage::Compute => {
+                self.lane = true;
+                self.set(out, *dst, "lane");
             }
             MovesOp::Cs2r { dst, sr: 0xff, wide } => {
                 self.set(out, *dst, "0u");
@@ -1228,6 +1416,69 @@ impl Cx {
                 let at = self.image_coords(*coord, coords);
                 let v: Vec<String> = (0..4).map(|k| if *data == RZ { "0.0".to_string() } else { format!("f({})", self.r(data + k)) }).collect();
                 let _ = writeln!(out, "textureStore(img{slot}, {at}, vec4<f32>({}));", v.join(", "));
+            }
+            // LDG through a pointer from a constant bank: the address minus that pointer
+            // indexes the buffer bound for it (`Interface::buffers`). Buffers are under 4 GiB:
+            // the low words are enough.
+            MemoryOp::Ldg { dst, addr: Addr { reg, reg64: true, ureg: None, offset, .. }, ty, pred, pred_dst, .. } if self.sph.stage == Stage::Compute && *pred == Pred::TRUE => {
+                let &(bank, at) = self.roots.get(reg).ok_or("LDG from an address not derived from a constant-bank pointer")?;
+                let n = match self.iface.buffers.iter().position(|b| *b == (bank, at)) {
+                    Some(n) => n,
+                    None => {
+                        let g = self.group();
+                        let n = self.iface.buffers.len();
+                        let _ = writeln!(self.decls, "@group({g}) @binding({}) var<storage, read> gm{n}: array<u32>;", BUFFER_BINDING + n as u32);
+                        self.iface.buffers.push((bank, at));
+                        n
+                    }
+                };
+                let base = self.cb(bank, u32::from(at))?;
+                let r = self.r(*reg);
+                let t = self.temp();
+                let _ = writeln!(out, "let {t} = {r} + {:#x}u - {base};", *offset as u32);
+                match small_mem(*ty) {
+                    Some((bits, signed)) => {
+                        let w = format!("gm{n}[{t} >> 2u]");
+                        let e = if signed { format!("bitcast<u32>(extractBits(bitcast<i32>({w}), ({t} & 3u) * 8u, {bits}u))") } else { format!("extractBits({w}, ({t} & 3u) * 8u, {bits}u)") };
+                        self.set(out, *dst, &e);
+                    }
+                    None => {
+                        let words = mem_words(*ty)?;
+                        let v = self.temp();
+                        let loads: Vec<String> = (0..words).map(|k| format!("gm{n}[({t} >> 2u) + {k}u]")).collect();
+                        let _ = writeln!(out, "let {v} = array<u32, {words}>({});", loads.join(", "));
+                        for k in 0..words {
+                            self.set(out, dst.saturating_add(k as u8), &format!("{v}[{k}]"));
+                        }
+                    }
+                }
+                self.set_p(out, *pred_dst, "true");
+            }
+            // LDSM: row r of matrix i is at the address lane 8i + r gives; lane t takes row
+            // t / 4, elements 2 (t % 4) and + 1 (MT8N8, transposed: column t / 4 of rows
+            // 2 (t % 4) and + 1), as one register per matrix.
+            MemoryOp::Ldsm { dst, addr, count, shape: shape @ (0 | 1) } if self.sph.stage == Stage::Compute => {
+                self.lane = true;
+                let at = self.shared_addr(out, addr, Stride::X1)?;
+                let half = |row: &str| format!("extractBits(atomicLoad(&shm[({row} + (lane / 4u) * 2u) >> 2u]), (({row} + (lane / 4u) * 2u) & 2u) * 8u, 16u)");
+                let mut words = Vec::new();
+                for i in 0..u32::from(*count) {
+                    let (r0, r1) = (self.temp(), self.temp());
+                    let v = if *shape == 0 {
+                        let _ = writeln!(out, "let {r0} = subgroupShuffle({at}, {}u + lane / 4u);", 8 * i);
+                        format!("atomicLoad(&shm[({r0} + (lane % 4u) * 4u) >> 2u])")
+                    } else {
+                        let _ = writeln!(out, "let {r0} = subgroupShuffle({at}, {}u + 2u * (lane % 4u));", 8 * i);
+                        let _ = writeln!(out, "let {r1} = subgroupShuffle({at}, {}u + 2u * (lane % 4u) + 1u);", 8 * i);
+                        format!("({} | ({} << 16u))", half(&r0), half(&r1))
+                    };
+                    let w = self.temp();
+                    let _ = writeln!(out, "let {w} = {v};");
+                    words.push(w);
+                }
+                for (i, w) in words.iter().enumerate() {
+                    self.set(out, dst.saturating_add(i as u8), w);
+                }
             }
             // Shared memory: words of `shm`; a byte or half-word is a part of its word.
             MemoryOp::Lds { dst, addr, ty, stride } if self.sph.stage == Stage::Compute => {

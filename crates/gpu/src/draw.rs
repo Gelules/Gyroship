@@ -502,7 +502,11 @@ impl Surfaces {
             }
             // An image a compute program wrote, or a render target at that address: its host texture.
             let (view, depth, source) = match self.map.values().find(|e| e.surface.addr == tic.address) {
-                _ if self.cache.images.contains_key(&tic.address) => (self.cache.images[&tic.address].create_view(&Default::default()), false, "image"),
+                // With the header's format when the image allows it as a view (sRGB over linear storage).
+                _ if self.cache.images.contains_key(&tic.address) => {
+                    let view = crate::surfaces::view_as(&self.cache.images[&tic.address], textures::wgpu_texture_format(&tic), wgpu::TextureUsages::TEXTURE_BINDING, Default::default());
+                    (view, false, "image")
+                }
                 Some(e) => {
                     let depth = e.texture.format().is_depth_stencil_format();
                     // A color target read counts as touched: frame dumps show what the frame sampled.
@@ -510,7 +514,8 @@ impl Surfaces {
                         self.touched.insert((e.surface.addr, e.surface.format));
                     }
                     let aspect = if depth { wgpu::TextureAspect::DepthOnly } else { wgpu::TextureAspect::All };
-                    (e.texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2), aspect, array_layer_count: Some(1), mip_level_count: Some(1), ..Default::default() }), depth, "target")
+                    let desc = wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2), aspect, array_layer_count: Some(1), mip_level_count: Some(1), ..Default::default() };
+                    (crate::surfaces::view_as(&e.texture, textures::wgpu_texture_format(&tic), wgpu::TextureUsages::TEXTURE_BINDING, desc), depth, "target")
                 }
                 None => (self.upload(&tic, header, mem)?.create_view(&Default::default()), false, "memory"),
             };

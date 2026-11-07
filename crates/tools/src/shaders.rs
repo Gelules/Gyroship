@@ -125,6 +125,16 @@ pub fn translate(files: &[std::path::PathBuf], out: Option<&Path>) -> super::Res
             Err(e) => {
                 all_ok = false;
                 println!("{name}: not translated: {e}");
+                // Every refused instruction, grouped by what is missing.
+                let mut gaps: std::collections::BTreeMap<String, Vec<(usize, String)>> = Default::default();
+                for g in gyroship_gpu::shader::gaps(&code, &Default::default()) {
+                    let what = g.what.split(" {").next().unwrap_or(&g.what).to_string();
+                    gaps.entry(what).or_default().push((g.at.unwrap_or(0), g.what));
+                }
+                for (what, seen) in gaps {
+                    let (at, example) = &seen[0];
+                    println!("  {} x {what}, first at {at:#x}: {}", seen.len(), example.chars().take(400).collect::<String>());
+                }
             }
             Ok(t) => {
                 let valid = gyroship_gpu::shader::validate(&t.wgsl);

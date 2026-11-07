@@ -37,6 +37,14 @@ pub(crate) fn color_format(f: u32) -> Option<wgpu::TextureFormat> {
     })
 }
 
+/// A view of `texture` in `format` when it is the texture's sRGB or linear
+/// counterpart (one of its view formats), limited then to `usage` (an sRGB view
+/// cannot carry the texture's storage usage); else in the texture's format.
+pub(crate) fn view_as(texture: &wgpu::Texture, format: Option<wgpu::TextureFormat>, usage: wgpu::TextureUsages, desc: wgpu::TextureViewDescriptor) -> wgpu::TextureView {
+    let other = format.filter(|f| *f != texture.format() && f.remove_srgb_suffix() == texture.format().remove_srgb_suffix());
+    texture.create_view(&wgpu::TextureViewDescriptor { format: other, usage: other.map(|_| usage), ..desc })
+}
+
 /// The wgpu format of a depth target format (SET_ZT_FORMAT).
 pub(crate) fn depth_format(f: u32) -> Option<wgpu::TextureFormat> {
     use wgpu::TextureFormat as T;
@@ -219,21 +227,27 @@ impl Surfaces {
         let key = (s.addr, s.format);
         let stale = self.map.get(&key).is_none_or(|e| e.surface != *s);
         if stale {
-            // Also a storage texture where the format allows it: compute programs may work on a target.
-            let storage = self.adapter.get_texture_format_features(format).allowed_usages & wgpu::TextureUsages::STORAGE_BINDING;
+            // Also a storage texture where the format allows it: compute programs may work on a
+            // target (the game's upscaler writes the layer its interface is then drawn on). An
+            // sRGB target is kept in its linear format, rendered through an sRGB view: wgpu has
+            // no sRGB storage.
+            let usages = |f: wgpu::TextureFormat| self.adapter.get_texture_format_features(f).allowed_usages;
+            let linear = format.remove_srgb_suffix();
+            let base = if linear != format && usages(linear).contains(wgpu::TextureUsages::STORAGE_BINDING) { linear } else { format };
+            let storage = usages(base) & wgpu::TextureUsages::STORAGE_BINDING;
             let texture = self.device.create_texture(&wgpu::TextureDescriptor {
                 label: None,
                 size: wgpu::Extent3d { width: s.width.max(1), height: s.height.max(1), depth_or_array_layers: s.layers },
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format,
+                format: base,
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC | storage,
-                view_formats: &[],
+                view_formats: if base == format { &[] } else { std::slice::from_ref(&format) },
             });
             self.map.insert(key, Entry { surface: *s, texture });
         }
-        self.map[&key].texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2), array_layer_count: Some(1), ..Default::default() })
+        view_as(&self.map[&key].texture, Some(format), wgpu::TextureUsages::RENDER_ATTACHMENT, wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2), array_layer_count: Some(1), ..Default::default() })
     }
 
     /// Runs a clear on the host textures.
