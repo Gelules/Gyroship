@@ -218,6 +218,9 @@ const I2M_METHODS: std::ops::RangeInclusive<u32> = 0x180..=0x1b4;
 const SEND_PCAS_A: u32 = 0x2b4;
 const SEND_SIGNALING_PCAS_B: u32 = 0x2bc;
 const SEND_SIGNALING_PCAS2_B: u32 = 0x2c0;
+// SET_INLINE_QMD_ADDRESS_A (upper) / _B (lower), the QMD address >> 8, and its data words.
+const SET_INLINE_QMD_ADDRESS: u32 = 0x318;
+const LOAD_INLINE_QMD_DATA: u32 = 0x320;
 const DMA_OFFSET_IN_UPPER: u32 = 0x400; // IN_LOWER + 4, OUT_UPPER + 8, OUT_LOWER + 0xc
 const DMA_PITCH_IN: u32 = 0x410; // PITCH_OUT + 4, LINE_LENGTH_IN + 8, LINE_COUNT + 0xc
 // The 3D class's macro unit.
@@ -508,6 +511,14 @@ impl Channel {
             effects.extend(self.resources.method(method, value, &|m| regs.get((m / 4) as usize).copied().unwrap_or(0)).into_iter().map(Effect::Write));
             effects.extend(self.resources.unsupported.drain(..).map(Effect::Unsupported));
             effects.extend(self.resources.semaphores.drain(..).map(Effect::Semaphore));
+        } else if self.classes[subchannel] & 0xff == 0xc0 && (LOAD_INLINE_QMD_DATA..LOAD_INLINE_QMD_DATA + 0x100).contains(&method) {
+            // LOAD_INLINE_QMD_DATA(i): word i of the QMD at SET_INLINE_QMD_ADDRESS_A/B << 8.
+            let at = (u64::from(self.reg(subchannel, SET_INLINE_QMD_ADDRESS)) << 32 | u64::from(self.reg(subchannel, SET_INLINE_QMD_ADDRESS + 4))) << 8;
+            effects.push(Effect::Write(MemWrite { address: at + u64::from(method - LOAD_INLINE_QMD_DATA), data: value.to_le_bytes().to_vec() }));
+            // The last word launches it (the game's per-frame dispatches; Lichii runs them).
+            if method == LOAD_INLINE_QMD_DATA + 0xfc {
+                effects.push(Effect::Dispatch(at));
+            }
         } else if matches!(self.classes[subchannel] & 0xff, 0xc0 | 0x40) && (I2M_METHODS).contains(&method) {
             // Compute and inline-to-memory classes share the 3D class's upload methods.
             let regs = &self.engine[subchannel * 0x1000..(subchannel + 1) * 0x1000];
@@ -702,7 +713,9 @@ impl Channel {
             (0x97, CLEAR_SURFACE) => Some(Effect::Clear(self.clear(subchannel, value))),
             // A launch: PCAS_B with SCHEDULE (bit 1), or PCAS2_B whose PCAS_ACTION (3:0) schedules.
             (0xc0, SEND_SIGNALING_PCAS_B) if value & 2 != 0 => Some(Effect::Dispatch(u64::from(self.reg(subchannel, SEND_PCAS_A)) << 8)),
-            (0xc0, SEND_SIGNALING_PCAS2_B) if matches!(value & 0xf, 2 | 3 | 9 | 10 | 11) => Some(Effect::Dispatch(u64::from(self.reg(subchannel, SEND_PCAS_A)) << 8)),
+            // The game launches its per-frame dispatch with 0xc (INCREMENT_DEPENDENCE in the
+            // header); Lichii runs one dispatch for each, so it is taken as a launch too.
+            (0xc0, SEND_SIGNALING_PCAS2_B) if matches!(value & 0xf, 2 | 3 | 9 | 10 | 11 | 12) => Some(Effect::Dispatch(u64::from(self.reg(subchannel, SEND_PCAS_A)) << 8)),
             (0x97, DRAW_INDEX_BUFFER | DRAW_VERTEX_ARRAY) => Some(Effect::Draw(Box::new(self.draw(subchannel, method, value)))),
             (0x97, m) if OTHER_DRAWS.contains(&m) => Some(ignored),
             // Copy engine: after the copy (`copy`), a semaphore by bits 4:3 (1 one word, 2 four).
