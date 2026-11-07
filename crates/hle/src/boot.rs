@@ -169,7 +169,9 @@ pub(crate) unsafe fn on_probe(cpu: *mut Cpu, pc: u64, name: &str) {
     crate::with(|k| {
         let caller = k.symbolize(lr);
         k.log(&format!("probe {name} at {pc:#x}: x0={:#x} x1={:#x} x2={:#x} x3={:#x} x8={:#x}, called from {lr:#x} {caller}", x[0], x[1], x[2], x[3], x[8]));
-        // Probes named `regs:...` also log every register, `stack:...` their frame chain.
+        // Probes named `regs:...` also log every register, `stack:...` their frame chain;
+        // an `each:` prefix (every pass is reported) combines with them.
+        let name = name.strip_prefix("each:").unwrap_or(name);
         if name.starts_with("regs:") {
             let all: Vec<String> = x.iter().enumerate().map(|(i, v)| format!("x{i}={v:#x}")).collect();
             k.log(&format!("  {}", all.join(" ")));

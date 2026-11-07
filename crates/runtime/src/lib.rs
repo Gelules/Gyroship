@@ -299,9 +299,20 @@ pub fn probe_counts() -> Vec<(u64, &'static str, u64)> {
     PROBES.get().map_or_else(Vec::new, |p| p.iter().map(|(a, n, c)| (*a, n.as_str(), c.load(Ordering::Relaxed))).collect())
 }
 
-/// Generated code passes a probed address; the first pass (the first four
-/// for a probe named `stack:...`) goes to the HLE's hook, or to stderr
-/// without one.
+/// How many passes of a probe are reported: every one up to 512 for
+/// `each:...`, four for `stack:...` and `dump:...`, otherwise the first.
+fn reported_passes(name: &str) -> u64 {
+    if name.starts_with("each:") {
+        512
+    } else if name.starts_with("stack:") || name.starts_with("dump:") {
+        4
+    } else {
+        1
+    }
+}
+
+/// Generated code passes a probed address; the reported passes go to the
+/// HLE's hook, or to stderr without one.
 ///
 /// # Safety
 /// `cpu` must point to a valid context.
@@ -309,7 +320,7 @@ pub fn probe_counts() -> Vec<(u64, &'static str, u64)> {
 pub unsafe extern "C" fn gyroship_probe(cpu: *mut Cpu, pc: u64) {
     let Some(p) = PROBES.get() else { return };
     if let Ok(i) = p.binary_search_by_key(&pc, |e| e.0)
-        && p[i].2.fetch_add(1, Ordering::Relaxed) < if p[i].1.starts_with("stack:") || p[i].1.starts_with("dump:") { 4 } else { 1 }
+        && p[i].2.fetch_add(1, Ordering::Relaxed) < reported_passes(&p[i].1)
     {
         match HOOKS.get() {
             // SAFETY: guaranteed by the caller.
