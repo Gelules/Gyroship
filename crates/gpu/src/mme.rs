@@ -68,9 +68,12 @@ const OUT_NONE: u8 = 0;
 const OUT_LOAD0: u8 = 3;
 const OUT_LOAD1: u8 = 4;
 
-/// Which of (alu 0, alu 1, out 0, out 1) a predicate mode makes conditional:
-/// `U` always runs, `T` runs when the predicate register is non-zero, `F`
-/// when it is zero (open-gpu-doc `pred.h`, in its order).
+/// Which of (alu 0, alu 1, out 0, out 1) a predicate mode makes conditional
+/// (open-gpu-doc `pred.h`, in its order). A part runs when its letter is
+/// not the predicate's state: `U` always, `T` when the predicate register is
+/// zero, `F` when it is non-zero. This is the behaviour of Mesa's simulator,
+/// which its tests check against the hardware; the game's macro 29 (disable
+/// a pipeline stage only if the data RAM marks it enabled) needs it too.
 const PRED_MODES: [&[u8; 4]; 16] = [
     b"UUUU", b"TTTT", b"FFFF", b"TTUU", b"FFUU", b"TFUU", b"TUUU", b"FUUU", b"UUTT", b"UUTF", b"UUTU", b"UUFT", b"UUFF", b"UUFU", b"UUUT", b"UUUF",
 ];
@@ -177,7 +180,7 @@ impl Mme {
                 0 => [true; 4],
                 m => {
                     let v = run.read(&g, 0, g.pred)? != 0;
-                    PRED_MODES[usize::from(m)].map(|c| c == b'U' || (c == b'T') == v)
+                    PRED_MODES[usize::from(m)].map(|c| c != if v { b'T' } else { b'F' })
                 }
             };
             for (i, _) in mask[..2].iter().enumerate().filter(|m| *m.1) {
@@ -481,7 +484,7 @@ mod tests {
 
     #[test]
     fn predication_masks_parts_and_state_reads_the_shadow() {
-        // R0 = STATE(0x400 >> 2 + 0) ; then with pred R0 (UUTF): out 0 runs if R0 != 0, out 1 if 0.
+        // R0 = STATE(0x400 >> 2 + 0) ; then with pred R0 (UUTF): out 0 runs if R0 == 0, out 1 if not.
         let mut set = group(alu(22, 0, IMMED, ZERO, 0x100), NOP, [(5, OUT_NONE), (OUT_NONE, OUT_NONE)]);
         set.alu[0].imm = 0x100;
         let mut p = group(NOP, NOP, [(OUT_NONE, 5), (OUT_NONE, 6)]);
@@ -494,10 +497,10 @@ mod tests {
         load(&mut mme, 3, &[set, p, end, group(NOP, NOP, [(OUT_NONE, OUT_NONE); 2])]);
         let mut host = Fake { state: vec![(0x400, 77)], ..Fake::default() };
         mme.call(3, &mut host).unwrap();
-        assert_eq!(host.emitted, vec![(0x400, 1)]);
+        assert_eq!(host.emitted, vec![(0x400, 2)]);
         let mut host = Fake::default();
         mme.call(3, &mut host).unwrap();
-        assert_eq!(host.emitted, vec![(0x400, 2)]);
+        assert_eq!(host.emitted, vec![(0x400, 1)]);
     }
 
     #[test]
