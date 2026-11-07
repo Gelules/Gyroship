@@ -153,17 +153,53 @@ pub struct Kernel {
     pub surfaces: Option<gyroship_gpu::surfaces::Surfaces>,
     /// The GPU channels and what they ran.
     pub gpu: nvdrv::Gpu,
+    /// Normal activity, by name (submits, draws…), for the summary line.
+    pub counts: std::collections::BTreeMap<&'static str, u64>,
+    /// Named anomalies seen (D32), for the summary line.
+    pub anomalies: std::collections::BTreeMap<&'static str, u64>,
 }
 
 /// Exit code of a run the HLE stops (an unknown or forbidden SVC, a guest
-/// abort).
+/// abort, an anomaly in strict mode).
 pub const STOP_EXIT: i32 = 0x48;
+
+/// Anomalies strict mode lets pass for now, each until a known fix (D32).
+// ponytail: one entry; NVN's releases at GPU address 0 are syncpoint
+// increments we do not perform yet (M4 plan, step 4).
+const TOLERATED: &[&str] = &["gpu release at 0"];
 
 impl Kernel {
     pub fn new(mem: Memory, mut journal: Journal, config: Config) -> Kernel {
         let mode = if config.explore { "exploration (not a validation run)" } else { "strict" };
         journal.line(0, 0, &format!("gyroship hle: mode {mode}, seed {:#x}, non-system memory {:#x}", config.seed, config.non_system_memory));
-        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None, sessions: Vec::new(), objects: Vec::new(), domains: Vec::new(), allowed_services: Vec::new(), shared: Vec::new(), transfers: Vec::new(), time_shared: None, frame: (0, 0, 0), symbols: Vec::new(), romfs: None, gs: gs::State::default(), hid_shared: None, spin: Vec::new(), saves: Default::default(), timers: Vec::new(), surfaces: None, gpu: Default::default() }
+        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None, sessions: Vec::new(), objects: Vec::new(), domains: Vec::new(), allowed_services: Vec::new(), shared: Vec::new(), transfers: Vec::new(), time_shared: None, frame: (0, 0, 0), symbols: Vec::new(), romfs: None, gs: gs::State::default(), hid_shared: None, spin: Vec::new(), saves: Default::default(), timers: Vec::new(), surfaces: None, gpu: Default::default(), counts: Default::default(), anomalies: Default::default() }
+    }
+
+    /// Counts one more `name` (normal activity); returns the new count.
+    pub fn count(&mut self, name: &'static str) -> u64 {
+        let c = self.counts.entry(name).or_default();
+        *c += 1;
+        *c
+    }
+
+    /// A named anomaly (D32): counted, journaled the first times, and fatal
+    /// in strict mode unless tolerated.
+    pub fn anomaly(&mut self, name: &'static str, text: &str) {
+        *self.anomalies.entry(name).or_default() += 1;
+        let line = format!("anomaly {name}: {text}");
+        if !self.config.explore && !TOLERATED.contains(&name) {
+            self.stop(STOP_EXIT, &line);
+        }
+        if self.journal.few(name, 4) {
+            self.log(&line);
+        }
+    }
+
+    /// One line: presents, activity, then the anomalies (or none).
+    pub fn summary(&self) -> String {
+        let list = |m: &std::collections::BTreeMap<&str, u64>| m.iter().map(|(n, c)| format!("{n} {c}")).collect::<Vec<_>>().join(", ");
+        let anomalies = if self.anomalies.is_empty() { "none".to_string() } else { list(&self.anomalies) };
+        format!("summary: {} presents; activity: {}; anomalies: {anomalies}", self.gs.presents, list(&self.counts))
     }
 
     /// Logs a line for the running thread (0 when none runs).
@@ -175,6 +211,8 @@ impl Kernel {
     /// Ends the run: logs why, flushes the journal, exits with `code`.
     pub fn stop(&mut self, code: i32, why: &str) -> ! {
         self.log(why);
+        let summary = self.summary();
+        self.log(&summary);
         for line in self.backtrace() {
             self.log(&line);
         }

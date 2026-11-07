@@ -198,9 +198,9 @@ pub(crate) unsafe fn on_probe(cpu: *mut Cpu, pc: u64, name: &str) {
 }
 
 /// The generated harness's `main`: `boot <exefs> [--log FILE] [--explore]
-/// [--all-svcs] [--seconds N] [--frames N]` runs the game (for N virtual
-/// seconds, 60 by default, or until N frames are presented); any other mode
-/// is the runtime's.
+/// [--all-svcs] [--seconds N] [--frames N]` runs the game (until N frames
+/// are presented, or for N virtual seconds: 60 when neither is given); any
+/// other mode is the runtime's.
 pub fn main(table: Vec<rt::Entry>) {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) != Some("boot") {
@@ -214,14 +214,14 @@ pub fn main(table: Vec<rt::Entry>) {
     let log = args.iter().position(|a| a == "--log").and_then(|i| args.get(i + 1)).map_or("boot.log", String::as_str);
     let mut journal = Journal::file(Path::new(log)).unwrap_or_else(|e| panic!("{log}: {e}"));
     journal.all_svcs = flag("--all-svcs");
-    // A virtual time limit, 60 s unless --seconds says otherwise.
-    let seconds: u64 = args.iter().position(|a| a == "--seconds").and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()).unwrap_or(60);
-    let frames: Option<u64> = args.iter().position(|a| a == "--frames").and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok());
     let value = |f: &str| args.iter().position(|a| a == f).and_then(|i| args.get(i + 1)).cloned();
+    let frames: Option<u64> = value("--frames").and_then(|s| s.parse().ok());
+    // A virtual time limit: --seconds, else 60 s unless --frames bounds the run.
+    let seconds: Option<u64> = value("--seconds").and_then(|s| s.parse().ok()).or(if frames.is_some() { None } else { Some(60) });
     let save_dir = value("--save").map(std::path::PathBuf::from);
     let config = Config {
         explore: flag("--explore"),
-        time_limit: Some(seconds * 31_250_000),
+        time_limit: seconds.map(|s| s * 31_250_000),
         frames,
         save_dir,
         vsync: !flag("--no-vsync"),
@@ -251,6 +251,8 @@ pub fn main(table: Vec<rt::Entry>) {
     crate::with(|k| match &outcome {
         thread::Outcome::Finished => {
             k.log("every guest thread ended");
+            let summary = k.summary();
+            k.log(&summary);
             k.journal.flush();
         }
         thread::Outcome::Deadlock(who) => k.stop(STOP_EXIT, &format!("deadlock: {who}")),

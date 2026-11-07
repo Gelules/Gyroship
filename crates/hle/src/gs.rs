@@ -407,16 +407,25 @@ impl Kernel {
         }
         // GPU work that waited for the CPU's semaphores runs before the frame is shown.
         crate::nvdrv::poll(self);
+        // The host GPU's refusals since the last present.
+        // ponytail: checked once per frame; per operation if a stop needs the guest stack.
+        if let Some(s) = self.surfaces.as_mut() {
+            let skipped = std::mem::take(&mut s.skipped);
+            let errors = s.errors.lock().map(|mut e| std::mem::take(&mut *e)).unwrap_or_default();
+            for (why, count) in skipped {
+                self.anomaly("gpu operation not done", &format!("frame {n}: {why} ({count} times)"));
+            }
+            for e in errors {
+                self.anomaly("wgpu error", &format!("frame {n}: {e}"));
+            }
+        }
         // The render targets this frame touched, as PNG files (game output: never committed).
         let every = self.config.dump_every;
         if let (Some(dir), Some(s)) = (self.config.frames_dump.clone(), self.surfaces.as_mut())
             && n.is_multiple_of(every)
         {
             let line = match s.dump(&dir, &format!("frame-{n:04}")) {
-                Ok(count) => {
-                    let errors = s.errors.lock().map(|e| e.clone()).unwrap_or_default();
-                    format!("gpu: frame {n}: {count} render targets dumped; {} draws done, not done so far: {:?}; wgpu errors: {errors:?}", s.drawn, s.skipped)
-                }
+                Ok(count) => format!("gpu: frame {n}: {count} render targets dumped; {} draws done", s.drawn),
                 Err(e) => format!("gpu: frame {n}: dump failed: {e}"),
             };
             self.log(&line);
@@ -425,6 +434,10 @@ impl Kernel {
         }
         if self.config.frames.is_some_and(|f| n >= f) {
             self.stop(0, &format!("{n} frames presented"));
+        }
+        if n.is_multiple_of(600) {
+            let summary = self.summary();
+            self.log(&summary);
         }
         // The display's cadence (as a console's compositor, or Lichii's pace to
         // vblank): the presenting thread resumes at the next vsync its swap

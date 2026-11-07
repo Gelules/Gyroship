@@ -124,16 +124,11 @@ pub struct Nvdrv {
 pub struct Gpu {
     /// Each channel's command processor and the gsv address space it runs in, by fd.
     channels: BTreeMap<u32, (Channel, u32)>,
-    submits: u64,
     /// Program keys by GPU address, and the keys already seen.
     programs: BTreeMap<u64, u64>,
     keys: std::collections::BTreeSet<u64>,
-    /// Draws so far.
-    draws: u64,
     /// Presents each waiting channel has waited through.
     stalls: BTreeMap<u32, u32>,
-    /// Compute dispatches so far.
-    dispatches: u64,
     /// Every channel's compute QMDs and what they wait for.
     scheduler: gyroship_gpu::state::qmd::Scheduler,
 }
@@ -324,8 +319,7 @@ impl Nvdrv {
             (Device::Gpu, 0xc018481b) => {
                 let flags = u32_at(&input, 0xc);
                 put32(&mut out, 0xc, 0);
-                k.gpu.submits += 1;
-                let n = k.gpu.submits;
+                let n = k.count("submits");
                 let mut fence = String::new();
                 if flags & 2 != 0 {
                     let s = &mut k.gs.syncpts[CHANNEL_SYNCPT as usize];
@@ -380,18 +374,17 @@ fn run_gpfifo(k: &mut Kernel, fd: u32, space: u32, entries: &[u8]) {
         let mut raw = vec![0u8; 4 * len.min(0x10_0000)];
         let addr = k.gpu_to_cpu(space, at);
         if k.mem.read(addr, &mut raw).is_err() {
-            if k.journal.few("gpfifo unreadable", 4) {
-                k.log(&format!("nvsrv: channel fd {fd}: pushbuffer {at:#x} ({len} words) is not readable at {addr:#x}"));
-            }
+            k.anomaly("gpfifo unreadable", &format!("channel fd {fd}: pushbuffer {at:#x} ({len} words) is not readable at {addr:#x}"));
             continue;
         }
         let words: Vec<u32> = raw.as_chunks::<4>().0.iter().map(|w| u32::from_le_bytes(*w)).collect();
         // Raw segments of the first submits in GPFIFO order, for study (never committed: game data).
+        let submits = k.counts.get("submits").copied().unwrap_or(0);
         if let Some(dir) = &k.config.gpfifo_dump
-            && gpu.submits <= 300
+            && submits <= 300
         {
             let _ = std::fs::create_dir_all(dir);
-            let _ = std::fs::write(dir.join(format!("submit-{:04}-{rank:04}-{at:010x}.bin", gpu.submits)), &raw);
+            let _ = std::fs::write(dir.join(format!("submit-{submits:04}-{rank:04}-{at:010x}.bin")), &raw);
         }
         let (channel, channel_space) = gpu.channels.entry(fd).or_insert_with(|| (Channel::default(), space));
         *channel_space = space;
@@ -422,9 +415,7 @@ pub fn poll(k: &mut Kernel) {
             && let Some(a) = channel.skip_wait()
         {
             *stalls = 0;
-            if k.journal.few("gpu watchdog", 16) {
-                k.log(&format!("gpu: channel fd {fd} waited two presents for {:#x} {:?} {:#x}; it goes on", a.addr, a.op, a.value));
-            }
+            k.anomaly("gpu watchdog", &format!("channel fd {fd} waited two presents for {:#x} {:?} {:#x}; it goes on", a.addr, a.op, a.value));
             effects.extend(channel.resume(&mut |a, buf| k.read_gpu(space, a, buf)));
         }
         note_wait(k, fd, space, before, channel.waiting());
@@ -445,8 +436,8 @@ fn semaphore(k: &mut Kernel, space: u32, r: &gyroship_gpu::state::qmd::Release) 
         bytes.extend((k.now() * 32).to_le_bytes());
     }
     let cpu = k.gpu_to_cpu(space, r.addr);
-    if k.mem.write_object(cpu, &bytes).is_err() && k.journal.few("gpu semaphore", 4) {
-        k.log(&format!("gpu: semaphore at {:#x} not writable", r.addr));
+    if k.mem.write_object(cpu, &bytes).is_err() {
+        k.anomaly("gpu semaphore not writable", &format!("semaphore at {:#x}", r.addr));
     }
     if k.journal.few("gpu semaphore release", 8) {
         k.log(&format!("gpu: semaphore {r:x?}"));
@@ -504,23 +495,21 @@ impl Gpu {
                         bytes.resize(8, 0);
                         bytes.extend((k.now() * 32).to_le_bytes());
                     }
-                    let ok = k.mem.write_object(at, &bytes).is_ok();
-                    if k.journal.few("gpu release", 8) || !ok {
-                        k.log(&format!("gpu: method {:#x} releases {} at {:#x} (cpu {at:#x}){}{}", r.method, r.value, r.addr, if r.timestamp { " with timestamp" } else { "" }, if ok { "" } else { ": not writable" }));
+                    let what = format!("method {:#x} releases {} at {:#x} (cpu {at:#x}){}", r.method, r.value, r.addr, if r.timestamp { " with timestamp" } else { "" });
+                    if k.mem.write_object(at, &bytes).is_err() {
+                        k.anomaly(if r.addr == 0 { "gpu release at 0" } else { "gpu release not writable" }, &what);
+                    } else if k.journal.few("gpu release", 8) {
+                        k.log(&format!("gpu: {what}"));
                     }
                 }
-                Effect::Ignored { class, method, value } => {
-                    if k.journal.few(&format!("gpu ignored {class:#x} {method:#x}"), 2) {
-                        k.log(&format!("gpu: class {class:#x} method {method:#x} = {value:#x} not executed"));
-                    }
-                }
+                Effect::Ignored { class, method, value } => k.anomaly("gpu method ignored", &format!("class {class:#x} method {method:#x} = {value:#x} not executed")),
                 Effect::Clear(c) => {
                     if let Some(s) = &mut k.surfaces {
                         s.clear(&c);
                     }
                 }
                 Effect::Draw(d) => {
-                    self.draws += 1;
+                    let draw = k.count("draws");
                     let keys: Vec<String> = d.programs.iter().enumerate().filter_map(|(stage, p)| Some(format!("stage {stage} {}", self.program(k, space, (*p)?)))).collect();
                     let mut outcome = String::new();
                     if let Some(mut s) = k.surfaces.take() {
@@ -532,16 +521,16 @@ impl Gpu {
                         if let (Some(dir), Some(n)) = (&k.config.frames_dump, k.config.dump_draws)
                             && k.gs.presents + 1 == n
                         {
-                            let _ = s.dump(dir, &format!("frame-{n:04}-draw-{:06}", self.draws));
+                            let _ = s.dump(dir, &format!("frame-{n:04}-draw-{draw:06}"));
                         }
                         k.surfaces = Some(s);
                     }
                     // The first frames' draws, one line each.
                     let dumped = k.config.frames_dump.is_some() && (k.gs.presents + 1).is_multiple_of(k.config.dump_every);
-                    if k.gs.presents < 3 || self.draws <= 64 || dumped {
+                    if k.gs.presents < 3 || draw <= 64 || dumped {
                         let index = d.index.as_ref().map(|i| (i.address, i.bytes_per_index, i.first));
                         let targets: Vec<String> = d.targets.iter().map(|t| format!("{:#x} {:#x} {}x{}", t.addr, t.format, t.width, t.height)).collect();
-                        k.log(&format!("gpu: draw {}: topology {} count {} index {index:x?} first {}: {}; targets [{}]; viewport scale {:?} offset {:?} origin {}, clip {:?}{outcome}", self.draws, d.topology, d.count, d.first, keys.join(", "), targets.join(", "), d.render.viewport.scale, d.render.viewport.offset, d.render.viewport.origin_lower_left as u8 | (d.render.viewport.flip_y as u8) << 1, d.render.surface_clip));
+                        k.log(&format!("gpu: draw {draw}: topology {} count {} index {index:x?} first {}: {}; targets [{}]; viewport scale {:?} offset {:?} origin {}, clip {:?}{outcome}", d.topology, d.count, d.first, keys.join(", "), targets.join(", "), d.render.viewport.scale, d.render.viewport.offset, d.render.viewport.origin_lower_left as u8 | (d.render.viewport.flip_y as u8) << 1, d.render.surface_clip));
                     }
                 }
                 // The copy engine, line by line (the GPU writes whatever the CPU's permissions).
@@ -576,8 +565,8 @@ impl Gpu {
                             }
                         }
                     }
-                    if !ok && k.journal.few("gpu copy", 4) {
-                        k.log(&format!("gpu: copy {c:x?} not done (memory not readable or writable)"));
+                    if !ok {
+                        k.anomaly("gpu copy not done", &format!("copy {c:x?}: memory not readable or writable"));
                     }
                     let span = match &block {
                         Some((_, l)) => l.size(),
@@ -599,7 +588,7 @@ impl Gpu {
                         if !self.scheduler.signal(at, action, || readable.then_some(q)) {
                             continue;
                         }
-                        self.dispatches += 1;
+                        let dispatch = k.count("dispatches");
                         let releases = qmd::releases(&q);
                         let launch = qmd::launch(&q);
                         let program = gyroship_gpu::draw::read_compute_program(&mut |gpu, buf| k.read_gpu(space, gpu, buf), launch.program);
@@ -609,17 +598,15 @@ impl Gpu {
                             let _ = std::fs::write(dir.join(format!("{key:016x}.bin")), code);
                         }
                         if k.journal.few("gpu dispatch", 8) {
-                            k.log(&format!("gpu: compute dispatch {}: QMD {at:#x} ({action:?}) version {:?}, program {key} at {:#x}, grid {:?} block {:?} shared {:#x} cbufs {:x?}; releases {releases:x?}; dependent {:x?}", self.dispatches, qmd::version(&q), launch.program, launch.grid, launch.block, launch.shared, launch.cbufs, qmd::dependent(&q)));
+                            k.log(&format!("gpu: compute dispatch {dispatch}: QMD {at:#x} ({action:?}) version {:?}, program {key} at {:#x}, grid {:?} block {:?} shared {:#x} cbufs {:x?}; releases {releases:x?}; dependent {:x?}", qmd::version(&q), launch.program, launch.grid, launch.block, launch.shared, launch.cbufs, qmd::dependent(&q)));
                         }
                         // The program runs before its releases signal it done; then its dependent QMD.
                         if let Some(mut s) = k.surfaces.take() {
                             let result = s.dispatch(&launch, pools, &mut |gpu, buf| k.read_gpu(space, gpu, buf));
                             let read = std::mem::take(&mut s.textures_read);
                             k.surfaces = Some(s);
-                            if let Err(e) = result
-                                && k.journal.first(&format!("gpu compute {key} {e}"))
-                            {
-                                k.log(&format!("gpu: compute dispatch {}: program {key}, grid {:?} block {:?} shared {:#x}: not run: {e}", self.dispatches, launch.grid, launch.block, launch.shared));
+                            if let Err(e) = result {
+                                k.anomaly("gpu compute not run", &format!("dispatch {dispatch}: program {key}, grid {:?} block {:?} shared {:#x}: {e}", launch.grid, launch.block, launch.shared));
                             }
                             // Each program's texture sources, once (as draws log theirs).
                             if !read.is_empty() && k.journal.first(&format!("gpu compute reads {key}")) {
@@ -644,20 +631,12 @@ impl Gpu {
                         s.invalidate(w.address, w.data.len() as u64);
                     }
                     let at = k.gpu_to_cpu(space, w.address);
-                    if k.mem.write_object(at, &w.data).is_err() && k.journal.few("gpu write", 4) {
-                        k.log(&format!("gpu: {} bytes at {:#x} (cpu {at:#x}) not writable", w.data.len(), w.address));
+                    if k.mem.write_object(at, &w.data).is_err() {
+                        k.anomaly("gpu write not done", &format!("{} bytes at {:#x} (cpu {at:#x}) not writable", w.data.len(), w.address));
                     }
                 }
-                Effect::Unsupported(u) => {
-                    if k.journal.few("gpu unsupported", 8) {
-                        k.log(&format!("gpu: not applied: {u:x?}"));
-                    }
-                }
-                Effect::MacroFault { index, fault } => {
-                    if k.journal.few(&format!("gpu macro fault {index}"), 2) {
-                        k.log(&format!("gpu: macro {index} stopped: {fault:?}"));
-                    }
-                }
+                Effect::Unsupported(u) => k.anomaly("gpu unsupported", &format!("not applied: {u:x?}")),
+                Effect::MacroFault { index, fault } => k.anomaly("gpu macro fault", &format!("macro {index} stopped: {fault:?}")),
                 Effect::MacroRead { addr, words } => {
                     if k.journal.few("gpu macro read", 20) {
                         k.log(&format!("gpu: macro read {words} words at {addr:#x}"));

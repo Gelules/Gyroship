@@ -122,7 +122,7 @@ pub struct Surfaces {
     pub textures_read: Vec<(u64, &'static str)>,
     /// Operations not done, by reason.
     pub skipped: BTreeMap<String, u64>,
-    /// wgpu validation errors (the first ones): reported, never fatal to the game.
+    /// wgpu validation errors (the first ones), which the HLE takes as anomalies.
     pub errors: Arc<Mutex<Vec<String>>>,
 }
 

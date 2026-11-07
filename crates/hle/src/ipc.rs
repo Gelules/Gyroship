@@ -333,10 +333,8 @@ impl Kernel {
                 match self.domains[d].objects.get(&id) {
                     Some(&o) => o,
                     None => {
-                        if self.journal.few("ipc unknown domain object", 8) {
-                            let ids: Vec<u32> = self.domains[d].objects.keys().copied().collect();
-                            self.log(&format!("ipc domain {d}: command {} for unknown object {id} (known {ids:?})", req.command));
-                        }
+                        let ids: Vec<u32> = self.domains[d].objects.keys().copied().collect();
+                        self.anomaly("ipc unknown domain object", &format!("domain {d}: command {} for unknown object {id} (known {ids:?})", req.command));
                         return (Reply::error(crate::result::INVALID_HANDLE), Vec::new());
                     }
                 }

@@ -164,8 +164,30 @@ fn stop_child() {
         "forbidden" => svc(&mut k, &mut cpu, 0x40, &[]),
         "abort" => svc(&mut k, &mut cpu, 0x26, &[0, 0, 4]),
         "unknown" => svc(&mut k, &mut cpu, 0x99, &[7]),
+        "anomaly" => {
+            k.anomaly("gpu watchdog", "channel fd 3 waited two presents");
+            0
+        }
         _ => unreachable!(),
     };
+}
+
+/// Strict mode lets the tolerated anomaly pass; exploration counts every
+/// one; the summary names them apart from the activity.
+#[test]
+fn anomalies_are_counted_and_summarized() {
+    let (mut k, _) = kernel(Config::default());
+    k.anomaly("gpu release at 0", "method 0x1b0c releases 1 at 0x0");
+    k.count("draws");
+    k.count("draws");
+    assert_eq!(k.summary(), "summary: 0 presents; activity: draws 2; anomalies: gpu release at 0 1");
+    let (mut k, _) = kernel(Config { explore: true, ..Config::default() });
+    assert_eq!(k.summary(), "summary: 0 presents; activity: ; anomalies: none");
+    for _ in 0..6 {
+        k.anomaly("gpu watchdog", "w");
+    }
+    assert_eq!(k.anomalies["gpu watchdog"], 6);
+    assert_eq!(k.journal.text().matches("anomaly gpu watchdog: w").count(), 4, "journaled the first times only");
 }
 
 #[test]
@@ -174,6 +196,7 @@ fn stops_are_logged() {
         ("forbidden", "forbidden svc 0x40 CreateSession at 0x7000000100: the KAC does not grant it"),
         ("abort", "svc 0x26 Break at 0x7000000100: the guest aborts, reason 0x0 info 0x0+0x4"),
         ("unknown", "svc 0x99 ? at 0x7000000100 is not implemented; x0=0x7"),
+        ("anomaly", "anomaly gpu watchdog: channel fd 3 waited two presents"),
     ] {
         let out = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "stop_child", "--nocapture", "--test-threads=1"])
