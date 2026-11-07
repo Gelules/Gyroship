@@ -2,6 +2,7 @@
 //! sound come next. The generated harness calls [`main`]. `boot --headless`
 //! (tests, reference runs) runs without a window, as before.
 
+pub mod pads;
 pub mod sdl;
 
 use gyroship_hle::boot::HostWindow;
@@ -28,7 +29,7 @@ pub fn main(table: Vec<Entry>) {
     }
     let event_loop = EventLoop::new().unwrap_or_else(|e| fail(&format!("cannot open a window: {e}")));
     event_loop.set_control_flow(ControlFlow::Wait);
-    let mut app = App { table: Some(table), shared: Arc::new(Shared::default()), window: None };
+    let mut app = App { table: Some(table), shared: Arc::new(Shared::default()), window: None, pads: None };
     if let Err(e) = event_loop.run_app(&mut app) {
         fail(&format!("window: {e}"));
     }
@@ -59,6 +60,8 @@ struct Shared {
     /// between two samples still counts once), as `key_bit` bits.
     held: AtomicU64,
     pressed: AtomicU64,
+    /// The gamepads' state, from SDL.
+    pads: pads::Shared,
 }
 
 impl Shared {
@@ -72,6 +75,17 @@ struct App {
     table: Option<Vec<Entry>>,
     shared: Arc<Shared>,
     window: Option<Arc<Window>>,
+    /// SDL's gamepads, polled from this thread (SDL's rule), if SDL3.dll loads.
+    pads: Option<pads::Pads>,
+}
+
+/// `--sdl FILE`, else SDL3.dll next to the executable.
+fn sdl_path() -> std::path::PathBuf {
+    let args: Vec<String> = std::env::args().collect();
+    match args.iter().position(|a| a == "--sdl").and_then(|i| args.get(i + 1)) {
+        Some(p) => p.into(),
+        None => std::env::current_exe().ok().and_then(|e| Some(e.parent()?.join("SDL3.dll"))).unwrap_or_else(|| "SDL3.dll".into()),
+    }
 }
 
 impl ApplicationHandler for App {
@@ -86,10 +100,28 @@ impl ApplicationHandler for App {
         // The surface comes from this thread: winit gives window handles only here.
         let instance = gyroship_gpu::Renderer::instance_for(backend());
         let surface = instance.create_surface(window.clone()).unwrap_or_else(|e| fail(&format!("cannot draw in the window: {e}")));
-        let host = HostWindow { instance, surface, size: (size.width, size.height), pace: pace(self.shared.clone()), input: input(self.shared.clone()), audio: None };
+        // Controllers and sound: without SDL3, the keyboard alone and silence.
+        let sdl = match sdl::Sdl::load(&sdl_path()) {
+            Ok(s) => Some(Arc::new(s)),
+            Err(e) => {
+                eprintln!("gyroship: no SDL3 ({e}): keyboard only, no sound");
+                None
+            }
+        };
+        let audio = sdl.clone().and_then(|s| pads::audio(s, 2, 48_000));
+        self.pads = sdl.map(pads::Pads::new);
+        let host = HostWindow { instance, surface, size: (size.width, size.height), pace: pace(self.shared.clone()), input: input(self.shared.clone()), audio };
         // The guest's own fibers carry its code; this thread only needs room for the HLE.
         std::thread::Builder::new().name("guest".into()).stack_size(64 << 20).spawn(move || gyroship_hle::boot::run(table, Some(host))).unwrap_or_else(|e| fail(&format!("cannot start the guest: {e}")));
         self.window = Some(window);
+    }
+
+    /// SDL is polled every 4 ms (its events and gamepad states).
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(p) = self.pads.as_mut() {
+            p.poll(&self.shared.pads);
+            event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(4)));
+        }
     }
 
     fn window_event(&mut self, _event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -202,7 +234,12 @@ fn pad_of(bits: u64) -> gyroship_hle::hid::Pad {
 /// The live state for each hid sample: what is held, plus what was pressed
 /// since the last sample.
 fn input(shared: Arc<Shared>) -> gyroship_hle::LiveInput {
-    Box::new(move || pad_of(shared.held.load(Ordering::Relaxed) | shared.pressed.swap(0, Ordering::Relaxed)))
+    Box::new(move || {
+        let keys = pad_of(shared.held.load(Ordering::Relaxed) | shared.pressed.swap(0, Ordering::Relaxed));
+        let p = &shared.pads;
+        let (l, r) = p.sticks();
+        pads::merge(keys, p.held.load(Ordering::Relaxed) | p.pressed.swap(0, Ordering::Relaxed), l, r)
+    })
 }
 
 #[cfg(test)]
