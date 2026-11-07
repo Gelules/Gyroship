@@ -219,7 +219,16 @@ pub fn main(table: Vec<rt::Entry>) {
     let frames: Option<u64> = args.iter().position(|a| a == "--frames").and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok());
     let value = |f: &str| args.iter().position(|a| a == f).and_then(|i| args.get(i + 1)).cloned();
     let save_dir = value("--save").map(std::path::PathBuf::from);
-    let config = Config { explore: flag("--explore"), time_limit: Some(seconds * 31_250_000), frames, save_dir, vsync: !flag("--no-vsync"), gpfifo_dump: value("--dump-gpfifo").map(std::path::PathBuf::from), ..Config::default() };
+    let config = Config {
+        explore: flag("--explore"),
+        time_limit: Some(seconds * 31_250_000),
+        frames,
+        save_dir,
+        vsync: !flag("--no-vsync"),
+        gpfifo_dump: value("--dump-gpfifo").map(std::path::PathBuf::from),
+        frames_dump: value("--dump-frames").map(std::path::PathBuf::from),
+        ..Config::default()
+    };
     let installed = table.len();
     rt::install(table);
     mem::install_fault_handler();
@@ -228,6 +237,12 @@ pub fn main(table: Vec<rt::Entry>) {
         std::process::exit(2);
     });
     k.log(&format!("{installed} recompiled functions installed"));
+    if k.config.frames_dump.is_some() {
+        match gyroship_gpu::surfaces::Surfaces::headless(gyroship_gpu::Backend::Auto) {
+            Ok(s) => k.surfaces = Some(s),
+            Err(e) => k.log(&format!("gpu: no host renderer, frames are not dumped: {e}")),
+        }
+    }
     crate::install(k);
     let outcome = thread::run();
     crate::with(|k| match &outcome {

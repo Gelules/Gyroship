@@ -96,11 +96,14 @@ pub struct Config {
     pub vsync: bool,
     /// `--dump-gpfifo DIR`: the first submits' pushbuffer segments go to DIR, raw.
     pub gpfifo_dump: Option<std::path::PathBuf>,
+    /// `--dump-frames DIR`: at each present, the render targets the frame
+    /// touched go to DIR as PNG files.
+    pub frames_dump: Option<std::path::PathBuf>,
 }
 
 impl Default for Config {
     fn default() -> Config {
-        Config { seed: 0x5EED, explore: false, non_system_memory: 0x2_6410_0000, time_limit: None, frames: None, save_dir: None, vsync: true, gpfifo_dump: None }
+        Config { seed: 0x5EED, explore: false, non_system_memory: 0x2_6410_0000, time_limit: None, frames: None, save_dir: None, vsync: true, gpfifo_dump: None, frames_dump: None }
     }
 }
 
@@ -139,6 +142,8 @@ pub struct Kernel {
     pub saves: std::collections::BTreeMap<String, save::SaveFs>,
     /// Virtual timers (the audio sink).
     pub timers: Vec<thread::Timer>,
+    /// The host render targets, when something renders (`--dump-frames`).
+    pub surfaces: Option<gyroship_gpu::surfaces::Surfaces>,
 }
 
 /// Exit code of a run the HLE stops (an unknown or forbidden SVC, a guest
@@ -149,7 +154,7 @@ impl Kernel {
     pub fn new(mem: Memory, mut journal: Journal, config: Config) -> Kernel {
         let mode = if config.explore { "exploration (not a validation run)" } else { "strict" };
         journal.line(0, 0, &format!("gyroship hle: mode {mode}, seed {:#x}, non-system memory {:#x}", config.seed, config.non_system_memory));
-        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None, sessions: Vec::new(), objects: Vec::new(), domains: Vec::new(), allowed_services: Vec::new(), shared: Vec::new(), transfers: Vec::new(), time_shared: None, frame: (0, 0, 0), symbols: Vec::new(), romfs: None, gs: gs::State::default(), hid_shared: None, spin: Vec::new(), saves: Default::default(), timers: Vec::new() }
+        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None, sessions: Vec::new(), objects: Vec::new(), domains: Vec::new(), allowed_services: Vec::new(), shared: Vec::new(), transfers: Vec::new(), time_shared: None, frame: (0, 0, 0), symbols: Vec::new(), romfs: None, gs: gs::State::default(), hid_shared: None, spin: Vec::new(), saves: Default::default(), timers: Vec::new(), surfaces: None }
     }
 
     /// Logs a line for the running thread (0 when none runs).

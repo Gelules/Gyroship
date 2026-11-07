@@ -369,6 +369,17 @@ impl Kernel {
             let interval = req.u32_at(0x10 + 0x18).unwrap_or(0) >> 16;
             self.log(&format!("vi2: present #{n} layer {layer:#x} image {image} acquire fence ({fence_id}, {fence}) interval {interval}"));
         }
+        // The render targets this frame touched, as PNG files (game output: never committed).
+        if let (Some(dir), Some(s)) = (self.config.frames_dump.clone(), self.surfaces.as_mut()) {
+            let line = match s.dump(&dir, &format!("frame-{n:04}")) {
+                Ok(count) => {
+                    let errors = s.errors.lock().map(|e| e.clone()).unwrap_or_default();
+                    format!("gpu: frame {n}: {count} render targets dumped; not done so far: {:?}; wgpu errors: {errors:?}", s.skipped)
+                }
+                Err(e) => format!("gpu: frame {n}: dump failed: {e}"),
+            };
+            self.log(&line);
+        }
         if self.config.frames.is_some_and(|f| n >= f) {
             self.stop(0, &format!("{n} frames presented"));
         }

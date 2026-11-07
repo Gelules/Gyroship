@@ -395,6 +395,11 @@ impl Nvdrv {
                             k.log(&format!("gpu: class {class:#x} method {method:#x} = {value:#x} not executed"));
                         }
                     }
+                    Effect::Clear(c) => {
+                        if let Some(s) = &mut k.surfaces {
+                            s.clear(&c);
+                        }
+                    }
                     Effect::MacroFault { index, fault } => {
                         if k.journal.few(&format!("gpu macro fault {index}"), 2) {
                             k.log(&format!("gpu: macro {index} stopped: {fault:?}"));

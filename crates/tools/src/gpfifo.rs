@@ -55,6 +55,7 @@ pub fn run(dir: &Path, first: u32, last: u32, methods: bool) -> super::Result<()
             match e {
                 Effect::Release(r) => println!("  release {} at {:#x} by method {:#x}", r.value, r.addr, r.method),
                 Effect::MacroFault { index, fault } => println!("  macro {index} fault {fault:?}"),
+                Effect::Clear(c) => println!("  clear {c:?}"),
                 Effect::Ignored { class, method, value } => *stats.ignored.entry((class, method, value)).or_default() += 1,
             }
         }

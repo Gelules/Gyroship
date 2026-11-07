@@ -32,6 +32,34 @@ pub enum Effect {
     Ignored { class: u32, method: u32, value: u32 },
     /// A macro stopped early.
     MacroFault { index: usize, fault: mme::Fault },
+    /// CLEAR_SURFACE.
+    Clear(Clear),
+}
+
+/// A render target as the 3D class describes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Surface {
+    /// GPU address.
+    pub addr: u64,
+    pub width: u32,
+    pub height: u32,
+    /// The class's format number (SET_COLOR_TARGET_FORMAT or SET_ZT_FORMAT).
+    pub format: u32,
+    /// Array size (at least 1).
+    pub layers: u32,
+}
+
+/// A clear: one color target and/or the depth-stencil target, with the
+/// class's clear values (raw words: color floats, depth float, stencil).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Clear {
+    pub layer: u32,
+    /// Target, clear value, channel mask (bit 0 = R .. bit 3 = A).
+    pub color: Option<(Surface, [u32; 4], u8)>,
+    /// Target, depth value if cleared, stencil value if cleared.
+    pub depth: Option<(Surface, Option<u32>, Option<u8>)>,
+    /// The scissor that bounds the clear: x, y, width, height.
+    pub scissor: Option<[u32; 4]>,
 }
 
 /// Methods below this byte offset belong to the host, whatever the subchannel.
@@ -66,6 +94,18 @@ const SET_MME_SHADOW_RAM_CONTROL: u32 = 0x124;
 /// CALL_MME_MACRO(i) at 0x3800 + 8i starts a call; CALL_MME_DATA(i), 4 bytes
 /// further, passes the next parameters.
 const CALL_MME: std::ops::Range<u32> = 0x3800..0x3c00;
+// Render targets and clears (clc797.h).
+const COLOR_TARGET: u32 = 0x800; // + 64 j: A, B, WIDTH, HEIGHT, FORMAT, MEMORY, THIRD_DIMENSION
+const COLOR_CLEAR_VALUE: u32 = 0xd80;
+const Z_CLEAR_VALUE: u32 = 0xd90;
+const STENCIL_CLEAR_VALUE: u32 = 0xda0;
+const SCISSOR_ENABLE: u32 = 0xe00; // HORIZONTAL + 4, VERTICAL + 8
+const ZT_A: u32 = 0xfe0; // B + 4, FORMAT + 8
+const CLEAR_SURFACE_CONTROL: u32 = 0x10f8;
+const CT_SELECT: u32 = 0x121c;
+const ZT_SIZE_A: u32 = 0x1228; // SIZE_B + 4, SIZE_C + 8
+const ZT_SELECT: u32 = 0x1538;
+const CLEAR_SURFACE: u32 = 0x19d0;
 
 /// A channel's state between submits.
 #[derive(Clone, Debug)]
@@ -300,6 +340,32 @@ impl Channel {
         }
     }
 
+    /// CLEAR_SURFACE: Z (bit 0), stencil (1), R..A (2..5), MRT index (9:6),
+    /// array layer (25:10); the MRT index goes through SET_CT_SELECT.
+    fn clear(&self, sub: usize, value: u32) -> Clear {
+        let reg = |m: u32| self.reg(sub, m);
+        let mask = (value >> 2 & 0xf) as u8;
+        let color = (mask != 0).then(|| {
+            let mrt = value >> 6 & 0xf;
+            let j = reg(CT_SELECT) >> (4 + 3 * mrt) & 7;
+            let t = COLOR_TARGET + 64 * j;
+            let surface = Surface { addr: u64::from(reg(t)) << 32 | u64::from(reg(t + 4)), width: reg(t + 8), height: reg(t + 0xc), format: reg(t + 0x10) & 0xff, layers: (reg(t + 0x18) & 0xfff_ffff).max(1) };
+            (surface, [0, 1, 2, 3].map(|i| reg(COLOR_CLEAR_VALUE + 4 * i)), mask)
+        });
+        let (z, s) = (value & 1 != 0, value & 2 != 0);
+        let depth = ((z || s) && reg(ZT_SELECT) & 1 != 0).then(|| {
+            let surface = Surface { addr: u64::from(reg(ZT_A)) << 32 | u64::from(reg(ZT_A + 4)), width: reg(ZT_SIZE_A), height: reg(ZT_SIZE_A + 4), format: reg(ZT_A + 8) & 0x1f, layers: (reg(ZT_SIZE_A + 8) & 0xffff).max(1) };
+            (surface, z.then(|| reg(Z_CLEAR_VALUE)), s.then(|| reg(STENCIL_CLEAR_VALUE) as u8))
+        });
+        // Scissor 0 bounds the clear when SET_CLEAR_SURFACE_CONTROL says so and it is on.
+        let scissor = (reg(CLEAR_SURFACE_CONTROL) & 0x100 != 0 && reg(SCISSOR_ENABLE) & 1 != 0).then(|| {
+            let (h, v) = (reg(SCISSOR_ENABLE + 4), reg(SCISSOR_ENABLE + 8));
+            let (x0, x1, y0, y1) = (h & 0xffff, h >> 16, v & 0xffff, v >> 16);
+            [x0, y0, x1.saturating_sub(x0), y1.saturating_sub(y0)]
+        });
+        Clear { layer: value >> 10 & 0xffff, color, depth, scissor }
+    }
+
     fn engine_effect(&self, subchannel: usize, method: u32, value: u32) -> Option<Effect> {
         let class = self.classes[subchannel];
         let ignored = Effect::Ignored { class, method, value };
@@ -315,6 +381,7 @@ impl Channel {
                 }),
                 _ => ignored,
             }),
+            (0x97, CLEAR_SURFACE) => Some(Effect::Clear(self.clear(subchannel, value))),
             // Copy engine: a copy (ignored), then a semaphore by bits 4:3 (1 one word, 2 four).
             (0xb5, DMA_LAUNCH) => Some(match value >> 3 & 3 {
                 kind @ (1 | 2) => Effect::Release(Release {
@@ -410,6 +477,37 @@ mod tests {
         assert_eq!(c.run(&words), vec![Effect::Release(Release { method: REPORT_SEMAPHORE_D, addr: 0x10_5fc1_1000, value: 2, width: 4, timestamp: false })]);
         // An unloaded macro is a fault.
         assert!(matches!(c.run(&[header(1, 1, 0, CALL_MME.start + 8), 0])[..], [Effect::MacroFault { index: 1, .. }]));
+    }
+
+    #[test]
+    fn clear_surface_describes_the_selected_target() {
+        let mut c = Channel::default();
+        // Color target 1 at 0x81_0000_2000, 1600x900, RF16_GF16_BF16_AF16; MRT 0 -> target 1.
+        let t = COLOR_TARGET + 64;
+        let words = [
+            header(1, 1, 0, SET_OBJECT),
+            0xc797,
+            header(1, 5, 0, t),
+            0x81,
+            0x2000,
+            1600,
+            900,
+            0xca,
+            header(1, 1, 0, t + 0x18),
+            1,
+            header(1, 1, 0, CT_SELECT),
+            1 | 1 << 4,
+            header(1, 4, 0, COLOR_CLEAR_VALUE),
+            0x3f00_0000,
+            0,
+            0x3f00_0000,
+            0x3f80_0000,
+            header(1, 1, 0, CLEAR_SURFACE),
+            0x3c,
+        ];
+        let surface = Surface { addr: 0x81_0000_2000, width: 1600, height: 900, format: 0xca, layers: 1 };
+        let expected = Clear { layer: 0, color: Some((surface, [0x3f00_0000, 0, 0x3f00_0000, 0x3f80_0000], 0xf)), depth: None, scissor: None };
+        assert_eq!(c.run(&words), vec![Effect::Clear(expected)]);
     }
 
     #[test]
