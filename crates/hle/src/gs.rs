@@ -378,6 +378,8 @@ impl Kernel {
             let interval = req.u32_at(0x10 + 0x18).unwrap_or(0) >> 16;
             self.log(&format!("vi2: present #{n} layer {layer:#x} image {image} acquire fence ({fence_id}, {fence}) interval {interval}"));
         }
+        // GPU work that waited for the CPU's semaphores runs before the frame is shown.
+        crate::nvdrv::poll(self);
         // The render targets this frame touched, as PNG files (game output: never committed).
         let every = self.config.dump_every;
         if let (Some(dir), Some(s)) = (self.config.frames_dump.clone(), self.surfaces.as_mut())

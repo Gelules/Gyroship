@@ -15,7 +15,9 @@
 //! ponytail: block-linear and remapped copies, and the 2D class, are
 //! reported, not executed.
 
+use crate::draw::Mem;
 use crate::mme::{self, Mme};
+use std::collections::VecDeque;
 use crate::state::raster::{self, RenderState};
 use crate::state::resources::{self, Bindings, MemWrite, Pool, Resources, SamplerBinding, Unsupported};
 use crate::state::vertex::{self, Attribute, IndexBuffer, Stream};
@@ -30,6 +32,50 @@ pub struct Release {
     pub value: u64,
     pub width: u8,
     pub timestamp: bool,
+}
+
+/// A semaphore the channel waits for before going on (an acquire of the
+/// host class: SEMAPHORED or SEM_EXECUTE, clc76f.h).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Acquire {
+    pub addr: u64,
+    pub value: u64,
+    /// A 64-bit semaphore (SEM_EXECUTE_PAYLOAD_SIZE), else 32-bit.
+    pub wide: bool,
+    pub op: AcquireOp,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AcquireOp {
+    /// Memory equals the value.
+    Equal,
+    /// Memory is at or past the value, with wrap-around (ACQ_GEQ, ACQ_CIRC_GEQ).
+    CircGeq,
+    /// Memory is at least the value, unsigned (ACQ_STRICT_GEQ).
+    StrictGeq,
+    /// Memory and the value share a set bit (ACQ_AND).
+    And,
+}
+
+impl Acquire {
+    /// Whether the semaphore's memory value `m` lets the channel go on.
+    pub fn met(&self, m: u64) -> bool {
+        let (m, v) = if self.wide { (m, self.value) } else { (m & 0xffff_ffff, self.value & 0xffff_ffff) };
+        match self.op {
+            AcquireOp::Equal => m == v,
+            AcquireOp::CircGeq if self.wide => m.wrapping_sub(v) as i64 >= 0,
+            AcquireOp::CircGeq => (m as u32).wrapping_sub(v as u32) as i32 >= 0,
+            AcquireOp::StrictGeq => m >= v,
+            AcquireOp::And => m & v != 0,
+        }
+    }
+
+    /// Reads the semaphore; one that cannot be read does not hold the channel.
+    fn met_in(&self, read: Mem) -> bool {
+        let mut b = [0u8; 8];
+        let n = if self.wide { 8 } else { 4 };
+        !read(self.addr, &mut b[..n]) || self.met(u64::from_le_bytes(b))
+    }
 }
 
 /// What a segment did besides storing methods.
@@ -195,6 +241,10 @@ pub struct Channel {
     running: Option<usize>,
     /// The 3D class's constant-buffer bindings and memory writes.
     resources: Resources,
+    /// Segments not run yet, with where to start in each.
+    queue: VecDeque<(Vec<u32>, usize)>,
+    /// The acquire the channel waits for.
+    wait: Option<Acquire>,
     /// Every method executed, when set (for study tools).
     pub trace: Option<Vec<Traced>>,
 }
@@ -230,6 +280,8 @@ impl Default for Channel {
             call: None,
             running: None,
             resources: Resources::default(),
+            queue: VecDeque::new(),
+            wait: None,
             trace: None,
         }
     }
@@ -256,11 +308,55 @@ impl mme::Host for MacroHost<'_> {
 }
 
 impl Channel {
-    /// Runs one pushbuffer segment.
+    /// Runs one pushbuffer segment, every acquire taken as met (for replays
+    /// without memory).
     pub fn run(&mut self, words: &[u32]) -> Vec<Effect> {
+        self.run_with(words, &mut |_, _| false)
+    }
+
+    /// Queues one pushbuffer segment and runs the channel as far as its
+    /// acquires allow; `read` reads the semaphores.
+    pub fn run_with(&mut self, words: &[u32], read: Mem) -> Vec<Effect> {
+        self.queue.push_back((words.to_vec(), 0));
+        self.resume(read)
+    }
+
+    /// The acquire the channel waits for, if any.
+    pub fn waiting(&self) -> Option<Acquire> {
+        self.wait
+    }
+
+    /// Gives up the acquire the channel waits for (a watchdog's decision).
+    pub fn skip_wait(&mut self) -> Option<Acquire> {
+        self.wait.take()
+    }
+
+    /// Runs the queued segments until they are done or an acquire is not met.
+    pub fn resume(&mut self, read: Mem) -> Vec<Effect> {
         let mut effects = Vec::new();
-        let mut i = 0;
+        while let Some((words, at)) = self.queue.pop_front() {
+            if let Some(w) = self.wait {
+                if !w.met_in(read) {
+                    self.queue.push_front((words, at));
+                    break;
+                }
+                self.wait = None;
+            }
+            if let Some(next) = self.segment(&words, at, &mut effects) {
+                self.queue.push_front((words, next));
+            }
+        }
+        effects
+    }
+
+    /// Runs a segment from word `start`; the word to go on from when an
+    /// acquire stopped it.
+    fn segment(&mut self, words: &[u32], start: usize, effects: &mut Vec<Effect>) -> Option<usize> {
+        let mut i = start;
         while i < words.len() {
+            if self.wait.is_some() {
+                return Some(i);
+            }
             let Some(mut p) = self.pending.take() else {
                 let h = words[i];
                 i += 1;
@@ -269,7 +365,7 @@ impl Channel {
                     // Incrementing, non-incrementing, increment once: data words follow.
                     1 | 3 | 5 if count > 0 => self.pending = Some(Pending { op, subchannel, method, left: count }),
                     // Immediate: the value is in the header.
-                    4 => self.write(subchannel, method * 4, count, &mut effects),
+                    4 => self.write(subchannel, method * 4, count, effects),
                     // End of the segment.
                     7 => break,
                     // Sub-device masks and empty methods carry no data.
@@ -277,7 +373,7 @@ impl Channel {
                 }
                 continue;
             };
-            self.write(p.subchannel, p.method * 4, words[i], &mut effects);
+            self.write(p.subchannel, p.method * 4, words[i], effects);
             i += 1;
             p.left -= 1;
             match p.op {
@@ -293,11 +389,14 @@ impl Channel {
                 self.pending = Some(p);
             }
         }
+        if self.wait.is_some() {
+            return Some(i);
+        }
         // A call whose parameters do not continue in the next segment runs now.
         if self.pending.is_none() {
-            self.flush_call(&mut effects);
+            self.flush_call(effects);
         }
-        effects
+        None
     }
 
     /// Runs the macro call gathered so far, if any.
@@ -334,6 +433,10 @@ impl Channel {
             self.host[(method / 4) as usize] = value;
             if method == SET_OBJECT {
                 self.classes[subchannel] = value;
+            }
+            if let Some(a) = self.acquire(method, value) {
+                self.wait = Some(a);
+                return;
             }
             if let Some(e) = self.host_effect(method, value) {
                 effects.push(e);
@@ -383,6 +486,29 @@ impl Channel {
 
     fn reg(&self, subchannel: usize, method: u32) -> u32 {
         self.engine[subchannel * 0x1000 + (method / 4) as usize]
+    }
+
+    /// SEMAPHORED operations (4:0) 1 ACQUIRE, 4 ACQ_GEQ, 8 ACQ_AND, on
+    /// SEMAPHOREA/B/C; SEM_EXECUTE operations (2:0) 0 ACQUIRE, 2 ACQ_STRICT_GEQ,
+    /// 3 ACQ_CIRC_GEQ, 4 ACQ_AND, on SEM_ADDR/PAYLOAD (64-bit with bit 24).
+    fn acquire(&self, method: u32, value: u32) -> Option<Acquire> {
+        let op = match (method, value) {
+            (SEMAPHORE_D, v) => [(1, AcquireOp::Equal), (4, AcquireOp::CircGeq), (8, AcquireOp::And)].into_iter().find(|(k, _)| v & 0x1f == *k)?.1,
+            (SEM_EXECUTE, v) => [(0, AcquireOp::Equal), (2, AcquireOp::StrictGeq), (3, AcquireOp::CircGeq), (4, AcquireOp::And)].into_iter().find(|(k, _)| v & 7 == *k)?.1,
+            _ => return None,
+        };
+        Some(if method == SEMAPHORE_D {
+            Acquire { addr: u64::from(self.host_reg(SEMAPHORE_A) & 0xff) << 32 | u64::from(self.host_reg(SEMAPHORE_B) & !3), value: u64::from(self.host_reg(SEMAPHORE_C)), wide: false, op }
+        } else {
+            let wide = value >> 24 & 1 == 1;
+            let lo = u64::from(self.host_reg(SEM_PAYLOAD_LO));
+            Acquire {
+                addr: u64::from(self.host_reg(SEM_ADDR_HI) & 0xff) << 32 | u64::from(self.host_reg(SEM_ADDR_LO) & !3),
+                value: if wide { lo | u64::from(self.host_reg(SEM_PAYLOAD_HI)) << 32 } else { lo },
+                wide,
+                op,
+            }
+        })
     }
 
     fn host_effect(&self, method: u32, value: u32) -> Option<Effect> {
@@ -504,8 +630,9 @@ impl Channel {
         let ignored = Effect::Ignored { class, method, value };
         match (class & 0xff, method) {
             // 3D and compute: operation in bits 1:0 (0 = release); bit 28: one word, else four.
+            // REPORT_ONLY (2) of REPORT_NONE (27:23 = 0) writes the payload too.
             (0x97 | 0xc0, REPORT_SEMAPHORE_D) => Some(match value & 3 {
-                0 => Effect::Release(Release {
+                op if op == 0 || (op == 2 && value >> 23 & 0x1f == 0) => Effect::Release(Release {
                     method,
                     addr: u64::from(self.reg(subchannel, REPORT_SEMAPHORE_A) & 0xff) << 32 | u64::from(self.reg(subchannel, REPORT_SEMAPHORE_B)),
                     value: u64::from(self.reg(subchannel, REPORT_SEMAPHORE_C)),
@@ -595,8 +722,38 @@ mod tests {
         let words = [header(1, 8, 4, DMA_OFFSET_IN_UPPER), 0x12, 0x3400, 0x12, 0x5600, 0x100, 0x80, 0x40, 2, header(1, 1, 4, DMA_LAUNCH), 2 | 3 << 7 | 1 << 9 | 1 << 3];
         let copy = Copy { src: 0x12_0000_3400, dst: 0x12_0000_5600, pitch_in: 0x100, pitch_out: 0x80, line_length: 0x40, line_count: 2 };
         assert_eq!(c.run(&words), vec![Effect::Copy(copy), Effect::Release(Release { method: DMA_LAUNCH, addr: 0x1_0000_2000, value: 5, width: 4, timestamp: false })]);
-        // An acquire is reported as ignored, not executed.
-        assert!(matches!(c.run(&[header(1, 1, 0, SEMAPHORE_D), 1])[..], [Effect::Ignored { method: SEMAPHORE_D, value: 1, .. }]));
+        // A reduction is reported as ignored, not executed.
+        assert!(matches!(c.run(&[header(1, 1, 0, SEMAPHORE_D), 0x10])[..], [Effect::Ignored { method: SEMAPHORE_D, value: 0x10, .. }]));
+    }
+
+    #[test]
+    fn an_acquire_holds_the_channel_until_memory_meets_it() {
+        let mut c = Channel::default();
+        // Wait until the word at 0x10_0000_1000 is >= 5 (ACQ_GEQ), then release 7 at 0x2000.
+        let acquire = [header(1, 4, 0, SEMAPHORE_A), 0x10, 0x1000, 5, 0x1004];
+        let release = [header(1, 4, 0, SEMAPHORE_A), 0, 0x2000, 7, 0x0100_0002];
+        let mut memory = 4u32;
+        let mut read = |addr: u64, buf: &mut [u8]| {
+            assert_eq!(addr, 0x10_0000_1000);
+            buf.copy_from_slice(&memory.to_le_bytes()[..buf.len()]);
+            true
+        };
+        assert!(c.run_with(&[&acquire[..], &release[..]].concat(), &mut read).is_empty());
+        assert_eq!(c.waiting().map(|a| (a.value, a.op)), Some((5, AcquireOp::CircGeq)));
+        // A later segment queues behind the wait.
+        assert!(c.run_with(&release, &mut read).is_empty());
+        memory = 5;
+        let mut read = |_: u64, buf: &mut [u8]| {
+            buf.copy_from_slice(&memory.to_le_bytes()[..buf.len()]);
+            true
+        };
+        let r = Effect::Release(Release { method: SEMAPHORE_D, addr: 0x2000, value: 7, width: 4, timestamp: false });
+        assert_eq!(c.resume(&mut read), vec![r.clone(), r]);
+        assert_eq!(c.waiting(), None);
+        // Wrap-around: 0xffff_fffe is not yet at 2, 3 is.
+        let a = Acquire { addr: 0, value: 2, wide: false, op: AcquireOp::CircGeq };
+        assert!(!a.met(0xffff_fffe) && a.met(3) && a.met(2));
+        assert!(Acquire { op: AcquireOp::And, ..a }.met(6) && !Acquire { op: AcquireOp::Equal, ..a }.met(3));
     }
 
     /// The three words of an MME64 group, high first.
