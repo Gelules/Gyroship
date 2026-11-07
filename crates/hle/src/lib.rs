@@ -106,11 +106,13 @@ pub struct Config {
     /// `--dump-shaders DIR`: the code of every program a draw uses, once, as
     /// `{key}.bin`.
     pub shaders_dump: Option<std::path::PathBuf>,
+    /// `--replay FILE`: the controller's states by hid sample (D29).
+    pub replay: Option<Vec<(u64, hid::Step)>>,
 }
 
 impl Default for Config {
     fn default() -> Config {
-        Config { seed: 0x5EED, explore: false, non_system_memory: 0x2_6410_0000, time_limit: None, frames: None, save_dir: None, vsync: true, gpfifo_dump: None, frames_dump: None, dump_every: 1, dump_draws: None, shaders_dump: None }
+        Config { seed: 0x5EED, explore: false, non_system_memory: 0x2_6410_0000, time_limit: None, frames: None, save_dir: None, vsync: true, gpfifo_dump: None, frames_dump: None, dump_every: 1, dump_draws: None, shaders_dump: None, replay: None }
     }
 }
 
@@ -143,6 +145,8 @@ pub struct Kernel {
     pub gs: gs::State,
     /// hid's shared memory, once a client asked for it.
     pub hid_shared: Option<usize>,
+    /// Where the controller's replay script stands.
+    pub input: hid::Input,
     /// Spin detector: each thread's counter reads and waits since its last SVC.
     pub spin: Vec<u32>,
     /// Open saves, by key (user id and save type).
@@ -172,7 +176,7 @@ impl Kernel {
     pub fn new(mem: Memory, mut journal: Journal, config: Config) -> Kernel {
         let mode = if config.explore { "exploration (not a validation run)" } else { "strict" };
         journal.line(0, 0, &format!("gyroship hle: mode {mode}, seed {:#x}, non-system memory {:#x}", config.seed, config.non_system_memory));
-        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None, sessions: Vec::new(), objects: Vec::new(), domains: Vec::new(), allowed_services: Vec::new(), shared: Vec::new(), transfers: Vec::new(), time_shared: None, frame: (0, 0, 0), symbols: Vec::new(), romfs: None, gs: gs::State::default(), hid_shared: None, spin: Vec::new(), saves: Default::default(), timers: Vec::new(), surfaces: None, gpu: Default::default(), counts: Default::default(), anomalies: Default::default() }
+        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None, sessions: Vec::new(), objects: Vec::new(), domains: Vec::new(), allowed_services: Vec::new(), shared: Vec::new(), transfers: Vec::new(), time_shared: None, frame: (0, 0, 0), symbols: Vec::new(), romfs: None, gs: gs::State::default(), hid_shared: None, input: Default::default(), spin: Vec::new(), saves: Default::default(), timers: Vec::new(), surfaces: None, gpu: Default::default(), counts: Default::default(), anomalies: Default::default() }
     }
 
     /// Counts one more `name` (normal activity); returns the new count.

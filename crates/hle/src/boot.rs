@@ -230,6 +230,13 @@ pub fn main(table: Vec<rt::Entry>) {
         dump_draws: value("--dump-draws").and_then(|s| s.parse().ok()),
         dump_every: value("--dump-every").and_then(|s| s.parse().ok()).filter(|&k| k > 0).unwrap_or(1),
         shaders_dump: value("--dump-shaders").map(std::path::PathBuf::from),
+        replay: value("--replay").map(|f| {
+            let script = std::fs::read_to_string(&f).map_err(|e| e.to_string()).and_then(|t| crate::hid::parse_script(&t));
+            script.unwrap_or_else(|e| {
+                eprintln!("gyroship: --replay {f}: {e}");
+                std::process::exit(2);
+            })
+        }),
         ..Config::default()
     };
     let installed = table.len();

@@ -181,6 +181,8 @@ pub enum TimerAction {
     /// (+0x44) takes the write index (+0x1004) if valid, then the stream's
     /// data event (`Kernel::events` index) is signaled.
     AudioSink { ring: u64, slots: u32, event: usize },
+    /// hid's controller sample, into shared memory `shared` (D29).
+    HidSample { shared: usize },
 }
 
 /// The scheduler's state, inside the kernel.
@@ -467,7 +469,7 @@ impl Kernel {
 
     /// Whether a thread waits for the event timer `i` signals.
     fn timer_awaited(&self, i: usize) -> bool {
-        let TimerAction::AudioSink { event, .. } = self.timers[i].action;
+        let TimerAction::AudioSink { event, .. } = self.timers[i].action else { return false };
         self.sched.threads.iter().any(|t| t.state == State::Waiting && matches!(&t.wait, Wait::Sync(list) if list.contains(&Object::ReadableEvent(event))))
     }
 
@@ -475,17 +477,21 @@ impl Kernel {
     /// wakes start at `at`, and it rearms.
     fn fire(&mut self, i: usize, at: u64) {
         let was_ready: Vec<bool> = self.sched.threads.iter().map(|t| t.state == State::Ready).collect();
-        let TimerAction::AudioSink { ring, slots, event } = self.timers[i].action;
-        // The silent sink plays everything written: the read index catches up with the write index.
-        let mut w = [0; 4];
-        let write = self.mem.read(ring + 0x1004, &mut w).map(|()| u32::from_le_bytes(w)).unwrap_or(u32::MAX);
-        if write < slots {
-            let _ = self.mem.write(ring + 0x44, &write.to_le_bytes());
-        }
-        self.signal_event(event);
         let k = self.timers[i].k;
-        if k == 1 || k.is_multiple_of(100) {
-            self.journal.line(at, 0, &format!("audio sink: tick {k} read index -> {write}"));
+        match self.timers[i].action {
+            TimerAction::AudioSink { ring, slots, event } => {
+                // The silent sink plays everything written: the read index catches up with the write index.
+                let mut w = [0; 4];
+                let write = self.mem.read(ring + 0x1004, &mut w).map(|()| u32::from_le_bytes(w)).unwrap_or(u32::MAX);
+                if write < slots {
+                    let _ = self.mem.write(ring + 0x44, &write.to_le_bytes());
+                }
+                self.signal_event(event);
+                if k == 1 || k.is_multiple_of(100) {
+                    self.journal.line(at, 0, &format!("audio sink: tick {k} read index -> {write}"));
+                }
+            }
+            TimerAction::HidSample { shared } => self.hid_sample(shared, k),
         }
         for (t, was) in was_ready.into_iter().enumerate() {
             if !was && self.sched.threads[t].state == State::Ready {
