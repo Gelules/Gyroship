@@ -974,6 +974,7 @@ dependencies = [
  "gyroship-gpu",
  "gyroship-hle",
  "gyroship-runtime",
+ "libloading",
  "winit",
 ]
 

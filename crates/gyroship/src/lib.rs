@@ -2,6 +2,8 @@
 //! sound come next. The generated harness calls [`main`]. `boot --headless`
 //! (tests, reference runs) runs without a window, as before.
 
+pub mod sdl;
+
 use gyroship_hle::boot::HostWindow;
 use gyroship_runtime::Entry;
 use std::sync::Arc;

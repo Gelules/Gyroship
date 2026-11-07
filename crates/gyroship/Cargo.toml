@@ -10,3 +10,4 @@ gyroship-gpu = { path = "../gpu" }
 gyroship-hle = { path = "../hle" }
 gyroship-runtime = { path = "../runtime" }
 winit = "0.30"
+libloading = "0.8"
