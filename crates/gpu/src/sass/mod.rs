@@ -213,7 +213,17 @@ pub fn program(sass: &[u8]) -> Option<&[u8]> {
 /// Offline translation and the runtime's shader cache agree on it.
 pub fn program_key(code: &[u8]) -> Option<(u64, usize)> {
     let len = SPH_SIZE + program(code.get(SPH_SIZE..)?)?.len();
-    Some((code[..len].iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)), len))
+    Some((fnv(&code[..len]), len))
+}
+
+/// The key and length of a compute program (no SPH: the QMD describes it).
+pub fn compute_key(code: &[u8]) -> Option<(u64, usize)> {
+    let len = program(code)?.len();
+    Some((fnv(&code[..len]), len))
+}
+
+fn fnv(code: &[u8]) -> u64 {
+    code.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
 }
 
 #[cfg(test)]

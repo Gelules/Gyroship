@@ -597,8 +597,15 @@ impl Gpu {
                         continue;
                     }
                     let releases = qmd::releases(&q);
+                    let launch = qmd::launch(&q);
+                    let program = gyroship_gpu::draw::read_compute_program(&mut |gpu, buf| k.read_gpu(space, gpu, buf), launch.program);
+                    let key = program.as_ref().map_or_else(|| "not readable".to_string(), |(key, code)| format!("{key:016x}, {} bytes", code.len()));
+                    if let (Some(dir), Some((key, code))) = (&k.config.shaders_dump, &program) {
+                        let _ = std::fs::create_dir_all(dir);
+                        let _ = std::fs::write(dir.join(format!("{key:016x}.bin")), code);
+                    }
                     if k.journal.few("gpu dispatch", 8) {
-                        k.log(&format!("gpu: compute dispatch {}: QMD {at:#x} version {:?}, program not run, releases {releases:x?}", self.dispatches, qmd::version(&q)));
+                        k.log(&format!("gpu: compute dispatch {}: QMD {at:#x} version {:?}, program {key} at {:#x}, grid {:?} block {:?} shared {:#x} cbufs {:x?}; not run; releases {releases:x?}", self.dispatches, qmd::version(&q), launch.program, launch.grid, launch.block, launch.shared, launch.cbufs));
                     }
                     for r in releases {
                         semaphore(k, space, &r);

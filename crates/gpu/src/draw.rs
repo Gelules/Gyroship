@@ -31,6 +31,15 @@ const CBUF_BYTES: usize = 0x10000;
 /// The key and code (SPH then SASS, up to its closing self-branch) of the
 /// program at `gpu`.
 pub fn read_program(mem: Mem, gpu: u64) -> Option<(u64, Vec<u8>)> {
+    read_until(mem, gpu, crate::sass::program_key)
+}
+
+/// The key and code of the compute program at `gpu` (no SPH).
+pub fn read_compute_program(mem: Mem, gpu: u64) -> Option<(u64, Vec<u8>)> {
+    read_until(mem, gpu, crate::sass::compute_key)
+}
+
+fn read_until(mem: Mem, gpu: u64, key: fn(&[u8]) -> Option<(u64, usize)>) -> Option<(u64, Vec<u8>)> {
     let mut code = Vec::new();
     while code.len() < 0x4_0000 {
         let mut chunk = vec![0u8; 0x1000];
@@ -38,7 +47,7 @@ pub fn read_program(mem: Mem, gpu: u64) -> Option<(u64, Vec<u8>)> {
             return None;
         }
         code.extend(chunk);
-        if let Some((key, len)) = crate::sass::program_key(&code) {
+        if let Some((key, len)) = key(&code) {
             code.truncate(len);
             return Some((key, code));
         }

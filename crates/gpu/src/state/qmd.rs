@@ -60,6 +60,37 @@ impl Release {
     }
 }
 
+/// What a dispatch runs (QMD V03_00 fields).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Launch {
+    /// PROGRAM_ADDRESS_LOWER/UPPER: the SASS, without an SPH.
+    pub program: u64,
+    /// CTA_RASTER_WIDTH/HEIGHT/DEPTH: blocks in the grid.
+    pub grid: [u32; 3],
+    /// CTA_THREAD_DIMENSION0..2: threads in a block.
+    pub block: [u32; 3],
+    /// SHARED_MEMORY_SIZE, bytes.
+    pub shared: u32,
+    /// The valid CONSTANT_BUFFER(i): bank, address, size in bytes.
+    pub cbufs: Vec<(u8, u64, u32)>,
+}
+
+pub fn launch(q: &[u8]) -> Launch {
+    Launch {
+        program: u64::from(mw(q, 1584, 1568)) << 32 | u64::from(mw(q, 1567, 1536)),
+        grid: [mw(q, 415, 384), mw(q, 431, 416), mw(q, 463, 448)],
+        block: [mw(q, 607, 592), mw(q, 623, 608), mw(q, 639, 624)],
+        shared: mw(q, 561, 544),
+        cbufs: (0..8u32)
+            .filter(|i| mw(q, 640 + i, 640 + i) != 0)
+            .map(|i| {
+                let b = 1024 + 64 * i;
+                (i as u8, u64::from(mw(q, b + 48, b + 32)) << 32 | u64::from(mw(q, b + 31, b)), mw(q, b + 63, b + 51) << 4)
+            })
+            .collect(),
+    }
+}
+
 /// `QMD_MAJOR_VERSION` and `QMD_VERSION`.
 pub fn version(q: &[u8]) -> (u32, u32) {
     (mw(q, 583, 580), mw(q, 579, 576))
@@ -123,5 +154,21 @@ mod tests {
         let min = Release { reduction: Some(Reduction::Min), payload: 0xffff_fffe, signed: true, ..r[0] };
         assert_eq!(min.apply(1), 0xffff_fffe);
         assert!(releases(&[0u8; SIZE]).is_empty());
+        // A launch: program, a 4x2x1 grid of 8x8x1 blocks, bank 1 of 0x100 bytes.
+        put(&mut q, 1567, 1536, 0x5678_9a00);
+        put(&mut q, 1584, 1568, 0x11);
+        put(&mut q, 415, 384, 4);
+        put(&mut q, 431, 416, 2);
+        put(&mut q, 463, 448, 1);
+        put(&mut q, 607, 592, 8);
+        put(&mut q, 623, 608, 8);
+        put(&mut q, 639, 624, 1);
+        put(&mut q, 561, 544, 0x400);
+        put(&mut q, 641, 641, 1);
+        put(&mut q, 1024 + 64 + 31, 1024 + 64, 0x2000);
+        put(&mut q, 1024 + 64 + 48, 1024 + 64 + 32, 0x12);
+        put(&mut q, 1024 + 64 + 63, 1024 + 64 + 51, 0x10);
+        let l = launch(&q);
+        assert_eq!(l, Launch { program: 0x11_5678_9a00, grid: [4, 2, 1], block: [8, 8, 1], shared: 0x400, cbufs: vec![(1, 0x12_0000_2000, 0x100)] });
     }
 }
