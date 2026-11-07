@@ -423,6 +423,39 @@ mod tests {
         }
     }
 
+    /// FLO, as PTX's bfind: per lane, plain, signed, .SH and inverted forms on
+    /// edge values, against a reference written from the definition.
+    #[test]
+    fn flo_finds_the_leading_bit_as_ptx_bfind() {
+        let values: Vec<u32> = [0, 1, 2, 3, 0x8000_0000, 0xffff_ffff, 0x7fff_ffff, 0xffff_fffe, 0x0001_0000, 0x4000_0001, 0xc000_0000, 0x0000_ffff, 0xfffe_ffff, 0x10, 0x8000_0001, 0x2468_ace0]
+            .into_iter()
+            .chain((0..16).map(|i| 0x9e37_79b9u32.wrapping_mul(i + 1)))
+            .collect();
+        let unsigned = |x: u32| if x == 0 { u32::MAX } else { 31 - x.leading_zeros() };
+        let signed = |x: u32| if (x as i32) < 0 { unsigned(!x) } else { unsigned(x) };
+        let sh = |r: u32| if r == u32::MAX { r } else { 31 - r };
+        let global: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        // S2R R0 = lane; S2R R1 = tid.y; MOV R5 = 4; IMAD R2 = R0 * R5 + c[0][0x80]; LDG.32 R4;
+        // FLO R12 = R4; FLO.S32 R13 = R4; FLO.SH R14 = R4; FLO R15 = ~R4; SUST [R0, R1] = R12..R15.
+        let flo = |dst: u128, extra: &[(u32, u128)]| w(0x300, &[&[(16, dst), (32, 4), (81, 7)][..], extra].concat());
+        let code = [
+            w(0x919, &[(16, 0), (72, 0)]),
+            w(0x919, &[(16, 1), (72, 0x22)]),
+            w(0x802, &[(16, 5), (32, 4), (72, 0xf)]),
+            w(0x624, &[(16, 2), (24, 0), (64, 5), (38, 0x80), (54, 0), (81, 7), (87, 7)]),
+            w(0x381, &[(16, 4), (24, 2), (72, 1), (40, 0), (73, 4), (81, 7)]),
+            flo(12, &[]),
+            flo(13, &[(73, 1)]),
+            flo(14, &[(74, 1)]),
+            flo(15, &[(63, 1)]),
+            w(0xb9b, &[(24, 0), (32, 12), (40, 0x20 / 4), (54, 0), (61, 3), (72, 0xf)]),
+        ];
+        let Some(words) = run_warp(&code, global, 1, 0) else { return };
+        for (l, &x) in values.iter().enumerate() {
+            assert_eq!(words[4 * l..4 * l + 4], [unsigned(x), signed(x), sh(unsigned(x)), unsigned(!x)], "lane {l}: {x:#x}");
+        }
+    }
+
     #[test]
     fn an_image_store_outside_the_image_is_dropped() {
         // Lane l stores 1.0 at (l, 0), then 2.0 at (l, 1), past the single row: row 0

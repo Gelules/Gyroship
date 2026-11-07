@@ -8,7 +8,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, WindowEvent};
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 
@@ -52,6 +53,10 @@ struct Shared {
     closed: AtomicBool,
     /// Client size, width << 32 | height.
     size: AtomicU64,
+    /// Keys held, and keys pressed since the last hid sample (a short press
+    /// between two samples still counts once), as `key_bit` bits.
+    held: AtomicU64,
+    pressed: AtomicU64,
 }
 
 impl Shared {
@@ -79,7 +84,7 @@ impl ApplicationHandler for App {
         // The surface comes from this thread: winit gives window handles only here.
         let instance = gyroship_gpu::Renderer::instance_for(backend());
         let surface = instance.create_surface(window.clone()).unwrap_or_else(|e| fail(&format!("cannot draw in the window: {e}")));
-        let host = HostWindow { instance, surface, size: (size.width, size.height), pace: pace(self.shared.clone()) };
+        let host = HostWindow { instance, surface, size: (size.width, size.height), pace: pace(self.shared.clone()), input: input(self.shared.clone()) };
         // The guest's own fibers carry its code; this thread only needs room for the HLE.
         std::thread::Builder::new().name("guest".into()).stack_size(64 << 20).spawn(move || gyroship_hle::boot::run(table, Some(host))).unwrap_or_else(|e| fail(&format!("cannot start the guest: {e}")));
         self.window = Some(window);
@@ -98,6 +103,23 @@ impl ApplicationHandler for App {
                 });
             }
             WindowEvent::Resized(s) => self.shared.size.store(u64::from(s.width) << 32 | u64::from(s.height), Ordering::Relaxed),
+            WindowEvent::KeyboardInput { event, .. } if !event.repeat => {
+                if let PhysicalKey::Code(code) = event.physical_key
+                    && let Some(bit) = key_bit(code)
+                {
+                    match event.state {
+                        ElementState::Pressed => {
+                            self.shared.held.fetch_or(1 << bit, Ordering::Relaxed);
+                            self.shared.pressed.fetch_or(1 << bit, Ordering::Relaxed);
+                        }
+                        ElementState::Released => {
+                            self.shared.held.fetch_and(!(1 << bit), Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+            // Keys released while another window has the focus never come: let go of all.
+            WindowEvent::Focused(false) => self.shared.held.store(0, Ordering::Relaxed),
             _ => {}
         }
     }
@@ -127,4 +149,83 @@ fn pace(shared: Arc<Shared>) -> gyroship_hle::Pace {
         }
         Some(shared.size())
     })
+}
+
+/// Bits of the left stick's keys, above the Npad buttons.
+const STICK_UP: u32 = 48;
+const STICK_LEFT: u32 = 49;
+const STICK_DOWN: u32 = 50;
+const STICK_RIGHT: u32 = 51;
+
+/// The default keyboard layout, by physical key (US labels, so the same
+/// places on any layout): the Npad button bit, or a stick key.
+fn key_bit(code: KeyCode) -> Option<u32> {
+    Some(match code {
+        KeyCode::Enter => 0,      // A
+        KeyCode::Backspace => 1,  // B
+        KeyCode::KeyX => 2,       // X
+        KeyCode::KeyY => 3,       // Y
+        KeyCode::KeyQ => 6,       // L
+        KeyCode::KeyE => 7,       // R
+        KeyCode::Digit1 => 8,     // ZL
+        KeyCode::Digit3 => 9,     // ZR
+        KeyCode::KeyP => 10,      // Plus
+        KeyCode::KeyM => 11,      // Minus
+        KeyCode::ArrowLeft => 12,
+        KeyCode::ArrowUp => 13,
+        KeyCode::ArrowRight => 14,
+        KeyCode::ArrowDown => 15,
+        KeyCode::KeyW => STICK_UP,
+        KeyCode::KeyA => STICK_LEFT,
+        KeyCode::KeyS => STICK_DOWN,
+        KeyCode::KeyD => STICK_RIGHT,
+        _ => return None,
+    })
+}
+
+/// The controller state of a set of `key_bit` bits: buttons, the left stick
+/// at full deflection, and its direction bits (LSLeft..LSDown, 16..19).
+fn pad_of(bits: u64) -> gyroship_hle::hid::Pad {
+    let on = |b: u32| i32::from(bits >> b & 1 != 0);
+    let (x, y) = ((on(STICK_RIGHT) - on(STICK_LEFT)) * 0x7fff, (on(STICK_UP) - on(STICK_DOWN)) * 0x7fff);
+    let mut buttons = bits & 0xffff_ffff;
+    for (moved, bit) in [(x < 0, 16), (y > 0, 17), (x > 0, 18), (y < 0, 19)] {
+        if moved {
+            buttons |= 1 << bit;
+        }
+    }
+    gyroship_hle::hid::Pad { buttons, l: [x, y], r: [0, 0] }
+}
+
+/// The live state for each hid sample: what is held, plus what was pressed
+/// since the last sample.
+fn input(shared: Arc<Shared>) -> gyroship_hle::LiveInput {
+    Box::new(move || pad_of(shared.held.load(Ordering::Relaxed) | shared.pressed.swap(0, Ordering::Relaxed)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keys_make_buttons_and_a_full_stick() {
+        let bit = |c| 1u64 << key_bit(c).unwrap();
+        let p = pad_of(bit(KeyCode::Enter) | bit(KeyCode::ArrowUp) | bit(KeyCode::KeyW) | bit(KeyCode::KeyD));
+        assert_eq!(p.buttons, 1 | 1 << 13 | 1 << 17 | 1 << 18);
+        assert_eq!(p.l, [0x7fff, 0x7fff]);
+        // Opposite keys cancel.
+        assert_eq!(pad_of(bit(KeyCode::KeyA) | bit(KeyCode::KeyD)), gyroship_hle::hid::Pad::default());
+    }
+
+    /// A key pressed and released between two samples is seen by the next one, once.
+    #[test]
+    fn a_short_press_between_samples_counts_once() {
+        let shared = Arc::new(Shared::default());
+        let mut sample = input(shared.clone());
+        shared.held.fetch_or(1, Ordering::Relaxed);
+        shared.pressed.fetch_or(1, Ordering::Relaxed);
+        shared.held.fetch_and(!1, Ordering::Relaxed);
+        assert_eq!(sample().buttons, 1);
+        assert_eq!(sample().buttons, 0);
+    }
 }

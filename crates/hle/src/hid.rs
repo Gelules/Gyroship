@@ -131,6 +131,20 @@ pub struct Input {
     /// The script's next line.
     pub next: usize,
     pub current: Pad,
+    /// The last sample taken.
+    pub last: u64,
+}
+
+/// One line of a `--replay` script, as `--record` writes it.
+pub fn script_line(sample: u64, p: &Pad) -> String {
+    let names: Vec<&str> = BUTTONS.iter().enumerate().filter(|(bit, _)| p.buttons >> bit & 1 != 0).map(|(_, n)| *n).collect();
+    let mut line = format!("{sample} {}", if names.is_empty() { "-".to_string() } else { names.join("+") });
+    for (name, [x, y]) in [("L", p.l), ("R", p.r)] {
+        if (x, y) != (0, 0) {
+            line += &format!(" {name}={x},{y}");
+        }
+    }
+    line
 }
 
 #[derive(Debug)]
@@ -253,10 +267,21 @@ impl Kernel {
                 Step::End => self.stop(0, &format!("hid: replay ended at sample {k}")),
             }
         }
-        if self.journal.first("hid sampling") || input.current != self.input.current {
+        // Without a script, the host's live state (keyboard, controllers), read only here.
+        if self.config.replay.is_none()
+            && let Some(live) = self.live_input.as_mut()
+        {
+            input.current = live();
+        }
+        let first = self.journal.first("hid sampling");
+        if first || input.current != self.input.current {
             let p = input.current;
             self.log(&format!("hid: sample {k} (present {}): buttons {:#x} L {:?} R {:?}", self.gs.presents, p.buttons, p.l, p.r));
+            if let Some(lines) = self.recorded.as_mut() {
+                lines.push(script_line(k, &p));
+            }
         }
+        input.last = k;
         self.input = input;
         let at = NPAD + 0x28;
         let mut lifo = self.shared[m].data[at..at + LIFO_SIZE].to_vec();
@@ -316,6 +341,16 @@ mod tests {
         assert_eq!(lifo[LIFO_COUNT], 17);
         assert_eq!(u64::from_le_bytes(lifo[LIFO_ENTRIES + 6 * ENTRY + 8..][..8].try_into().unwrap()), 40, "sampling number of the newest entry (tail 40 mod 17)");
         assert_eq!(read(&lifo), last);
+    }
+
+    /// What `--record` writes, `--replay` reads back unchanged.
+    #[test]
+    fn recorded_lines_replay_as_written() {
+        let pads = [Pad::default(), Pad { buttons: 1 | 1 << 13 | 1 << 27, l: [-0x7fff, 0x7fff], r: [0, 0] }, Pad { buttons: 0, l: [0, 0], r: [3, -4] }];
+        let text: String = pads.iter().enumerate().map(|(i, p)| script_line(10 * i as u64, p) + "\n").collect::<String>() + "40 end\n";
+        let expected: Vec<(u64, Step)> = pads.iter().enumerate().map(|(i, p)| (10 * i as u64, Step::Pad(*p))).chain([(40, Step::End)]).collect();
+        assert_eq!(parse_script(&text).unwrap(), expected);
+        assert_eq!(script_line(7, &pads[1]), "7 A+Up+RightSR L=-32767,32767");
     }
 
     #[test]

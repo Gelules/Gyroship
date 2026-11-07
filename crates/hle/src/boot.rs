@@ -217,6 +217,8 @@ pub struct HostWindow {
     /// that time on the wall clock (D27), then gives the window's size, or
     /// None once the window is closed.
     pub pace: crate::Pace,
+    /// The controller's live state (keyboard now, controllers later), read at each hid sample.
+    pub input: crate::LiveInput,
 }
 
 /// [`main`], showing the frames in a host window when one is given.
@@ -259,6 +261,7 @@ pub fn run(table: Vec<rt::Entry>, window: Option<HostWindow>) {
         profile: value("--profile").map(|f| (f.into(), value("--profile-from").and_then(|n| n.parse().ok()).unwrap_or(600))),
         perf: value("--perf").map(Into::into),
         hashes: value("--hashes").map(Into::into),
+        record: value("--record").map(Into::into),
         ..Config::default()
     };
     let installed = table.len();
@@ -283,6 +286,7 @@ pub fn run(table: Vec<rt::Entry>, window: Option<HostWindow>) {
         let surfaces = match window {
             Some(w) => {
                 k.window = Some((w.pace, w.size));
+                k.live_input = Some(w.input);
                 gyroship_gpu::surfaces::Surfaces::windowed(&w.instance, w.surface, w.size)
             }
             None => gyroship_gpu::surfaces::Surfaces::headless(backend),

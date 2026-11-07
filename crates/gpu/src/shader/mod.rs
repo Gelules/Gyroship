@@ -1206,6 +1206,17 @@ impl Cx {
                 let ext = if *signed { format!("bitcast<u32>(extractBits(bitcast<i32>({x}), 0u, min({n}, 32u)))") } else { format!("extractBits({x}, 0u, min({n}, 32u))") };
                 self.set(out, *dst, &format!("select({x}, {ext}, {n} < 32u)"));
             }
+            // FLO (PTX bfind): the highest set bit, or for signed values the highest bit
+            // unlike the sign; 0xffffffff when none; .SH gives 31 - position instead.
+            // WGSL's firstLeadingBit has the same definition, for u32 and i32.
+            IntOp::Flo { dst, src, not, signed, sh, pdst } if *pdst == PT => {
+                let x = self.raw(src)?;
+                let x = if *not { format!("(~{x})") } else { x };
+                let (t, r) = (self.temp(), self.temp());
+                let found = if *signed { format!("bitcast<u32>(firstLeadingBit(bitcast<i32>({x})))") } else { format!("firstLeadingBit({x})") };
+                let _ = writeln!(out, "let {t} = {found};\nlet {r} = select({t}, 31u - {t}, {} && {t} != 0xffffffffu);", *sh);
+                self.set(out, *dst, &r);
+            }
             other => return Err(format!("unsupported: {other:?}")),
         }
         Ok(())
