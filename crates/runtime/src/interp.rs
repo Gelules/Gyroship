@@ -264,6 +264,46 @@ fn fp2(a: u128, b: u128, e: u32, q: bool, f: impl Fn(f64, f64) -> f64, g: impl F
     Ok(r)
 }
 
+/// The quiet bit and the infinity of `e`-bit floats.
+fn nan_bits(e: u32) -> (u64, u64) {
+    if e == 32 { (1 << 22, 0x7F80_0000) } else { (1 << 51, 0x7FF << 52) }
+}
+
+/// Arm's result (FPCR.DN = 0) for an operation on `ops` whose IEEE result is
+/// `r`: the first signalling NaN operand, quieted, else the first quiet NaN;
+/// with no NaN operand, an invalid operation gives the default NaN. The host's
+/// NaNs differ (x86 keeps the first operand's NaN, its default NaN is negative).
+fn arm_nan(ops: &[u64], r: u64, e: u32) -> u64 {
+    let (quiet, inf) = nan_bits(e);
+    let nan = |x: u64| (x & (mask(e) >> 1)) > inf;
+    match ops.iter().find(|&&x| nan(x) && (x & quiet) == 0).or_else(|| ops.iter().find(|&&x| nan(x))) {
+        Some(x) => x | quiet,
+        None if nan(r) => inf | quiet,
+        None => r,
+    }
+}
+
+/// FPMulAdd(acc, a, b) with Arm's NaNs: `arm_nan` on (acc, a, b), except that
+/// a quiet NaN addend gives the default NaN when a * b is inf * 0.
+fn fma_nan(acc: u64, a: u64, b: u64, r: u64, e: u32) -> u64 {
+    let (quiet, inf) = nan_bits(e);
+    let abs = |x: u64| x & (mask(e) >> 1);
+    let inf_zero = |x: u64, y: u64| abs(x) == inf && abs(y) == 0;
+    if abs(acc) > inf && (acc & quiet) != 0 && (inf_zero(a, b) || inf_zero(b, a)) { inf | quiet } else { arm_nan(&[acc, a, b], r, e) }
+}
+
+/// `fp2` with Arm's NaN results.
+fn fp2_arm(a: u128, b: u128, e: u32, q: bool, f: impl Fn(f64, f64) -> f64, g: impl Fn(f32, f32) -> f32) -> Result<u128> {
+    fp2(
+        a,
+        b,
+        e,
+        q,
+        |x, y| f64b(arm_nan(&[x.to_bits(), y.to_bits()], f(x, y).to_bits(), 64)),
+        |x, y| f32b(arm_nan(&[x.to_bits().into(), y.to_bits().into()], g(x, y).to_bits().into(), 32)),
+    )
+}
+
 fn fp1(a: u128, e: u32, q: bool, f: impl Fn(f64) -> f64, g: impl Fn(f32) -> f32) -> Result<u128> {
     fp2(a, 0, e, q, |x, _| f(x), |x, _| g(x))
 }
@@ -295,7 +335,7 @@ fn saturate(v: i128, e: u32, signed: bool) -> u64 {
     (v.clamp(lo, hi) as u64) & mask(e)
 }
 
-fn crc(mut acc: u32, data: u64, bytes: u32, poly: u32) -> u32 {
+pub(crate) fn crc(mut acc: u32, data: u64, bytes: u32, poly: u32) -> u32 {
     for k in 0..bytes {
         acc ^= ((data >> (8 * k)) & 0xFF) as u32;
         for _ in 0..8 {
@@ -988,7 +1028,7 @@ fn exec(c: &mut Cpu, _pc: u64, i: &Instruction) -> Result {
         C::ADD | C::SUB | C::MUL | C::MLA | C::MLS | C::SMAX | C::SMIN | C::UMAX | C::UMIN | C::SQADD | C::UQADD | C::SQSUB | C::UQSUB
         | C::SHADD | C::UHADD | C::SHSUB | C::URHADD | C::SRHADD | C::SABD | C::UABD | C::SABA | C::UABA | C::CMEQ | C::CMGE | C::CMGT
         | C::CMHI | C::CMHS | C::CMLE | C::CMLT | C::CMTST | C::SQDMULH | C::SQRDMULH | C::USHL | C::SSHL | C::ADDP | C::UMAXP
-        | C::UMINP | C::AND | C::ORR | C::BIC | C::EOR | C::ORN | C::NOT | C::NEG | C::ABS | C::CNT => int_vector(c, i),
+        | C::UMINP | C::SMAXP | C::SMINP | C::AND | C::ORR | C::BIC | C::EOR | C::ORN | C::NOT | C::NEG | C::ABS | C::CNT => int_vector(c, i),
         C::SHL | C::USHR | C::SSHR | C::USRA | C::SSRA | C::SRSHR | C::URSHR | C::SRSRA | C::URSRA | C::SRI | C::SLI | C::SQSHL
         | C::SQSHLU => shift_imm(c, i),
         C::XTN | C::XTN2 | C::SQXTN | C::SQXTN2 | C::UQXTN | C::UQXTN2 | C::SQXTUN | C::SQXTUN2 | C::SHRN | C::SHRN2 | C::RSHRN
@@ -1073,7 +1113,7 @@ fn fp_vector(c: &mut Cpu, i: &Instruction) -> Result {
             let (a, _, e) = vec(&o[1])?;
             let (x, y) = (lane(c.vr[a], 0, e), lane(c.vr[a], 1, e));
             let r = match i.opcode {
-                C::FADDP => fp2(u128::from(x), u128::from(y), e, false, |x, y| x + y, |x, y| x + y)?,
+                C::FADDP => fp2_arm(u128::from(x), u128::from(y), e, false, |x, y| x + y, |x, y| x + y)?,
                 C::FMAXNMP => fp2(u128::from(x), u128::from(y), e, false, fmaxnm64, fmaxnm32)?,
                 C::FMINMNP => fp2(u128::from(x), u128::from(y), e, false, fminnm64, fminnm32)?,
                 C::FMAXP => fp2(u128::from(x), u128::from(y), e, false, crate::fmax64, crate::fmax32)?,
@@ -1101,10 +1141,10 @@ fn fp_vector(c: &mut Cpu, i: &Instruction) -> Result {
     };
     let acc = c.vr[d];
     let r = match i.opcode {
-        C::FADD => fp2(a, b, e, q, |x, y| x + y, |x, y| x + y),
-        C::FSUB => fp2(a, b, e, q, |x, y| x - y, |x, y| x - y),
-        C::FMUL | C::FMULX => fp2(a, b, e, q, |x, y| x * y, |x, y| x * y),
-        C::FDIV => fp2(a, b, e, q, |x, y| x / y, |x, y| x / y),
+        C::FADD => fp2_arm(a, b, e, q, |x, y| x + y, |x, y| x + y),
+        C::FSUB => fp2_arm(a, b, e, q, |x, y| x - y, |x, y| x - y),
+        C::FMUL | C::FMULX => fp2_arm(a, b, e, q, |x, y| x * y, |x, y| x * y),
+        C::FDIV => fp2_arm(a, b, e, q, |x, y| x / y, |x, y| x / y),
         C::FMAX => fp2(a, b, e, q, crate::fmax64, crate::fmax32),
         C::FMIN => fp2(a, b, e, q, crate::fmin64, crate::fmin32),
         C::FMAXNM => fp2(a, b, e, q, fmaxnm64, fmaxnm32),
@@ -1117,14 +1157,15 @@ fn fp_vector(c: &mut Cpu, i: &Instruction) -> Result {
             let mut r = 0;
             for j in 0..n {
                 let (x, y, z) = (lane(a, j, e), lane(b, j, e), lane(acc, j, e));
+                // FMLS negates the first factor before FPMulAdd, NaN or not.
                 let v = match e {
                     32 => {
                         let x = if neg { -f32b(x) } else { f32b(x) };
-                        u64::from(x.mul_add(f32b(y), f32b(z)).to_bits())
+                        fma_nan(z, x.to_bits().into(), y, x.mul_add(f32b(y), f32b(z)).to_bits().into(), 32)
                     }
                     64 => {
                         let x = if neg { -f64b(x) } else { f64b(x) };
-                        x.mul_add(f64b(y), f64b(z)).to_bits()
+                        fma_nan(z, x.to_bits(), y, x.mul_add(f64b(y), f64b(z)).to_bits(), 64)
                     }
                     _ => return Err("half-precision lanes"),
                 };
@@ -1140,7 +1181,7 @@ fn fp_vector(c: &mut Cpu, i: &Instruction) -> Result {
             for j in 0..total {
                 let (x, y) = (u128::from(cat(2 * j)), u128::from(cat(2 * j + 1)));
                 let v = match i.opcode {
-                    C::FADDP => fp2(x, y, e, false, |x, y| x + y, |x, y| x + y)?,
+                    C::FADDP => fp2_arm(x, y, e, false, |x, y| x + y, |x, y| x + y)?,
                     C::FMAXP => fp2(x, y, e, false, crate::fmax64, crate::fmax32)?,
                     C::FMINP => fp2(x, y, e, false, crate::fmin64, crate::fmin32)?,
                     C::FMAXNMP => fp2(x, y, e, false, fmaxnm64, fmaxnm32)?,
@@ -1282,7 +1323,7 @@ fn int_vector(c: &mut Cpu, i: &Instruction) -> Result {
     let signed = matches!(
         i.opcode,
         C::SMAX | C::SMIN | C::SQADD | C::SQSUB | C::SHADD | C::SHSUB | C::SRHADD | C::SABD | C::SABA | C::CMGE | C::CMGT | C::CMLE | C::CMLT
-            | C::SQDMULH | C::SQRDMULH | C::SSHL | C::SQSHL | C::NEG | C::ABS
+            | C::SQDMULH | C::SQRDMULH | C::SSHL | C::SQSHL | C::NEG | C::ABS | C::SMAXP | C::SMINP
     );
     let n = lanes(q, e);
     let mut r = 0;
@@ -1340,13 +1381,14 @@ fn int_vector(c: &mut Cpu, i: &Instruction) -> Result {
                     saturate(sx << s, e, true)
                 }
             }
-            C::ADDP | C::UMAXP | C::UMINP => {
+            C::ADDP | C::UMAXP | C::UMINP | C::SMAXP | C::SMINP => {
                 let cat = |k: u32| if k < n { lane(a, k, e) } else { b.map_or(0, |b| lane(b, k - n, e)) };
                 let (p, s) = (cat(2 * j), cat(2 * j + 1));
+                let (sp, ss) = (ival(p, e, signed), ival(s, e, signed));
                 match i.opcode {
                     C::ADDP => p.wrapping_add(s),
-                    C::UMAXP => p.max(s),
-                    _ => p.min(s),
+                    C::UMAXP | C::SMAXP => sp.max(ss) as u64,
+                    _ => sp.min(ss) as u64,
                 }
             }
             C::AND => x & y,

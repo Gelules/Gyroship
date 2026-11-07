@@ -130,7 +130,7 @@ fn fwrite(n: u8, v: &str) -> String {
 }
 
 /// A data operation as one statement block.
-fn data(op: &Op) -> String {
+fn data(op: &Op, pc: u64, word: u32) -> String {
     match *op {
         Op::Alu { op, w, dst, a, b, flags } => {
             let (x, y) = (rd(a, w), operand(b, w));
@@ -331,7 +331,13 @@ fn data(op: &Op) -> String {
                 FBin::Nmul => "-(a * b)".to_string(),
                 FBin::Abd => "(a - b).abs()".to_string(),
             };
-            format!("{{ let (a, b) = ({}, {}); let r: f{t} = {e}; {} }}", fread(a, f64), fread(b, f64), fwrite(dst, "r"))
+            // Arm's NaNs are not the host's: as in the Cranelift backend, a NaN result takes the interpreter.
+            let store = if matches!(op, FBin::Add | FBin::Sub | FBin::Mul | FBin::Div) {
+                format!("if r.is_nan() {{ rt::gyroship_unhandled(c, {pc:#x}, {word:#x}); }} else {{ {} }}", fwrite(dst, "r"))
+            } else {
+                fwrite(dst, "r")
+            };
+            format!("{{ let (a, b) = ({}, {}); let r: f{t} = {e}; {store} }}", fread(a, f64), fread(b, f64))
         }
         Op::FUn { op, f64, dst, src } => {
             let e = match op {
@@ -484,8 +490,18 @@ pub fn function(out: &mut String, input: &Input) {
                     format!("unsafe {{ rt::gyroship_counter(c, {pc:#x}, {n}) }};")
                 }
                 Op::Yield(kind) => format!("rt::gyroship_yield(c, {pc:#x}, {kind});"),
-                Op::Unhandled => format!("rt::gyroship_unhandled(c, {pc:#x}, {word:#x});"),
-                ref op => data(op),
+                // ponytail: this experimental backend leaves the vector-lane forms and CRC to the interpreter.
+                Op::Unhandled
+                | Op::Crc { .. }
+                | Op::LoadLane { .. }
+                | Op::ToLane { .. }
+                | Op::VShuffle { .. }
+                | Op::VFp { .. }
+                | Op::VFUn { .. }
+                | Op::VFCmp { .. }
+                | Op::VInt { .. }
+                | Op::VIntToF { .. } => format!("rt::gyroship_unhandled(c, {pc:#x}, {word:#x});"),
+                ref op => data(op, pc, word),
             };
             if !s.is_empty() {
                 let _ = writeln!(out, "                {s}");

@@ -345,6 +345,31 @@ pub unsafe extern "C" fn gyroship_svc(cpu: *mut Cpu, pc: u64, imm: u32) {
     }
 }
 
+/// CRC32/CRC32C for generated code: `kind` is log2 of the data bytes, plus 4
+/// for CRC32C (the Castagnoli polynomial, which x86 computes in hardware).
+#[unsafe(no_mangle)]
+pub extern "C" fn gyroship_crc32(acc: u32, data: u64, kind: u32) -> u32 {
+    let (bytes, castagnoli) = (1 << (kind & 3), kind & 4 != 0);
+    #[cfg(target_arch = "x86_64")]
+    if castagnoli && std::arch::is_x86_feature_detected!("sse4.2") {
+        // SAFETY: the CPU has SSE4.2.
+        return unsafe { crc32c_sse42(acc, data, bytes) };
+    }
+    interp::crc(acc, data, bytes, if castagnoli { 0x82F6_3B78 } else { 0xEDB8_8320 })
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.2")]
+fn crc32c_sse42(acc: u32, data: u64, bytes: u32) -> u32 {
+    use std::arch::x86_64::{_mm_crc32_u8, _mm_crc32_u16, _mm_crc32_u32, _mm_crc32_u64};
+    match bytes {
+        1 => _mm_crc32_u8(acc, data as u8),
+        2 => _mm_crc32_u16(acc, data as u16),
+        4 => _mm_crc32_u32(acc, data as u32),
+        _ => _mm_crc32_u64(u64::from(acc), data) as u32,
+    }
+}
+
 /// A computed jump or a resume landed on an address its function does not
 /// know: an analysis gap, fatal.
 #[unsafe(no_mangle)]

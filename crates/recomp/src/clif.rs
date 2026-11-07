@@ -14,12 +14,13 @@
 //! load or store; caching them in SSA values between calls is the upgrade if
 //! this backend wins.
 
-use crate::ir::{Addr, Alu, Cond, FBin, FUn, Op, Operand, Reg, Select, Shift, Unary, Writeback, W};
+use crate::ir::{Addr, Alu, Cond, FBin, FUn, Op, Operand, Reg, Select, Shift, Unary, VCmp, VFp, VInt, Writeback, W, ZERO};
 use crate::{Callee, Input};
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types::{F32, F32X4, F64, F64X2, I8, I8X16, I16, I16X8, I32, I32X4, I64, I64X2, Type};
 use cranelift_codegen::ir::{
-    AbiParam, AliasRegionData, Block, FuncRef, Function, InstBuilder, MemFlagsData, Signature, UserFuncName, Value,
+    AbiParam, AliasRegionData, Block, ConstantData, Endianness, FuncRef, Function, InstBuilder, MemFlagsData, Signature, UserFuncName,
+    Value,
 };
 use cranelift_codegen::isa::OwnedTargetIsa;
 use cranelift_codegen::settings::{self, Configurable};
@@ -53,6 +54,7 @@ struct Runtime {
     counter: FuncId,
     yield_: FuncId,
     probe: FuncId,
+    crc32: FuncId,
 }
 
 /// The functions of one output: an object file (`ObjectModule`), or JIT
@@ -104,6 +106,9 @@ impl<M: Module> Object<M> {
             s
         };
         let sig = sig_with(&[ptr, I64]);
+        let mut crc_sig = sig_with(&[I32, I64, I32]);
+        crc_sig.returns.push(AbiParam::new(I32));
+        let crc32 = module.declare_function("gyroship_crc32", Linkage::Import, &crc_sig).map_err(|e| e.to_string())?;
         let mut import = |name: &str, params: &[Type]| module.declare_function(name, Linkage::Import, &sig_with(params)).map_err(|e| e.to_string());
         let rt = Runtime {
             call: import("gyroship_call", &[ptr, I64])?,
@@ -114,6 +119,7 @@ impl<M: Module> Object<M> {
             counter: import("gyroship_counter", &[ptr, I64, I32])?,
             yield_: import("gyroship_yield", &[ptr, I64, I32])?,
             probe: import("gyroship_probe", &[ptr, I64])?,
+            crc32,
         };
         let mut ids = HashMap::new();
         for &(a, _) in defined {
@@ -301,7 +307,7 @@ impl<M: Module> Object<M> {
                         }
                     }
                     Op::Unhandled => e.runtime(e.rt.unhandled, pc, word),
-                    ref op => e.data(op),
+                    ref op => e.data(op, pc, word),
                 }
             }
             if !ended {
@@ -532,7 +538,8 @@ impl<M: Module> Emit<'_, '_, M> {
         };
     }
 
-    fn data(&mut self, op: &Op) {
+    /// A data operation, the instruction `word` at `pc`.
+    fn data(&mut self, op: &Op, pc: u64, word: u32) {
         match *op {
             Op::Alu { op, w, dst, a, b, flags } => {
                 let (x, y) = (self.get(a, w), self.operand(b, w));
@@ -743,6 +750,14 @@ impl<M: Module> Emit<'_, '_, M> {
                 self.set(dst, W::W64, v);
             }
             Op::Nop => {}
+            Op::Crc { dst, acc, data, size, castagnoli } => {
+                let (a, d) = (self.get(acc, W::W32), self.get(data, W::W64));
+                let kind = self.b.ins().iconst(I32, i64::from(u8::from(castagnoli) << 2 | size));
+                let f = self.func(self.rt.crc32);
+                let call = self.b.ins().call(f, &[a, d, kind]);
+                let r = self.b.inst_results(call)[0];
+                self.set(dst, W::W32, r);
+            }
             Op::LoadV { dst, size, addr } => {
                 let (_, host) = self.address(&addr);
                 let v = self.b.ins().load(vtype(size), self.heap_flags, host, 0);
@@ -838,7 +853,12 @@ impl<M: Module> Emit<'_, '_, M> {
                         self.b.ins().fabs(d)
                     }
                 };
-                self.vset(dst, r);
+                if matches!(op, FBin::Add | FBin::Sub | FBin::Mul | FBin::Div) {
+                    let nan = self.b.ins().fcmp(FloatCC::Unordered, r, r);
+                    self.unless_nan(nan, pc, word, |e| e.vset(dst, r));
+                } else {
+                    self.vset(dst, r);
+                }
             }
             Op::FUn { op, f64, dst, src } => {
                 let x = self.fget(src, f64);
@@ -918,6 +938,112 @@ impl<M: Module> Emit<'_, '_, M> {
                 let r = if signed { self.b.ins().fcvt_to_sint_sat(ty(w), x) } else { self.b.ins().fcvt_to_uint_sat(ty(w), x) };
                 self.set(dst, w, r);
             }
+            Op::LoadLane { dst, size, lane, q, addr } => {
+                let (_, host) = self.address(&addr);
+                let v = self.b.ins().load(vtype(size), self.heap_flags, host, 0);
+                self.put_lanes(dst, size, lane, q, v);
+            }
+            Op::ToLane { dst, src, size, lane, q } => {
+                let v = self.get(src, if size == 3 { W::W64 } else { W::W32 });
+                let v = if size < 2 { self.b.ins().ireduce(vtype(size), v) } else { v };
+                self.put_lanes(dst, size, lane, q, v);
+            }
+            Op::VShuffle { dst, a, b, mask } => {
+                let x = self.vget(a, 4);
+                // One source when b is a or unused; zeroed bytes repeat the lanes before them,
+                // which keeps the common masks (pshufd and the like) recognizable.
+                let one = a == b || mask.iter().all(|&m| m < 16 || m == ZERO);
+                let y = if one { x } else { self.vget(b, 4) };
+                let k = mask.iter().position(|&m| m == ZERO).unwrap_or(16).max(1);
+                let mut idx = [0u8; 16];
+                for i in 0..16 {
+                    idx[i] = if mask[i] == ZERO { idx[i % k] } else if one { mask[i] % 16 } else { mask[i] };
+                }
+                let imm = self.b.func.dfg.immediates.push(ConstantData::from(idx.to_vec()));
+                let mut r = self.b.ins().shuffle(x, y, imm);
+                if mask.contains(&ZERO) {
+                    let keep = self.vconst(I8X16, mask.map(|m| if m == ZERO { 0 } else { 0xFF }));
+                    r = self.b.ins().band(r, keep);
+                }
+                self.b.ins().store(self.cpu_flags, r, self.cpu, vr_offset(dst));
+            }
+            Op::VFp { op, f64, q, dst, a, b, lane } => {
+                let (t, eb) = if f64 { (F64X2, 8) } else { (F32X4, 4) };
+                let (x, y) = if op == VFp::AddP {
+                    let (even, odd) = self.pairs(a, b, eb, q);
+                    (self.cast(t, even), self.cast(t, odd))
+                } else {
+                    let y = match lane {
+                        Some(l) => {
+                            let e = self.b.ins().load(t.lane_type(), self.cpu_flags, self.cpu, vr_offset(b) + i32::from(l) * eb as i32);
+                            self.b.ins().splat(t, e)
+                        }
+                        None => self.vload(t, b),
+                    };
+                    (self.vload(t, a), y)
+                };
+                let r = match op {
+                    VFp::Add | VFp::AddP => self.b.ins().fadd(x, y),
+                    VFp::Sub => self.b.ins().fsub(x, y),
+                    VFp::Mul => self.b.ins().fmul(x, y),
+                    VFp::Mla | VFp::Mls => {
+                        let acc = self.vload(t, dst);
+                        let x = if op == VFp::Mls { self.b.ins().fneg(x) } else { x };
+                        self.b.ins().fma(x, y, acc)
+                    }
+                };
+                let nan = self.b.ins().fcmp(FloatCC::Unordered, r, r);
+                let lanes = self.b.ins().vhigh_bits(I32, nan);
+                let lanes = if q { lanes } else { self.b.ins().band_imm_s(lanes, 0b11) };
+                self.unless_nan(lanes, pc, word, |e| e.vput(dst, r, q));
+            }
+            Op::VFUn { op, f64, q, dst, src } => {
+                let x = self.vload(if f64 { F64X2 } else { F32X4 }, src);
+                let r = if op == FUn::Neg { self.b.ins().fneg(x) } else { self.b.ins().fabs(x) };
+                self.vput(dst, r, q);
+            }
+            Op::VFCmp { cmp, f64, q, dst, a, b } => {
+                let t = if f64 { F64X2 } else { F32X4 };
+                let x = self.vload(t, a);
+                let y = match b {
+                    Some(b) => self.vload(t, b),
+                    None => self.vconst(t, [0; 16]),
+                };
+                let cc = match cmp {
+                    VCmp::Eq => FloatCC::Equal,
+                    VCmp::Ge => FloatCC::GreaterThanOrEqual,
+                    VCmp::Gt => FloatCC::GreaterThan,
+                    VCmp::Le => FloatCC::LessThanOrEqual,
+                    VCmp::Lt => FloatCC::LessThan,
+                };
+                let r = self.b.ins().fcmp(cc, x, y);
+                self.vput(dst, r, q);
+            }
+            Op::VInt { op, size, q, pairwise, dst, a, b } => {
+                let t = lanes_type(size);
+                let (x, y) = if pairwise {
+                    let (even, odd) = self.pairs(a, b, 1 << size, q);
+                    (self.cast(t, even), self.cast(t, odd))
+                } else {
+                    (self.vload(t, a), self.vload(t, b))
+                };
+                let i = self.b.ins();
+                let r = match op {
+                    VInt::Add => i.iadd(x, y),
+                    VInt::Sub => i.isub(x, y),
+                    VInt::UMin => i.umin(x, y),
+                    VInt::UMax => i.umax(x, y),
+                    VInt::SMin => i.smin(x, y),
+                    VInt::SMax => i.smax(x, y),
+                };
+                self.vput(dst, r, q);
+            }
+            Op::VIntToF { f64, q, signed, dst, src } => {
+                let (it, ft) = if f64 { (I64X2, F64X2) } else { (I32X4, F32X4) };
+                let x = self.vload(it, src);
+                let r = if signed { self.b.ins().fcvt_from_sint(ft, x) } else { self.b.ins().fcvt_from_uint(ft, x) };
+                self.vput(dst, r, q);
+            }
             _ => unreachable!("control flow is emitted by the block"),
         }
     }
@@ -948,6 +1074,79 @@ impl<M: Module> Emit<'_, '_, M> {
             self.b.ins().scalar_to_vector(lanes, v)
         };
         self.b.ins().store(self.cpu_flags, v, self.cpu, vr_offset(n));
+    }
+
+    /// A whole vector register as a vector of type `t`.
+    fn vload(&mut self, t: Type, n: u8) -> Value {
+        self.b.ins().load(t, self.cpu_flags, self.cpu, vr_offset(n))
+    }
+
+    /// Writes a whole vector to a register, or (`q` false) its low 8 bytes, zeroing the rest.
+    fn vput(&mut self, n: u8, v: Value, q: bool) {
+        let v = if q {
+            v
+        } else {
+            let t = self.b.func.dfg.value_type(v);
+            let low = self.vconst(t, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0]);
+            self.b.ins().band(v, low)
+        };
+        self.b.ins().store(self.cpu_flags, v, self.cpu, vr_offset(n));
+    }
+
+    fn vconst(&mut self, t: Type, bytes: [u8; 16]) -> Value {
+        let c = self.b.func.dfg.constants.insert(ConstantData::from(bytes.to_vec()));
+        self.b.ins().vconst(t, c)
+    }
+
+    /// The same 16 bytes as a vector of type `t` (lanes in little-endian order).
+    fn cast(&mut self, t: Type, v: Value) -> Value {
+        if self.b.func.dfg.value_type(v) == t { v } else { self.b.ins().bitcast(t, MemFlagsData::new().with_endianness(Endianness::Little), v) }
+    }
+
+    /// The even and the odd lanes (of `eb` bytes) of the concatenation a:b,
+    /// as two I8X16; with `q` false, a and b are 8 bytes each and only the low
+    /// 8 bytes of the results count.
+    fn pairs(&mut self, a: u8, b: u8, eb: u32, q: bool) -> (Value, Value) {
+        let width = if q { 16 } else { 8 };
+        let n = width / eb;
+        let cat = |k: u32| if k < n { k * eb } else { 16 + (k - n) * eb };
+        let x = self.vget(a, 4);
+        let y = if a == b { x } else { self.vget(b, 4) };
+        let mut half = |odd: u32| {
+            let idx: Vec<u8> = (0..16).map(|i| (cat(2 * (i % width / eb) + odd) + i % eb) as u8).collect();
+            let imm = self.b.func.dfg.immediates.push(ConstantData::from(idx));
+            self.b.ins().shuffle(x, y, imm)
+        };
+        (half(0), half(1))
+    }
+
+    /// Writes `v` (1 << size bytes) into one lane of a vector register, or into every lane.
+    fn put_lanes(&mut self, n: u8, size: u8, lane: Option<u8>, q: bool, v: Value) {
+        match lane {
+            Some(l) => {
+                self.b.ins().store(self.cpu_flags, v, self.cpu, vr_offset(n) + (i32::from(l) << size));
+            }
+            None => {
+                let s = self.b.ins().splat(lanes_type(size), v);
+                self.vput(n, s, q);
+            }
+        }
+    }
+
+    /// Stores an FP result with `store` unless `nan` (nonzero: a live lane is NaN).
+    /// A NaN result is the only one where x86 and Arm differ (which NaN, the default
+    /// NaN's sign): those rare results take the interpreter, the reference, instead.
+    fn unless_nan(&mut self, nan: Value, pc: u64, word: u32, store: impl FnOnce(&mut Self)) {
+        let (slow, fast, done) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
+        self.b.set_cold_block(slow);
+        self.b.ins().brif(nan, slow, &[], fast, &[]);
+        self.b.switch_to_block(slow);
+        self.runtime(self.rt.unhandled, pc, word);
+        self.b.ins().jump(done, &[]);
+        self.b.switch_to_block(fast);
+        store(self);
+        self.b.ins().jump(done, &[]);
+        self.b.switch_to_block(done);
     }
 
     /// NZCV of an FP compare: equal 0110, less 1000, greater 0010, unordered 0011.
@@ -1096,6 +1295,16 @@ fn reg_number(r: Reg) -> u32 {
 
 fn vr_offset(n: u8) -> i32 {
     layout::VR + 16 * i32::from(n)
+}
+
+/// A vector of lanes of 1 << size bytes.
+fn lanes_type(size: u8) -> Type {
+    match size {
+        0 => I8X16,
+        1 => I16X8,
+        2 => I32X4,
+        _ => I64X2,
+    }
 }
 
 /// The type that moves 1 << size bytes of a vector register.

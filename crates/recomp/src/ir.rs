@@ -123,6 +123,8 @@ pub enum Op {
     StorePair { a: Reg, b: Reg, size: u8, addr: Addr },
     /// MRS of TPIDR_EL0 / TPIDRRO_EL0.
     ReadThread { dst: Reg, ro: bool },
+    /// CRC32 or CRC32C (`castagnoli`) of the low 1 << size bytes of data, into acc.
+    Crc { dst: Reg, acc: Reg, data: Reg, size: u8, castagnoli: bool },
     Nop,
     // FP and SIMD registers. `size` is log2 of the bytes accessed (0 = B .. 4 = Q);
     // writing fewer than 16 bytes zeroes the rest of the register.
@@ -157,6 +159,26 @@ pub enum Op {
     IntToF { dst: u8, src: Reg, w: W, f64: bool, signed: bool },
     /// FCVTZS/FCVTZU to a general register (saturating, NaN gives 0).
     FToInt { dst: Reg, w: W, src: u8, f64: bool, signed: bool },
+    // Vector lanes. `q` false: 8-byte forms, which zero the upper 8 bytes.
+    /// LD1 of one lane (of 1 << size bytes; the other lanes are kept, `q` unused), or
+    /// LD1R (`lane` None): the element in every lane.
+    LoadLane { dst: u8, size: u8, lane: Option<u8>, q: bool, addr: Addr },
+    /// INS of a general register into one lane, or DUP (`lane` None) into every lane, as `LoadLane`.
+    ToLane { dst: u8, src: Reg, size: u8, lane: Option<u8>, q: bool },
+    /// Each byte of dst is the byte `mask[i]` of a:b (0..16 from a, 16..32
+    /// from b), or 0 for [`ZERO`]: EXT, REV*, ZIP/UZP/TRN, DUP and INS of an element.
+    VShuffle { dst: u8, a: u8, b: u8, mask: [u8; 16] },
+    /// Lane-wise FP on singles (`f64` false) or doubles; `lane` gives every
+    /// lane element `lane` of b (the by-element forms).
+    VFp { op: VFp, f64: bool, q: bool, dst: u8, a: u8, b: u8, lane: Option<u8> },
+    /// FNEG/FABS of every lane.
+    VFUn { op: FUn, f64: bool, q: bool, dst: u8, src: u8 },
+    /// FCMEQ...FCMLT against a register or (None) +0.0: all ones where true.
+    VFCmp { cmp: VCmp, f64: bool, q: bool, dst: u8, a: u8, b: Option<u8> },
+    /// Integer lanes of 1 << size bytes; `pairwise` combines adjacent lanes of a:b.
+    VInt { op: VInt, size: u8, q: bool, pairwise: bool, dst: u8, a: u8, b: u8 },
+    /// SCVTF/UCVTF of 32-bit (`f64` false) or 64-bit integer lanes.
+    VIntToF { f64: bool, q: bool, signed: bool, dst: u8, src: u8 },
     // Control flow: the last operation of a block.
     Jump(u64),
     Branch(Cond, u64),
@@ -205,6 +227,41 @@ pub enum FUn {
     Nearest,
     /// FRINTA: ties away from zero.
     Round,
+}
+
+/// A [`Op::VShuffle`] mask byte that gives 0.
+pub const ZERO: u8 = 0xFF;
+
+/// Vector FP operations, with Arm's NaN results (FPCR.DN = 0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VFp {
+    Add,
+    Sub,
+    Mul,
+    /// dst + a * b, dst - a * b: fused, one rounding.
+    Mla,
+    Mls,
+    /// FADDP: sums of adjacent lanes of a:b.
+    AddP,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VCmp {
+    Eq,
+    Ge,
+    Gt,
+    Le,
+    Lt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VInt {
+    Add,
+    Sub,
+    UMin,
+    UMax,
+    SMin,
+    SMax,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -2,7 +2,7 @@
 
 use gyroship_analysis::cfg::{Block, Cfg};
 use gyroship_analysis::discover::Function;
-use gyroship_recomp::ir::{Addr, Alu, Cond, Op, Operand, Reg, Shift, W, Writeback};
+use gyroship_recomp::ir::{Addr, Alu, Cond, Op, Operand, Reg, Shift, VCmp, VFp, VInt, W, Writeback, ZERO};
 use gyroship_recomp::{Callee, Input, clif, lift::lift, rust};
 
 #[test]
@@ -66,7 +66,48 @@ fn lifts_the_common_integer_forms() {
     assert_eq!(lift(0x0f0007e1, pc), Op::VConst { dst: 1, value: 0x1f_0000_001f }, "movi v1.2s, #0x1f");
     assert_eq!(lift(0x1e2e1000, pc), Op::VConst { dst: 0, value: u128::from(1.0f32.to_bits()) }, "fmov s0, #1.0");
     assert_eq!(lift(0x4ea01c01, pc), Op::VMov { dst: 1, src: 0, size: 4 }, "mov v1.16b, v0.16b");
-    assert_eq!(lift(0x6e042486, pc), Op::Unhandled, "ins: vector lanes are not translated yet");
+    assert_eq!(lift(0x0e208400 | 3 << 22, pc), Op::Unhandled, "add v0.1d is reserved");
+}
+
+#[test]
+fn lifts_the_vector_lane_forms() {
+    let pc = 0x71_0000_1000;
+    let at = |n| Addr { base: Reg::X(n), offset: 0, index: None, writeback: Writeback::None };
+    assert_eq!(lift(0x0d409000, pc), Op::LoadLane { dst: 0, size: 2, lane: Some(1), q: true, addr: at(0) }, "ld1 {{v0.s}}[1], [x0]");
+    assert_eq!(lift(0x4d40c8e8, pc), Op::LoadLane { dst: 8, size: 2, lane: None, q: true, addr: at(7) }, "ld1r {{v8.4s}}, [x7]");
+    assert_eq!(lift(0x4e0c1d00, pc), Op::ToLane { dst: 0, src: Reg::X(8), size: 2, lane: Some(1), q: true }, "mov v0.s[1], w8");
+    assert_eq!(
+        lift(0x4f831368, pc),
+        Op::VFp { op: VFp::Mla, f64: false, q: true, dst: 8, a: 27, b: 3, lane: Some(0) },
+        "fmla v8.4s, v27.4s, v3.s[0]"
+    );
+    assert_eq!(
+        lift(0x2eaaad08, pc),
+        Op::VInt { op: VInt::UMin, size: 2, q: false, pairwise: true, dst: 8, a: 8, b: 10 },
+        "uminp v8.2s, v8.2s, v10.2s"
+    );
+    assert_eq!(lift(0x4ea0c820, pc), Op::VFCmp { cmp: VCmp::Gt, f64: false, q: true, dst: 0, a: 1, b: None }, "fcmgt v0.4s, v1.4s, #0.0");
+    let mask: [u8; 16] = std::array::from_fn(|i| i as u8 + 8);
+    assert_eq!(lift(0x6e08410a, pc), Op::VShuffle { dst: 10, a: 8, b: 8, mask }, "ext v10.16b, v8.16b, v8.16b, #8");
+    let mask: [u8; 16] = std::array::from_fn(|i| if i < 4 { 20 + i as u8 } else { i as u8 });
+    assert_eq!(lift(0x6e042486, pc), Op::VShuffle { dst: 6, a: 6, b: 4, mask }, "mov v6.s[0], v4.s[1]");
+    let mask: [u8; 16] = std::array::from_fn(|i| if i < 8 { 4 + i as u8 % 4 } else { ZERO });
+    assert_eq!(lift(0x0e0c0441, pc), Op::VShuffle { dst: 1, a: 2, b: 2, mask }, "dup v1.2s, v2.s[1]");
+    // Neighbours left to the interpreter.
+    for (word, what) in [
+        (0x0dc29000, "ld1 {v0.s}[1], [x0], x2"),
+        (0x4c40a800, "ld1 {v0.4s, v1.4s}, [x0]"),
+        (0x0d609000, "ld2 {v0.s, v1.s}[1], [x0]"),
+        (0x0d009000, "st1 {v0.s}[1], [x0]"),
+        (0x4e421420, "fadd v0.8h, v1.8h, v2.8h"),
+        (0x4f3de420, "scvtf v0.4s, v1.4s, #0x3"),
+        (0x5fa21020, "fmla s0, s1, v2.s[1]"),
+        (0x4e22dc20, "fmulx v0.4s, v1.4s, v2.4s"),
+        (0x6ea2d420, "fabd v0.4s, v1.4s, v2.4s"),
+    ] {
+        assert_eq!(lift(word, pc), Op::Unhandled, "{what}");
+        assert_eq!(gyroship_runtime::interp::disassemble(word), what);
+    }
 }
 
 /// `loop: subs x1, x1, #1; add x0, x0, x2; b.ne loop; bl 0x2000; ret` at 0x1000.
