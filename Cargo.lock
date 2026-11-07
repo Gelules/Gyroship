@@ -1050,6 +1050,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "gyroship-analysis",
+ "gyroship-gpu",
  "gyroship-loader",
  "gyroship-recomp",
  "windows",

@@ -7,6 +7,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 mod experiment;
+mod gpfifo;
 mod measure;
 mod recompile;
 
@@ -88,6 +89,21 @@ enum Command {
         #[arg(long)]
         compare: Option<PathBuf>,
     },
+    /// Replay a --dump-gpfifo folder through the GPU command processor
+    /// (macros included) and report each submit
+    Gpfifo {
+        /// Folder of submit-SSSS-RRRR-GPU.bin files
+        dir: PathBuf,
+        /// First submit reported (earlier ones still run, silently)
+        #[arg(long, default_value_t = 0)]
+        first: u32,
+        /// Last submit run
+        #[arg(long, default_value_t = u32::MAX)]
+        last: u32,
+        /// Print every executed method
+        #[arg(long)]
+        methods: bool,
+    },
     /// Convert NSO executables to AArch64 ELF files for disassemblers
     Nso2elf {
         /// NSO files to convert
@@ -115,6 +131,7 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Command::Nso(NsoCommand::Info { nso, symbols }) => nso_info(&nso, symbols).map(|_| true),
         Command::Nso2elf { inputs, out } => nso2elf(&inputs, &out).map(|_| true),
+        Command::Gpfifo { dir, first, last, methods } => gpfifo::run(&dir, first, last, methods).map(|_| true),
         Command::Link { exefs, verbose } => link(&exefs, verbose),
         Command::Discover { exefs, examples } => discover(&exefs, examples).map(|_| true),
         Command::Functions { nso, compare } => functions(&nso, compare.as_deref()).map(|_| true),

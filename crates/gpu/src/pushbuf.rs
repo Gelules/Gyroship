@@ -84,6 +84,21 @@ pub struct Channel {
     mme: Option<Box<Mme>>,
     /// A macro call still gathering its parameters: subchannel, index, parameters.
     call: Option<(usize, usize, Vec<u32>)>,
+    /// The macro running now, if any.
+    running: Option<usize>,
+    /// Every method executed, when set (for study tools).
+    pub trace: Option<Vec<Traced>>,
+}
+
+/// One executed method, for tracing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Traced {
+    pub subchannel: usize,
+    pub class: u32,
+    pub method: u32,
+    pub value: u32,
+    /// The macro that emitted it.
+    pub from_macro: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -104,6 +119,8 @@ impl Default for Channel {
             pending: None,
             mme: Some(Box::default()),
             call: None,
+            running: None,
+            trace: None,
         }
     }
 }
@@ -177,7 +194,9 @@ impl Channel {
     fn flush_call(&mut self, effects: &mut Vec<Effect>) {
         let Some((subchannel, index, params)) = self.call.take() else { return };
         let Some(mut unit) = self.mme.take() else { return };
+        self.running = Some(index);
         let result = unit.call(index, &mut MacroHost { channel: self, subchannel, params: params.into_iter(), effects });
+        self.running = None;
         self.mme = Some(unit);
         if let Err(fault) = result {
             effects.push(Effect::MacroFault { index, fault });
@@ -198,6 +217,9 @@ impl Channel {
             return;
         }
         self.flush_call(effects);
+        if let Some(t) = &mut self.trace {
+            t.push(Traced { subchannel, class: if method < HOST_METHODS { 0 } else { self.classes[subchannel] }, method, value, from_macro: self.running });
+        }
         if method < HOST_METHODS {
             self.host[(method / 4) as usize] = value;
             if method == SET_OBJECT {

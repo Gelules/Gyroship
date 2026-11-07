@@ -10,6 +10,7 @@ clap.workspace = true
 gyroship-loader = { version = "0.1.0", path = "../loader" }
 gyroship-analysis = { version = "0.1.0", path = "../analysis" }
 gyroship-recomp = { version = "0.1.0", path = "../recomp" }
+gyroship-gpu = { version = "0.1.0", path = "../gpu" }
 
 [target."cfg(windows)".dependencies]
 windows-capture = "2"
