@@ -4,8 +4,10 @@
 
 use std::path::Path;
 
+pub mod datazip;
 pub mod mme;
 pub mod pushbuf;
+pub mod sass;
 pub mod surfaces;
 
 pub const WIDTH: u32 = 640;

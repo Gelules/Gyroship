@@ -9,3 +9,4 @@ publish.workspace = true
 wgpu = "30"
 pollster = "1"
 png = "0.18"
+lz4_flex = { version = "0.14", default-features = false, features = ["safe-decode", "std"] }

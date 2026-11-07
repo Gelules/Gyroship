@@ -10,6 +10,7 @@ mod experiment;
 mod gpfifo;
 mod measure;
 mod recompile;
+mod shaders;
 
 #[derive(Parser)]
 #[command(name = "gyroship-tools", version, about = "Gyroship developer tools")]
@@ -104,6 +105,16 @@ enum Command {
         #[arg(long)]
         methods: bool,
     },
+    /// Inventory of the game's shaders: every nvn_gen2.raw blob of data.zip,
+    /// its program and its instructions by opcode and stage (exit code 1 if a
+    /// program has no closing self-branch)
+    Shaders {
+        /// The romfs data.zip
+        zip: PathBuf,
+        /// Write real instruction words, one file per opcode, into this folder
+        #[arg(long)]
+        samples: Option<PathBuf>,
+    },
     /// Convert NSO executables to AArch64 ELF files for disassemblers
     Nso2elf {
         /// NSO files to convert
@@ -132,6 +143,7 @@ fn main() -> ExitCode {
         Command::Nso(NsoCommand::Info { nso, symbols }) => nso_info(&nso, symbols).map(|_| true),
         Command::Nso2elf { inputs, out } => nso2elf(&inputs, &out).map(|_| true),
         Command::Gpfifo { dir, first, last, methods } => gpfifo::run(&dir, first, last, methods).map(|_| true),
+        Command::Shaders { zip, samples } => shaders::run(&zip, samples.as_deref()),
         Command::Link { exefs, verbose } => link(&exefs, verbose),
         Command::Discover { exefs, examples } => discover(&exefs, examples).map(|_| true),
         Command::Functions { nso, compare } => functions(&nso, compare.as_deref()).map(|_| true),
