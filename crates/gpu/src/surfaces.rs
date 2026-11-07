@@ -109,6 +109,8 @@ pub struct Surfaces {
     pub(crate) cache: crate::draw::Cache,
     /// Draws done.
     pub drawn: u64,
+    /// The texture addresses the last draw read, slot by slot (for logs).
+    pub textures_read: Vec<u64>,
     /// Operations not done, by reason.
     pub skipped: BTreeMap<String, u64>,
     /// wgpu validation errors (the first ones): reported, never fatal to the game.
@@ -185,7 +187,7 @@ impl Surfaces {
             }],
         });
         let fill = (fill_module, fill_layout, Default::default());
-        Ok(Surfaces { adapter, device, queue, map: BTreeMap::new(), touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, skipped: BTreeMap::new(), errors })
+        Ok(Surfaces { adapter, device, queue, map: BTreeMap::new(), touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors })
     }
 
     /// Whether this device can render to `format` (and read it back).

@@ -5,8 +5,9 @@
 //! guest memory.
 //!
 //! ponytail: one encoder and fresh buffers per draw (ordering for free; a
-//! ring buffer when draw counts make it slow); level-0 2D textures cached
-//! by address and header, never invalidated; float vertex attributes; no
+//! ring buffer when draw counts make it slow); textures cached by address
+//! and header, dropped when the GPU writes their memory (not when the CPU
+//! does); float vertex attributes; no
 //! depth-compare textures;
 //! pipelines keyed by a Debug string. Each draw not done counts its reason
 //! in `Surfaces::skipped`.
@@ -55,7 +56,8 @@ pub struct Cache {
     /// Translations by (program key, key of the pixel program it pairs with).
     modules: HashMap<(u64, Option<u64>), Module>,
     pipelines: HashMap<String, (wgpu::RenderPipeline, Vec<wgpu::BindGroupLayout>)>,
-    textures: HashMap<(u64, [u8; 32]), wgpu::Texture>,
+    /// Uploaded textures by address and header, with the end of the memory they came from.
+    textures: HashMap<(u64, [u8; 32]), (wgpu::Texture, u64)>,
     samplers: HashMap<([u8; 32], bool), wgpu::Sampler>,
 }
 
@@ -107,6 +109,7 @@ impl Surfaces {
     /// Runs a draw; one that cannot be done is counted in `skipped` by
     /// reason, and the reason returned.
     pub fn draw(&mut self, d: &Draw, mem: Mem) -> Result<(), String> {
+        self.textures_read.clear();
         let result = self.try_draw(d, mem);
         match &result {
             Ok(()) => self.drawn += 1,
@@ -460,6 +463,7 @@ impl Surfaces {
                 None => (self.upload(&tic, header, mem)?.create_view(&Default::default()), false),
             };
             swizzles[slot] = textures::swizzle_code(&tic);
+            self.textures_read.push(tic.address);
             let sampler = match x.fetch {
                 true => None,
                 false => {
@@ -483,7 +487,7 @@ impl Surfaces {
 
     /// A 2D or 3D texture from guest memory: the level the view starts at, layer 0.
     fn upload(&mut self, tic: &textures::Tic, header: [u8; 32], mem: Mem) -> Result<wgpu::Texture, String> {
-        if let Some(t) = self.cache.textures.get(&(tic.address, header)) {
+        if let Some((t, _)) = self.cache.textures.get(&(tic.address, header)) {
             return Ok(t.clone());
         }
         let three_d = tic.texture_type == TextureType::ThreeD;
@@ -499,6 +503,7 @@ impl Surfaces {
         let (width, height) = ((tic.width >> level).max(1), (tic.height >> level).max(1));
         let (columns, rows) = (width.div_ceil(bw), height.div_ceil(bh));
         let depth = if three_d { (tic.depth >> level).max(1) } else { 1 };
+        let end;
         let data = match tic.layout {
             Layout::BlockLinear => {
                 let l = textures::tic_level(tic, level).ok_or("texture level")?;
@@ -507,6 +512,7 @@ impl Surfaces {
                 if !mem(tic.address + offset, &mut raw) {
                     return Err("texture not readable".into());
                 }
+                end = tic.address + offset + raw.len() as u64;
                 l.deswizzle(&raw)
             }
             Layout::Pitch if level == 0 && !three_d => {
@@ -515,6 +521,7 @@ impl Surfaces {
                 if !mem(tic.address, &mut raw) {
                     return Err("texture not readable".into());
                 }
+                end = tic.address + raw.len() as u64;
                 raw.chunks(tic.pitch as usize).flat_map(|r| &r[..row]).copied().collect()
             }
             other => return Err(format!("texture layout {other:?}")),
@@ -536,8 +543,15 @@ impl Surfaces {
             wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(columns * bpe), rows_per_image: Some(rows) },
             texture.size(),
         );
-        self.cache.textures.insert((tic.address, header), texture.clone());
+        self.cache.textures.insert((tic.address, header), (texture.clone(), end));
         Ok(texture)
+    }
+
+    /// Forgets the uploaded textures whose memory `[start, start + len)` overlaps:
+    /// the GPU wrote there.
+    pub fn invalidate(&mut self, start: u64, len: u64) {
+        let end = start.saturating_add(len);
+        self.cache.textures.retain(|(addr, _), (_, last)| *last <= start || *addr >= end);
     }
 
     /// The sampler of a header; a non-filtering one (nearest everywhere) for

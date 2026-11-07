@@ -523,7 +523,7 @@ impl Gpu {
                     let mut outcome = String::new();
                     if let Some(mut s) = k.surfaces.take() {
                         outcome = match s.draw(&d, &mut |gpu, buf| k.read_gpu(space, gpu, buf)) {
-                            Ok(()) => " -> drawn".into(),
+                            Ok(()) => format!(" -> drawn{}", if s.textures_read.is_empty() { String::new() } else { format!(", textures {:x?}", s.textures_read) }),
                             Err(why) => format!(" -> not drawn: {why}"),
                         };
                         // One frame, draw by draw (game output: never committed).
@@ -544,18 +544,45 @@ impl Gpu {
                 }
                 // The copy engine, line by line (the GPU writes whatever the CPU's permissions).
                 Effect::Copy(c) => {
+                    use gyroship_gpu::state::textures::{BlockLinear, GobLayout};
                     let mut line = vec![0u8; c.line_length.min(64 << 20) as usize];
                     let mut ok = u64::from(c.line_length) * u64::from(c.line_count) <= 256 << 20;
-                    for i in 0..u64::from(c.line_count) {
+                    // A block-linear destination: 16 aligned bytes stay contiguous in a GOB.
+                    let block = c.dst_block.map(|b| {
+                        let l = BlockLinear { bytes_per_texel: 1, width: b.width, height: b.height, depth: b.depth.max(1), tile_width_log2: 0, gob_height_log2: b.gob_height_log2, gob_depth_log2: b.gob_depth_log2, gob: GobLayout::DEFAULT };
+                        (b, l)
+                    });
+                    for i in 0..c.line_count {
                         if !ok {
                             break;
                         }
-                        ok = k.read_gpu(space, c.src + i * u64::from(c.pitch_in), &mut line);
-                        let at = k.gpu_to_cpu(space, c.dst + i * u64::from(c.pitch_out));
-                        ok = ok && k.mem.write_object(at, &line).is_ok();
+                        ok = k.read_gpu(space, c.src + u64::from(i) * u64::from(c.pitch_in), &mut line);
+                        match &block {
+                            None => {
+                                let at = k.gpu_to_cpu(space, c.dst + u64::from(i) * u64::from(c.pitch_out));
+                                ok = ok && k.mem.write_object(at, &line).is_ok();
+                            }
+                            Some((b, l)) => {
+                                let mut j = 0;
+                                while ok && j < line.len() {
+                                    let x = b.x + j as u32;
+                                    let n = ((16 - x % 16) as usize).min(line.len() - j);
+                                    let at = k.gpu_to_cpu(space, c.dst + l.offset(x, b.y + i, b.layer));
+                                    ok = k.mem.write_object(at, &line[j..j + n]).is_ok();
+                                    j += n;
+                                }
+                            }
+                        }
                     }
                     if !ok && k.journal.few("gpu copy", 4) {
                         k.log(&format!("gpu: copy {c:x?} not done (memory not readable or writable)"));
+                    }
+                    let span = match &block {
+                        Some((_, l)) => l.size(),
+                        None => u64::from(c.pitch_out) * u64::from(c.line_count.max(1)),
+                    };
+                    if let Some(s) = &mut k.surfaces {
+                        s.invalidate(c.dst, span);
                     }
                 }
                 // A compute dispatch: its QMD's releases (the program is not run yet).
@@ -580,6 +607,9 @@ impl Gpu {
                 Effect::Semaphore(r) => semaphore(k, space, &r),
                 // The GPU writes whatever the CPU's permissions.
                 Effect::Write(w) => {
+                    if let Some(s) = &mut k.surfaces {
+                        s.invalidate(w.address, w.data.len() as u64);
+                    }
                     let at = k.gpu_to_cpu(space, w.address);
                     if k.mem.write_object(at, &w.data).is_err() && k.journal.few("gpu write", 4) {
                         k.log(&format!("gpu: {} bytes at {:#x} (cpu {at:#x}) not writable", w.data.len(), w.address));

@@ -141,6 +141,26 @@ pub struct Copy {
     pub pitch_out: u32,
     pub line_length: u32,
     pub line_count: u32,
+    /// A block-linear destination (then `pitch_out` does not apply).
+    pub dst_block: Option<BlockDst>,
+}
+
+/// A block-linear copy destination (clc7b5.h SET_DST_*), in bytes: the
+/// copy engine without remapping moves bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockDst {
+    /// SET_DST_WIDTH (bytes), SET_DST_HEIGHT, SET_DST_DEPTH.
+    pub width: u32,
+    pub height: u32,
+    pub depth: u32,
+    /// SET_DST_LAYER: the slice the lines go to.
+    pub layer: u32,
+    /// DST_ORIGIN_X (bytes) and DST_ORIGIN_Y.
+    pub x: u32,
+    pub y: u32,
+    /// SET_DST_BLOCK_SIZE_HEIGHT (7:4) and _DEPTH (11:8), log2 GOBs.
+    pub gob_height_log2: u32,
+    pub gob_depth_log2: u32,
 }
 
 /// A render target as the 3D class describes it.
@@ -631,11 +651,11 @@ impl Channel {
     /// (7, 8) 1 = pitch; MULTI_LINE_ENABLE (9); REMAP_ENABLE (10).
     fn copy(&self, sub: usize, value: u32) -> Option<Effect> {
         let reg = |m: u32| self.reg(sub, m);
-        let pitch = value >> 7 & 3 == 3;
+        // The source must be pitch (bit 7); the destination may be block linear.
         if value & 3 == 0 {
             return None;
         }
-        if !pitch || value >> 10 & 1 != 0 {
+        if value >> 7 & 1 == 0 || value >> 10 & 1 != 0 {
             return Some(Effect::Ignored { class: self.classes[sub], method: DMA_LAUNCH, value });
         }
         let at = |m: u32| u64::from(reg(m) & 0x1_ffff) << 32 | u64::from(reg(m + 4));
@@ -646,6 +666,10 @@ impl Channel {
             pitch_out: reg(DMA_PITCH_IN + 4),
             line_length: reg(DMA_PITCH_IN + 8),
             line_count: if value >> 9 & 1 != 0 { reg(DMA_PITCH_IN + 0xc) } else { 1 },
+            dst_block: (value >> 8 & 1 == 0).then(|| {
+                let block = reg(0x70c);
+                BlockDst { width: reg(0x710), height: reg(0x714), depth: reg(0x718), layer: reg(0x71c), x: reg(0x74c), y: reg(0x750), gob_height_log2: block >> 4 & 0xf, gob_depth_log2: block >> 8 & 0xf }
+            }),
         }))
     }
 
@@ -757,7 +781,7 @@ mod tests {
         assert_eq!(c.run(&words), vec![Effect::Release(Release { method: DMA_LAUNCH, addr: 0x1_0000_2000, value: 5, width: 4, timestamp: false })]);
         // A pitch-to-pitch copy of two 0x40-byte lines, then its one-word semaphore.
         let words = [header(1, 8, 4, DMA_OFFSET_IN_UPPER), 0x12, 0x3400, 0x12, 0x5600, 0x100, 0x80, 0x40, 2, header(1, 1, 4, DMA_LAUNCH), 2 | 3 << 7 | 1 << 9 | 1 << 3];
-        let copy = Copy { src: 0x12_0000_3400, dst: 0x12_0000_5600, pitch_in: 0x100, pitch_out: 0x80, line_length: 0x40, line_count: 2 };
+        let copy = Copy { src: 0x12_0000_3400, dst: 0x12_0000_5600, pitch_in: 0x100, pitch_out: 0x80, line_length: 0x40, line_count: 2, dst_block: None };
         assert_eq!(c.run(&words), vec![Effect::Copy(copy), Effect::Release(Release { method: DMA_LAUNCH, addr: 0x1_0000_2000, value: 5, width: 4, timestamp: false })]);
         // A reduction is reported as ignored, not executed.
         assert!(matches!(c.run(&[header(1, 1, 0, SEMAPHORE_D), 0x10])[..], [Effect::Ignored { method: SEMAPHORE_D, value: 0x10, .. }]));

@@ -848,6 +848,11 @@ impl BlockLinear {
         Geom { tw, th, td, tiles, gob: self.gob }
     }
 
+    /// Offset from the level's start of byte `x` of row `y` of slice `z`.
+    pub fn offset(&self, x: u32, y: u32, z: u32) -> u64 {
+        self.geom().offset(u64::from(x), u64::from(y), u64::from(z))
+    }
+
     /// Bytes the level occupies in memory (whole tiles).
     pub fn size(&self) -> u64 {
         let g = self.geom();
