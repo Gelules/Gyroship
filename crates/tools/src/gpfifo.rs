@@ -6,7 +6,7 @@ use gyroship_gpu::pushbuf::{Channel, Effect};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-pub fn run(dir: &Path, first: u32, last: u32, methods: bool) -> super::Result<()> {
+pub fn run(dir: &Path, first: u32, last: u32, methods: bool, listing: Option<usize>) -> super::Result<()> {
     let mut files: Vec<(u32, u32, PathBuf)> = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
@@ -68,6 +68,12 @@ pub fn run(dir: &Path, first: u32, last: u32, methods: bool) -> super::Result<()
         }
     }
     stats.print(current);
+    if let (Some(index), Some(unit)) = (listing, &channel.mme) {
+        println!("macro {index}:");
+        for line in unit.listing(index) {
+            println!("  {line}");
+        }
+    }
     Ok(())
 }
 

@@ -287,7 +287,7 @@ pub struct Channel {
     /// A method whose data words continue into the next segment.
     pending: Option<Pending>,
     /// The macro unit, out of the channel while a macro runs.
-    mme: Option<Box<Mme>>,
+    pub mme: Option<Box<Mme>>,
     /// A macro call still gathering its parameters: subchannel, index, parameters.
     call: Option<(usize, usize, Vec<u32>)>,
     /// The macro running now, if any.
@@ -498,6 +498,10 @@ impl Channel {
         let macros = three_d || self.classes[subchannel] & 0xff == 0xc0;
         if macros && CALL_MME.contains(&method) {
             let index = ((method - CALL_MME.start) / 8) as usize;
+            // Calls are traced too (method CALL_MME_MACRO(i) or _DATA(i), each parameter).
+            if let Some(t) = &mut self.trace {
+                t.push(Traced { subchannel, class: self.classes[subchannel], method, value, from_macro: self.running });
+            }
             match &mut self.call {
                 Some((s, i, params)) if method % 8 == 4 && *s == subchannel && *i == index => params.push(value),
                 _ => {

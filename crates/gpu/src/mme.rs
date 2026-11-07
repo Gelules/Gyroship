@@ -139,6 +139,8 @@ struct Run<'a, H: Host> {
     stop: bool,
     /// Words MME_DMA_READ_FIFOED queued after the call's parameters.
     fifo: std::collections::VecDeque<u32>,
+    /// Each ALU's (x, y), read before either ALU of the group writes.
+    sources: [(u32, u32); 2],
 }
 
 impl Mme {
@@ -171,13 +173,27 @@ impl Mme {
         self.start_ptr += 1;
     }
 
+    /// Macro `index`'s groups from its start up to the next macro's start (or
+    /// 64 groups), decoded, one line each (for study).
+    pub fn listing(&self, index: usize) -> Vec<String> {
+        let Some(&start) = self.starts.get(index).filter(|s| **s != u32::MAX) else { return Vec::new() };
+        let next = self.starts.iter().filter(|&&s| s > start && s != u32::MAX).min().copied().unwrap_or(start + 64);
+        (start..next.min(start + 256))
+            .filter_map(|ip| {
+                let at = ip as usize * 3;
+                let w = self.code.get(at..at + 3)?;
+                Some(format!("{ip:4}: {:?}", Group::decode([w[0], w[1], w[2]])))
+            })
+            .collect()
+    }
+
     /// Runs macro `index` to its end.
     pub fn call<H: Host>(&mut self, index: usize, host: &mut H) -> Result<(), Fault> {
         let start = *self.starts.get(index).ok_or(Fault::NoMacro(index))? as usize;
         if start == u32::MAX as usize {
             return Err(Fault::NoMacro(index));
         }
-        let mut run = Run { host, regs: [0; 24], load: [0; 2], alu_res: [0; 2], carry: 0, method: 0, inc: 0, stop: false, fifo: Default::default() };
+        let mut run = Run { host, regs: [0; 24], load: [0; 2], alu_res: [0; 2], carry: 0, method: 0, inc: 0, stop: false, fifo: Default::default(), sources: [(0, 0); 2] };
         let (mut ip, mut end_next) = (start, false);
         let mut lp = None::<(usize, usize, u32)>; // (start, end, remaining)
         for _ in 0..STEP_LIMIT {
@@ -198,6 +214,14 @@ impl Mme {
                     PRED_MODES[usize::from(m)].map(|c| c != if v { b'T' } else { b'F' })
                 }
             };
+            // Both ALUs read the registers before either writes its destination (the
+            // game's macros rely on it: macro code computes a value in one ALU while the
+            // other still reads the register's old value); only the carry chains.
+            run.sources = [(0, 0); 2];
+            for (i, _) in mask[..2].iter().enumerate().filter(|m| *m.1) {
+                let a = g.alu[i];
+                run.sources[i] = (run.read(&g, i, a.src[0])?, run.read(&g, i, a.src[1])?);
+            }
             for (i, _) in mask[..2].iter().enumerate().filter(|m| *m.1) {
                 run.alu(self, &g, i, ip, &mut next, &mut lp)?;
             }
@@ -239,8 +263,8 @@ impl<H: Host> Run<'_, H> {
     }
 
     fn alu(&mut self, mme: &mut Mme, g: &Group, i: usize, ip: usize, next: &mut usize, lp: &mut Option<(usize, usize, u32)>) -> Result<(), Fault> {
+        let (x, y) = self.sources[i];
         let a = g.alu[i];
-        let (x, y) = (self.read(g, i, a.src[0])?, self.read(g, i, a.src[1])?);
         let wide = |p: u64| (p as u32, (p >> 32) as u32);
         let branch = |taken: bool| taken == (a.imm & 0x8000 != 0);
         let res = match a.op {
@@ -502,10 +526,10 @@ mod tests {
 
     #[test]
     fn a_loop_repeats_its_body() {
-        // LOOP R0=param (3) over one group that emits R1 += 2.
+        // LOOP param (3) times over one group that emits R1 += 2.
         let mut set = group(NOP, NOP, [(5, OUT_NONE), (OUT_NONE, OUT_NONE)]);
         set.alu[0].imm = 0x200;
-        let lp = group(alu(0, 0, LOAD0, ZERO, 0), alu(23, ZERO, 0, ZERO, 2), [(OUT_NONE, OUT_NONE); 2]);
+        let lp = group(alu(0, 0, LOAD0, ZERO, 0), alu(23, ZERO, LOAD0, ZERO, 2), [(OUT_NONE, OUT_NONE); 2]);
         let body = group(alu(0, 1, 1, IMMED, 2), NOP, [(OUT_NONE, 1), (OUT_NONE, OUT_NONE)]);
         let end = last(group(NOP, NOP, [(OUT_NONE, OUT_NONE); 2]));
         let host = run(&[set, lp, body, end, group(NOP, NOP, [(OUT_NONE, OUT_NONE); 2])], &[3]);
@@ -572,6 +596,18 @@ mod tests {
         let word = |i: u32| 0x4000_0110 + i;
         let expected = vec![(0x550, 1), (0x554, 0x40), (0x558, 2), (MME_DMA_READ, 3), (MME_DMA_READ_FIFOED, 2), (0x1000, word(1)), (0x1000, 7), (0x1000, word(0)), (0x1000, word(1))];
         assert_eq!(host.emitted, expected);
+    }
+
+    #[test]
+    fn both_alus_read_registers_before_either_writes() {
+        // R0 = 5; then in one group R0 = R0 + 1 and R1 = R0 + 0 (the old R0): emit R1, R0.
+        let set = group(alu(0, 0, ZERO, IMMED, 5), NOP, [(OUT_NONE, OUT_NONE); 2]);
+        let mut both = group(alu(0, 0, 0, IMMED, 1), alu(0, 1, 0, ZERO, 0), [(5, 2), (OUT_NONE, 1)]);
+        both.alu[0].imm = 1;
+        let end = last(group(NOP, NOP, [(OUT_NONE, OUT_NONE); 2]));
+        let host = run(&[set, both, end, group(NOP, NOP, [(OUT_NONE, OUT_NONE); 2])], &[]);
+        // Method index 1 (byte 4) from alu 0's immediate.
+        assert_eq!(host.emitted, vec![(4, 5), (4, 6)]);
     }
 
     #[test]
