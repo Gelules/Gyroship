@@ -15,6 +15,7 @@ pub mod hid;
 pub mod ipc;
 pub mod journal;
 pub mod nvdrv;
+pub mod opus;
 pub mod save;
 pub mod service;
 pub mod shared;
@@ -184,6 +185,8 @@ pub struct Kernel {
     pub audio_out: Option<AudioOut>,
     /// `--dump-audio`: every frame played so far.
     pub audio_samples: Option<Vec<f32>>,
+    /// hwopus decoders, by manager (its results ring) and instance.
+    pub opus: std::collections::BTreeMap<(u64, u16), opus::Decoder>,
     /// The stream's gain (SetStreamGain), and its channels and rate.
     pub audio_gain: f32,
     pub audio_format: (u16, u32),
@@ -211,7 +214,7 @@ impl Kernel {
         journal.line(0, 0, &format!("gyroship hle: mode {mode}, seed {:#x}, non-system memory {:#x}", config.seed, config.non_system_memory));
         let recorded = config.record.as_ref().map(|_| Vec::new());
         let audio_samples = config.audio_dump.as_ref().map(|_| Vec::new());
-        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None, sessions: Vec::new(), objects: Vec::new(), domains: Vec::new(), allowed_services: Vec::new(), shared: Vec::new(), transfers: Vec::new(), time_shared: None, frame: (0, 0, 0), symbols: Vec::new(), romfs: None, gs: gs::State::default(), hid_shared: None, input: Default::default(), spin: Vec::new(), saves: Default::default(), timers: Vec::new(), surfaces: None, gpu: Default::default(), counts: Default::default(), anomalies: Default::default(), frame_hashes: Vec::new(), window: None, live_input: None, recorded, audio_out: None, audio_samples, audio_gain: 1.0, audio_format: (2, 48_000) }
+        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None, sessions: Vec::new(), objects: Vec::new(), domains: Vec::new(), allowed_services: Vec::new(), shared: Vec::new(), transfers: Vec::new(), time_shared: None, frame: (0, 0, 0), symbols: Vec::new(), romfs: None, gs: gs::State::default(), hid_shared: None, input: Default::default(), spin: Vec::new(), saves: Default::default(), timers: Vec::new(), surfaces: None, gpu: Default::default(), counts: Default::default(), anomalies: Default::default(), frame_hashes: Vec::new(), window: None, live_input: None, recorded, audio_out: None, audio_samples, opus: Default::default(), audio_gain: 1.0, audio_format: (2, 48_000) }
     }
 
     /// Counts one more `name` (normal activity); returns the new count.

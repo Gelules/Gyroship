@@ -24,7 +24,8 @@ pub enum Audio {
     OpusSession,
     /// A codec manager (OpenManager): its results ring (in the client's
     /// memory), the ring's record count, and the PCM bytes of one frame.
-    OpusManager { ring: u64, slots: u32, out_stride: u32 },
+    /// `io` the I/O buffers' start; buffer i's input at io + i × (in + out), its output right after.
+    OpusManager { ring: u64, slots: u32, io: u64, in_stride: u32, out_stride: u32 },
     DevMgr,
     DevMgrManager,
     Mixer,
@@ -86,19 +87,22 @@ impl Audio {
                     }
                 }
                 let (region, ring_at, out_stride, io) = (req.u64_at(0x68)?, req.u32_at(0x2c)?, req.u32_at(0x40)?, req.u32_at(0x44)?);
-                let manager = Audio::OpusManager { ring: region + u64::from(ring_at), slots: io + 1, out_stride };
+                let (io_at, in_stride) = (req.u32_at(0x24)?, req.u32_at(0x3c)?);
+                let manager = Audio::OpusManager { ring: region + u64::from(ring_at), slots: io + 1, io: region + u64::from(io_at), in_stride, out_stride };
                 let tag = 1 + k.objects.iter().filter(|o| matches!(o, Service::Audio(Audio::OpusManager { .. }))).count() as u32;
                 k.log(&format!("hwopus: manager {tag}, {io} I/O buffers, {out_stride} PCM bytes per frame"));
                 let ev = k.lone_event()?;
                 Reply { copy_handles: vec![ev], data: tag.to_le_bytes().to_vec(), objects: vec![Service::Audio(manager)], ..Reply::ok() }
             }
             (Audio::OpusManager { .. }, 0) => Reply::ok(),
-            // Execute(tasks of 16 bytes, in the X or A buffer): every task completes at
-            // once, in order, as a frame of silence. A 64-byte record per task in the
-            // results ring (+0x80): the task's first 8 bytes (tag, instance, I/O buffer,
-            // sequence), +0x10 the PCM byte count, Result 0; then the producer index
-            // (+4), last. The output buffers stay as the client zeroed them.
-            (Audio::OpusManager { ring, slots, out_stride }, 10) => {
+            // Execute(tasks of 16 bytes, in the X or A buffer: +2 instance, +4 I/O buffer,
+            // +8 input size, +0xc reset): every task completes at once, in order. Its
+            // input (a big-endian size, 4 bytes of 0, the Opus packet) decodes to 960
+            // s16 samples per channel in the buffer's output. A 64-byte record per task in
+            // the results ring (+0x80): the task's first 8 bytes (tag, instance, I/O
+            // buffer, sequence), +8 duration 0 (never host time), +0x10 the PCM byte
+            // count, Result 0; then the producer index (+4), last.
+            (Audio::OpusManager { ring, slots, io, in_stride, out_stride }, 10) => {
                 let b = req.send_buffer(0)?;
                 let mut tasks = vec![0u8; b.size.min(0xff0) as usize];
                 k.mem.read(b.addr, &mut tasks).ok()?;
@@ -106,16 +110,40 @@ impl Audio {
                 k.mem.read(*ring + 4, &mut w).ok()?;
                 let mut w = u32::from_le_bytes(w) % *slots;
                 let n = tasks.len() / 16;
+                let channels = (*out_stride / (960 * 2)).clamp(1, 2) as usize;
                 for t in tasks.as_chunks::<16>().0 {
+                    let (instance, buffer) = (u16::from_le_bytes([t[2], t[3]]), u16::from_le_bytes([t[4], t[5]]));
+                    let input = *io + u64::from(buffer) * u64::from(*in_stride + *out_stride);
+                    let mut head = [0u8; 8];
+                    let _ = k.mem.read_object(input, &mut head);
+                    let size = (u32::from_be_bytes(head[..4].try_into().unwrap()) as usize).min(*in_stride as usize - 8);
+                    let mut packet = vec![0u8; size];
+                    let _ = k.mem.read_object(input + 8, &mut packet);
+                    let decoder = k.opus.entry((*ring, instance)).or_insert_with(|| crate::opus::Decoder::new(channels));
+                    if t[0xc] != 0 {
+                        decoder.reset();
+                    }
+                    let mut pcm = vec![0i16; 960 * channels];
+                    let decoded = decoder.decode(&packet, &mut pcm);
+                    if decoded != Ok(960) {
+                        // Concealment, never an error code: the game aborts on any.
+                        let _ = decoder.decode(&[], &mut pcm);
+                        if k.journal.few("hwopus decode", 4) {
+                            k.log(&format!("hwopus: instance {instance}: packet of {size} bytes gave {decoded:?}; concealed"));
+                        }
+                    }
+                    k.count(if pcm.iter().all(|&s| s == 0) { "opus silent frames" } else { "opus sounding frames" });
+                    let bytes: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
+                    let _ = k.mem.write_object(input + u64::from(*in_stride), &bytes);
                     let mut e = [0u8; 0x40];
                     e[..8].copy_from_slice(&t[..8]);
-                    e[0x10..0x14].copy_from_slice(&out_stride.to_le_bytes());
+                    e[0x10..0x14].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
                     k.mem.write(*ring + 0x80 + u64::from(w) * 0x40, &e).ok()?;
                     w = (w + 1) % *slots;
                 }
                 k.mem.write(*ring + 4, &w.to_le_bytes()).ok()?;
                 if k.journal.few("hwopus execute", 3) {
-                    k.log(&format!("hwopus: {n} tasks decoded as silence, producer index {w}"));
+                    k.log(&format!("hwopus: {n} tasks decoded, producer index {w}"));
                 }
                 Reply::ok()
             }
