@@ -96,9 +96,97 @@ pub fn version(q: &[u8]) -> (u32, u32) {
     (mw(q, 583, 580), mw(q, 579, 576))
 }
 
-/// The enabled releases (RELEASE0 at bit 768, RELEASE1 at bit 896).
+/// What a PCAS, or a finished QMD's dependent pointer, asks of a QMD.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Action {
+    /// SCHEDULE: run once loaded and no dependence is left (not again once done).
+    Schedule,
+    /// INVALIDATE_COPY_SCHEDULE: reload from memory, not done any more, schedule.
+    Reload,
+    /// INCREMENT_DEPENDENCE (positive) or DECREMENT_DEPENDENCE (negative).
+    Dependence(i32),
+}
+
+impl Action {
+    /// SEND_SIGNALING_PCAS2_B: PCAS_ACTION (3:0), OFFSET_MINUS_ONE (23:14) the count.
+    /// The prefetch and other actions do nothing that matters here.
+    pub fn pcas2(value: u32) -> Option<Action> {
+        let count = (value >> 14 & 0x3ff) as i32 + 1;
+        match value & 0xf {
+            2 => Some(Action::Schedule),
+            3 => Some(Action::Reload),
+            7 => Some(Action::Dependence(-count)),
+            0xc => Some(Action::Dependence(count)),
+            _ => None,
+        }
+    }
+}
+
+/// DEPENDENT_QMD0: the QMD a finished one signals, and how.
+pub fn dependent(q: &[u8]) -> Option<(u64, Action)> {
+    let action = match mw(q, 515, 513) {
+        1 => Action::Schedule,
+        3 => Action::Reload,
+        4 => Action::Dependence(-1),
+        _ => return None,
+    };
+    (mw(q, 512, 512) != 0).then(|| (u64::from(mw(q, 511, 480)) << 8, action))
+}
+
+/// The state of the QMDs that PCAS actions reach, by address, shared by every
+/// channel (one schedules what another releases). Lichii's model, in our words:
+/// a QMD runs once it is loaded, scheduled, not done, and its dependence counter
+/// (DEPENDENCE_COUNTER when loaded) is down to 0; counts that come while it is not
+/// loaded, or done, wait for its next load.
+#[derive(Debug, Default)]
+pub struct Scheduler {
+    qmds: std::collections::HashMap<u64, Entry>,
+}
+
+#[derive(Debug, Default)]
+struct Entry {
+    loaded: bool,
+    scheduled: bool,
+    done: bool,
+    counter: i64,
+    deferred: i64,
+}
+
+impl Scheduler {
+    /// Applies `action` to the QMD at `addr`; `q` reads it when it loads. True
+    /// when it runs now (it is then done).
+    pub fn signal(&mut self, addr: u64, action: Action, q: impl FnOnce() -> Option<[u8; SIZE]>) -> bool {
+        // ponytail: a cap instead of tracking lifetimes; NVN's rings reuse a few addresses.
+        if self.qmds.len() > 4096 {
+            self.qmds.retain(|_, e| !e.done);
+        }
+        let e = self.qmds.entry(addr).or_default();
+        match action {
+            Action::Dependence(n) if e.loaded && !e.done => e.counter += i64::from(n),
+            Action::Dependence(n) => e.deferred += i64::from(n),
+            Action::Schedule | Action::Reload => {
+                if action == Action::Reload || !e.loaded {
+                    let Some(q) = q() else { return false };
+                    e.counter = i64::from(mw(&q, 157, 142)) + std::mem::take(&mut e.deferred);
+                    e.loaded = true;
+                    e.done = false;
+                }
+                e.scheduled = true;
+            }
+        }
+        let run = e.loaded && e.scheduled && !e.done && e.counter <= 0;
+        if run {
+            e.done = true;
+            e.scheduled = false;
+        }
+        run
+    }
+}
+
+/// The enabled releases (RELEASE0 at bit 768, RELEASE1 at bit 896, RELEASE2 at
+/// bit 1664, which NVN patches for queue-to-queue syncs).
 pub fn releases(q: &[u8]) -> Vec<Release> {
-    [768u32, 896]
+    [768u32, 896, 1664]
         .into_iter()
         .filter(|&b| mw(q, b + 55, b + 55) != 0) // RELEASEn_ENABLE
         .map(|b| Release {
@@ -170,5 +258,29 @@ mod tests {
         put(&mut q, 1024 + 64 + 63, 1024 + 64 + 51, 0x10);
         let l = launch(&q);
         assert_eq!(l, Launch { program: 0x11_5678_9a00, grid: [4, 2, 1], block: [8, 8, 1], shared: 0x400, cbufs: vec![(1, 0x12_0000_2000, 0x100)] });
+    }
+
+    #[test]
+    fn a_qmd_runs_once_scheduled_and_its_dependences_are_met() {
+        let mut q = [0u8; SIZE];
+        put(&mut q, 157, 142, 2); // DEPENDENCE_COUNTER
+        put(&mut q, 511, 480, 0x1234); // DEPENDENT_QMD0: decrement the one at 0x123400
+        put(&mut q, 512, 512, 1);
+        put(&mut q, 515, 513, 4);
+        assert_eq!(dependent(&q), Some((0x12_3400, Action::Dependence(-1))));
+        assert_eq!(Action::pcas2(1 << 14 | 0xc), Some(Action::Dependence(2)));
+        assert_eq!(Action::pcas2(7), Some(Action::Dependence(-1)));
+        let mut s = Scheduler::default();
+        let read = || Some(q);
+        assert!(!s.signal(0x100, Action::Schedule, read));
+        assert!(!s.signal(0x100, Action::Dependence(-1), read));
+        assert!(s.signal(0x100, Action::Dependence(-1), read));
+        // Done: a schedule does not run it again; a reload starts it over.
+        assert!(!s.signal(0x100, Action::Schedule, read));
+        assert!(!s.signal(0x100, Action::Reload, read));
+        assert!(s.signal(0x100, Action::Dependence(-2), read));
+        // Counts before the load wait for it.
+        assert!(!s.signal(0x200, Action::Dependence(-2), read));
+        assert!(s.signal(0x200, Action::Reload, read));
     }
 }

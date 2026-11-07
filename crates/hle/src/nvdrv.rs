@@ -134,6 +134,8 @@ pub struct Gpu {
     stalls: BTreeMap<u32, u32>,
     /// Compute dispatches so far.
     dispatches: u64,
+    /// Every channel's compute QMDs and what they wait for.
+    scheduler: gyroship_gpu::state::qmd::Scheduler,
 }
 
 impl Nvdrv {
@@ -585,40 +587,49 @@ impl Gpu {
                         s.invalidate(c.dst, span);
                     }
                 }
-                // A compute dispatch: its QMD's releases (the program is not run yet).
-                Effect::Dispatch(at, headers) => {
+                // A PCAS action: the QMDs it lets run, each then its releases and its dependent QMD.
+                Effect::Dispatch(first, action, pools) => {
                     use gyroship_gpu::state::qmd;
-                    self.dispatches += 1;
-                    let mut q = [0u8; qmd::SIZE];
-                    if !k.read_gpu(space, at, &mut q) {
-                        if k.journal.few("gpu qmd", 4) {
-                            k.log(&format!("gpu: compute dispatch: QMD at {at:#x} not readable"));
+                    let mut work = std::collections::VecDeque::from([(first, action)]);
+                    // Lichii's bound on a chain of dependents.
+                    let mut chain = 256;
+                    while let Some((at, action)) = work.pop_front() {
+                        let mut q = [0u8; qmd::SIZE];
+                        let readable = k.read_gpu(space, at, &mut q);
+                        if !self.scheduler.signal(at, action, || readable.then_some(q)) {
+                            continue;
                         }
-                        continue;
-                    }
-                    let releases = qmd::releases(&q);
-                    let launch = qmd::launch(&q);
-                    let program = gyroship_gpu::draw::read_compute_program(&mut |gpu, buf| k.read_gpu(space, gpu, buf), launch.program);
-                    let key = program.as_ref().map_or_else(|| "not readable".to_string(), |(key, code)| format!("{key:016x}, {} bytes", code.len()));
-                    if let (Some(dir), Some((key, code))) = (&k.config.shaders_dump, &program) {
-                        let _ = std::fs::create_dir_all(dir);
-                        let _ = std::fs::write(dir.join(format!("{key:016x}.bin")), code);
-                    }
-                    if k.journal.few("gpu dispatch", 8) {
-                        k.log(&format!("gpu: compute dispatch {}: QMD {at:#x} version {:?}, program {key} at {:#x}, grid {:?} block {:?} shared {:#x} cbufs {:x?}; releases {releases:x?}", self.dispatches, qmd::version(&q), launch.program, launch.grid, launch.block, launch.shared, launch.cbufs));
-                    }
-                    // The program runs before its releases signal it done.
-                    if let Some(mut s) = k.surfaces.take() {
-                        let result = s.dispatch(&launch, headers, &mut |gpu, buf| k.read_gpu(space, gpu, buf));
-                        k.surfaces = Some(s);
-                        if let Err(e) = result
-                            && k.journal.few(&format!("gpu compute {e}"), 2)
+                        self.dispatches += 1;
+                        let releases = qmd::releases(&q);
+                        let launch = qmd::launch(&q);
+                        let program = gyroship_gpu::draw::read_compute_program(&mut |gpu, buf| k.read_gpu(space, gpu, buf), launch.program);
+                        let key = program.as_ref().map_or_else(|| "not readable".to_string(), |(key, code)| format!("{key:016x}, {} bytes", code.len()));
+                        if let (Some(dir), Some((key, code))) = (&k.config.shaders_dump, &program) {
+                            let _ = std::fs::create_dir_all(dir);
+                            let _ = std::fs::write(dir.join(format!("{key:016x}.bin")), code);
+                        }
+                        if k.journal.few("gpu dispatch", 8) {
+                            k.log(&format!("gpu: compute dispatch {}: QMD {at:#x} ({action:?}) version {:?}, program {key} at {:#x}, grid {:?} block {:?} shared {:#x} cbufs {:x?}; releases {releases:x?}; dependent {:x?}", self.dispatches, qmd::version(&q), launch.program, launch.grid, launch.block, launch.shared, launch.cbufs, qmd::dependent(&q)));
+                        }
+                        // The program runs before its releases signal it done; then its dependent QMD.
+                        if let Some(mut s) = k.surfaces.take() {
+                            let result = s.dispatch(&launch, pools,&mut |gpu, buf| k.read_gpu(space, gpu, buf));
+                            k.surfaces = Some(s);
+                            if let Err(e) = result
+                                && k.journal.first(&format!("gpu compute {key} {e}"))
+                            {
+                                k.log(&format!("gpu: compute dispatch {}: program {key}, grid {:?} block {:?} shared {:#x}: not run: {e}", self.dispatches, launch.grid, launch.block, launch.shared));
+                            }
+                        }
+                        for r in releases {
+                            semaphore(k, space, &r);
+                        }
+                        if let Some(next) = qmd::dependent(&q)
+                            && chain > 0
                         {
-                            k.log(&format!("gpu: compute dispatch {}: not run: {e}", self.dispatches));
+                            chain -= 1;
+                            work.push_back(next);
                         }
-                    }
-                    for r in releases {
-                        semaphore(k, space, &r);
                     }
                 }
                 Effect::Semaphore(r) => semaphore(k, space, &r),
@@ -640,6 +651,11 @@ impl Gpu {
                 Effect::MacroFault { index, fault } => {
                     if k.journal.few(&format!("gpu macro fault {index}"), 2) {
                         k.log(&format!("gpu: macro {index} stopped: {fault:?}"));
+                    }
+                }
+                Effect::MacroRead { addr, words } => {
+                    if k.journal.few("gpu macro read", 20) {
+                        k.log(&format!("gpu: macro read {words} words at {addr:#x}"));
                     }
                 }
             }

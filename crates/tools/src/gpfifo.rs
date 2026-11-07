@@ -55,12 +55,13 @@ pub fn run(dir: &Path, first: u32, last: u32, methods: bool) -> super::Result<()
             match e {
                 Effect::Release(r) => println!("  release {} at {:#x} by method {:#x}", r.value, r.addr, r.method),
                 Effect::MacroFault { index, fault } => println!("  macro {index} fault {fault:?}"),
+                Effect::MacroRead { addr, words } => println!("  macro read {words} words at {addr:#x}"),
                 Effect::Clear(c) => println!("  clear {c:?}"),
                 Effect::Draw(d) => println!("  draw {d:x?}"),
                 Effect::Write(w) => stats.written += w.data.len(),
                 Effect::Unsupported(u) => println!("  not applied: {u:x?}"),
                 Effect::Copy(c) => println!("  copy {c:x?}"),
-                Effect::Dispatch(q, _) => println!("  compute dispatch, QMD at {q:#x}"),
+                Effect::Dispatch(q, action, _) => println!("  compute {action:?}, QMD at {q:#x}"),
                 Effect::Semaphore(s) => println!("  semaphore {s:x?}"),
                 Effect::Ignored { class, method, value } => *stats.ignored.entry((class, method, value)).or_default() += 1,
             }

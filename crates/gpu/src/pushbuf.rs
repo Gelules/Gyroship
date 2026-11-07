@@ -18,6 +18,7 @@
 use crate::draw::Mem;
 use crate::mme::{self, Mme};
 use std::collections::VecDeque;
+use crate::state::qmd;
 use crate::state::raster::{self, RenderState};
 use crate::state::resources::{self, Bindings, MemWrite, Pool, Resources, SamplerBinding, Unsupported};
 use crate::state::vertex::{self, Attribute, IndexBuffer, Stream};
@@ -87,15 +88,19 @@ pub enum Effect {
     Ignored { class: u32, method: u32, value: u32 },
     /// A macro stopped early.
     MacroFault { index: usize, fault: mme::Fault },
+    /// A macro read `words` words of memory at `addr` (MME_DMA_READ or its
+    /// FIFOED form); done already, reported for logs.
+    MacroRead { addr: u64, words: u32 },
     /// CLEAR_SURFACE.
     Clear(Clear),
     /// DRAW_INDEX_BUFFER or DRAW_VERTEX_ARRAY.
     Draw(Box<Draw>),
     /// A copy engine copy, pitch to pitch.
     Copy(Copy),
-    /// A compute dispatch: the GPU address of its QMD, and the compute class's
-    /// texture header pool its images come from.
-    Dispatch(u64, Pool),
+    /// A PCAS action on a compute QMD (its GPU address), which may launch it;
+    /// with the compute class's texture header and sampler pools its images
+    /// and textures come from.
+    Dispatch(u64, crate::state::qmd::Action, Pools),
     /// A semaphore an inline-to-memory upload releases once its data is in.
     Semaphore(crate::state::qmd::Release),
     /// Bytes the 3D method stream writes to memory, before what follows reads it.
@@ -164,6 +169,18 @@ pub struct BlockDst {
     pub gob_depth_log2: u32,
 }
 
+/// A class's texture header and sampler pools and sampler binding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pools {
+    pub headers: Pool,
+    pub samplers: Pool,
+    pub sampler_binding: SamplerBinding,
+}
+
+fn pools(r: crate::state::Reg) -> Pools {
+    Pools { headers: resources::header_pool(r), samplers: resources::sampler_pool(r), sampler_binding: resources::sampler_binding(r) }
+}
+
 /// A render target as the 3D class describes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Surface {
@@ -219,6 +236,8 @@ const I2M_METHODS: std::ops::RangeInclusive<u32> = 0x180..=0x1b4;
 const SEND_PCAS_A: u32 = 0x2b4;
 const SEND_SIGNALING_PCAS_B: u32 = 0x2bc;
 const SEND_SIGNALING_PCAS2_B: u32 = 0x2c0;
+/// SEND_PCAS_ENABLE (bit 24): an inline QMD schedules itself once loaded.
+const SET_QMD_VIRTUALIZATION_CONTROL: u32 = 0x29c;
 // SET_INLINE_QMD_ADDRESS_A (upper) / _B (lower), the QMD address >> 8, and its data words.
 const SET_INLINE_QMD_ADDRESS: u32 = 0x318;
 const LOAD_INLINE_QMD_DATA: u32 = 0x320;
@@ -324,23 +343,46 @@ impl Default for Channel {
     }
 }
 
-/// What a running macro sees: its parameters, and the channel it emits into.
+/// What a running macro sees: its parameters, the channel it emits into, and memory.
 struct MacroHost<'a> {
     channel: &'a mut Channel,
     subchannel: usize,
     params: std::vec::IntoIter<u32>,
     effects: &'a mut Vec<Effect>,
+    read: Mem<'a>,
 }
 
 impl mme::Host for MacroHost<'_> {
-    fn param(&mut self) -> u32 {
-        self.params.next().unwrap_or(0)
+    fn param(&mut self) -> Option<u32> {
+        self.params.next()
     }
     fn state(&mut self, method: u32) -> u32 {
         self.channel.shadow.get(self.subchannel * 0x1000 + (method / 4) as usize).copied().unwrap_or(0)
     }
     fn method(&mut self, method: u32, data: u32) {
-        self.channel.write(self.subchannel, method, data, self.effects);
+        self.channel.write(self.subchannel, method, data, self.effects, &mut *self.read);
+    }
+    fn reg(&mut self, method: u32) -> u32 {
+        self.channel.reg(self.subchannel, method)
+    }
+    fn read(&mut self, addr: u64, words: &mut [u32]) {
+        let mut bytes = vec![0u8; words.len() * 4];
+        (self.read)(addr, &mut bytes);
+        // Writes earlier in this run are not in memory yet; the GPU would see them.
+        // ponytail: copies and dispatches still pending are not seen; flush them first if a macro needs them.
+        let end = addr + bytes.len() as u64;
+        for e in self.effects.iter() {
+            if let Effect::Write(w) = e {
+                let (from, to) = (w.address.max(addr), (w.address + w.data.len() as u64).min(end));
+                if from < to {
+                    bytes[(from - addr) as usize..(to - addr) as usize].copy_from_slice(&w.data[(from - w.address) as usize..(to - w.address) as usize]);
+                }
+            }
+        }
+        for (w, b) in words.iter_mut().zip(bytes.as_chunks::<4>().0) {
+            *w = u32::from_le_bytes(*b);
+        }
+        self.effects.push(Effect::MacroRead { addr, words: words.len() as u32 });
     }
 }
 
@@ -379,7 +421,7 @@ impl Channel {
                 }
                 self.wait = None;
             }
-            if let Some(next) = self.segment(&words, at, &mut effects) {
+            if let Some(next) = self.segment(&words, at, &mut effects, &mut *read) {
                 self.queue.push_front((words, next));
             }
         }
@@ -388,7 +430,7 @@ impl Channel {
 
     /// Runs a segment from word `start`; the word to go on from when an
     /// acquire stopped it.
-    fn segment(&mut self, words: &[u32], start: usize, effects: &mut Vec<Effect>) -> Option<usize> {
+    fn segment(&mut self, words: &[u32], start: usize, effects: &mut Vec<Effect>, read: Mem) -> Option<usize> {
         let mut i = start;
         while i < words.len() {
             if self.wait.is_some() {
@@ -402,7 +444,7 @@ impl Channel {
                     // Incrementing, non-incrementing, increment once: data words follow.
                     1 | 3 | 5 if count > 0 => self.pending = Some(Pending { op, subchannel, method, left: count }),
                     // Immediate: the value is in the header.
-                    4 => self.write(subchannel, method * 4, count, effects),
+                    4 => self.write(subchannel, method * 4, count, effects, &mut *read),
                     // End of the segment.
                     7 => break,
                     // Sub-device masks and empty methods carry no data.
@@ -410,7 +452,7 @@ impl Channel {
                 }
                 continue;
             };
-            self.write(p.subchannel, p.method * 4, words[i], effects);
+            self.write(p.subchannel, p.method * 4, words[i], effects, &mut *read);
             i += 1;
             p.left -= 1;
             match p.op {
@@ -431,17 +473,17 @@ impl Channel {
         }
         // A call whose parameters do not continue in the next segment runs now.
         if self.pending.is_none() {
-            self.flush_call(effects);
+            self.flush_call(effects, read);
         }
         None
     }
 
     /// Runs the macro call gathered so far, if any.
-    fn flush_call(&mut self, effects: &mut Vec<Effect>) {
+    fn flush_call(&mut self, effects: &mut Vec<Effect>, read: Mem) {
         let Some((subchannel, index, params)) = self.call.take() else { return };
         let Some(mut unit) = self.mme.take() else { return };
         self.running = Some(index);
-        let result = unit.call(index, &mut MacroHost { channel: self, subchannel, params: params.into_iter(), effects });
+        let result = unit.call(index, &mut MacroHost { channel: self, subchannel, params: params.into_iter(), effects, read });
         self.running = None;
         self.mme = Some(unit);
         if let Err(fault) = result {
@@ -449,7 +491,7 @@ impl Channel {
         }
     }
 
-    fn write(&mut self, subchannel: usize, method: u32, value: u32, effects: &mut Vec<Effect>) {
+    fn write(&mut self, subchannel: usize, method: u32, value: u32, effects: &mut Vec<Effect>, read: Mem) {
         let three_d = self.classes[subchannel] & 0xff == 0x97;
         // The macro unit is the channel's: the 3D and compute classes both load and call it
         // (NVK calls its macros on the compute class too); a macro emits to its caller.
@@ -459,13 +501,13 @@ impl Channel {
             match &mut self.call {
                 Some((s, i, params)) if method % 8 == 4 && *s == subchannel && *i == index => params.push(value),
                 _ => {
-                    self.flush_call(effects);
+                    self.flush_call(effects, &mut *read);
                     self.call = Some((subchannel, index, vec![value]));
                 }
             }
             return;
         }
-        self.flush_call(effects);
+        self.flush_call(effects, &mut *read);
         if let Some(t) = &mut self.trace {
             t.push(Traced { subchannel, class: if method < HOST_METHODS { 0 } else { self.classes[subchannel] }, method, value, from_macro: self.running });
         }
@@ -516,10 +558,15 @@ impl Channel {
             // LOAD_INLINE_QMD_DATA(i): word i of the QMD at SET_INLINE_QMD_ADDRESS_A/B << 8.
             let at = (u64::from(self.reg(subchannel, SET_INLINE_QMD_ADDRESS)) << 32 | u64::from(self.reg(subchannel, SET_INLINE_QMD_ADDRESS + 4))) << 8;
             effects.push(Effect::Write(MemWrite { address: at + u64::from(method - LOAD_INLINE_QMD_DATA), data: value.to_le_bytes().to_vec() }));
-            // The last word launches it (the game's per-frame dispatches; Lichii runs them).
+            // Once the last word is in, it schedules itself unless it waits for a PCAS.
             if method == LOAD_INLINE_QMD_DATA + 0xfc {
                 let regs = &self.engine[subchannel * 0x1000..(subchannel + 1) * 0x1000];
-                effects.push(Effect::Dispatch(at, resources::header_pool(&|m| regs.get((m / 4) as usize).copied().unwrap_or(0))));
+                let reg = |m: u32| regs.get((m / 4) as usize).copied().unwrap_or(0);
+                // REQUIRE_SCHEDULING_PCAS: QMD bit 140, word 4 bit 12.
+                let requires_pcas = reg(LOAD_INLINE_QMD_DATA + 16) >> 12 & 1 != 0;
+                if reg(SET_QMD_VIRTUALIZATION_CONTROL) >> 24 & 1 != 0 || !requires_pcas {
+                    effects.push(Effect::Dispatch(at, qmd::Action::Reload, pools(&reg)));
+                }
             }
         } else if matches!(self.classes[subchannel] & 0xff, 0xc0 | 0x40) && (I2M_METHODS).contains(&method) {
             // Compute and inline-to-memory classes share the 3D class's upload methods.
@@ -686,10 +733,10 @@ impl Channel {
         }))
     }
 
-    /// The dispatch of the QMD at SEND_PCAS_A << 8.
-    fn dispatch(&self, sub: usize) -> Effect {
+    /// A PCAS action on the QMD at SEND_PCAS_A << 8.
+    fn pcas(&self, sub: usize, action: Option<qmd::Action>) -> Option<Effect> {
         let reg = |m: u32| self.reg(sub, m);
-        Effect::Dispatch(u64::from(reg(SEND_PCAS_A)) << 8, resources::header_pool(&reg))
+        Some(Effect::Dispatch(u64::from(reg(SEND_PCAS_A)) << 8, action?, pools(&reg)))
     }
 
     fn engine_effect(&self, subchannel: usize, method: u32, value: u32) -> Option<Effect> {
@@ -719,11 +766,9 @@ impl Channel {
                 _ => ignored,
             }),
             (0x97, CLEAR_SURFACE) => Some(Effect::Clear(self.clear(subchannel, value))),
-            // A launch: PCAS_B with SCHEDULE (bit 1), or PCAS2_B whose PCAS_ACTION (3:0) schedules.
-            (0xc0, SEND_SIGNALING_PCAS_B) if value & 2 != 0 => Some(self.dispatch(subchannel)),
-            // The game launches its per-frame dispatch with 0xc (INCREMENT_DEPENDENCE in the
-            // header); Lichii runs one dispatch for each, so it is taken as a launch too.
-            (0xc0, SEND_SIGNALING_PCAS2_B) if matches!(value & 0xf, 2 | 3 | 9 | 10 | 11 | 12) => Some(self.dispatch(subchannel)),
+            // PCAS_B with SCHEDULE (bit 1), INVALIDATE (bit 0) a reload; PCAS2_B's PCAS_ACTION.
+            (0xc0, SEND_SIGNALING_PCAS_B) if value & 2 != 0 => self.pcas(subchannel, qmd::Action::pcas2(value & 3)),
+            (0xc0, SEND_SIGNALING_PCAS2_B) => self.pcas(subchannel, qmd::Action::pcas2(value)),
             (0x97, DRAW_INDEX_BUFFER | DRAW_VERTEX_ARRAY) => Some(Effect::Draw(Box::new(self.draw(subchannel, method, value)))),
             (0x97, m) if OTHER_DRAWS.contains(&m) => Some(ignored),
             // Copy engine: after the copy (`copy`), a semaphore by bits 4:3 (1 one word, 2 four).

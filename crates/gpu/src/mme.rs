@@ -17,14 +17,27 @@ pub const MACROS: usize = 0x80;
 /// A macro running longer than this many groups is a runaway.
 const STEP_LIMIT: u64 = 1 << 22;
 
+// The class methods a macro emits to read memory (open-gpu-doc `clc797.h`).
+const SET_MME_MEM_ADDRESS_A: u32 = 0x550;
+const SET_MME_MEM_ADDRESS_B: u32 = 0x554;
+const SET_MME_DATA_RAM_ADDRESS: u32 = 0x558;
+pub const MME_DMA_READ: u32 = 0x55c;
+pub const MME_DMA_READ_FIFOED: u32 = 0x560;
+/// The most words one DMA read takes (Lichii's bound).
+const DMA_LIMIT: u32 = 0x1000;
+
 /// What a running macro reads from and writes to its class.
 pub trait Host {
-    /// The next parameter of the call (`LOAD0`, `LOAD1`); 0 once they run out.
-    fn param(&mut self) -> u32;
+    /// The next parameter of the call (`LOAD0`, `LOAD1`), if any is left.
+    fn param(&mut self) -> Option<u32>;
     /// The shadowed value of the method at byte address `method` (`STATE`).
     fn state(&mut self, method: u32) -> u32;
     /// A method the macro emits (byte address, data).
     fn method(&mut self, method: u32, data: u32);
+    /// The class's current value of a method (what the macro last emitted to it).
+    fn reg(&mut self, method: u32) -> u32;
+    /// Words of GPU memory, for MME_DMA_READ(_FIFOED); left as they are where unmapped.
+    fn read(&mut self, addr: u64, words: &mut [u32]);
 }
 
 /// Why a macro stopped early.
@@ -124,6 +137,8 @@ struct Run<'a, H: Host> {
     method: u32,
     inc: u32,
     stop: bool,
+    /// Words MME_DMA_READ_FIFOED queued after the call's parameters.
+    fifo: std::collections::VecDeque<u32>,
 }
 
 impl Mme {
@@ -162,7 +177,7 @@ impl Mme {
         if start == u32::MAX as usize {
             return Err(Fault::NoMacro(index));
         }
-        let mut run = Run { host, regs: [0; 24], load: [0; 2], alu_res: [0; 2], carry: 0, method: 0, inc: 0, stop: false };
+        let mut run = Run { host, regs: [0; 24], load: [0; 2], alu_res: [0; 2], carry: 0, method: 0, inc: 0, stop: false, fifo: Default::default() };
         let (mut ip, mut end_next) = (start, false);
         let mut lp = None::<(usize, usize, u32)>; // (start, end, remaining)
         for _ in 0..STEP_LIMIT {
@@ -171,10 +186,10 @@ impl Mme {
             let g = Group::decode([words[0], words[1], words[2]]);
             let mut next = ip + 1;
             if g.reads(LOAD0, OUT_LOAD0) {
-                run.load[0] = run.host.param();
+                run.load[0] = run.param();
             }
             if g.reads(LOAD1, OUT_LOAD1) {
-                run.load[1] = run.host.param();
+                run.load[1] = run.param();
             }
             let mask = match g.pred_mode {
                 0 => [true; 4],
@@ -188,7 +203,7 @@ impl Mme {
             }
             for i in 0..2 {
                 if mask[2 + i] {
-                    run.out(&g, i);
+                    run.out(self, &g, i);
                 }
             }
             if end_next || run.stop {
@@ -314,7 +329,28 @@ impl<H: Host> Run<'_, H> {
         Ok(())
     }
 
-    fn out(&mut self, g: &Group, i: usize) {
+    /// The call's parameters, then what DMA reads queued; 0 once both run out.
+    fn param(&mut self) -> u32 {
+        self.host.param().or_else(|| self.fifo.pop_front()).unwrap_or(0)
+    }
+
+    /// MME_DMA_READ(_FIFOED): `count` words at SET_MME_MEM_ADDRESS_A/B go to
+    /// data RAM from SET_MME_DATA_RAM_ADDRESS, or after the parameters.
+    fn dma(&mut self, mme: &mut Mme, method: u32, count: u32) {
+        let addr = u64::from(self.host.reg(SET_MME_MEM_ADDRESS_A) & 0x1_ffff) << 32 | u64::from(self.host.reg(SET_MME_MEM_ADDRESS_B));
+        let mut words = vec![0; count.min(DMA_LIMIT) as usize];
+        self.host.read(addr, &mut words);
+        if method == MME_DMA_READ_FIFOED {
+            self.fifo.extend(words);
+        } else {
+            let at = self.host.reg(SET_MME_DATA_RAM_ADDRESS) as usize;
+            for (d, w) in mme.data.iter_mut().skip(at).zip(words) {
+                *d = w;
+            }
+        }
+    }
+
+    fn out(&mut self, mme: &mut Mme, g: &Group, i: usize) {
         let (method, emit) = g.out[i];
         let value = |src: u8| {
             let (i0, i1) = (u32::from(g.alu[0].imm), u32::from(g.alu[1].imm));
@@ -339,6 +375,9 @@ impl<H: Host> Run<'_, H> {
         if emit != OUT_NONE {
             let d = value(emit);
             self.host.method(self.method, d);
+            if matches!(self.method, MME_DMA_READ | MME_DMA_READ_FIFOED) {
+                self.dma(mme, self.method, d);
+            }
             self.method += self.inc * 4;
         }
     }
@@ -367,14 +406,23 @@ mod tests {
     }
 
     impl Host for Fake {
-        fn param(&mut self) -> u32 {
-            if self.params.is_empty() { 0 } else { self.params.remove(0) }
+        fn param(&mut self) -> Option<u32> {
+            (!self.params.is_empty()).then(|| self.params.remove(0))
         }
         fn state(&mut self, method: u32) -> u32 {
             self.state.iter().find(|s| s.0 == method).map_or(0, |s| s.1)
         }
         fn method(&mut self, method: u32, data: u32) {
             self.emitted.push((method, data));
+        }
+        fn reg(&mut self, method: u32) -> u32 {
+            self.emitted.iter().rev().find(|e| e.0 == method).map_or(0, |e| e.1)
+        }
+        /// Memory holds its own word address, plus 0x100 per 4 GiB.
+        fn read(&mut self, addr: u64, words: &mut [u32]) {
+            for (i, w) in words.iter_mut().enumerate() {
+                *w = (addr / 4) as u32 + i as u32 + (addr >> 32) as u32 * 0x100;
+            }
         }
     }
 
@@ -501,6 +549,29 @@ mod tests {
         let mut host = Fake::default();
         mme.call(3, &mut host).unwrap();
         assert_eq!(host.emitted, vec![(0x400, 1)]);
+    }
+
+    #[test]
+    fn dma_reads_fill_data_ram_and_queue_after_the_parameters() {
+        let emit = |method: Option<u32>, data: u16| {
+            let mut g = group(NOP, NOP, [(if method.is_some() { 5 } else { OUT_NONE }, 6), (OUT_NONE, OUT_NONE)]);
+            g.alu[0].imm = method.unwrap_or(0) as u16;
+            g.alu[1].imm = data;
+            g
+        };
+        let none = [(OUT_NONE, OUT_NONE); 2];
+        // Address 0x1_0000_0040, data RAM index 2, read 3 words; then a FIFOED read of 2.
+        let setup = [emit(Some((1 << 12) | (SET_MME_MEM_ADDRESS_A / 4)), 1), emit(None, 0x40), emit(None, 2), emit(None, 3), emit(None, 2)];
+        // R0 = DREAD [3], emitted to 0x1000; then three loads.
+        let mut dread = group(alu(30, 0, IMMED, ZERO, 3), NOP, none);
+        dread.alu[0].imm = 3;
+        let mut set = group(NOP, alu(0, ZERO, 0, ZERO, 0), [(5, OUT_NONE), (OUT_NONE, 2)]);
+        set.alu[0].imm = 0x400;
+        let load = group(NOP, NOP, [(OUT_NONE, OUT_LOAD0), (OUT_NONE, OUT_NONE)]);
+        let host = run(&[&setup[..], &[dread, set, load, last(load), load]].concat(), &[7]);
+        let word = |i: u32| 0x4000_0110 + i;
+        let expected = vec![(0x550, 1), (0x554, 0x40), (0x558, 2), (MME_DMA_READ, 3), (MME_DMA_READ_FIFOED, 2), (0x1000, word(1)), (0x1000, 7), (0x1000, word(0)), (0x1000, word(1))];
+        assert_eq!(host.emitted, expected);
     }
 
     #[test]
