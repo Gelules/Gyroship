@@ -9,6 +9,7 @@ pub mod mme;
 pub mod pushbuf;
 pub mod sass;
 pub mod shader;
+pub mod state;
 pub mod surfaces;
 
 pub const WIDTH: u32 = 640;
