@@ -11,7 +11,79 @@
 //! scheduling controls in 105..126. Field positions come from the public
 //! encodings (open-gpu-doc for the SPH, Mesa's NAK for instructions).
 
+pub mod control;
+pub mod fp16;
+pub mod fp32;
+pub mod int;
+pub mod memory;
+pub mod moves;
 pub mod operand;
+pub mod texture;
+
+/// What the instruction families share.
+pub(crate) mod prelude {
+    pub use super::operand::*;
+    pub use super::{Word, bits};
+    #[cfg(test)]
+    pub use super::{ALWAYS_EXPLAINED, ranges};
+}
+
+/// A decoded instruction: one family's operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Op {
+    Fp32(fp32::Fp32Op),
+    Fp16(fp16::Fp16Op),
+    Int(int::IntOp),
+    Moves(moves::MovesOp),
+    Memory(memory::MemoryOp),
+    Texture(texture::TextureOp),
+    Control(control::ControlOp),
+}
+
+/// Decodes one instruction; `None` for an opcode no family knows.
+pub fn decode(w: Word) -> Option<Op> {
+    fp32::decode(w)
+        .map(Op::Fp32)
+        .or_else(|| fp16::decode(w).map(Op::Fp16))
+        .or_else(|| int::decode(w).map(Op::Int))
+        .or_else(|| moves::decode(w).map(Op::Moves))
+        .or_else(|| memory::decode(w).map(Op::Memory))
+        .or_else(|| texture::decode(w).map(Op::Texture))
+        .or_else(|| control::decode(w).map(Op::Control))
+}
+
+/// The bits the decoder reads for an opcode, with the opcode, guard and
+/// scheduling bits every instruction has.
+pub fn explained(opcode: u16) -> u128 {
+    ALWAYS_EXPLAINED | fp32::explained(opcode) | fp16::explained(opcode) | int::explained(opcode) | moves::explained(opcode) | memory::explained(opcode) | texture::explained(opcode) | control::explained(opcode)
+}
+
+/// Bits every instruction has that are not operands: opcode 0..12, guard
+/// 12..16, scheduling controls 105..128.
+pub const ALWAYS_EXPLAINED: u128 = 0xffff | (!0u128 << 105);
+
+/// A mask of bits lo..lo+len.
+pub const fn bits(lo: u32, len: u32) -> u128 {
+    ((1u128 << len) - 1) << lo
+}
+
+/// The bit ranges of a mask, for reports: "32..40 64..72".
+pub fn ranges(mask: u128) -> String {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < 128 {
+        if mask >> i & 1 != 0 {
+            let start = i;
+            while i < 128 && mask >> i & 1 != 0 {
+                i += 1;
+            }
+            out.push(format!("{start}..{i}"));
+        } else {
+            i += 1;
+        }
+    }
+    out.join(" ")
+}
 
 pub const BLOB_MAGIC: u32 = 0x1986_6891;
 const HEADER: usize = 0x18;

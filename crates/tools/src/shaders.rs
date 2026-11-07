@@ -19,6 +19,8 @@ pub fn run(zip: &Path, samples: Option<&Path>) -> super::Result<bool> {
     let mut stages: BTreeMap<Stage, usize> = BTreeMap::new();
     let mut opcodes: BTreeMap<u16, [usize; 6]> = BTreeMap::new();
     let mut kept: BTreeMap<u16, Vec<String>> = BTreeMap::new();
+    // Per opcode: a first word, the bits that vary from it, and how many fail to decode.
+    let mut seen: BTreeMap<u16, (u128, u128, usize)> = BTreeMap::new();
     let (mut blobs, mut no_end, mut instructions, mut trailer) = (0usize, Vec::new(), 0usize, 0usize);
     for e in &entries {
         if e.size < 0x18 || z.head(e, 4)? != sass::BLOB_MAGIC.to_le_bytes() {
@@ -42,6 +44,11 @@ pub fn run(zip: &Path, samples: Option<&Path>) -> super::Result<bool> {
         for (i, w) in sass::words(program).enumerate() {
             instructions += 1;
             opcodes.entry(w.opcode()).or_default()[stage as usize] += 1;
+            let s = seen.entry(w.opcode()).or_insert((w.0, 0, 0));
+            s.1 |= s.0 ^ w.0;
+            if sass::decode(w).is_none() {
+                s.2 += 1;
+            }
             if samples.is_some() {
                 let v = kept.entry(w.opcode()).or_default();
                 if v.len() < SAMPLES && !v.iter().any(|s| s.ends_with(&hex(w))) {
@@ -59,6 +66,20 @@ pub fn run(zip: &Path, samples: Option<&Path>) -> super::Result<bool> {
     for (op, n) in sorted {
         println!("{op:#05x} {:>9} {:>8} {:>8} {:>8} {:>8} {:>7} {:>7}", n.iter().sum::<usize>(), n[0], n[1], n[2], n[3], n[4], n[5]);
     }
+    // The decoder on every instruction: failures, and bits that vary but are never read.
+    let failed: usize = seen.values().map(|s| s.2).sum();
+    println!("decoder      {} of {instructions} instructions decoded ({failed} not)", instructions - failed);
+    let mut clean = true;
+    for (op, (_, varying, fails)) in &seen {
+        let unexplained = varying & !sass::explained(*op);
+        if *fails > 0 || unexplained != 0 {
+            clean = false;
+            println!("  {op:#05x}: {fails} not decoded; varying bits not read: {}", sass::ranges(unexplained));
+        }
+    }
+    if clean {
+        println!("             every opcode decodes, and every varying bit is read");
+    }
     if let Some(dir) = samples {
         std::fs::create_dir_all(dir)?;
         for (op, lines) in &kept {
@@ -70,7 +91,7 @@ pub fn run(zip: &Path, samples: Option<&Path>) -> super::Result<bool> {
         }
         println!("samples      up to {SAMPLES} words per opcode in {}", dir.display());
     }
-    Ok(no_end.is_empty())
+    Ok(no_end.is_empty() && clean)
 }
 
 fn hex(w: Word) -> String {
