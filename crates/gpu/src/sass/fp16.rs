@@ -18,7 +18,7 @@
 
 use super::prelude::*;
 
-pub const OPCODES: &[u16] = &[0x230, 0x245, 0x234, 0x8a4, 0x23e, 0x231, 0x232, 0xa45, 0xc45, 0x2a4, 0x4a4, 0x630, 0xa3e, 0x430, 0x832, 0x434];
+pub const OPCODES: &[u16] = &[0x230, 0x245, 0x234, 0x8a4, 0x23e, 0x231, 0x232, 0xa45, 0xc45, 0x2a4, 0x4a4, 0x630, 0xa3e, 0x430, 0x832, 0x434, 0x240, 0x23c, 0x23a];
 
 /// Lane selector values of a packed-half operand (`Operand::swizzle`), from
 /// NAK `set_swizzle` for F16v2 sources: 0 keeps both lanes, 2 broadcasts the
@@ -134,6 +134,21 @@ pub enum Fp16Op {
     /// encoder and come from its IADD3.X layout; in the game 74 is always 0
     /// and 87..91 always !UPT.
     Uimad { dst: u8, a: Operand, b: Operand, c: Operand, signed: bool, x: bool, carry_out: u8, carry_in: Pred },
+    /// HMNMX2 (0x040, SM 8.x): per lane min (`min` true) or max of a and b.
+    /// NAK `OpHMnMx2::encode`: the packed-half ALU layout of HADD2; ftz 80,
+    /// the min/max predicate 87..90 with not 90. Bits 78 (.F32), 81 (.NAN),
+    /// 82 (.XORSIGN) and 85 (.BF16_V2) are kept to refuse those forms.
+    Hmnmx2 { dst: u8, a: Operand, b: Operand, min: Pred, ftz: bool, f32: bool, nan: bool, xorsign: bool, bf16: bool },
+    /// HMMA (0x03c): a warp's matrix multiply-add D = A × B + C on half
+    /// floats, register fragments as PTX `mma.m16n8k{4,8,16}`. NAK
+    /// `OpHmma::encode`: dst 16, A 24, B 32, C 64 (RZ: no C); the shape in
+    /// bits 75 (low) and 78 (high): 0 = m16n8k8, 1 = m16n8k16, 2 = m16n8k4;
+    /// F32 accumulators 76; source type 82..84 (0 = F16).
+    Hmma { dst: u8, a: u8, b: u8, c: u8, k: u8, f32: bool, src_type: u8 },
+    /// MOVM (0x03a): transpose an 8×8 matrix of 16-bit values held as one
+    /// register per lane (lane t: row t / 4, columns 2 (t % 4) and + 1).
+    /// NAK `OpMovm::encode`: dst 16, source 24; shape 78..80 (0 = MT88).
+    Movm { dst: u8, src: u8, shape: u8 },
 }
 
 /// The second source of a two-operand op whose encoder puts a non-register
@@ -186,6 +201,17 @@ pub fn decode(w: Word) -> Option<Fp16Op> {
             let full = alu(w, false)?;
             Fp16Op::F2fp { dst: dst(w), a: Operand { neg: false, ..full.a }, b: full.b, c: reg(w, 64), h1: on(72), merge_c: on(78), rnd: Round::at(w, 79) }
         }
+        0x040 => Fp16Op::Hmnmx2 { dst: dst(w), a: half.a, b: second(&half), min: Pred::at(w, 87, 90), ftz: on(80), f32: on(78), nan: on(81), xorsign: on(82), bf16: on(85) },
+        0x03c => {
+            let k = match w.field(75, 1) | w.field(78, 1) << 1 {
+                0 => 8,
+                1 => 16,
+                2 => 4,
+                _ => 0,
+            };
+            Fp16Op::Hmma { dst: dst(w), a: reg(w, 24), b: reg(w, 32), c: reg(w, 64), k, f32: on(76), src_type: w.field(82, 2) as u8 }
+        }
+        0x03a => Fp16Op::Movm { dst: dst(w), src: reg(w, 24), shape: w.field(78, 2) as u8 },
         0x045 => Fp16Op::I2fp {
             dst: dst(w),
             src: alu(w, false)?.b,
@@ -246,6 +272,9 @@ pub fn explained(opcode: u16) -> u128 {
         0x034 => a_bits(true) | mid_bits(form, true) | bits(69, 3) | bits(76, 15),
         0x03e => dst | bits(24, 8) | bits(72, 2) | mid_bits(form, false) | bits(64, 8) | bits(78, 3),
         0x045 => dst | mid_bits(form, false) | bits(74, 6) | bits(84, 2),
+        0x040 => dst | a_bits(true) | mid_bits(form, true) | bit(78) | bits(80, 3) | bit(85) | bits(87, 4),
+        0x03c => dst | bits(24, 8) | bits(32, 8) | bits(64, 8) | bits(75, 2) | bit(78) | bits(82, 2),
+        0x03a => dst | bits(24, 8) | bits(78, 2),
         _ => {
             let b = if form == 1 { bits(32, 6) | bit(63) } else { bits(32, 32) };
             bits(16, 6) | bits(24, 6) | bits(72, 4) | b | bits(64, 6) | bits(81, 3) | bits(87, 4)
@@ -387,8 +416,23 @@ mod tests {
     }
 
     #[test]
+    fn tensor_ops() {
+        // HMNMX2 R4, R6.H1_H1, R8, !PT (max)
+        let w = word(0x240, &[(16, 4), (24, 6), (74, 3), (32, 8), (87, 7), (90, 1)]);
+        let Some(Fp16Op::Hmnmx2 { dst: 4, a, b, min, f32: false, .. }) = decode(w) else { panic!("{:?}", decode(w)) };
+        assert_eq!((a, b, min), (reg_op(6, false, false, SWZ_H1_H1), reg_op(8, false, false, 0), Pred { reg: PT, not: true }));
+        // HMMA.16816.F16 R10, R20, R24, R10 and HMMA.1688.F32 R2, R4, R6, RZ
+        let w = word(0x23c, &[(16, 10), (24, 20), (32, 24), (64, 10), (75, 1)]);
+        assert_eq!(decode(w), Some(Fp16Op::Hmma { dst: 10, a: 20, b: 24, c: 10, k: 16, f32: false, src_type: 0 }));
+        let w = word(0x23c, &[(16, 2), (24, 4), (32, 6), (64, 0xff), (76, 1)]);
+        assert_eq!(decode(w), Some(Fp16Op::Hmma { dst: 2, a: 4, b: 6, c: RZ, k: 8, f32: true, src_type: 0 }));
+        // MOVM.16.MT88 R3, R5
+        assert_eq!(decode(word(0x23a, &[(16, 3), (24, 5)])), Some(Fp16Op::Movm { dst: 3, src: 5, shape: 0 }));
+    }
+
+    #[test]
     fn foreign_opcodes() {
-        for op in [0x030, 0xe30, 0x033, 0x233, 0x024, 0x224, 0x040, 0x240, 0x0a4, 0x645] {
+        for op in [0x030, 0xe30, 0x033, 0x233, 0x024, 0x224, 0x040, 0x440, 0x0a4, 0x645] {
             assert_eq!(decode(word(op, &[])), None, "{op:#05x}");
             assert_eq!(explained(op), 0);
         }

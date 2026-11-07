@@ -15,7 +15,7 @@
 use super::prelude::*;
 
 pub const OPCODES: &[u16] = &[
-    0xb82, 0x326, 0x322, 0x321, 0x984, 0x981, 0x388, 0xb9b, 0x381, 0x986, 0xb97, 0x59f, 0x593, 0x387, 0x983, 0x38c, 0x98e, 0x3a1, 0x3a8, 0x925, 0x386,
+    0xb82, 0x326, 0x322, 0x321, 0x984, 0x981, 0x388, 0xb9b, 0x381, 0x986, 0xb97, 0x59f, 0x593, 0x387, 0x983, 0x38c, 0x98e, 0x3a1, 0x3a8, 0x925, 0x386, 0x83b,
 ];
 
 /// A small enum read from a bit field, with a catch-all for encodings no
@@ -160,6 +160,12 @@ pub enum MemoryOp {
     /// LDS 0x984, NAK `OpLd` shared: dst, uniform register at 32..38, size,
     /// stride 78..80.
     Lds { dst: u8, addr: Addr, ty: MemType, stride: Stride },
+    /// LDSM 0x83b, NAK `OpLdsm`: load `count` (1, 2 or 4; field 72..74)
+    /// 8×8 matrices of 16-bit values from shared memory, lane t of the warp
+    /// giving the address of row t % 8 of matrix t / 8; dst 16.., address as
+    /// LDS (uniform register at 32..38 with bit 91); shape 78..80 (0 = M8N8,
+    /// 1 = MT8N8, transposed).
+    Ldsm { dst: u8, addr: Addr, count: u8, shape: u8 },
     /// STG: 0x986 (uniform register at 64..70) or 0x386, NAK `OpSt` global:
     /// data GPR 32..40, size, order, eviction.
     Stg { data: u8, addr: Addr, ty: MemType, order: MemOrder, evict: Evict },
@@ -221,6 +227,7 @@ pub fn decode(w: Word) -> Option<MemoryOp> {
         0x381 => Ldg { dst, addr: global_addr(w, None), ty, order, evict, pred: Pred::TRUE, pred_dst },
         0x983 => Ldl { dst, addr: window_addr(w, Some(32)), ty, evict },
         0x984 => Lds { dst, addr: window_addr(w, Some(32)), ty, stride },
+        0x83b => Ldsm { dst, addr: window_addr(w, Some(32)), count: 1 << w.field(72, 2), shape: w.field(78, 2) as u8 },
         0x986 => Stg { data, addr: global_addr(w, Some(64)), ty, order, evict },
         0x386 => Stg { data, addr: global_addr(w, None), ty, order, evict },
         0x387 => Stl { data, addr: window_addr(w, None), ty, evict },
@@ -251,6 +258,7 @@ pub fn explained(opcode: u16) -> u128 {
         0x381 => dst | a | off24 | bits(72, 4) | order | pdst | evict,
         0x983 => dst | a | bits(32, 6) | off24 | ty | evict | bits(91, 1),
         0x984 => dst | a | bits(32, 6) | off24 | ty | bits(78, 2) | bits(91, 1),
+        0x83b => dst | a | bits(32, 6) | off24 | bits(72, 2) | bits(78, 2) | bits(91, 1),
         0x986 => a | b | off24 | bits(64, 6) | bits(72, 4) | order | evict | bits(90, 2),
         0x98e => a | b | off24 | bits(64, 6) | bits(72, 4) | order | evict | bits(87, 5),
         0x386 => a | b | off24 | bits(72, 4) | order | evict,
@@ -346,6 +354,10 @@ mod tests {
         let op = dec(0x984, &[(16, 8, 1), (24, 8, 3), (32, 6, 5), (40, 24, 0x400), (73, 3, 3), (78, 2, 3)]);
         let addr = Addr { reg: 3, reg64: false, ureg: None, ureg64: false, offset: 0x400 };
         assert_eq!(op, Lds { dst: 1, addr, ty: MemType::S16, stride: Stride::X16 });
+        // LDSM.16.MT88.4 R8, [R6 + UR4 + 0x200]
+        let op = dec(0x83b, &[(16, 8, 8), (24, 8, 6), (32, 6, 4), (40, 24, 0x200), (72, 2, 2), (78, 2, 1), (91, 1, 1)]);
+        let addr = Addr { reg: 6, reg64: false, ureg: Some(4), ureg64: false, offset: 0x200 };
+        assert_eq!(op, Ldsm { dst: 8, addr, count: 4, shape: 1 });
         let op = dec(0x387, &[(24, 8, 255), (32, 8, 0x3d), (40, 24, 8), (73, 3, 4), (84, 3, 1)]);
         let addr = Addr { reg: 255, reg64: false, ureg: None, ureg64: false, offset: 8 };
         assert_eq!(op, Stl { data: 0x3d, addr, ty: MemType::B32, evict: Evict::Normal });
