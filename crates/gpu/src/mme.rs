@@ -124,9 +124,10 @@ struct Run<'a, H: Host> {
 }
 
 impl Mme {
-    /// LOAD_MME_INSTRUCTION_RAM_POINTER (0x114).
-    pub fn set_code_pointer(&mut self, words: u32) {
-        self.code_ptr = words as usize;
+    /// LOAD_MME_INSTRUCTION_RAM_POINTER (0x114), in groups: the game loads a
+    /// macro of n words at pointer p, then the next one at p + n/3.
+    pub fn set_code_pointer(&mut self, groups: u32) {
+        self.code_ptr = 3 * groups as usize;
     }
 
     /// LOAD_MME_INSTRUCTION_RAM (0x118); the pointer advances.
@@ -142,10 +143,12 @@ impl Mme {
         self.start_ptr = index as usize;
     }
 
-    /// LOAD_MME_START_ADDRESS_RAM (0x120): a start in words of instruction RAM.
-    pub fn load_start(&mut self, words: u32) {
+    /// LOAD_MME_START_ADDRESS_RAM (0x120): a start in groups (the 96-bit
+    /// instruction words of the public notes; the game's starts are not
+    /// multiples of 3 and its 110 macros follow each other in group units).
+    pub fn load_start(&mut self, group: u32) {
         if let Some(s) = self.starts.get_mut(self.start_ptr) {
-            *s = words;
+            *s = group;
         }
         self.start_ptr += 1;
     }
@@ -157,7 +160,7 @@ impl Mme {
             return Err(Fault::NoMacro(index));
         }
         let mut run = Run { host, regs: [0; 24], load: [0; 2], alu_res: [0; 2], carry: 0, method: 0, inc: 0, stop: false };
-        let (mut ip, mut end_next) = (start / 3, false);
+        let (mut ip, mut end_next) = (start, false);
         let mut lp = None::<(usize, usize, u32)>; // (start, end, remaining)
         for _ in 0..STEP_LIMIT {
             let at = ip * 3;
@@ -389,7 +392,7 @@ mod tests {
     }
 
     fn load(mme: &mut Mme, slot: u32, groups: &[Group]) {
-        let start = mme.code_ptr as u32;
+        let start = (mme.code_ptr / 3) as u32;
         for g in groups {
             for w in enc(g) {
                 mme.load_code(w);

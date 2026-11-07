@@ -345,7 +345,7 @@ impl Nvdrv {
     fn run_gpfifo(&mut self, k: &mut Kernel, fd: u32, entries: &[u8]) {
         let space = self.channel_space.get(&fd).copied().unwrap_or(0);
         let channel = self.channels.entry(fd).or_default();
-        for e in entries.as_chunks::<8>().0.iter().map(|e| u64::from_le_bytes(*e)) {
+        for (rank, e) in entries.as_chunks::<8>().0.iter().map(|e| u64::from_le_bytes(*e)).enumerate() {
             let (gpu, len) = (e & 0xffff_fffc | (e >> 32 & 0xff) << 32, (e >> 42 & 0x1f_ffff) as usize);
             let mut raw = vec![0u8; 4 * len.min(0x10_0000)];
             let addr = k.gpu_to_cpu(space, gpu);
@@ -356,12 +356,12 @@ impl Nvdrv {
                 continue;
             }
             let words: Vec<u32> = raw.as_chunks::<4>().0.iter().map(|w| u32::from_le_bytes(*w)).collect();
-            // Raw segments of the first submits, for study (never committed: game data).
+            // Raw segments of the first submits in GPFIFO order, for study (never committed: game data).
             if let Some(dir) = &k.config.gpfifo_dump
                 && self.submits <= 300
             {
                 let _ = std::fs::create_dir_all(dir);
-                let _ = std::fs::write(dir.join(format!("submit-{:04}-{gpu:010x}.bin", self.submits)), &raw);
+                let _ = std::fs::write(dir.join(format!("submit-{:04}-{rank:04}-{gpu:010x}.bin", self.submits)), &raw);
             }
             for effect in channel.run(&words) {
                 match effect {
