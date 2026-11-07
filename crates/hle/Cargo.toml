@@ -8,3 +8,4 @@ publish.workspace = true
 [dependencies]
 gyroship-runtime = { version = "0.1.0", path = "../runtime" }
 gyroship-loader = { version = "0.1.0", path = "../loader" }
+gyroship-gpu = { version = "0.1.0", path = "../gpu" }

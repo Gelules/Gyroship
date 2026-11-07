@@ -9,6 +9,8 @@
 
 use std::collections::BTreeMap;
 
+use gyroship_gpu::pushbuf::{Channel, Effect};
+
 use crate::Kernel;
 use crate::ipc::{Reply, Request};
 
@@ -111,7 +113,7 @@ pub struct Nvdrv {
     as_space: BTreeMap<u32, u32>,
     channel_space: BTreeMap<u32, u32>,
     /// Each channel's command processor.
-    channels: BTreeMap<u32, crate::pushbuf::Channel>,
+    channels: BTreeMap<u32, Channel>,
     submits: u64,
 }
 
@@ -363,7 +365,7 @@ impl Nvdrv {
             }
             for effect in channel.run(&words) {
                 match effect {
-                    crate::pushbuf::Effect::Release(r) => {
+                    Effect::Release(r) => {
                         let at = k.gpu_to_cpu(space, r.addr);
                         let mut bytes = r.value.to_le_bytes()[..r.width as usize].to_vec();
                         if r.timestamp {
@@ -375,9 +377,14 @@ impl Nvdrv {
                             k.log(&format!("gpu: method {:#x} releases {} at {:#x} (cpu {at:#x}){}{}", r.method, r.value, r.addr, if r.timestamp { " with timestamp" } else { "" }, if ok { "" } else { ": not writable" }));
                         }
                     }
-                    crate::pushbuf::Effect::Ignored { class, method, value } => {
+                    Effect::Ignored { class, method, value } => {
                         if k.journal.few(&format!("gpu ignored {class:#x} {method:#x}"), 2) {
                             k.log(&format!("gpu: class {class:#x} method {method:#x} = {value:#x} not executed"));
+                        }
+                    }
+                    Effect::MacroFault { index, fault } => {
+                        if k.journal.few(&format!("gpu macro fault {index}"), 2) {
+                            k.log(&format!("gpu: macro {index} stopped: {fault:?}"));
                         }
                     }
                 }

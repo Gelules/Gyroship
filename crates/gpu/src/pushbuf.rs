@@ -1,14 +1,15 @@
-//! The fake GPU's command processor for M2: it decodes a channel's
-//! pushbuffer segments (NVIDIA's public method header format), keeps which
-//! class each subchannel holds and the last value of every method, and
-//! reports only what the CPU side waits for: semaphore releases, from the
-//! host (SEMAPHOREA..D, SEM_ADDR..SEM_EXECUTE), 3D and compute
-//! (SET_REPORT_SEMAPHORE_A..D) and the copy engine (LAUNCH_DMA). Everything
-//! else is stored and ignored. Addresses are GPU addresses; the caller
-//! translates them.
+//! The GPU's command processor: it decodes a channel's pushbuffer segments
+//! (NVIDIA's public method header format), keeps which class each
+//! subchannel holds and the last value of every method, runs the 3D class's
+//! macros (MME64), and reports what the CPU side waits for: semaphore
+//! releases, from the host (SEMAPHOREA..D, SEM_ADDR..SEM_EXECUTE), 3D and
+//! compute (SET_REPORT_SEMAPHORE_A..D) and the copy engine (LAUNCH_DMA).
+//! Addresses are GPU addresses; the caller translates them.
 //!
 //! ponytail: semaphores only; drawing, copies and inline writes come with
-//! the real renderer (M3), in `gyroship-gpu`.
+//! the renderer (M3).
+
+use crate::mme::{self, Mme};
 
 /// A semaphore release: `value` (4 or 8 bytes) at `addr`; with `timestamp`,
 /// a u64 GPU time at `addr + 8` (and zero in between for a 4-byte value).
@@ -29,6 +30,8 @@ pub enum Effect {
     /// A method the fake does not execute but that matters (a copy, an
     /// acquire, a reduction): its class, method byte offset and value.
     Ignored { class: u32, method: u32, value: u32 },
+    /// A macro stopped early.
+    MacroFault { index: usize, fault: mme::Fault },
 }
 
 /// Methods below this byte offset belong to the host, whatever the subchannel.
@@ -54,6 +57,15 @@ const DMA_SEMAPHORE_A: u32 = 0x240;
 const DMA_SEMAPHORE_B: u32 = 0x244;
 const DMA_SEMAPHORE_PAYLOAD: u32 = 0x248;
 const DMA_LAUNCH: u32 = 0x300;
+// The 3D class's macro unit.
+const LOAD_MME_INSTRUCTION_RAM_POINTER: u32 = 0x114;
+const LOAD_MME_INSTRUCTION_RAM: u32 = 0x118;
+const LOAD_MME_START_ADDRESS_RAM_POINTER: u32 = 0x11c;
+const LOAD_MME_START_ADDRESS_RAM: u32 = 0x120;
+const SET_MME_SHADOW_RAM_CONTROL: u32 = 0x124;
+/// CALL_MME_MACRO(i) at 0x3800 + 8i starts a call; CALL_MME_DATA(i), 4 bytes
+/// further, passes the next parameters.
+const CALL_MME: std::ops::Range<u32> = 0x3800..0x3c00;
 
 /// A channel's state between submits.
 #[derive(Clone, Debug)]
@@ -64,8 +76,14 @@ pub struct Channel {
     host: Vec<u32>,
     /// Each subchannel's method values, by dword.
     engine: Vec<u32>,
+    /// The values the 3D macros read (MME shadow RAM), by dword like `engine`.
+    shadow: Vec<u32>,
     /// A method whose data words continue into the next segment.
     pending: Option<Pending>,
+    /// The macro unit, out of the channel while a macro runs.
+    mme: Option<Box<Mme>>,
+    /// A macro call still gathering its parameters: subchannel, index, parameters.
+    call: Option<(usize, usize, Vec<u32>)>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -78,7 +96,35 @@ struct Pending {
 
 impl Default for Channel {
     fn default() -> Channel {
-        Channel { classes: [0; 8], host: vec![0; (HOST_METHODS / 4) as usize], engine: vec![0; 8 * 0x1000], pending: None }
+        Channel {
+            classes: [0; 8],
+            host: vec![0; (HOST_METHODS / 4) as usize],
+            engine: vec![0; 8 * 0x1000],
+            shadow: vec![0; 8 * 0x1000],
+            pending: None,
+            mme: Some(Box::default()),
+            call: None,
+        }
+    }
+}
+
+/// What a running macro sees: its parameters, and the channel it emits into.
+struct MacroHost<'a> {
+    channel: &'a mut Channel,
+    subchannel: usize,
+    params: std::vec::IntoIter<u32>,
+    effects: &'a mut Vec<Effect>,
+}
+
+impl mme::Host for MacroHost<'_> {
+    fn param(&mut self) -> u32 {
+        self.params.next().unwrap_or(0)
+    }
+    fn state(&mut self, method: u32) -> u32 {
+        self.channel.shadow.get(self.subchannel * 0x1000 + (method / 4) as usize).copied().unwrap_or(0)
+    }
+    fn method(&mut self, method: u32, data: u32) {
+        self.channel.write(self.subchannel, method, data, self.effects);
     }
 }
 
@@ -109,17 +155,49 @@ impl Channel {
             p.left -= 1;
             match p.op {
                 1 => p.method += 1,
-                5 => p.op = 3,
+                // Increment once: the first word to the method, the rest to the next one.
+                5 => {
+                    p.method += 1;
+                    p.op = 3;
+                }
                 _ => {}
             }
             if p.left > 0 {
                 self.pending = Some(p);
             }
         }
+        // A call whose parameters do not continue in the next segment runs now.
+        if self.pending.is_none() {
+            self.flush_call(&mut effects);
+        }
         effects
     }
 
+    /// Runs the macro call gathered so far, if any.
+    fn flush_call(&mut self, effects: &mut Vec<Effect>) {
+        let Some((subchannel, index, params)) = self.call.take() else { return };
+        let Some(mut unit) = self.mme.take() else { return };
+        let result = unit.call(index, &mut MacroHost { channel: self, subchannel, params: params.into_iter(), effects });
+        self.mme = Some(unit);
+        if let Err(fault) = result {
+            effects.push(Effect::MacroFault { index, fault });
+        }
+    }
+
     fn write(&mut self, subchannel: usize, method: u32, value: u32, effects: &mut Vec<Effect>) {
+        let three_d = self.classes[subchannel] & 0xff == 0x97;
+        if three_d && CALL_MME.contains(&method) {
+            let index = ((method - CALL_MME.start) / 8) as usize;
+            match &mut self.call {
+                Some((s, i, params)) if method % 8 == 4 && *s == subchannel && *i == index => params.push(value),
+                _ => {
+                    self.flush_call(effects);
+                    self.call = Some((subchannel, index, vec![value]));
+                }
+            }
+            return;
+        }
+        self.flush_call(effects);
         if method < HOST_METHODS {
             self.host[(method / 4) as usize] = value;
             if method == SET_OBJECT {
@@ -130,8 +208,30 @@ impl Channel {
             }
             return;
         }
-        let Some(slot) = self.engine.get_mut(subchannel * 0x1000 + (method / 4) as usize) else { return };
-        *slot = value;
+        let i = subchannel * 0x1000 + (method / 4) as usize;
+        if i >= self.engine.len() {
+            return;
+        }
+        // The shadow RAM tracks method values (modes 0 and 1), is left alone
+        // (passthrough), or replaces them (replay).
+        let mut value = value;
+        if method != SET_MME_SHADOW_RAM_CONTROL {
+            match self.reg(subchannel, SET_MME_SHADOW_RAM_CONTROL) & 3 {
+                0 | 1 => self.shadow[i] = value,
+                3 => value = self.shadow[i],
+                _ => {}
+            }
+        }
+        self.engine[i] = value;
+        if three_d && let Some(unit) = self.mme.as_mut() {
+            match method {
+                LOAD_MME_INSTRUCTION_RAM_POINTER => unit.set_code_pointer(value),
+                LOAD_MME_INSTRUCTION_RAM => unit.load_code(value),
+                LOAD_MME_START_ADDRESS_RAM_POINTER => unit.set_start_pointer(value),
+                LOAD_MME_START_ADDRESS_RAM => unit.load_start(value),
+                _ => {}
+            }
+        }
         if let Some(e) = self.engine_effect(subchannel, method, value) {
             effects.push(e);
         }
@@ -267,5 +367,36 @@ mod tests {
         assert_eq!(c.run(&words), vec![Effect::Release(Release { method: DMA_LAUNCH, addr: 0x1_0000_2000, value: 5, width: 4, timestamp: false })]);
         // An acquire is reported as ignored, not executed.
         assert!(matches!(c.run(&[header(1, 1, 0, SEMAPHORE_D), 1])[..], [Effect::Ignored { method: SEMAPHORE_D, value: 1, .. }]));
+    }
+
+    /// The three words of an MME64 group, high first.
+    fn group(bits: u128) -> [u32; 3] {
+        [(bits >> 64) as u32, (bits >> 32) as u32, bits as u32]
+    }
+
+    #[test]
+    fn a_loaded_macro_runs_when_called_and_its_methods_take_effect() {
+        // Group 0: method REPORT_SEMAPHORE_A (index 0x6c0, increment 1) from immediate 0,
+        // emit LOAD0 then LOAD1; group 1 (end next): emit LOAD0, LOAD1; group 2: nothing.
+        let code = [group((0x16c0 << 30) | (5 << 82) | (3 << 85) | (4 << 92)), group(1 | (3 << 85) | (4 << 92)), group(0)].concat();
+        let mut words = vec![header(1, 1, 0, SET_OBJECT), 0xc797, header(1, 1, 0, LOAD_MME_INSTRUCTION_RAM_POINTER), 0, header(3, 9, 0, LOAD_MME_INSTRUCTION_RAM)];
+        words.extend(code);
+        words.extend([header(1, 2, 0, LOAD_MME_START_ADDRESS_RAM_POINTER), 5, 0]);
+        // Macro 5, called with its four parameters (increment once: then CALL_MME_DATA(5)).
+        words.extend([header(5, 4, 0, CALL_MME.start + 5 * 8), 0x10, 0x5fc1_1000, 2, 0x1000_f010]);
+        let mut c = Channel::default();
+        assert_eq!(c.run(&words), vec![Effect::Release(Release { method: REPORT_SEMAPHORE_D, addr: 0x10_5fc1_1000, value: 2, width: 4, timestamp: false })]);
+        // An unloaded macro is a fault.
+        assert!(matches!(c.run(&[header(1, 1, 0, CALL_MME.start + 8), 0])[..], [Effect::MacroFault { index: 1, .. }]));
+    }
+
+    #[test]
+    fn replay_mode_takes_values_from_the_shadow() {
+        let mut c = Channel::default();
+        c.run(&[header(1, 1, 0, SET_OBJECT), 0xc797, header(1, 1, 0, REPORT_SEMAPHORE_C), 5]);
+        c.run(&[header(1, 1, 0, SET_MME_SHADOW_RAM_CONTROL), 3, header(1, 1, 0, REPORT_SEMAPHORE_C), 9]);
+        assert_eq!(c.reg(0, REPORT_SEMAPHORE_C), 5);
+        c.run(&[header(1, 1, 0, SET_MME_SHADOW_RAM_CONTROL), 2, header(1, 1, 0, REPORT_SEMAPHORE_C), 9]);
+        assert_eq!((c.reg(0, REPORT_SEMAPHORE_C), c.shadow[(REPORT_SEMAPHORE_C / 4) as usize]), (9, 5));
     }
 }

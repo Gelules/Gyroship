@@ -1000,6 +1000,7 @@ dependencies = [
 name = "gyroship-hle"
 version = "0.1.0"
 dependencies = [
+ "gyroship-gpu",
  "gyroship-loader",
  "gyroship-runtime",
 ]
