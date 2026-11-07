@@ -3,13 +3,14 @@
 //! class's texture pools; the images it writes are host storage textures kept
 //! by GPU address, which later draws sample instead of guest memory.
 //!
-//! ponytail: images written whole (SUST with all four channels), float
-//! storage formats only, no shared memory yet; image contents stay on the
-//! host (never written back to guest memory).
+//! ponytail: images written whole (SUST with all four channels), float and
+//! normalized storage formats only; image contents stay on the host (never
+//! written back to guest memory).
 
 use crate::draw::{Bindings, Mem};
 use crate::pushbuf::Pools;
 use crate::shader::{self, Handle, IMAGE_BINDING, Options, Translation};
+use crate::sass::texture::TexDim;
 use crate::state::qmd::Launch;
 use crate::state::resources::TexHandle;
 use crate::state::textures::{self, TextureType};
@@ -83,30 +84,52 @@ impl Surfaces {
             let w = banks.get(bank)?.get(at..at + 4)?;
             Some(u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
         };
-        // The images: their headers give the formats the translation needs.
-        let first = self.compute_program(key, l, Vec::new())?.0;
-        let mut images = Vec::new();
-        for img in &first.interface.images {
-            let handle = TexHandle::new(word(&banks, &img.handle).ok_or_else(|| format!("image handle {:?}", img.handle))?);
+        let mut tic_of = |h: &Handle| -> Result<textures::Tic, String> {
+            let handle = TexHandle::new(word(&banks, h).ok_or_else(|| format!("image handle {h:?}"))?);
             let mut header = [0u8; 32];
             if !mem(pools.headers.entry(handle.header).ok_or("image index past the pool")?, &mut header) {
                 return Err("image header not readable".into());
             }
-            let tic = textures::tic(&header).ok_or("image header layout")?;
+            textures::tic(&header).ok_or_else(|| "image header layout".into())
+        };
+        // The images and queried textures: their headers give the formats and types the translation needs.
+        let first = self.compute_program(key, l, Vec::new(), BTreeMap::new())?.0;
+        let mut images = Vec::new();
+        for img in &first.interface.images {
+            let tic = tic_of(&img.handle)?;
             let format = textures::wgpu_texture_format(&tic).ok_or_else(|| format!("image format {:?}", tic.components))?;
             let name = storage_format(format).ok_or_else(|| format!("image format {format:?} as storage"))?;
+            if img.read && !self.adapter.get_texture_format_features(format).flags.contains(wgpu::TextureFormatFeatureFlags::STORAGE_READ_WRITE) {
+                return Err(format!("image format {format:?} both read and written"));
+            }
             images.push((tic, format, name.to_string()));
         }
-        let (t, module) = self.compute_program(key, l, images.iter().map(|i| i.2.clone()).collect())?;
+        let mut queried = BTreeMap::new();
+        for (slot, x) in first.interface.textures.iter().enumerate().filter(|(_, x)| x.query) {
+            if tic_of(&x.handle).is_ok_and(|t| t.texture_type == TextureType::ThreeD) {
+                queried.insert(slot, TexDim::D3);
+            }
+        }
+        let (t, module) = self.compute_program(key, l, images.iter().map(|i| i.2.clone()).collect(), queried)?;
         if let Some(b) = t.interface.cbufs.iter().chain(&Self::handle_banks(&t)).find(|b| !banks.contains_key(b)) {
             return Err(format!("compute constant bank {b} not bound"));
         }
 
-        // Host storage textures, by address.
+        // Host storage textures, by address: a render target's own texture when the image is
+        // one (the game draws glyphs, then filters them in place), else one kept for images.
         let mut views = Vec::new();
         for (tic, format, _) in &images {
             let three_d = tic.texture_type == TextureType::ThreeD;
             let size = wgpu::Extent3d { width: tic.width, height: tic.height, depth_or_array_layers: if three_d { tic.depth } else { 1 } };
+            let target = self.map.values().find(|e| {
+                let t = &e.texture;
+                e.surface.addr == tic.address && t.format() == *format && t.width() == size.width && t.height() == size.height && !three_d && t.usage().contains(wgpu::TextureUsages::STORAGE_BINDING)
+            });
+            if let Some(e) = target {
+                views.push(e.texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2), array_layer_count: Some(1), ..Default::default() }));
+                self.cache.images.remove(&tic.address);
+                continue;
+            }
             let fresh = self.cache.images.get(&tic.address).is_none_or(|x| x.size() != size || x.format() != *format);
             if fresh {
                 let texture = self.device.create_texture(&wgpu::TextureDescriptor {
@@ -138,7 +161,7 @@ impl Surfaces {
             layout_entries.push(wgpu::BindGroupLayoutEntry {
                 binding: IMAGE_BINDING + i as u32,
                 visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::StorageTexture { access: wgpu::StorageTextureAccess::WriteOnly, format: *format, view_dimension },
+                ty: wgpu::BindingType::StorageTexture { access: if img.read { wgpu::StorageTextureAccess::ReadWrite } else { wgpu::StorageTextureAccess::WriteOnly }, format: *format, view_dimension },
                 count: None,
             });
         }
@@ -189,13 +212,13 @@ impl Surfaces {
     }
 
     /// The translation and module of a compute program for a launch's block
-    /// and shared memory sizes, and image formats.
-    fn compute_program(&mut self, key: u64, l: &Launch, images: Vec<String>) -> Compiled {
-        let id = format!("{key:x}/{:?}/{:#x}/{images:?}", l.block, l.shared);
+    /// and shared memory sizes, image formats and queried texture types.
+    fn compute_program(&mut self, key: u64, l: &Launch, images: Vec<String>, queried: BTreeMap<usize, TexDim>) -> Compiled {
+        let id = format!("{key:x}/{:?}/{:#x}/{images:?}/{queried:?}", l.block, l.shared);
         if let Some(c) = self.cache.compute.get(&id) {
             return c.clone();
         }
-        let options = Options { workgroup: l.block, shared: l.shared, images, ..Default::default() };
+        let options = Options { workgroup: l.block, shared: l.shared, images, queried, ..Default::default() };
         let made = shader::translate_with(&self.cache.code[&key], &options).map_err(|e| format!("compute program {key:016x}: {e}")).and_then(|t| {
             if let Err(e) = shader::validate(&t.wgsl) {
                 self.error(format!("compute program {key:016x}: {e}"));

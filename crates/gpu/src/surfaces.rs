@@ -98,7 +98,7 @@ pub(crate) struct Entry {
 }
 
 pub struct Surfaces {
-    adapter: wgpu::Adapter,
+    pub(crate) adapter: wgpu::Adapter,
     pub(crate) device: wgpu::Device,
     pub(crate) queue: wgpu::Queue,
     pub(crate) map: BTreeMap<(u64, u32), Entry>,
@@ -109,8 +109,9 @@ pub struct Surfaces {
     pub(crate) cache: crate::draw::Cache,
     /// Draws done.
     pub drawn: u64,
-    /// The texture addresses the last draw read, slot by slot (for logs).
-    pub textures_read: Vec<u64>,
+    /// The textures the last draw read, slot by slot: address, and where the
+    /// texels came from (a render target, a compute image, or guest memory).
+    pub textures_read: Vec<(u64, &'static str)>,
     /// Operations not done, by reason.
     pub skipped: BTreeMap<String, u64>,
     /// wgpu validation errors (the first ones): reported, never fatal to the game.
@@ -218,6 +219,8 @@ impl Surfaces {
         let key = (s.addr, s.format);
         let stale = self.map.get(&key).is_none_or(|e| e.surface != *s);
         if stale {
+            // Also a storage texture where the format allows it: compute programs may work on a target.
+            let storage = self.adapter.get_texture_format_features(format).allowed_usages & wgpu::TextureUsages::STORAGE_BINDING;
             let texture = self.device.create_texture(&wgpu::TextureDescriptor {
                 label: None,
                 size: wgpu::Extent3d { width: s.width.max(1), height: s.height.max(1), depth_or_array_layers: s.layers },
@@ -225,7 +228,7 @@ impl Surfaces {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC | storage,
                 view_formats: &[],
             });
             self.map.insert(key, Entry { surface: *s, texture });

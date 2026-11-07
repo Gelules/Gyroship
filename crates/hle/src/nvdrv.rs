@@ -541,7 +541,7 @@ impl Gpu {
                     if k.gs.presents < 3 || self.draws <= 64 || dumped {
                         let index = d.index.as_ref().map(|i| (i.address, i.bytes_per_index, i.first));
                         let targets: Vec<String> = d.targets.iter().map(|t| format!("{:#x} {:#x} {}x{}", t.addr, t.format, t.width, t.height)).collect();
-                        k.log(&format!("gpu: draw {}: topology {} count {} index {index:x?} first {}: {}; targets [{}]{outcome}", self.draws, d.topology, d.count, d.first, keys.join(", "), targets.join(", ")));
+                        k.log(&format!("gpu: draw {}: topology {} count {} index {index:x?} first {}: {}; targets [{}]; viewport scale {:?} offset {:?} origin {}, clip {:?}{outcome}", self.draws, d.topology, d.count, d.first, keys.join(", "), targets.join(", "), d.render.viewport.scale, d.render.viewport.offset, d.render.viewport.origin_lower_left as u8 | (d.render.viewport.flip_y as u8) << 1, d.render.surface_clip));
                     }
                 }
                 // The copy engine, line by line (the GPU writes whatever the CPU's permissions).

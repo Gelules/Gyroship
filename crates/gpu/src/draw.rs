@@ -74,6 +74,8 @@ pub struct Cache {
     /// Uploaded textures by address and header, with the end of the memory they came from.
     textures: HashMap<(u64, [u8; 32]), (wgpu::Texture, u64)>,
     samplers: HashMap<([u8; 32], bool), wgpu::Sampler>,
+    /// Stand-ins for textures only queried, by width, height, depth and levels.
+    queried: HashMap<(u32, u32, u32, u32), wgpu::Texture>,
 }
 
 /// A stage's bindings.
@@ -483,18 +485,37 @@ impl Surfaces {
             if want != tic.texture_type && !(want == TextureType::TwoD && tic.texture_type == TextureType::TwoDNoMipmap) {
                 return Err(format!("{:?} texture read as {:?}", tic.texture_type, x.dim));
             }
+            // Only queried (TXQ): a stand-in of its size and levels, as the texture itself
+            // may be an image the same dispatch writes, which wgpu cannot also bind for reading.
+            if x.query {
+                let three_d = want == TextureType::ThreeD;
+                let size = wgpu::Extent3d { width: tic.width.max(1), height: tic.height.max(1), depth_or_array_layers: if three_d { tic.depth.max(1) } else { 1 } };
+                let dim = if three_d { wgpu::TextureDimension::D3 } else { wgpu::TextureDimension::D2 };
+                let levels = (tic.max_mip_level + 1).min(size.max_mips(dim));
+                let device = &self.device;
+                let texture = self.cache.queried.entry((size.width, size.height, size.depth_or_array_layers, levels)).or_insert_with(|| {
+                    device.create_texture(&wgpu::TextureDescriptor { label: Some("queried"), size, mip_level_count: levels, sample_count: 1, dimension: dim, format: wgpu::TextureFormat::R8Unorm, usage: wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[] })
+                });
+                let dimension = if three_d { wgpu::TextureViewDimension::D3 } else { wgpu::TextureViewDimension::D2 };
+                textures.push(Slot { view: texture.create_view(&Default::default()), sampler: None, depth: false, dimension });
+                continue;
+            }
             // An image a compute program wrote, or a render target at that address: its host texture.
-            let (view, depth) = match self.map.values().find(|e| e.surface.addr == tic.address) {
-                _ if self.cache.images.contains_key(&tic.address) => (self.cache.images[&tic.address].create_view(&Default::default()), false),
+            let (view, depth, source) = match self.map.values().find(|e| e.surface.addr == tic.address) {
+                _ if self.cache.images.contains_key(&tic.address) => (self.cache.images[&tic.address].create_view(&Default::default()), false, "image"),
                 Some(e) => {
                     let depth = e.texture.format().is_depth_stencil_format();
+                    // A color target read counts as touched: frame dumps show what the frame sampled.
+                    if !depth {
+                        self.touched.insert((e.surface.addr, e.surface.format));
+                    }
                     let aspect = if depth { wgpu::TextureAspect::DepthOnly } else { wgpu::TextureAspect::All };
-                    (e.texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2), aspect, array_layer_count: Some(1), mip_level_count: Some(1), ..Default::default() }), depth)
+                    (e.texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2), aspect, array_layer_count: Some(1), mip_level_count: Some(1), ..Default::default() }), depth, "target")
                 }
-                None => (self.upload(&tic, header, mem)?.create_view(&Default::default()), false),
+                None => (self.upload(&tic, header, mem)?.create_view(&Default::default()), false, "memory"),
             };
             swizzles[slot] = textures::swizzle_code(&tic);
-            self.textures_read.push(tic.address);
+            self.textures_read.push((tic.address, source));
             let sampler = match x.fetch {
                 true => None,
                 false => {

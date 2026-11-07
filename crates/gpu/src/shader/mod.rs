@@ -31,7 +31,7 @@ use crate::sass::control::{BarMode, ControlOp};
 use crate::sass::fp16::Fp16Op;
 use crate::sass::fp32::{self, Fp32Op, MufuFn, Rnd};
 use crate::sass::int::{self, IntOp};
-use crate::sass::memory::{Addr, AtomOp, AtomType, ImageDim, InterpFreq, InterpLoc, LdcMode, MemType, MemoryOp, Stride};
+use crate::sass::memory::{Addr, AtomOp, AtomType, CbHandle, ImageDim, InterpFreq, InterpLoc, LdcMode, MemType, MemoryOp, Stride};
 use crate::sass::moves::{self, MovesOp};
 use crate::sass::operand::{Operand, PT, Pred, RZ, Src, URZ};
 use crate::sass::texture::{LodMode, TexDim, TexHandle, TexQuery, TextureOp};
@@ -75,6 +75,8 @@ pub struct Interface {
 pub struct Image {
     pub handle: Handle,
     pub dim: ImageDim,
+    /// Also loaded (SULD) by the program that stores to it: bound read-write.
+    pub read: bool,
 }
 
 /// The binding of image slot 0; slot i is at `IMAGE_BINDING + i`.
@@ -88,6 +90,8 @@ pub struct Texture {
     pub compare: bool,
     /// A texel fetch (no sampler).
     pub fetch: bool,
+    /// Only its dimensions are read (TXQ), whatever its type.
+    pub query: bool,
 }
 
 /// Where a texture instruction's 32-bit handle comes from (texture index in
@@ -137,6 +141,9 @@ pub struct Options {
     /// Compute: the WGSL storage format of each image slot (from its texture
     /// header); a missing one is `rgba16float`.
     pub images: Vec<String>,
+    /// The type of each texture slot that TXQ queries, from its header (D2 or
+    /// D3), by slot; a missing one is D2.
+    pub queried: BTreeMap<usize, TexDim>,
 }
 
 /// Translates a graphics program on its own.
@@ -167,6 +174,18 @@ pub fn translate_with(code: &[u8], options: &Options) -> Result<Translation, Err
     }
     let mut cx = Cx::new(sph);
     cx.images = options.images.clone();
+    cx.queried = options.queried.clone();
+    // Images the program both stores to and loads from: their loads read the image itself.
+    let handles = |load: bool| -> BTreeSet<(u8, u16)> {
+        ops.iter()
+            .filter_map(|o| match o {
+                Op::Memory(MemoryOp::Sust { handle, .. }) if !load => Some((handle.bank, handle.offset)),
+                Op::Memory(MemoryOp::Suld { handle, .. }) if load => Some((handle.bank, handle.offset)),
+                _ => None,
+            })
+            .collect()
+    };
+    cx.read_write = handles(true).intersection(&handles(false)).copied().collect();
     let body = cx.program(&words, &ops)?;
     Ok(Translation { key, stage, wgsl: cx.module(&body, options), interface: cx.iface })
 }
@@ -225,8 +244,15 @@ struct Cx {
     // the handle computations seen (they come first); branchy ones would
     // need the flow graph.
     uexpr: BTreeMap<u8, UExpr>,
+    /// The same for ordinary registers (MOV, LDC and LOP3 of known values), for
+    /// texture handles computed in a GPR. A predicated write counts as made.
+    gexpr: BTreeMap<u8, UExpr>,
     /// Compute: the storage format of each image slot (`Options::images`).
     images: Vec<String>,
+    /// Images both stored to and loaded from, by constant-bank handle.
+    read_write: BTreeSet<(u8, u16)>,
+    /// `Options::queried`.
+    queried: BTreeMap<usize, TexDim>,
     /// Compute: the program uses shared memory (`shm`, words as atomics so
     /// that ATOMS and plain accesses can share it).
     shm: bool,
@@ -253,7 +279,7 @@ const SHM_CAS: &str = "fn shm_cas(i: u32, op: u32, v: u32) -> u32 {
 
 impl Cx {
     fn new(sph: Sph) -> Cx {
-        Cx { sph, regs: BTreeSet::new(), preds: BTreeSet::new(), uregs: BTreeSet::new(), upreds: BTreeSet::new(), iface: Interface::default(), decls: String::new(), helpers: BTreeSet::new(), temps: 0, uexpr: BTreeMap::new(), images: Vec::new(), shm: false }
+        Cx { sph, regs: BTreeSet::new(), preds: BTreeSet::new(), uregs: BTreeSet::new(), upreds: BTreeSet::new(), iface: Interface::default(), decls: String::new(), helpers: BTreeSet::new(), temps: 0, uexpr: BTreeMap::new(), gexpr: BTreeMap::new(), images: Vec::new(), queried: BTreeMap::new(), read_write: BTreeSet::new(), shm: false }
     }
 
     /// A shared memory access's byte address, `reg × stride + ureg + offset`, as a new `let`.
@@ -372,6 +398,7 @@ impl Cx {
     }
 
     fn set(&mut self, out: &mut String, d: u8, e: &str) {
+        self.gexpr.remove(&d);
         if d != RZ {
             let r = self.r(d);
             let _ = writeln!(out, "{r} = {e};");
@@ -387,6 +414,8 @@ impl Cx {
             Src::Imm(v) => UExpr::Imm(v),
             Src::UReg(URZ) => UExpr::Imm(0),
             Src::UReg(n) => self.uexpr.get(&n)?.clone(),
+            Src::Reg(RZ) => UExpr::Imm(0),
+            Src::Reg(n) => self.gexpr.get(&n)?.clone(),
             Src::CBuf { bank, offset } => UExpr::CBuf(bank, offset),
             _ => return None,
         })
@@ -400,6 +429,13 @@ impl Cx {
     fn known(&mut self, d: u8, e: Option<UExpr>) {
         if let (Some(e), true) = (e, d != URZ) {
             self.uexpr.insert(d, e);
+        }
+    }
+
+    /// Records an ordinary register's value after its write.
+    fn gknown(&mut self, d: u8, e: Option<UExpr>) {
+        if let (Some(e), true) = (e, d != RZ) {
+            self.gexpr.insert(d, e);
         }
     }
 
@@ -879,6 +915,7 @@ impl Cx {
                 self.set_p(out, *dst1, &e2);
             }
             IntOp::Lop3 { dst, a, b, c, lut, pand, pdst, psrc } => {
+                let known = self.uvals([a, b, c]).map(|x| UExpr::Lop3(*lut, Box::new(x)));
                 let (x, y, z) = (self.raw(a)?, self.raw(b)?, self.raw(c)?);
                 let e = lop3(*lut, &x, &y, &z);
                 if *pdst == PT {
@@ -894,6 +931,7 @@ impl Cx {
                     self.set_p(out, *pdst, &pe);
                     self.set(out, *dst, &t);
                 }
+                self.gknown(*dst, known);
             }
             IntOp::Sel { dst, a, b, cond } => {
                 let (x, y, c) = (self.raw(a)?, self.raw(b)?, self.p(*cond));
@@ -956,8 +994,10 @@ impl Cx {
     fn moves(&mut self, out: &mut String, op: &MovesOp) -> R<()> {
         match op {
             MovesOp::Mov { dst, src, quad_lanes: 0xf } => {
+                let known = self.uval(src);
                 let e = self.raw(src)?;
                 self.set(out, *dst, &e);
+                self.gknown(*dst, known);
             }
             MovesOp::UMov { dst, src } => {
                 let known = self.uval(src);
@@ -1153,6 +1193,7 @@ impl Cx {
             }
             // SULD: a typed image load, as a texel fetch of the image's texture; the enabled
             // channels go to consecutive registers, and no access faults.
+            // From an image the program also stores to, the load reads the image itself.
             MemoryOp::Suld { dst, coord, handle, dim, mask, pred_dst, .. } => {
                 let (coords, tdim, ty) = match dim {
                     ImageDim::D1 => (1, TexDim::D1, "texture_1d<f32>"),
@@ -1160,11 +1201,14 @@ impl Cx {
                     ImageDim::D3 => (3, TexDim::D3, "texture_3d<f32>"),
                     d => return Err(format!("SULD from a {d:?} image")),
                 };
-                let slot = self.texture_slot(TexHandle::CBuf { bank: handle.bank, offset: handle.offset }, tdim, ty, false, true);
-                let reg = |cx: &mut Cx, base: u8, k: u8| if base == RZ { "0u".to_string() } else { cx.r(base + k) };
-                let cs: Vec<String> = (0..coords).map(|k| format!("i32({})", reg(self, *coord, k))).collect();
-                let at = if coords == 1 { cs[0].clone() } else { format!("vec{coords}<i32>({})", cs.join(", ")) };
-                let v = self.swizzled(slot, &format!("bitcast<vec4<u32>>(textureLoad(tex{slot}, {at}, 0))"));
+                let at = self.image_coords(*coord, coords);
+                let v = if self.read_write.contains(&(handle.bank, handle.offset)) {
+                    let slot = self.image_slot(*handle, *dim)?;
+                    format!("bitcast<vec4<u32>>(textureLoad(img{slot}, {at}))")
+                } else {
+                    let slot = self.texture_slot(TexHandle::CBuf { bank: handle.bank, offset: handle.offset }, tdim, ty, false, true);
+                    self.swizzled(slot, &format!("bitcast<vec4<u32>>(textureLoad(tex{slot}, {at}, 0))"))
+                };
                 let t = self.temp();
                 let _ = writeln!(out, "let {t} = {v};");
                 for (k, c) in (0..4u8).filter(|c| mask >> c & 1 != 0).enumerate() {
@@ -1175,21 +1219,14 @@ impl Cx {
                 self.set_p(out, *pred_dst, "false");
             }
             MemoryOp::Sust { coord, data, handle, dim, mask: 0xf, .. } if self.sph.stage == Stage::Compute => {
-                let (coords, ty) = match dim {
-                    ImageDim::D1 => (1, "texture_storage_1d"),
-                    ImageDim::D2 => (2, "texture_storage_2d"),
-                    ImageDim::D3 => (3, "texture_storage_3d"),
-                    d => return Err(format!("SUST to a {d:?} image")),
+                let slot = self.image_slot(*handle, *dim)?;
+                let coords = match dim {
+                    ImageDim::D1 => 1,
+                    ImageDim::D3 => 3,
+                    _ => 2,
                 };
-                let slot = self.iface.images.len();
-                self.iface.images.push(Image { handle: Handle::CBuf { bank: handle.bank, offset: handle.offset }, dim: *dim });
-                let format = self.images.get(slot).cloned().unwrap_or_else(|| "rgba16float".into());
-                let g = self.group();
-                let _ = writeln!(self.decls, "@group({g}) @binding({}) var img{slot}: {ty}<{format}, write>;", IMAGE_BINDING + slot as u32);
-                let reg = |cx: &mut Cx, base: u8, k: u8| if base == RZ { "0u".to_string() } else { cx.r(base + k) };
-                let cs: Vec<String> = (0..coords).map(|k| format!("i32({})", reg(self, *coord, k))).collect();
-                let at = if coords == 1 { cs[0].clone() } else { format!("vec{coords}<i32>({})", cs.join(", ")) };
-                let v: Vec<String> = (0..4).map(|k| format!("f({})", reg(self, *data, k))).collect();
+                let at = self.image_coords(*coord, coords);
+                let v: Vec<String> = (0..4).map(|k| if *data == RZ { "0.0".to_string() } else { format!("f({})", self.r(data + k)) }).collect();
                 let _ = writeln!(out, "textureStore(img{slot}, {at}, vec4<f32>({}));", v.join(", "));
             }
             // Shared memory: words of `shm`; a byte or half-word is a part of its word.
@@ -1272,8 +1309,10 @@ impl Cx {
                 };
                 if *index == RZ {
                     for k in 0..words {
-                        let e = self.cb(*bank, u32::from(*offset) + 4 * k)?;
+                        let at = u32::from(*offset) + 4 * k;
+                        let e = self.cb(*bank, at)?;
                         self.set(out, dst.saturating_add(k as u8), &e);
+                        self.gknown(dst.saturating_add(k as u8), u16::try_from(at).ok().map(|at| UExpr::CBuf(*bank, at)));
                     }
                 } else {
                     let ix = self.r(*index);
@@ -1290,6 +1329,35 @@ impl Cx {
         Ok(())
     }
 
+    /// The image slot of a constant-bank handle, one per handle, declared at its
+    /// first use: written, or read and written (`read_write`).
+    fn image_slot(&mut self, handle: CbHandle, dim: ImageDim) -> R<usize> {
+        let ty = match dim {
+            ImageDim::D1 => "texture_storage_1d",
+            ImageDim::D2 => "texture_storage_2d",
+            ImageDim::D3 => "texture_storage_3d",
+            d => return Err(format!("a {d:?} image")),
+        };
+        let h = Handle::CBuf { bank: handle.bank, offset: handle.offset };
+        if let Some(slot) = self.iface.images.iter().position(|i| i.handle == h) {
+            return Ok(slot);
+        }
+        let slot = self.iface.images.len();
+        let read = self.read_write.contains(&(handle.bank, handle.offset));
+        self.iface.images.push(Image { handle: h, dim, read });
+        let format = self.images.get(slot).cloned().unwrap_or_else(|| "rgba16float".into());
+        let g = self.group();
+        let access = if read { "read_write" } else { "write" };
+        let _ = writeln!(self.decls, "@group({g}) @binding({}) var img{slot}: {ty}<{format}, {access}>;", IMAGE_BINDING + slot as u32);
+        Ok(slot)
+    }
+
+    /// An image access's integer coordinates, from `coords` registers at `base`.
+    fn image_coords(&mut self, base: u8, coords: usize) -> String {
+        let cs: Vec<String> = (0..coords as u8).map(|k| format!("i32({})", if base == RZ { "0u".to_string() } else { self.r(base + k) })).collect();
+        if coords == 1 { cs[0].clone() } else { format!("vec{coords}<i32>({})", cs.join(", ")) }
+    }
+
     /// A texture slot for an instruction's handle: its declaration, and its
     /// sampler's unless it is fetched or queried.
     fn texture_slot(&mut self, handle: TexHandle, dim: TexDim, ty: &str, compare: bool, fetch: bool) -> usize {
@@ -1302,7 +1370,7 @@ impl Cx {
             },
             TexHandle::Bindless => Handle::Bindless,
         };
-        self.iface.textures.push(Texture { handle, dim, compare, fetch });
+        self.iface.textures.push(Texture { handle, dim, compare, fetch, query: false });
         let g = self.group();
         let _ = writeln!(self.decls, "@group({g}) @binding({}) var tex{slot}: {ty};", 32 + 2 * slot);
         if !fetch {
@@ -1330,11 +1398,15 @@ impl Cx {
             TextureOp::Tld { io, dim, lod, scr, aoffi, ms: false } => (io, *dim, true, *lod, *scr, *aoffi, false),
             TextureOp::Txd { io, dim, aoffi } => return self.txd(out, io, *dim, *aoffi),
             // The size of a level (the texture is taken as 2D): width, height, 1, levels.
+            // TXQ: the texture declared as the type its header has (`Options::queried`).
             TextureOp::Txq { dst, dst2, handle, src, query: TexQuery::Dimension, mask, .. } => {
-                let slot = self.texture_slot(*handle, TexDim::D2, "texture_2d<f32>", false, true);
+                let three_d = self.queried.get(&self.iface.textures.len()) == Some(&TexDim::D3);
+                let (dim, ty, depth) = if three_d { (TexDim::D3, "texture_3d<f32>", "") } else { (TexDim::D2, "texture_2d<f32>", ", 1u") };
+                let slot = self.texture_slot(*handle, dim, ty, false, true);
+                self.iface.textures[slot].query = true;
                 let level = self.raw(src)?;
                 let t = self.temp();
-                let _ = writeln!(out, "let {t} = vec4<u32>(textureDimensions(tex{slot}, {level}), 1u, textureNumLevels(tex{slot}));");
+                let _ = writeln!(out, "let {t} = vec4<u32>(textureDimensions(tex{slot}, {level}){depth}, textureNumLevels(tex{slot}));");
                 return self.tex_results(out, &t, false, *mask, *dst, *dst2);
             }
             other => return Err(format!("unsupported: {other:?}")),
@@ -1408,14 +1480,23 @@ impl Cx {
             Item::Dref => 11,
         };
         let mut regs: BTreeMap<usize, String> = BTreeMap::new();
+        let mut handle_reg = None;
         for (list, start) in [(&a, ra), (&b, rb)] {
             for (k, item) in list.iter().enumerate() {
                 let r = if start == RZ { "0u".to_string() } else { self.r(start + k as u8) };
                 regs.insert(key(*item), r);
+                if *item == Item::Handle {
+                    handle_reg = Some(start.saturating_add(k as u8));
+                }
             }
         }
         let get = |item: Item| -> R<String> { regs.get(&key(item)).cloned().ok_or_else(|| "texture source missing".to_string()) };
+        let known = handle_reg.and_then(|r| self.uval(&Operand { src: Src::Reg(r), neg: false, abs: false, swizzle: 0 }));
         let slot = self.texture_slot(io.handle, dim, ty, dc, fetch);
+        // A bindless handle whose register holds known constant-bank words.
+        if let Some(e) = known {
+            self.iface.textures[slot].handle = Handle::Uniform(e);
+        }
         let cs: Vec<String> = (0..coords).map(|c| get(Item::Coord(c))).collect::<R<_>>()?;
         let vec = |cast: &str, sc: &str| if coords == 1 { format!("{cast}({})", cs[0]) } else { format!("vec{coords}<{sc}>({})", cs.iter().map(|c| format!("{cast}({c})")).collect::<Vec<_>>().join(", ")) };
         let arr = if array { format!(", i32({})", get(Item::Array)?) } else { String::new() };
@@ -1711,9 +1792,22 @@ mod tests {
         let tex = w(0xb60, &[(16, 0), (24, 1), (32, 2), (64, 255), (40, 0x70 / 4), (54, 2), (61, 1), (72, 1), (81, 7), (84, 1), (60, 1)]);
         let code = program(&[(0, 0x000c_5482), (6, 0xa), (18, 1)], &[ipa(1, 0x80), ipa(2, 0x84), fsetp, skip, tex, exit()]);
         let t = ok(&code);
-        assert_eq!(t.interface.textures, vec![Texture { handle: Handle::CBuf { bank: 2, offset: 0x70 }, dim: TexDim::D2, compare: false, fetch: false }]);
+        assert_eq!(t.interface.textures, vec![Texture { handle: Handle::CBuf { bank: 2, offset: 0x70 }, dim: TexDim::D2, compare: false, fetch: false, query: false }]);
         assert_eq!(t.interface.targets, BTreeMap::from([(0, 1)]));
         assert!(t.wgsl.contains("switch pc"), "{}", t.wgsl);
+    }
+
+    #[test]
+    fn a_bindless_handle_made_of_constant_words_is_tracked() {
+        // R7 = c[2][0x258]; R5 = c[2][0x5c0]; R4 = R7 | R5; TEX.SCR 2D at (R1, R2), handle R4.
+        let ipa = |dst: u128, attr: u128| w(0x326, &[(16, dst), (64, attr / 4), (32, 255), (81, 7)]);
+        let ldc =|dst: u128, offset: u128| w(0xb82, &[(16, dst), (24, 255), (54, 2), (38, offset), (73, 4)]);
+        let lop3 = w(0x212, &[(16, 4), (24, 7), (32, 5), (64, 255), (72, 0xfc), (81, 7), (87, 7)]);
+        let tex = w(0x361, &[(16, 0), (24, 1), (32, 4), (64, 255), (59, 1), (61, 1), (72, 1), (81, 7), (84, 1), (60, 1)]);
+        let code = program(&[(0, 0x000c_5482), (6, 0xa), (18, 1)], &[ipa(1, 0x80), ipa(2, 0x84), ldc(7, 0x258), ldc(5, 0x5c0), lop3, tex, exit()]);
+        let t = ok(&code);
+        let want = Handle::Uniform(UExpr::Lop3(0xfc, Box::new([UExpr::CBuf(2, 0x258), UExpr::CBuf(2, 0x5c0), UExpr::Imm(0)])));
+        assert_eq!(t.interface.textures[0].handle, want);
     }
 
     #[test]
@@ -1757,8 +1851,27 @@ mod tests {
         let t = translate_with(&code, &options).unwrap_or_else(|e| panic!("{e}"));
         validate(&t.wgsl).unwrap_or_else(|e| panic!("{e}\n{}", t.wgsl));
         assert_eq!(t.stage, Stage::Compute);
-        assert_eq!(t.interface.images, vec![Image { handle: Handle::CBuf { bank: 0, offset: 0x20 }, dim: ImageDim::D3 }]);
+        assert_eq!(t.interface.images, vec![Image { handle: Handle::CBuf { bank: 0, offset: 0x20 }, dim: ImageDim::D3, read: false }]);
         for want in ["@workgroup_size(8, 8, 1)", "r0 = lid.x;", "r2 = wid.z;", "texture_storage_3d<rgba16float, write>", "textureStore(img0, vec3<i32>(i32(r0), i32(r1), i32(r2))"] {
+            assert!(t.wgsl.contains(want), "{want}\n{}", t.wgsl);
+        }
+    }
+
+    #[test]
+    fn an_image_loaded_and_stored_by_one_program_is_bound_read_write() {
+        // S2R R0, R1 = tid.x, tid.y; SULD R4..R7 = image c[0][0x30] at (R0, R1); SUST it back.
+        let s2r = |dst: u128, sr: u128| w(0x919, &[(16, dst), (72, sr)]);
+        let suld = w(0xb97, &[(16, 4), (24, 0), (40, 0x30 / 4), (54, 0), (61, 3), (72, 0xf), (81, 7)]);
+        let sust = w(0xb9b, &[(24, 0), (32, 4), (40, 0x30 / 4), (54, 0), (61, 3), (72, 0xf)]);
+        let mut code = Vec::new();
+        for i in [s2r(0, 0x21), s2r(1, 0x22), suld, sust, exit(), bra(-16)] {
+            code.extend(i);
+        }
+        let t = translate_with(&code, &Options { workgroup: [8, 8, 1], ..Default::default() }).unwrap_or_else(|e| panic!("{e}"));
+        validate(&t.wgsl).unwrap_or_else(|e| panic!("{e}\n{}", t.wgsl));
+        assert_eq!(t.interface.images, vec![Image { handle: Handle::CBuf { bank: 0, offset: 0x30 }, dim: ImageDim::D2, read: true }]);
+        assert!(t.interface.textures.is_empty());
+        for want in ["texture_storage_2d<rgba16float, read_write>", "textureLoad(img0, vec2<i32>(i32(r0), i32(r1)))", "textureStore(img0,"] {
             assert!(t.wgsl.contains(want), "{want}\n{}", t.wgsl);
         }
     }
