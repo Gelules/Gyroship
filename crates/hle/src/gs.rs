@@ -450,7 +450,7 @@ impl Kernel {
         };
         self.gs.syncpt_page = Some(b.0);
         self.gs.syncpt_events = self.event_of(_req_r).zip(self.event_of(ack_r));
-        self.log(&format!("gsv 204: syncpoint memory rw {:#x}+{:#x} r {:#x}+{:#x}, header version 1 n 0", a.0, a.1, b.0, b.1));
+        self.log(&format!("gsv 204: syncpoint memory rw {:#x}+{:#x} r {:#x}+{:#x}, header version 1 n 0, events (request, acknowledge) {:?}", a.0, a.1, b.0, b.1, self.gs.syncpt_events));
         Reply { move_handles: vec![req_w, ack_r], ..Reply::ok() }
     }
 }

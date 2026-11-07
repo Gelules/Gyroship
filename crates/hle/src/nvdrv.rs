@@ -132,6 +132,8 @@ pub struct Gpu {
     draws: u64,
     /// Presents each waiting channel has waited through.
     stalls: BTreeMap<u32, u32>,
+    /// Compute dispatches so far.
+    dispatches: u64,
 }
 
 impl Nvdrv {
@@ -429,6 +431,26 @@ pub fn poll(k: &mut Kernel) {
     k.gpu = gpu;
 }
 
+/// Performs a semaphore release or reduction in guest memory (the GPU
+/// writes whatever the CPU's permissions).
+fn semaphore(k: &mut Kernel, space: u32, r: &gyroship_gpu::state::qmd::Release) {
+    let n = if r.wide { 8 } else { 4 };
+    let mut old = [0u8; 8];
+    let _ = k.read_gpu(space, r.addr, &mut old[..n]);
+    let mut bytes = r.apply(u64::from_le_bytes(old)).to_le_bytes()[..n].to_vec();
+    if r.timestamp {
+        bytes.resize(8, 0);
+        bytes.extend((k.now() * 32).to_le_bytes());
+    }
+    let cpu = k.gpu_to_cpu(space, r.addr);
+    if k.mem.write_object(cpu, &bytes).is_err() && k.journal.few("gpu semaphore", 4) {
+        k.log(&format!("gpu: semaphore at {:#x} not writable", r.addr));
+    }
+    if k.journal.few("gpu semaphore release", 8) {
+        k.log(&format!("gpu: semaphore {r:x?}"));
+    }
+}
+
 /// Logs a channel starting or stopping a wait on a semaphore (the first ones).
 fn note_wait(k: &mut Kernel, fd: u32, space: u32, before: Option<gyroship_gpu::pushbuf::Acquire>, after: Option<gyroship_gpu::pushbuf::Acquire>) {
     if before == after || !k.journal.few("gpu wait", 48) {
@@ -439,7 +461,9 @@ fn note_wait(k: &mut Kernel, fd: u32, space: u32, before: Option<gyroship_gpu::p
             let mut b = [0u8; 8];
             let read = k.read_gpu(space, a.addr, &mut b[..if a.wide { 8 } else { 4 }]);
             let now = if read { format!("{:#x}", u64::from_le_bytes(b)) } else { "unreadable".into() };
-            k.log(&format!("gpu: channel fd {fd} waits until {:#x} is {:?} {:#x} (now {now})", a.addr, a.op, a.value));
+            let cpu = k.gpu_to_cpu(space, a.addr);
+            let map = k.gs.gpu_maps.iter().rev().find(|m| m.0 == space && (m.1..=m.2).contains(&a.addr)).copied();
+            k.log(&format!("gpu: channel fd {fd} waits until {:#x} (cpu {cpu:#x}, mapping {map:x?}) is {:?} {:#x} (now {now})", a.addr, a.op, a.value));
         }
         None => k.log(&format!("gpu: channel fd {fd} goes on")),
     }
@@ -534,6 +558,26 @@ impl Gpu {
                         k.log(&format!("gpu: copy {c:x?} not done (memory not readable or writable)"));
                     }
                 }
+                // A compute dispatch: its QMD's releases (the program is not run yet).
+                Effect::Dispatch(at) => {
+                    use gyroship_gpu::state::qmd;
+                    self.dispatches += 1;
+                    let mut q = [0u8; qmd::SIZE];
+                    if !k.read_gpu(space, at, &mut q) {
+                        if k.journal.few("gpu qmd", 4) {
+                            k.log(&format!("gpu: compute dispatch: QMD at {at:#x} not readable"));
+                        }
+                        continue;
+                    }
+                    let releases = qmd::releases(&q);
+                    if k.journal.few("gpu dispatch", 8) {
+                        k.log(&format!("gpu: compute dispatch {}: QMD {at:#x} version {:?}, program not run, releases {releases:x?}", self.dispatches, qmd::version(&q)));
+                    }
+                    for r in releases {
+                        semaphore(k, space, &r);
+                    }
+                }
+                Effect::Semaphore(r) => semaphore(k, space, &r),
                 // The GPU writes whatever the CPU's permissions.
                 Effect::Write(w) => {
                     let at = k.gpu_to_cpu(space, w.address);

@@ -93,6 +93,10 @@ pub enum Effect {
     Draw(Box<Draw>),
     /// A copy engine copy, pitch to pitch.
     Copy(Copy),
+    /// A compute dispatch: the GPU address of its QMD.
+    Dispatch(u64),
+    /// A semaphore an inline-to-memory upload releases once its data is in.
+    Semaphore(crate::state::qmd::Release),
     /// Bytes the 3D method stream writes to memory, before what follows reads it.
     Write(MemWrite),
     /// A 3D resource method whose effect is not applied.
@@ -188,6 +192,12 @@ const DMA_SEMAPHORE_A: u32 = 0x240;
 const DMA_SEMAPHORE_B: u32 = 0x244;
 const DMA_SEMAPHORE_PAYLOAD: u32 = 0x248;
 const DMA_LAUNCH: u32 = 0x300;
+/// LINE_LENGTH_IN .. LOAD_INLINE_DATA: inline-to-memory uploads.
+const I2M_METHODS: std::ops::RangeInclusive<u32> = 0x180..=0x1b4;
+// Compute (clc7c0.h): the QMD address >> 8, and the two launch methods.
+const SEND_PCAS_A: u32 = 0x2b4;
+const SEND_SIGNALING_PCAS_B: u32 = 0x2bc;
+const SEND_SIGNALING_PCAS2_B: u32 = 0x2c0;
 const DMA_OFFSET_IN_UPPER: u32 = 0x400; // IN_LOWER + 4, OUT_UPPER + 8, OUT_LOWER + 0xc
 const DMA_PITCH_IN: u32 = 0x410; // PITCH_OUT + 4, LINE_LENGTH_IN + 8, LINE_COUNT + 0xc
 // The 3D class's macro unit.
@@ -241,6 +251,8 @@ pub struct Channel {
     running: Option<usize>,
     /// The 3D class's constant-buffer bindings and memory writes.
     resources: Resources,
+    /// The inline-to-memory uploads of compute and I2M subchannels.
+    uploads: std::collections::BTreeMap<usize, Resources>,
     /// Segments not run yet, with where to start in each.
     queue: VecDeque<(Vec<u32>, usize)>,
     /// The acquire the channel waits for.
@@ -280,6 +292,7 @@ impl Default for Channel {
             call: None,
             running: None,
             resources: Resources::default(),
+            uploads: Default::default(),
             queue: VecDeque::new(),
             wait: None,
             trace: None,
@@ -414,7 +427,10 @@ impl Channel {
 
     fn write(&mut self, subchannel: usize, method: u32, value: u32, effects: &mut Vec<Effect>) {
         let three_d = self.classes[subchannel] & 0xff == 0x97;
-        if three_d && CALL_MME.contains(&method) {
+        // The macro unit is the channel's: the 3D and compute classes both load and call it
+        // (NVK calls its macros on the compute class too); a macro emits to its caller.
+        let macros = three_d || self.classes[subchannel] & 0xff == 0xc0;
+        if macros && CALL_MME.contains(&method) {
             let index = ((method - CALL_MME.start) / 8) as usize;
             match &mut self.call {
                 Some((s, i, params)) if method % 8 == 4 && *s == subchannel && *i == index => params.push(value),
@@ -458,7 +474,7 @@ impl Channel {
             }
         }
         self.engine[i] = value;
-        if three_d && let Some(unit) = self.mme.as_mut() {
+        if macros && let Some(unit) = self.mme.as_mut() {
             match method {
                 LOAD_MME_INSTRUCTION_RAM_POINTER => unit.set_code_pointer(value),
                 LOAD_MME_INSTRUCTION_RAM => unit.load_code(value),
@@ -471,6 +487,14 @@ impl Channel {
             let regs = &self.engine[subchannel * 0x1000..(subchannel + 1) * 0x1000];
             effects.extend(self.resources.method(method, value, &|m| regs.get((m / 4) as usize).copied().unwrap_or(0)).into_iter().map(Effect::Write));
             effects.extend(self.resources.unsupported.drain(..).map(Effect::Unsupported));
+            effects.extend(self.resources.semaphores.drain(..).map(Effect::Semaphore));
+        } else if matches!(self.classes[subchannel] & 0xff, 0xc0 | 0x40) && (I2M_METHODS).contains(&method) {
+            // Compute and inline-to-memory classes share the 3D class's upload methods.
+            let regs = &self.engine[subchannel * 0x1000..(subchannel + 1) * 0x1000];
+            let r = self.uploads.entry(subchannel).or_default();
+            effects.extend(r.method(method, value, &|m| regs.get((m / 4) as usize).copied().unwrap_or(0)).into_iter().map(Effect::Write));
+            effects.extend(r.unsupported.drain(..).map(Effect::Unsupported));
+            effects.extend(r.semaphores.drain(..).map(Effect::Semaphore));
         }
         if self.classes[subchannel] & 0xff == 0xb5 && method == DMA_LAUNCH {
             effects.extend(self.copy(subchannel, value));
@@ -639,9 +663,22 @@ impl Channel {
                     width: 4,
                     timestamp: value >> 28 & 1 == 0,
                 }),
+                // REPORT_ONLY of a counter (pipeline statistics, pixel counts): the
+                // 64-bit value then, in the four-word form, the timestamp (NVK's query
+                // layout). ponytail: counters are not kept; they read 0.
+                2 => Effect::Release(Release {
+                    method,
+                    addr: u64::from(self.reg(subchannel, REPORT_SEMAPHORE_A) & 0xff) << 32 | u64::from(self.reg(subchannel, REPORT_SEMAPHORE_B)),
+                    value: 0,
+                    width: if value >> 28 & 1 == 0 { 8 } else { 4 },
+                    timestamp: value >> 28 & 1 == 0,
+                }),
                 _ => ignored,
             }),
             (0x97, CLEAR_SURFACE) => Some(Effect::Clear(self.clear(subchannel, value))),
+            // A launch: PCAS_B with SCHEDULE (bit 1), or PCAS2_B whose PCAS_ACTION (3:0) schedules.
+            (0xc0, SEND_SIGNALING_PCAS_B) if value & 2 != 0 => Some(Effect::Dispatch(u64::from(self.reg(subchannel, SEND_PCAS_A)) << 8)),
+            (0xc0, SEND_SIGNALING_PCAS2_B) if matches!(value & 0xf, 2 | 3 | 9 | 10 | 11) => Some(Effect::Dispatch(u64::from(self.reg(subchannel, SEND_PCAS_A)) << 8)),
             (0x97, DRAW_INDEX_BUFFER | DRAW_VERTEX_ARRAY) => Some(Effect::Draw(Box::new(self.draw(subchannel, method, value)))),
             (0x97, m) if OTHER_DRAWS.contains(&m) => Some(ignored),
             // Copy engine: after the copy (`copy`), a semaphore by bits 4:3 (1 one word, 2 four).

@@ -60,6 +60,8 @@ pub fn run(dir: &Path, first: u32, last: u32, methods: bool) -> super::Result<()
                 Effect::Write(w) => stats.written += w.data.len(),
                 Effect::Unsupported(u) => println!("  not applied: {u:x?}"),
                 Effect::Copy(c) => println!("  copy {c:x?}"),
+                Effect::Dispatch(q) => println!("  compute dispatch, QMD at {q:#x}"),
+                Effect::Semaphore(s) => println!("  semaphore {s:x?}"),
                 Effect::Ignored { class, method, value } => *stats.ignored.entry((class, method, value)).or_default() += 1,
             }
         }

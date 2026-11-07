@@ -23,6 +23,7 @@
 //!   "cbuf" texture reference), so that location comes from the shader.
 
 use super::Reg;
+use super::qmd::{self, Reduction};
 
 // Method byte offsets, clc797.h.
 const LINE_LENGTH_IN: u32 = 0x0180;
@@ -32,6 +33,8 @@ const OFFSET_OUT: u32 = 0x018c;
 const PITCH_OUT: u32 = 0x0190;
 const LAUNCH_DMA: u32 = 0x01b0;
 const LOAD_INLINE_DATA: u32 = 0x01b4;
+/// SET_I2M_SEMAPHORE_A (upper 7:0), _B (lower), _C (payload).
+const I2M_SEMAPHORE: u32 = 0x01dc;
 const SET_ROOT_TABLE_SELECTOR: u32 = 0x0504;
 const LOAD_ROOT_TABLE: u32 = 0x0508;
 const UNBIND_ALL: u32 = 0x10f4;
@@ -84,9 +87,8 @@ pub enum Unsupported {
     CbufLoadPastSize { address: u64, offset: u32, size: u32 },
     /// A method whose effect is not applied: SET_ROOT_TABLE_SELECTOR,
     /// LOAD_ROOT_TABLE, UNBIND_ALL (which groups it clears is not stated),
-    /// BIND_GROUP_CONSTANT_BUFFER(j) for j >= 5, LAUNCH_DMA with
-    /// COMPLETION_TYPE_RELEASE_SEMAPHORE (the semaphore write is not done),
-    /// LOAD_INLINE_DATA with no upload pending.
+    /// BIND_GROUP_CONSTANT_BUFFER(j) for j >= 5, LOAD_INLINE_DATA with no
+    /// upload pending.
     Method { method: u32, value: u32 },
 }
 
@@ -171,6 +173,8 @@ struct Upload {
     total: u64,
     done: u64,
     write: bool,
+    /// Released once the data is in.
+    semaphore: Option<qmd::Release>,
 }
 
 /// Constant-buffer bindings and the stream's own memory writes.
@@ -183,6 +187,8 @@ pub struct Resources {
     /// Everything not turned into effects, in stream order (the command
     /// processor drains it after each method).
     pub unsupported: Vec<Unsupported>,
+    /// Semaphores the finished uploads release, in order (drained likewise).
+    pub semaphores: Vec<qmd::Release>,
 }
 
 /// The constant buffers bound to every stage and bank: (address, size).
@@ -234,10 +240,20 @@ impl Resources {
     }
 
     fn launch(&mut self, value: u32, r: Reg) {
-        // LAUNCH_DMA_COMPLETION_TYPE (5:4) == RELEASE_SEMAPHORE (2).
-        if (value >> 4) & 3 == 2 {
-            self.unsupported.push(Unsupported::Method { method: LAUNCH_DMA, value });
-        }
+        // LAUNCH_DMA_COMPLETION_TYPE (5:4) == RELEASE_SEMAPHORE (2): SEMAPHORE_STRUCT_SIZE
+        // (12) 0 = four words (with a timestamp), REDUCTION_ENABLE (1), REDUCTION_OP
+        // (15:13), REDUCTION_FORMAT (3:2) 1 = signed.
+        let semaphore = ((value >> 4) & 3 == 2).then(|| {
+            use Reduction::*;
+            qmd::Release {
+                addr: address(r(I2M_SEMAPHORE), r(I2M_SEMAPHORE + 4)),
+                payload: u64::from(r(I2M_SEMAPHORE + 8)),
+                reduction: (value >> 1 & 1 == 1).then(|| [Add, Min, Max, Inc, Dec, And, Or, Xor][(value >> 13 & 7) as usize]),
+                signed: value >> 2 & 3 == 1,
+                wide: false,
+                timestamp: value >> 12 & 1 == 0,
+            }
+        });
         let address = address(r(OFFSET_OUT_UPPER), r(OFFSET_OUT));
         let (line_length, line_count) = (r(LINE_LENGTH_IN), r(LINE_COUNT));
         let total = line_length as u64 * line_count as u64;
@@ -249,6 +265,9 @@ impl Resources {
         } else if !packing_known {
             self.unsupported.push(Unsupported::I2mLinePacking { address, line_length, line_count });
         }
+        if total == 0 {
+            self.semaphores.extend(semaphore);
+        }
         self.upload = (total > 0).then(|| Upload {
             address,
             line_length: line_length as u64,
@@ -256,6 +275,7 @@ impl Resources {
             total,
             done: 0,
             write: pitch_layout && packing_known,
+            semaphore,
         });
     }
 
@@ -279,6 +299,7 @@ impl Resources {
         }
         u.done += n;
         if u.done == u.total {
+            self.semaphores.extend(u.semaphore);
             self.upload = None;
         }
         out
@@ -395,10 +416,15 @@ mod tests {
         i2m(&mut res, &mut regs, 16, 1, 0, 0x2000, 0x1010);
         assert!((0..4).all(|v| feed(&mut res, &mut regs, 0x01b4, v).is_empty()));
         assert_eq!(res.unsupported, vec![Unsupported::I2mBlockLinear { address: 0x2000, bytes: 16 }]);
-        // RELEASE_SEMAPHORE completion is reported, the data still lands.
-        i2m(&mut res, &mut regs, 4, 1, 0, 0x3000, 0x21);
+        // RELEASE_SEMAPHORE completion: a one-word increment at 0x12_0000_4000 once the data is in.
+        for (m, v) in [(0x01dc, 0x12), (0x01e0, 0x4000), (0x01e4, 9)] {
+            feed(&mut res, &mut regs, m, v);
+        }
+        i2m(&mut res, &mut regs, 4, 1, 0, 0x3000, 0x21 | 1 << 12 | 1 << 1 | 3 << 13);
+        assert!(res.semaphores.is_empty());
         assert_eq!(feed(&mut res, &mut regs, 0x01b4, 7)[0].address, 0x3000);
-        assert_eq!(res.unsupported[1], Unsupported::Method { method: 0x01b0, value: 0x21 });
+        assert_eq!(res.semaphores, vec![qmd::Release { addr: 0x12_0000_4000, payload: 9, reduction: Some(Reduction::Inc), signed: false, wide: false, timestamp: false }]);
+        assert_eq!(res.unsupported.len(), 1);
     }
 
     #[test]

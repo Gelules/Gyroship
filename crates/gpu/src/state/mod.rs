@@ -6,6 +6,7 @@
 //! and from how Mesa's NVK/NAK/NIL drive the same hardware; where neither
 //! settles a value, the decoders keep it raw or say so.
 
+pub mod qmd;
 pub mod raster;
 pub mod resources;
 pub mod textures;
