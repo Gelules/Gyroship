@@ -227,6 +227,7 @@ pub fn main(table: Vec<rt::Entry>) {
         vsync: !flag("--no-vsync"),
         gpfifo_dump: value("--dump-gpfifo").map(std::path::PathBuf::from),
         frames_dump: value("--dump-frames").map(std::path::PathBuf::from),
+        shaders_dump: value("--dump-shaders").map(std::path::PathBuf::from),
         ..Config::default()
     };
     let installed = table.len();

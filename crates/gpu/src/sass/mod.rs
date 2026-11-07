@@ -202,9 +202,33 @@ pub fn program(sass: &[u8]) -> Option<&[u8]> {
     Some(&sass[..16 * (end + 1)])
 }
 
+/// The key of a graphics program, from its code as it lies at its GPU
+/// address or in a blob's code section (SPH, then SASS): FNV-1a 64 of the
+/// SPH and the program up to its closing self-branch, and that length.
+/// Offline translation and the runtime's shader cache agree on it.
+pub fn program_key(code: &[u8]) -> Option<(u64, usize)> {
+    let len = SPH_SIZE + program(code.get(SPH_SIZE..)?)?.len();
+    Some((code[..len].iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)), len))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_program_key_covers_the_sph_and_the_program_only() {
+        let mut code = vec![0u8; SPH_SIZE];
+        code.extend(insn(0x94d, 7 << 87));
+        code.extend(insn(BRA, 7 << 87 | (((-16i64) as u64 as u128) & ((1 << 50) - 1)) << 32));
+        let (key, len) = program_key(&code).unwrap();
+        assert_eq!(len, SPH_SIZE + 32);
+        // What follows the program does not change the key; the program does.
+        code.extend([0x55; 16]);
+        assert_eq!(program_key(&code).unwrap(), (key, len));
+        code[SPH_SIZE] ^= 1;
+        assert_ne!(program_key(&code).unwrap().0, key);
+        assert!(program_key(&code[..SPH_SIZE + 16]).is_none());
+    }
 
     fn insn(opcode: u16, extra: u128) -> [u8; 16] {
         // @PT, operands from `extra`.

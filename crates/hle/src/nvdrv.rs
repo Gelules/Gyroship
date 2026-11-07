@@ -118,6 +118,11 @@ pub struct Nvdrv {
     /// Each channel's command processor.
     channels: BTreeMap<u32, Channel>,
     submits: u64,
+    /// Program keys by GPU address, and the keys already seen.
+    programs: BTreeMap<u64, u64>,
+    keys: std::collections::BTreeSet<u64>,
+    /// Draws so far.
+    draws: u64,
 }
 
 impl Nvdrv {
@@ -352,12 +357,44 @@ impl Nvdrv {
 }
 
 impl Nvdrv {
+    /// The key of the graphics program at a GPU address (read from guest
+    /// memory once, until its closing self-branch); new programs go to
+    /// `--dump-shaders DIR` (game code: never committed).
+    fn program(&mut self, k: &mut Kernel, space: u32, gpu: u64) -> String {
+        if let Some(key) = self.programs.get(&gpu) {
+            return format!("{key:016x}");
+        }
+        let at = k.gpu_to_cpu(space, gpu);
+        let mut code = Vec::new();
+        let found = loop {
+            let mut chunk = vec![0u8; 0x1000];
+            if code.len() >= 0x4_0000 || k.mem.read(at + code.len() as u64, &mut chunk).is_err() {
+                break None;
+            }
+            code.extend(chunk);
+            if let Some(found) = gyroship_gpu::sass::program_key(&code) {
+                break Some(found);
+            }
+        };
+        let Some((key, len)) = found else {
+            return format!("program at {gpu:#x}: no end found in {:#x} readable bytes", code.len());
+        };
+        self.programs.insert(gpu, key);
+        if self.keys.insert(key) {
+            k.log(&format!("gpu: program {key:016x}: {len} bytes at {gpu:#x}"));
+            if let Some(dir) = &k.config.shaders_dump {
+                let _ = std::fs::create_dir_all(dir);
+                let _ = std::fs::write(dir.join(format!("{key:016x}.bin")), &code[..len]);
+            }
+        }
+        format!("{key:016x}")
+    }
+
     /// Runs a submit's GPFIFO entries (GPU address bits 2..40, length in
     /// words at bits 42..63) through the channel's command processor, and
     /// performs its semaphore releases in guest memory.
     fn run_gpfifo(&mut self, k: &mut Kernel, fd: u32, entries: &[u8]) {
         let space = self.channel_space.get(&fd).copied().unwrap_or(0);
-        let channel = self.channels.entry(fd).or_default();
         for (rank, e) in entries.as_chunks::<8>().0.iter().map(|e| u64::from_le_bytes(*e)).enumerate() {
             let (gpu, len) = (e & 0xffff_fffc | (e >> 32 & 0xff) << 32, (e >> 42 & 0x1f_ffff) as usize);
             let mut raw = vec![0u8; 4 * len.min(0x10_0000)];
@@ -376,7 +413,8 @@ impl Nvdrv {
                 let _ = std::fs::create_dir_all(dir);
                 let _ = std::fs::write(dir.join(format!("submit-{:04}-{rank:04}-{gpu:010x}.bin", self.submits)), &raw);
             }
-            for effect in channel.run(&words) {
+            let effects = self.channels.entry(fd).or_default().run(&words);
+            for effect in effects {
                 match effect {
                     Effect::Release(r) => {
                         let at = k.gpu_to_cpu(space, r.addr);
@@ -398,6 +436,14 @@ impl Nvdrv {
                     Effect::Clear(c) => {
                         if let Some(s) = &mut k.surfaces {
                             s.clear(&c);
+                        }
+                    }
+                    Effect::Draw(d) => {
+                        self.draws += 1;
+                        let keys: Vec<String> = d.programs.iter().enumerate().filter_map(|(stage, p)| Some(format!("stage {stage} {}", self.program(k, space, (*p)?)))).collect();
+                        // The first frames' draws, one line each.
+                        if k.gs.presents < 3 || self.draws <= 64 {
+                            k.log(&format!("gpu: draw {}: topology {} count {} index {:x?} first {}: {}", self.draws, d.topology, d.count, d.index, d.first, keys.join(", ")));
                         }
                     }
                     Effect::MacroFault { index, fault } => {

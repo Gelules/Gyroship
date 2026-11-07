@@ -34,6 +34,24 @@ pub enum Effect {
     MacroFault { index: usize, fault: mme::Fault },
     /// CLEAR_SURFACE.
     Clear(Clear),
+    /// DRAW_INDEX_BUFFER or DRAW_VERTEX_ARRAY.
+    Draw(Draw),
+}
+
+/// A draw, with the state it names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Draw {
+    /// BEGIN's primitive (4 = triangles).
+    pub topology: u32,
+    /// Index buffer: GPU address, bytes per index, first index.
+    pub index: Option<(u64, u8, u32)>,
+    /// First vertex (vertex arrays).
+    pub first: u32,
+    pub count: u32,
+    /// The GPU address of each enabled pipeline stage's program (SPH then
+    /// SASS): 0 vertex before fetch, 1 vertex, 2 tessellation init, 3
+    /// tessellation, 4 geometry, 5 pixel.
+    pub programs: [Option<u64>; 6],
 }
 
 /// A render target as the 3D class describes it.
@@ -106,6 +124,15 @@ const CT_SELECT: u32 = 0x121c;
 const ZT_SIZE_A: u32 = 0x1228; // SIZE_B + 4, SIZE_C + 8
 const ZT_SELECT: u32 = 0x1538;
 const CLEAR_SURFACE: u32 = 0x19d0;
+// Draws.
+const VERTEX_ARRAY_START: u32 = 0xd74;
+const DRAW_VERTEX_ARRAY: u32 = 0xd78;
+const BEGIN: u32 = 0x1618;
+const INDEX_BUFFER_A: u32 = 0x17c8; // B + 4, E (size) + 0x10, F (first) + 0x14
+const DRAW_INDEX_BUFFER: u32 = 0x17e0;
+const PIPELINE_SHADER: u32 = 0x2000; // + 64 j; PROGRAM_ADDRESS_A/B at + 0x14/0x18
+/// Draw methods not executed yet: reported, not silently dropped.
+const OTHER_DRAWS: [u32; 9] = [0x26c, 0x274, 0x304, 0x1214, 0x1218, 0x17e4, 0x17e8, 0x17ec, 0x17f0];
 
 /// A channel's state between submits.
 #[derive(Clone, Debug)]
@@ -366,6 +393,16 @@ impl Channel {
         Clear { layer: value >> 10 & 0xffff, color, depth, scissor }
     }
 
+    fn draw(&self, sub: usize, method: u32, count: u32) -> Draw {
+        let reg = |m: u32| self.reg(sub, m);
+        let index = (method == DRAW_INDEX_BUFFER).then(|| (u64::from(reg(INDEX_BUFFER_A) & 0xff) << 32 | u64::from(reg(INDEX_BUFFER_A + 4)), 1u8 << (reg(INDEX_BUFFER_A + 0x10) & 3), reg(INDEX_BUFFER_A + 0x14)));
+        let programs = std::array::from_fn(|j| {
+            let p = PIPELINE_SHADER + 64 * j as u32;
+            (reg(p) & 1 != 0).then(|| u64::from(reg(p + 0x14) & 0xff) << 32 | u64::from(reg(p + 0x18)))
+        });
+        Draw { topology: reg(BEGIN) & 0xffff, index, first: if index.is_some() { 0 } else { reg(VERTEX_ARRAY_START) }, count, programs }
+    }
+
     fn engine_effect(&self, subchannel: usize, method: u32, value: u32) -> Option<Effect> {
         let class = self.classes[subchannel];
         let ignored = Effect::Ignored { class, method, value };
@@ -382,6 +419,8 @@ impl Channel {
                 _ => ignored,
             }),
             (0x97, CLEAR_SURFACE) => Some(Effect::Clear(self.clear(subchannel, value))),
+            (0x97, DRAW_INDEX_BUFFER | DRAW_VERTEX_ARRAY) => Some(Effect::Draw(self.draw(subchannel, method, value))),
+            (0x97, m) if OTHER_DRAWS.contains(&m) => Some(ignored),
             // Copy engine: a copy (ignored), then a semaphore by bits 4:3 (1 one word, 2 four).
             (0xb5, DMA_LAUNCH) => Some(match value >> 3 & 3 {
                 kind @ (1 | 2) => Effect::Release(Release {
@@ -508,6 +547,41 @@ mod tests {
         let surface = Surface { addr: 0x81_0000_2000, width: 1600, height: 900, format: 0xca, layers: 1 };
         let expected = Clear { layer: 0, color: Some((surface, [0x3f00_0000, 0, 0x3f00_0000, 0x3f80_0000], 0xf)), depth: None, scissor: None };
         assert_eq!(c.run(&words), vec![Effect::Clear(expected)]);
+    }
+
+    #[test]
+    fn an_indexed_draw_names_its_programs_and_indices() {
+        let mut c = Channel::default();
+        let vs = PIPELINE_SHADER + 64;
+        let ps = PIPELINE_SHADER + 5 * 64;
+        let words = [
+            header(1, 1, 0, SET_OBJECT),
+            0xc797,
+            header(1, 1, 0, vs),
+            0x11,
+            header(1, 2, 0, vs + 0x14),
+            0x10,
+            0x6ab9_0900,
+            header(1, 1, 0, ps),
+            0x51,
+            header(1, 2, 0, ps + 0x14),
+            0x11,
+            0x5987_6400,
+            header(1, 2, 0, INDEX_BUFFER_A),
+            0x81,
+            0x2000,
+            header(1, 2, 0, INDEX_BUFFER_A + 0x10),
+            1,
+            6,
+            header(4, 4, 0, BEGIN),
+            header(1, 1, 0, DRAW_INDEX_BUFFER),
+            3,
+        ];
+        let mut programs = [None; 6];
+        programs[1] = Some(0x10_6ab9_0900);
+        programs[5] = Some(0x11_5987_6400);
+        let want = Draw { topology: 4, index: Some((0x81_0000_2000, 2, 6)), first: 0, count: 3, programs };
+        assert_eq!(c.run(&words), vec![Effect::Draw(want)]);
     }
 
     #[test]

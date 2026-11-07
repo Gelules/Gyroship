@@ -99,11 +99,14 @@ pub struct Config {
     /// `--dump-frames DIR`: at each present, the render targets the frame
     /// touched go to DIR as PNG files.
     pub frames_dump: Option<std::path::PathBuf>,
+    /// `--dump-shaders DIR`: the code of every program a draw uses, once, as
+    /// `{key}.bin`.
+    pub shaders_dump: Option<std::path::PathBuf>,
 }
 
 impl Default for Config {
     fn default() -> Config {
-        Config { seed: 0x5EED, explore: false, non_system_memory: 0x2_6410_0000, time_limit: None, frames: None, save_dir: None, vsync: true, gpfifo_dump: None, frames_dump: None }
+        Config { seed: 0x5EED, explore: false, non_system_memory: 0x2_6410_0000, time_limit: None, frames: None, save_dir: None, vsync: true, gpfifo_dump: None, frames_dump: None, shaders_dump: None }
     }
 }
 
