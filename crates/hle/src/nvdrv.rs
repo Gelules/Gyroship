@@ -613,12 +613,17 @@ impl Gpu {
                         }
                         // The program runs before its releases signal it done; then its dependent QMD.
                         if let Some(mut s) = k.surfaces.take() {
-                            let result = s.dispatch(&launch, pools,&mut |gpu, buf| k.read_gpu(space, gpu, buf));
+                            let result = s.dispatch(&launch, pools, &mut |gpu, buf| k.read_gpu(space, gpu, buf));
+                            let read = std::mem::take(&mut s.textures_read);
                             k.surfaces = Some(s);
                             if let Err(e) = result
                                 && k.journal.first(&format!("gpu compute {key} {e}"))
                             {
                                 k.log(&format!("gpu: compute dispatch {}: program {key}, grid {:?} block {:?} shared {:#x}: not run: {e}", self.dispatches, launch.grid, launch.block, launch.shared));
+                            }
+                            // Each program's texture sources, once (as draws log theirs).
+                            if !read.is_empty() && k.journal.first(&format!("gpu compute reads {key}")) {
+                                k.log(&format!("gpu: compute program {key} reads textures {read:x?}"));
                             }
                         }
                         for r in releases {

@@ -56,6 +56,7 @@ pub(crate) type Compiled = Result<(Translation, wgpu::ShaderModule), String>;
 impl Surfaces {
     /// Runs a dispatch; an empty grid does nothing.
     pub fn dispatch(&mut self, l: &Launch, pools: Pools, mem: Mem) -> Result<(), String> {
+        self.textures_read.clear();
         if l.grid.contains(&0) || l.program == 0 {
             return Ok(());
         }
@@ -414,6 +415,22 @@ mod tests {
             let want = [pair(d(g, 2 * q), d(g, 2 * q + 1)), pair(d(g + 8, 2 * q), d(g + 8, 2 * q + 1))];
             assert_eq!([words[4 * l], words[4 * l + 1]], want, "lane {l}");
         }
+    }
+
+    #[test]
+    fn an_image_store_outside_the_image_is_dropped() {
+        // Lane l stores 1.0 at (l, 0), then 2.0 at (l, 1), past the single row: row 0
+        // must keep 1.0 (the game's upscaler stores its last tile's extra row this way).
+        let imm = |dst: u128, v: u128| w(0x802, &[(16, dst), (32, v), (72, 0xf)]);
+        let sust = |coord: u128, data: u128| w(0xb9b, &[(24, coord), (32, data), (40, 0x20 / 4), (54, 0), (61, 3), (72, 0xf)]);
+        let mut code = vec![w(0x919, &[(16, 10), (72, 0)]), imm(11, 0), w(0x202, &[(16, 20), (32, 10), (72, 0xf)]), imm(21, 1)];
+        for k in 0..4 {
+            code.push(imm(12 + k, 0x3f80_0000));
+            code.push(imm(16 + k, 0x4000_0000));
+        }
+        code.extend([sust(10, 12), sust(20, 16)]);
+        let Some(words) = run_warp(&code, Vec::new(), 1, 0) else { return };
+        assert!(words.iter().all(|&x| x == 0x3f80_0000), "{words:x?}");
     }
 
     #[test]

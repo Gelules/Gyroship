@@ -197,6 +197,11 @@ pub fn translate_with(code: &[u8], options: &Options) -> Result<Translation, Err
     Ok(Translation { key, stage, wgsl: cx.module(&body, options), interface: cx.iface })
 }
 
+/// Whether integer image coordinates `at` (`coords` of them) fall inside image `slot`.
+fn image_inside(slot: usize, at: &str, coords: usize) -> String {
+    if coords == 1 { format!("(u32({at}) < textureDimensions(img{slot}))") } else { format!("all(vec{coords}<u32>({at}) < textureDimensions(img{slot}))") }
+}
+
 /// A sub-word access's bits and signedness.
 fn small_mem(ty: MemType) -> Option<(u32, bool)> {
     match ty {
@@ -1425,7 +1430,9 @@ impl Cx {
                 let at = self.image_coords(*coord, coords);
                 let v = if self.read_write.contains(&(handle.bank, handle.offset)) {
                     let slot = self.image_slot(*handle, *dim)?;
-                    format!("bitcast<vec4<u32>>(textureLoad(img{slot}, {at}))")
+                    // Outside the image: zeros (WGSL may return any texel there).
+                    let inside = image_inside(slot, &at, coords);
+                    format!("select(vec4<u32>(0u), bitcast<vec4<u32>>(textureLoad(img{slot}, {at})), {inside})")
                 } else {
                     let slot = self.texture_slot(TexHandle::CBuf { bank: handle.bank, offset: handle.offset }, tdim, ty, false, true);
                     self.swizzled(slot, &format!("bitcast<vec4<u32>>(textureLoad(tex{slot}, {at}, 0))"))
@@ -1448,7 +1455,10 @@ impl Cx {
                 };
                 let at = self.image_coords(*coord, coords);
                 let v: Vec<String> = (0..4).map(|k| if *data == RZ { "0.0".to_string() } else { format!("f({})", self.r(data + k)) }).collect();
-                let _ = writeln!(out, "textureStore(img{slot}, {at}, vec4<f32>({}));", v.join(", "));
+                // A store outside the image is dropped, as on the console: WGSL may instead
+                // write any texel (the edge, racing with its own store).
+                let inside = image_inside(slot, &at, coords);
+                let _ = writeln!(out, "if ({inside}) {{ textureStore(img{slot}, {at}, vec4<f32>({})); }}", v.join(", "));
             }
             // LDG through a pointer from a constant bank: the address minus that pointer
             // indexes the buffer bound for it (`Interface::buffers`). Buffers are under 4 GiB:
@@ -1812,7 +1822,14 @@ impl Cx {
                 _ => "0".to_string(),
             };
             if dim == TexDim::D1 || dim == TexDim::D3 || dim == TexDim::D2 || array {
-                format!("textureLoad(tex{slot}, {xy}{arr}, {level})")
+                // Outside the level (or the layers): zeros, as the console's texel fetch
+                // gives (WGSL may return any texel there, which made results vary).
+                let size = format!("textureDimensions(tex{slot}, {level})");
+                let mut inside = if coords == 1 { format!("(u32({xy}) < {size})") } else { format!("all(vec{coords}<u32>({xy}) < {size})") };
+                if array {
+                    inside = format!("({inside} && u32(i32({})) < textureNumLayers(tex{slot}))", get(Item::Array)?);
+                }
+                format!("select(vec4<f32>(0.0), textureLoad(tex{slot}, {xy}{arr}, {level}), {inside})")
             } else {
                 return Err(format!("texel fetch of {dim:?}"));
             }
