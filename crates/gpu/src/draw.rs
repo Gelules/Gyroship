@@ -18,9 +18,8 @@ use crate::shader::{self, Handle, Options, Translation};
 use crate::state::resources::{Pool, SamplerBinding, TexHandle};
 use crate::state::textures::{self, Layout, TextureType};
 use crate::state::vertex::{AttrKind, wgpu_vertex_format};
-use crate::surfaces::{Surfaces, color_format, depth_format};
+use crate::surfaces::{Surfaces, color_format, depth_format, uniform};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use wgpu::util::DeviceExt;
 
 /// Reads guest memory at a GPU address; false if a byte is not readable.
 pub type Mem<'a> = &'a mut dyn FnMut(u64, &mut [u8]) -> bool;
@@ -243,7 +242,7 @@ impl Surfaces {
             if !mem(s.address, &mut data[..bytes as usize]) {
                 return Err("vertex stream not readable".into());
             }
-            vertex_buffers.push(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: &data, usage: wgpu::BufferUsages::VERTEX }));
+            vertex_buffers.push(self.stage(&data));
         }
 
         // Constant buffers and textures, per stage (bind group 0 vertex, 1 pixel).
@@ -322,12 +321,12 @@ impl Surfaces {
         let mut bind_groups = Vec::new();
         for (g, layout) in bind_layouts.iter().enumerate() {
             let Bindings { cbufs, textures, swizzles } = &stages[g];
-            let mut buffers: Vec<(u32, wgpu::Buffer)> = cbufs.iter().map(|(b, data)| (u32::from(*b), self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: data, usage: wgpu::BufferUsages::UNIFORM }))).collect();
+            let mut buffers: Vec<(u32, (wgpu::Buffer, u64, u64))> = cbufs.iter().map(|(b, data)| (u32::from(*b), self.stage(data))).collect();
             if let Some(codes) = swizzles {
                 let bytes: Vec<u8> = codes.iter().flat_map(|c| c.to_le_bytes()).collect();
-                buffers.push((shader::SWIZZLE_BINDING, self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: &bytes, usage: wgpu::BufferUsages::UNIFORM })));
+                buffers.push((shader::SWIZZLE_BINDING, self.stage(&bytes)));
             }
-            let mut entries: Vec<wgpu::BindGroupEntry> = buffers.iter().map(|(b, buffer)| wgpu::BindGroupEntry { binding: *b, resource: buffer.as_entire_binding() }).collect();
+            let mut entries: Vec<wgpu::BindGroupEntry> = buffers.iter().map(|(b, u)| wgpu::BindGroupEntry { binding: *b, resource: uniform(u) }).collect();
             for (slot, Slot { view, sampler, .. }) in textures.iter().enumerate() {
                 entries.push(wgpu::BindGroupEntry { binding: 32 + 2 * slot as u32, resource: wgpu::BindingResource::TextureView(view) });
                 if let Some(sampler) = sampler {
@@ -336,11 +335,7 @@ impl Surfaces {
             }
             bind_groups.push(self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout, entries: &entries }));
         }
-        let index_buffer = indices.as_ref().map(|(bytes, format)| {
-            let mut padded = bytes.clone();
-            padded.resize(bytes.len().next_multiple_of(4), 0);
-            (self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: &padded, usage: wgpu::BufferUsages::INDEX }), *format)
-        });
+        let index_buffer = indices.as_ref().map(|(bytes, format)| (self.stage(bytes), *format));
 
         // The pass.
         let color_views: Vec<Option<wgpu::TextureView>> = colors.iter().map(|c| c.map(|(s, f)| self.texture(&s, f))).collect();
@@ -368,12 +363,12 @@ impl Surfaces {
             for (g, group) in bind_groups.iter().enumerate() {
                 pass.set_bind_group(g as u32, group, &[]);
             }
-            for (slot, buffer) in vertex_buffers.iter().enumerate() {
-                pass.set_vertex_buffer(slot as u32, buffer.slice(..));
+            for (slot, (buffer, at, size)) in vertex_buffers.iter().enumerate() {
+                pass.set_vertex_buffer(slot as u32, buffer.slice(*at..at + size));
             }
             match &index_buffer {
-                Some((buffer, format)) => {
-                    pass.set_index_buffer(buffer.slice(..), *format);
+                Some(((buffer, at, size), format)) => {
+                    pass.set_index_buffer(buffer.slice(*at..at + size), *format);
                     pass.draw_indexed(0..d.count, d.base_vertex, 0..1);
                 }
                 None => pass.draw(d.first..d.first + d.count, 0..1),

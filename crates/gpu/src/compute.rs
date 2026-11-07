@@ -227,13 +227,12 @@ impl Surfaces {
                 (pipeline, layout)
             }
         };
-        let uniform = |device: &wgpu::Device, contents: &[u8]| wgpu::util::DeviceExt::create_buffer_init(device, &wgpu::util::BufferInitDescriptor { label: None, contents, usage: wgpu::BufferUsages::UNIFORM });
-        let mut buffers: Vec<(u32, wgpu::Buffer)> = bindings.cbufs.iter().map(|(b, data)| (u32::from(*b), uniform(&self.device, data))).collect();
+        let mut buffers: Vec<(u32, (wgpu::Buffer, u64, u64))> = bindings.cbufs.iter().map(|(b, data)| (u32::from(*b), self.stage(data))).collect();
         if let Some(codes) = &bindings.swizzles {
             let bytes: Vec<u8> = codes.iter().flat_map(|c| c.to_le_bytes()).collect();
-            buffers.push((shader::SWIZZLE_BINDING, uniform(&self.device, &bytes)));
+            buffers.push((shader::SWIZZLE_BINDING, self.stage(&bytes)));
         }
-        let mut entries: Vec<wgpu::BindGroupEntry> = buffers.iter().map(|(b, buffer)| wgpu::BindGroupEntry { binding: *b, resource: buffer.as_entire_binding() }).collect();
+        let mut entries: Vec<wgpu::BindGroupEntry> = buffers.iter().map(|(b, u)| wgpu::BindGroupEntry { binding: *b, resource: crate::surfaces::uniform(u) }).collect();
         for (slot, s) in bindings.textures.iter().enumerate() {
             entries.push(wgpu::BindGroupEntry { binding: 32 + 2 * slot as u32, resource: wgpu::BindingResource::TextureView(&s.view) });
             if let Some(sampler) = &s.sampler {

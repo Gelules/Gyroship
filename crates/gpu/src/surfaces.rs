@@ -126,6 +126,21 @@ pub struct Surfaces {
     pub errors: Arc<Mutex<Vec<String>>>,
     /// The work recorded since the last [`Surfaces::flush`], in order.
     pending: Option<wgpu::CommandEncoder>,
+    /// This frame's vertex, index and constant data: one buffer, written at flush.
+    arena: (wgpu::Buffer, Vec<u8>),
+}
+
+/// Offsets in the upload arena: the uniform binding alignment wgpu allows at most.
+const ARENA_ALIGN: usize = 256;
+
+/// A uniform binding of a range of the upload arena.
+pub(crate) fn uniform((buffer, at, size): &(wgpu::Buffer, u64, u64)) -> wgpu::BindingResource<'_> {
+    wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer, offset: *at, size: wgpu::BufferSize::new(*size) })
+}
+
+fn arena_buffer(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
+    let usage = wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::INDEX | wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST;
+    device.create_buffer(&wgpu::BufferDescriptor { label: Some("arena"), size, usage, mapped_at_creation: false })
 }
 
 use std::sync::{Arc, Mutex};
@@ -198,7 +213,8 @@ impl Surfaces {
             }],
         });
         let fill = (fill_module, fill_layout, Default::default());
-        Ok(Surfaces { adapter, device, queue, map: BTreeMap::new(), touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pending: None })
+        let arena = (arena_buffer(&device, 16 << 20), Vec::new());
+        Ok(Surfaces { adapter, device, queue, map: BTreeMap::new(), touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pending: None, arena })
     }
 
     /// The encoder that collects a frame's passes: one submit per frame
@@ -215,9 +231,35 @@ impl Surfaces {
     /// readback). Uploads (`write_texture`) only ever go to new textures,
     /// which nothing recorded before can use, so they need no flush.
     pub fn flush(&mut self) {
+        // The arena's writes land before this submit's commands, and after the
+        // previous frame's, which read the same bytes: queue order.
+        if !self.arena.1.is_empty() {
+            self.queue.write_buffer(&self.arena.0, 0, &self.arena.1);
+            self.arena.1.clear();
+        }
         if let Some(e) = self.pending.take() {
             self.queue.submit([e.finish()]);
         }
+    }
+
+    /// Copies `bytes` (padded to 4) into this frame's upload arena; returns
+    /// the buffer and the range they will occupy when the frame is submitted.
+    pub(crate) fn stage(&mut self, bytes: &[u8]) -> (wgpu::Buffer, u64, u64) {
+        let size = bytes.len().next_multiple_of(4).max(4);
+        let at = self.arena.1.len().next_multiple_of(ARENA_ALIGN);
+        if (at + size) as u64 > self.arena.0.size() {
+            // Full: its bytes are written now (it is not reused this frame) and a
+            // buffer twice as large takes over; recorded work keeps the old one alive.
+            self.queue.write_buffer(&self.arena.0, 0, &self.arena.1);
+            let capacity = (self.arena.0.size() * 2).max((size as u64).next_power_of_two());
+            self.arena = (arena_buffer(&self.device, capacity), Vec::new());
+            return self.stage(bytes);
+        }
+        let data = &mut self.arena.1;
+        data.resize(at, 0);
+        data.extend_from_slice(bytes);
+        data.resize(at + size, 0);
+        (self.arena.0.clone(), at as u64, size as u64)
     }
 
     /// Whether this device can render to `format` (and read it back).
@@ -367,8 +409,8 @@ impl Surfaces {
         };
         let mut bytes: Vec<u8> = color.iter().chain(&[depth, 0.0, 0.0, 0.0]).flat_map(|v| v.to_le_bytes()).collect();
         bytes.truncate(32);
-        let buffer = wgpu::util::DeviceExt::create_buffer_init(&self.device, &wgpu::util::BufferInitDescriptor { label: None, contents: &bytes, usage: wgpu::BufferUsages::UNIFORM });
-        let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &self.fill.1, entries: &[wgpu::BindGroupEntry { binding: 0, resource: buffer.as_entire_binding() }] });
+        let u = self.stage(&bytes);
+        let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &self.fill.1, entries: &[wgpu::BindGroupEntry { binding: 0, resource: uniform(&u) }] });
         let view = self.texture(s, format);
         let load = wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store };
         let mut encoder = self.encoder();
