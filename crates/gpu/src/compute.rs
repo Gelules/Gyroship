@@ -310,17 +310,65 @@ mod tests {
         }
     }
 
-    #[test]
-    fn hmma_16816_matches_a_matrix_product_over_ptx_fragments() {
+    /// Runs `code` (closed by EXIT and the self-branch) as one 32-lane warp with
+    /// `shared` bytes of shared memory. c[0][0x80] points at `global` (its size at
+    /// 0x88); c[0][0x20] is the handle of a 32 × `rows` RGBA32F image, read back as
+    /// words, texel after texel. None without a GPU.
+    fn run_warp(code: &[[u8; 16]], global: Vec<u8>, rows: u32, shared: u32) -> Option<Vec<u32>> {
         let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
             eprintln!("no GPU adapter: test skipped");
-            return;
+            return None;
         };
         const PROGRAM: u64 = 0x10_0000;
         const CBUF: u64 = 0x20_0000;
         const GLOBAL: u64 = 0x30_0000;
         const HEADERS: u64 = 0x40_0000;
         const IMAGE: u64 = 0x50_0000;
+        let closing = [w(0x94d, &[(87, 7)]), w(0x947, &[(87, 7), (32, (-16i64 as u64 as u128) & ((1 << 50) - 1))])];
+        let mut program = [code, &closing[..]].concat().concat();
+        program.resize(0x1000, 0); // programs are read in 4 KiB chunks
+        let mut cbuf = vec![0u8; 0x10000];
+        cbuf[0x80..0x88].copy_from_slice(&GLOBAL.to_le_bytes());
+        cbuf[0x88..0x8c].copy_from_slice(&(global.len() as u32).to_le_bytes());
+        // Header 0: a 32 × rows pitch RGBA32F image at IMAGE.
+        let mut header = [0u8; 32];
+        for (hi, lo, v) in [(6, 0, 0x01), (9, 7, 7), (12, 10, 7), (15, 13, 7), (18, 16, 7), (21, 19, 2), (24, 22, 3), (27, 25, 4), (30, 28, 5)] {
+            put(&mut header, hi, lo, v);
+        }
+        for (hi, lo, v) in [(63, 37, (IMAGE >> 5) as u32), (87, 85, 2), (111, 96, 512 >> 5), (144, 128, 31), (154, 151, 1), (175, 160, rows - 1), (191, 191, 1)] {
+            put(&mut header, hi, lo, v);
+        }
+        let regions: Vec<(u64, Vec<u8>)> = vec![(PROGRAM, program), (CBUF, cbuf), (GLOBAL, global), (HEADERS, header.to_vec())];
+        let mut mem = |addr: u64, out: &mut [u8]| {
+            regions.iter().any(|(at, data)| {
+                let Some(start) = addr.checked_sub(*at).map(|o| o as usize) else { return false };
+                let Some(src) = data.get(start..start + out.len()) else { return false };
+                out.copy_from_slice(src);
+                true
+            })
+        };
+        let reg = |m: u32| match m {
+            0x1578 => HEADERS as u32,
+            _ => 0,
+        };
+        let pools = Pools { headers: resources::header_pool(&reg), samplers: resources::sampler_pool(&reg), sampler_binding: resources::sampler_binding(&reg) };
+        let launch = Launch { program: PROGRAM, grid: [1, 1, 1], block: [32, 1, 1], shared, cbufs: vec![(0, CBUF, 0x10000)] };
+        s.dispatch(&launch, pools, &mut mem).unwrap_or_else(|e| panic!("{e}"));
+        let image = &s.cache.images[&IMAGE];
+        let size = u64::from(512 * rows);
+        let buffer = s.device.create_buffer(&wgpu::BufferDescriptor { label: None, size, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+        let mut encoder = s.device.create_command_encoder(&Default::default());
+        let layout = wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(512), rows_per_image: Some(rows) };
+        encoder.copy_texture_to_buffer(image.as_image_copy(), wgpu::TexelCopyBufferInfo { buffer: &buffer, layout }, image.size());
+        s.queue.submit([encoder.finish()]);
+        buffer.slice(..).map_async(wgpu::MapMode::Read, |r| r.expect("readback mapping failed"));
+        s.device.poll(wgpu::PollType::wait_indefinitely()).expect("GPU poll");
+        let bytes = buffer.slice(..).get_mapped_range().expect("mapped").to_vec();
+        Some(bytes.as_chunks::<4>().0.iter().map(|b| u32::from_le_bytes(*b)).collect())
+    }
+
+    #[test]
+    fn hmma_16816_matches_a_matrix_product_over_ptx_fragments() {
         // A 16x16, B 16x8, C 16x8, small integers: every product is exact in halves, and
         // every result is non-zero (its bits go through an f32 store).
         let a = |r: usize, k: usize| ((r + 2 * k) % 5) as f32 - 2.0;
@@ -348,8 +396,8 @@ mod tests {
         }
         // S2R R0 = lane; S2R R1 = tid.y (0); MOV R5 = 32; IMAD R2 = R0 * R5 + c[0][0x80];
         // LDG.128 R4, LDG.64 R8, LDG.64 R10 from [R2.64]; HMMA.16816.F16 R12 = R4, R8, R10;
-        // SUST.D2 [R0, R1] = R12..R15 to the image of c[0][0x20]; EXIT.
-        let code: Vec<u8> = [
+        // SUST.D2 [R0, R1] = R12..R15.
+        let code = [
             w(0x919, &[(16, 0), (72, 0)]),
             w(0x919, &[(16, 1), (72, 0x22)]),
             w(0x802, &[(16, 5), (32, 32), (72, 0xf)]),
@@ -359,53 +407,68 @@ mod tests {
             w(0x381, &[(16, 10), (24, 2), (72, 1), (40, 24), (73, 5), (81, 7)]),
             w(0x23c, &[(16, 12), (24, 4), (32, 8), (64, 10), (75, 1)]),
             w(0xb9b, &[(24, 0), (32, 12), (40, 0x20 / 4), (54, 0), (61, 3), (72, 0xf)]),
-            w(0x94d, &[(87, 7)]),
-            w(0x947, &[(87, 7), (32, (-16i64 as u64 as u128) & ((1 << 50) - 1))]),
-        ]
-        .concat();
-        let mut code = code;
-        code.resize(0x1000, 0); // programs are read in 4 KiB chunks
-        let mut cbuf = vec![0u8; 0x10000];
-        cbuf[0x80..0x88].copy_from_slice(&GLOBAL.to_le_bytes());
-        cbuf[0x88..0x8c].copy_from_slice(&(global.len() as u32).to_le_bytes());
-        // Header 0: a 32x1 pitch RGBA32F image at IMAGE.
-        let mut header = [0u8; 32];
-        for (hi, lo, v) in [(6, 0, 0x01), (9, 7, 7), (12, 10, 7), (15, 13, 7), (18, 16, 7), (21, 19, 2), (24, 22, 3), (27, 25, 4), (30, 28, 5)] {
-            put(&mut header, hi, lo, v);
-        }
-        for (hi, lo, v) in [(63, 37, (IMAGE >> 5) as u32), (87, 85, 2), (111, 96, 512 >> 5), (144, 128, 31), (154, 151, 1), (191, 191, 1)] {
-            put(&mut header, hi, lo, v);
-        }
-        let regions: Vec<(u64, Vec<u8>)> = vec![(PROGRAM, code), (CBUF, cbuf), (GLOBAL, global), (HEADERS, header.to_vec())];
-        let mut mem = |addr: u64, out: &mut [u8]| {
-            regions.iter().any(|(at, data)| {
-                let Some(start) = addr.checked_sub(*at).map(|o| o as usize) else { return false };
-                let Some(src) = data.get(start..start + out.len()) else { return false };
-                out.copy_from_slice(src);
-                true
-            })
-        };
-        let reg = |m: u32| match m {
-            0x1578 => HEADERS as u32,
-            _ => 0,
-        };
-        let pools = Pools { headers: resources::header_pool(&reg), samplers: resources::sampler_pool(&reg), sampler_binding: resources::sampler_binding(&reg) };
-        let launch = Launch { program: PROGRAM, grid: [1, 1, 1], block: [32, 1, 1], shared: 0, cbufs: vec![(0, CBUF, 0x10000)] };
-        s.dispatch(&launch, pools, &mut mem).unwrap_or_else(|e| panic!("{e}"));
-        // Read the image back: texel l holds lane l's two D registers as f32 bits.
-        let image = &s.cache.images[&IMAGE];
-        let buffer = s.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 512, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
-        let mut encoder = s.device.create_command_encoder(&Default::default());
-        encoder.copy_texture_to_buffer(image.as_image_copy(), wgpu::TexelCopyBufferInfo { buffer: &buffer, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(512), rows_per_image: None } }, image.size());
-        s.queue.submit([encoder.finish()]);
-        buffer.slice(..).map_async(wgpu::MapMode::Read, |r| r.expect("readback mapping failed"));
-        s.device.poll(wgpu::PollType::wait_indefinitely()).expect("GPU poll");
-        let bytes = buffer.slice(..).get_mapped_range().expect("mapped").to_vec();
-        let words: Vec<u32> = bytes.as_chunks::<4>().0.iter().map(|b| u32::from_le_bytes(*b)).collect();
+        ];
+        let Some(words) = run_warp(&code, global, 1, 0) else { return };
         for l in 0..32 {
             let (g, q) = (l / 4, l % 4);
             let want = [pair(d(g, 2 * q), d(g, 2 * q + 1)), pair(d(g + 8, 2 * q), d(g + 8, 2 * q + 1))];
             assert_eq!([words[4 * l], words[4 * l + 1]], want, "lane {l}");
+        }
+    }
+
+    #[test]
+    fn ldsm_and_movm_follow_ptx_ldmatrix_and_movmatrix() {
+        // Lane l stores row l of four stacked 8x8 matrices of 16-bit values in shared
+        // memory (16 bytes at l * 16); element (row, col) = 0x4000 + row * 8 + col, which
+        // keeps every packed word a normal f32 through the image store.
+        let elem = |row: usize, col: usize| (0x4000 + row * 8 + col) as u32;
+        let mut global = Vec::new();
+        for l in 0..32 {
+            for j in 0..4 {
+                global.extend((elem(l, 2 * j) | elem(l, 2 * j + 1) << 16).to_le_bytes());
+            }
+        }
+        // S2R R0 = lane; MOV R5 = 16; IMAD R1 = R0 * R5 + RZ (the row address);
+        // IMAD R2 = R0 * R5 + c[0][0x80]; LDG.128 R8 = [R2.64]; STS.128 [R1] = R8;
+        // BAR.SYNC; LDSM.x4 R12 = [R1]; LDSM.x4.MT88 R16 = [R1]; MOVM.MT88 R20 = R12;
+        // texel (lane, 0) = R12..R15, (lane, 1) = R16..R19, (lane, 2) = R20..R23.
+        let mov = |dst: u128, src: u128| w(0x202, &[(16, dst), (32, src), (72, 0xf)]);
+        let imm = |dst: u128, v: u128| w(0x802, &[(16, dst), (32, v), (72, 0xf)]);
+        let sust = |coord: u128, data: u128| w(0xb9b, &[(24, coord), (32, data), (40, 0x20 / 4), (54, 0), (61, 3), (72, 0xf)]);
+        let code = [
+            w(0x919, &[(16, 0), (72, 0)]),
+            imm(5, 16),
+            w(0x224, &[(16, 1), (24, 0), (32, 5), (64, 255), (81, 7), (87, 7)]),
+            w(0x624, &[(16, 2), (24, 0), (64, 5), (38, 0x80), (54, 0), (81, 7), (87, 7)]),
+            w(0x381, &[(16, 8), (24, 2), (72, 1), (40, 0), (73, 6), (81, 7)]),
+            w(0x388, &[(24, 1), (32, 8), (73, 6)]),
+            w(0xb1d, &[]),
+            w(0x83b, &[(16, 12), (24, 1), (72, 2)]),
+            w(0x83b, &[(16, 16), (24, 1), (72, 2), (78, 1)]),
+            w(0x23a, &[(16, 20), (24, 12)]),
+            // Coordinates (x, y) in R24..R29: (lane, 0), (lane, 1), (lane, 2).
+            mov(24, 0),
+            imm(25, 0),
+            mov(26, 0),
+            imm(27, 1),
+            mov(28, 0),
+            imm(29, 2),
+            sust(24, 12),
+            sust(26, 16),
+            sust(28, 20),
+        ];
+        let Some(words) = run_warp(&code, global, 3, 0x200) else { return };
+        let texel = |row: usize, l: usize| [0, 1, 2, 3].map(|k| words[row * 128 + 4 * l + k]);
+        for l in 0..32 {
+            let (g, q) = (l / 4, l % 4);
+            // ldmatrix: register i = row g of matrix i, columns 2q and 2q + 1.
+            let plain = [0, 1, 2, 3].map(|i| elem(8 * i + g, 2 * q) | elem(8 * i + g, 2 * q + 1) << 16);
+            // .trans: column g of matrix i, rows 2q and 2q + 1.
+            let trans = [0, 1, 2, 3].map(|i| elem(8 * i + 2 * q, g) | elem(8 * i + 2 * q + 1, g) << 16);
+            assert_eq!(texel(0, l), plain, "LDSM, lane {l}");
+            assert_eq!(texel(1, l), trans, "LDSM.MT88, lane {l}");
+            // movmatrix.trans of matrix 0 is what the transposed load gives for it.
+            assert_eq!(texel(2, l)[0], trans[0], "MOVM, lane {l}");
         }
     }
 }
