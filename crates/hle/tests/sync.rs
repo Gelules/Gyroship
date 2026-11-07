@@ -205,7 +205,7 @@ unsafe extern "C" fn timed(cpu: *mut Cpu, _: u64) {
             let (w, r) = k.create_event().unwrap();
             k.handles.close(w);
             let event = k.event_of(r).unwrap();
-            k.timers.push(Timer { start, k: 1, num: 1000, den: 1, action: TimerAction::AudioSink { ring: RING, slots: 4, event } });
+            k.timers.push(Timer { start, k: 1, num: 1000, den: 1, action: TimerAction::AudioSink { ring: RING, slots: 4, data: RING + 0x1040, channels: 2, event } });
             r
         });
         store(cpu, RING + 0x1004, 2);

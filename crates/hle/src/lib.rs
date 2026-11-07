@@ -117,11 +117,13 @@ pub struct Config {
     pub hashes: Option<std::path::PathBuf>,
     /// `--record FILE`: the controller's states, in `--replay`'s format.
     pub record: Option<std::path::PathBuf>,
+    /// `--dump-audio FILE`: every frame the game plays, as a float WAV.
+    pub audio_dump: Option<std::path::PathBuf>,
 }
 
 impl Default for Config {
     fn default() -> Config {
-        Config { seed: 0x5EED, explore: false, non_system_memory: 0x2_6410_0000, time_limit: None, frames: None, save_dir: None, vsync: true, gpfifo_dump: None, frames_dump: None, dump_every: 1, dump_draws: None, shaders_dump: None, replay: None, profile: None, perf: None, hashes: None, record: None }
+        Config { seed: 0x5EED, explore: false, non_system_memory: 0x2_6410_0000, time_limit: None, frames: None, save_dir: None, vsync: true, gpfifo_dump: None, frames_dump: None, dump_every: 1, dump_draws: None, shaders_dump: None, replay: None, profile: None, perf: None, hashes: None, record: None, audio_dump: None }
     }
 }
 
@@ -178,7 +180,17 @@ pub struct Kernel {
     pub live_input: Option<LiveInput>,
     /// `--record`: the script lines so far.
     pub recorded: Option<Vec<String>>,
+    /// The host's sound output: each sink tick's frames, and the stream's gain.
+    pub audio_out: Option<AudioOut>,
+    /// `--dump-audio`: every frame played so far.
+    pub audio_samples: Option<Vec<f32>>,
+    /// The stream's gain (SetStreamGain), and its channels and rate.
+    pub audio_gain: f32,
+    pub audio_format: (u16, u32),
 }
+
+/// The host's sound output (`boot::HostWindow::audio`): interleaved f32 frames and the gain.
+pub type AudioOut = Box<dyn FnMut(&[f32], f32) + Send>;
 
 /// A host window's pace hook (`boot::HostWindow::pace`).
 pub type Pace = Box<dyn FnMut(u64) -> Option<(u32, u32)> + Send>;
@@ -198,7 +210,8 @@ impl Kernel {
         let mode = if config.explore { "exploration (not a validation run)" } else { "strict" };
         journal.line(0, 0, &format!("gyroship hle: mode {mode}, seed {:#x}, non-system memory {:#x}", config.seed, config.non_system_memory));
         let recorded = config.record.as_ref().map(|_| Vec::new());
-        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None, sessions: Vec::new(), objects: Vec::new(), domains: Vec::new(), allowed_services: Vec::new(), shared: Vec::new(), transfers: Vec::new(), time_shared: None, frame: (0, 0, 0), symbols: Vec::new(), romfs: None, gs: gs::State::default(), hid_shared: None, input: Default::default(), spin: Vec::new(), saves: Default::default(), timers: Vec::new(), surfaces: None, gpu: Default::default(), counts: Default::default(), anomalies: Default::default(), frame_hashes: Vec::new(), window: None, live_input: None, recorded }
+        let audio_samples = config.audio_dump.as_ref().map(|_| Vec::new());
+        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None, sessions: Vec::new(), objects: Vec::new(), domains: Vec::new(), allowed_services: Vec::new(), shared: Vec::new(), transfers: Vec::new(), time_shared: None, frame: (0, 0, 0), symbols: Vec::new(), romfs: None, gs: gs::State::default(), hid_shared: None, input: Default::default(), spin: Vec::new(), saves: Default::default(), timers: Vec::new(), surfaces: None, gpu: Default::default(), counts: Default::default(), anomalies: Default::default(), frame_hashes: Vec::new(), window: None, live_input: None, recorded, audio_out: None, audio_samples, audio_gain: 1.0, audio_format: (2, 48_000) }
     }
 
     /// Counts one more `name` (normal activity); returns the new count.
@@ -275,6 +288,11 @@ impl Kernel {
         gyroship_runtime::profile::finish(&|a| self.symbolize(a));
         if let Some(path) = &self.config.perf {
             gyroship_runtime::profile::write_perf(path, self.config.profile.as_ref().map_or(600, |p| p.1 as usize));
+        }
+        if let (Some(path), Some(samples)) = (&self.config.audio_dump, &self.audio_samples)
+            && let Err(e) = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::write(path, audio::wav(samples, self.audio_format.0, self.audio_format.1)))
+        {
+            eprintln!("gyroship: --dump-audio {}: {e}", path.display());
         }
         if let (Some(path), Some(lines)) = (&self.config.record, &self.recorded) {
             let end = format!("{} end", self.input.last + 1);

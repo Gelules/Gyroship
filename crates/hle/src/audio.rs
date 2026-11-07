@@ -31,7 +31,7 @@ pub enum Audio {
     MixerSession,
     /// A mixer stream: its ring (client memory) and, once opened, its slots,
     /// rate and data event (`Kernel::events` index).
-    Stream { ring: u64, size: u64, slots: u32, rate: u32, event: Option<usize> },
+    Stream { ring: u64, size: u64, slots: u32, rate: u32, channels: u32, data: u64, event: Option<usize> },
 }
 
 impl Audio {
@@ -143,17 +143,27 @@ impl Audio {
             (Audio::Mixer, 0) => return object(Audio::MixerSession),
             (Audio::MixerSession, 1) => {
                 let (ring, size) = (req.u64_at(0x10)?, req.u64_at(0x18)?);
-                Reply { data: 1u32.to_le_bytes().to_vec(), objects: vec![Service::Audio(Audio::Stream { ring, size, slots: 0, rate: 0, event: None })], ..Reply::ok() }
+                Reply { data: 1u32.to_le_bytes().to_vec(), objects: vec![Service::Audio(Audio::Stream { ring, size, slots: 0, rate: 0, channels: 0, data: 0, event: None })], ..Reply::ok() }
             }
             // OpenStream: frames and rate; the ring has frames + 1 slots.
-            (Audio::Stream { ring, size, slots, rate, .. }, 0) => {
-                (*rate, *slots) = (req.u32_at(8)?, req.u32_at(0xc)? + 1);
-                k.log(&format!("audsmx: stream 1 ring {ring:#x}+{size:#x}, {slots} slots, {rate} Hz"));
+            // Sample type, channels, rate, frames, then options (the SDK's OpenStreamImpl).
+            // Its ring layout (sdk 72402ae020): read header at +0x40, write header at
+            // +0x1000, samples at +0x1040 (0x80 further with option bit 0).
+            (Audio::Stream { ring, size, slots, rate, channels, data, .. }, 0) => {
+                (*rate, *slots, *channels) = (req.u32_at(8)?, req.u32_at(0xc)? + 1, req.u32_at(4)?);
+                let (kind, options) = (req.u32_at(0)?, req.u32_at(0x14).unwrap_or(0));
+                *data = *ring + 0x1040 + if options & 1 != 0 { 0x80 } else { 0 };
+                k.audio_format = (*channels as u16, *rate);
+                let args: String = req.data.iter().take(0x20).map(|b| format!("{b:02x}")).collect();
+                k.log(&format!("audsmx: stream 1 ring {ring:#x}+{size:#x}, {slots} slots, {rate} Hz, {channels} channels, sample type {kind}, options {options:#x}, samples at {data:#x}; arguments {args}"));
+                if kind != 5 {
+                    k.anomaly("audio format", &format!("sample type {kind}: only f32 (5) is played"));
+                }
                 Reply::ok()
             }
             // The stream's data event, which the silent sink signals once per ring's worth
             // of frames (frames × 31.25 MHz / rate ticks; the first one period from now).
-            (Audio::Stream { ring, slots, rate, event, .. }, 7) => {
+            (Audio::Stream { ring, slots, rate, channels, data, event, .. }, 7) => {
                 let (w, r) = k.create_event().ok()?;
                 k.handles.close(w);
                 *event = k.event_of(r);
@@ -161,15 +171,93 @@ impl Audio {
                     && *rate > 0
                     && *slots > 1
                 {
-                    let action = crate::thread::TimerAction::AudioSink { ring: *ring, slots: *slots, event: e };
+                    let action = crate::thread::TimerAction::AudioSink { ring: *ring, slots: *slots, data: *data, channels: *channels, event: e };
                     let (num, den) = (u64::from(*slots - 1) * 31_250_000, u64::from(*rate));
                     k.timers.push(crate::thread::Timer { start: k.now(), k: 1, num, den, action });
                     k.log(&format!("audsmx: silent sink every {} frames at {rate} Hz", *slots - 1));
                 }
                 Reply { copy_handles: vec![r], ..Reply::ok() }
             }
-            (Audio::Stream { .. }, 4) => Reply::ok(),
+            // SetStreamGain: an f32 gain, then a ramp; applied on the host side only.
+            (Audio::Stream { .. }, 4) => {
+                k.audio_gain = req.data.get(0..4).map_or(1.0, |b| f32::from_le_bytes(b.try_into().unwrap()));
+                if k.journal.few("audsmx gain", 4) {
+                    let args: String = req.data.iter().take(0x10).map(|b| format!("{b:02x}")).collect();
+                    k.log(&format!("audsmx: stream gain {}; arguments {args}", k.audio_gain));
+                }
+                Reply::ok()
+            }
             _ => return None,
         })
+    }
+}
+
+/// The frames a sink plays: slots `read` up to `write` (wrapping at
+/// `slots`), `channels` f32 each, from `data`, read through `read_f32s`.
+pub fn ring_frames(read_f32s: &mut dyn FnMut(u64, &mut [f32]) -> bool, data: u64, channels: u32, slots: u32, read: u32, write: u32) -> Vec<f32> {
+    let n = (write + slots - read) % slots;
+    let mut out = vec![0f32; (n * channels) as usize];
+    let stride = u64::from(channels) * 4;
+    // Two runs at most: up to the ring's end, then from its start.
+    let first = n.min(slots - read);
+    let (a, b) = out.split_at_mut((first * channels) as usize);
+    if !read_f32s(data + u64::from(read) * stride, a) || !read_f32s(data, b) {
+        out.fill(0.0);
+    }
+    out
+}
+
+/// A WAV file of interleaved f32 samples (IEEE float, format 3).
+pub fn wav(samples: &[f32], channels: u16, rate: u32) -> Vec<u8> {
+    let bytes = (samples.len() * 4) as u32;
+    let mut w = Vec::with_capacity(44 + bytes as usize);
+    w.extend(b"RIFF");
+    w.extend((36 + bytes).to_le_bytes());
+    w.extend(b"WAVEfmt ");
+    w.extend(16u32.to_le_bytes());
+    w.extend(3u16.to_le_bytes());
+    w.extend(channels.to_le_bytes());
+    w.extend(rate.to_le_bytes());
+    w.extend((rate * u32::from(channels) * 4).to_le_bytes());
+    w.extend((channels * 4).to_le_bytes());
+    w.extend(32u16.to_le_bytes());
+    w.extend(b"data");
+    w.extend(bytes.to_le_bytes());
+    for s in samples {
+        w.extend(s.to_le_bytes());
+    }
+    w
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Stereo frame i holds (i, -i): the frames come out in order, across the
+    /// ring's end (read 2040, write 10, 2049 slots: 19 frames).
+    #[test]
+    fn a_sink_reads_its_frames_in_order_across_the_end() {
+        const DATA: u64 = 0x1000;
+        let ring: Vec<f32> = (0..2049).flat_map(|i| [i as f32, -(i as f32)]).collect();
+        let mut read = |addr: u64, out: &mut [f32]| {
+            let at = ((addr - DATA) / 4) as usize;
+            out.copy_from_slice(&ring[at..at + out.len()]);
+            true
+        };
+        let frames = ring_frames(&mut read, DATA, 2, 2049, 2040, 10);
+        let want: Vec<f32> = (2040..2049).chain(0..10).flat_map(|i| [i as f32, -(i as f32)]).collect();
+        assert_eq!(frames, want);
+        assert!(ring_frames(&mut read, DATA, 2, 2049, 5, 5).is_empty());
+    }
+
+    #[test]
+    fn wav_header_describes_float_stereo() {
+        let w = wav(&[0.5, -0.5], 2, 48_000);
+        assert_eq!(&w[0..4], b"RIFF");
+        assert_eq!(u32::from_le_bytes(w[4..8].try_into().unwrap()), 36 + 8);
+        assert_eq!(u16::from_le_bytes(w[20..22].try_into().unwrap()), 3);
+        assert_eq!(u32::from_le_bytes(w[28..32].try_into().unwrap()), 48_000 * 8);
+        assert_eq!(w.len(), 44 + 8);
+        assert_eq!(f32::from_le_bytes(w[44..48].try_into().unwrap()), 0.5);
     }
 }

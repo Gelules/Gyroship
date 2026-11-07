@@ -180,7 +180,7 @@ pub enum TimerAction {
     /// The silent audio sink of an audsmx stream: the ring's read index
     /// (+0x44) takes the write index (+0x1004) if valid, then the stream's
     /// data event (`Kernel::events` index) is signaled.
-    AudioSink { ring: u64, slots: u32, event: usize },
+    AudioSink { ring: u64, slots: u32, data: u64, channels: u32, event: usize },
     /// hid's controller sample, into shared memory `shared` (D29).
     HidSample { shared: usize },
 }
@@ -479,11 +479,34 @@ impl Kernel {
         let was_ready: Vec<bool> = self.sched.threads.iter().map(|t| t.state == State::Ready).collect();
         let k = self.timers[i].k;
         match self.timers[i].action {
-            TimerAction::AudioSink { ring, slots, event } => {
-                // The silent sink plays everything written: the read index catches up with the write index.
-                let mut w = [0; 4];
-                let write = self.mem.read(ring + 0x1004, &mut w).map(|()| u32::from_le_bytes(w)).unwrap_or(u32::MAX);
+            TimerAction::AudioSink { ring, slots, data, channels, event } => {
+                // The sink plays everything written: frames from the read index to the write
+                // index go to the host (nothing goes back to the guest), then the read index
+                // catches up with the write index.
+                let index = |k: &Self, at: u64| {
+                    let mut w = [0; 4];
+                    k.mem.read(at, &mut w).map(|()| u32::from_le_bytes(w)).unwrap_or(u32::MAX)
+                };
+                let (read, write) = (index(self, ring + 0x44), index(self, ring + 0x1004));
                 if write < slots {
+                    if read < slots && (self.audio_out.is_some() || self.audio_samples.is_some()) {
+                        let mem = &self.mem;
+                        let mut read_f32s = |at: u64, out: &mut [f32]| {
+                            let mut bytes = vec![0u8; out.len() * 4];
+                            let ok = mem.read(at, &mut bytes).is_ok();
+                            for (o, c) in out.iter_mut().zip(bytes.as_chunks::<4>().0) {
+                                *o = f32::from_le_bytes(*c);
+                            }
+                            ok
+                        };
+                        let frames = crate::audio::ring_frames(&mut read_f32s, data, channels, slots, read, write);
+                        if let Some(all) = self.audio_samples.as_mut() {
+                            all.extend_from_slice(&frames);
+                        }
+                        if let Some(out) = self.audio_out.as_mut() {
+                            out(&frames, self.audio_gain);
+                        }
+                    }
                     let _ = self.mem.write(ring + 0x44, &write.to_le_bytes());
                 }
                 self.signal_event(event);

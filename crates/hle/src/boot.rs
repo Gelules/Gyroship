@@ -219,6 +219,8 @@ pub struct HostWindow {
     pub pace: crate::Pace,
     /// The controller's live state (keyboard now, controllers later), read at each hid sample.
     pub input: crate::LiveInput,
+    /// Where the game's sound goes (None: silent).
+    pub audio: Option<crate::AudioOut>,
 }
 
 /// [`main`], showing the frames in a host window when one is given.
@@ -262,6 +264,7 @@ pub fn run(table: Vec<rt::Entry>, window: Option<HostWindow>) {
         perf: value("--perf").map(Into::into),
         hashes: value("--hashes").map(Into::into),
         record: value("--record").map(Into::into),
+        audio_dump: value("--dump-audio").map(Into::into),
         ..Config::default()
     };
     let installed = table.len();
@@ -287,6 +290,7 @@ pub fn run(table: Vec<rt::Entry>, window: Option<HostWindow>) {
             Some(w) => {
                 k.window = Some((w.pace, w.size));
                 k.live_input = Some(w.input);
+                k.audio_out = w.audio;
                 gyroship_gpu::surfaces::Surfaces::windowed(&w.instance, w.surface, w.size)
             }
             None => gyroship_gpu::surfaces::Surfaces::headless(backend),

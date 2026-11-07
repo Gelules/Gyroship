@@ -86,7 +86,7 @@ impl ApplicationHandler for App {
         // The surface comes from this thread: winit gives window handles only here.
         let instance = gyroship_gpu::Renderer::instance_for(backend());
         let surface = instance.create_surface(window.clone()).unwrap_or_else(|e| fail(&format!("cannot draw in the window: {e}")));
-        let host = HostWindow { instance, surface, size: (size.width, size.height), pace: pace(self.shared.clone()), input: input(self.shared.clone()) };
+        let host = HostWindow { instance, surface, size: (size.width, size.height), pace: pace(self.shared.clone()), input: input(self.shared.clone()), audio: None };
         // The guest's own fibers carry its code; this thread only needs room for the HLE.
         std::thread::Builder::new().name("guest".into()).stack_size(64 << 20).spawn(move || gyroship_hle::boot::run(table, Some(host))).unwrap_or_else(|e| fail(&format!("cannot start the guest: {e}")));
         self.window = Some(window);
