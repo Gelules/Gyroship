@@ -15,7 +15,7 @@
 use crate::pushbuf::{Draw, Surface};
 use crate::sass::texture::TexDim;
 use crate::shader::{self, Handle, Options, Translation};
-use crate::state::resources::{SamplerBinding, TexHandle};
+use crate::state::resources::{Pool, SamplerBinding, TexHandle};
 use crate::state::textures::{self, Layout, TextureType};
 use crate::state::vertex::{AttrKind, wgpu_vertex_format};
 use crate::surfaces::{Surfaces, color_format, depth_format};
@@ -65,7 +65,8 @@ pub struct Cache {
     /// Compute program keys by GPU address, compiled compute programs, and the
     /// images compute programs wrote, by GPU address (see `compute.rs`).
     pub(crate) compute_programs: HashMap<u64, Option<u64>>,
-    pub(crate) compute: HashMap<String, Result<(Translation, wgpu::ComputePipeline, wgpu::BindGroupLayout), String>>,
+    pub(crate) compute: HashMap<String, Result<(Translation, wgpu::ShaderModule), String>>,
+    pub(crate) compute_pipelines: HashMap<String, (wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
     pub(crate) images: HashMap<u64, wgpu::Texture>,
     /// Translations by (program key, key of the pixel program it pairs with).
     modules: HashMap<(u64, Option<u64>), Module>,
@@ -76,26 +77,26 @@ pub struct Cache {
 }
 
 /// A stage's bindings.
-struct Bindings {
+pub(crate) struct Bindings {
     /// Constant buffers by bank.
-    cbufs: BTreeMap<u8, Vec<u8>>,
-    textures: Vec<Slot>,
+    pub(crate) cbufs: BTreeMap<u8, Vec<u8>>,
+    pub(crate) textures: Vec<Slot>,
     /// Each slot's header swizzle, when the program reads them.
-    swizzles: Option<Vec<u32>>,
+    pub(crate) swizzles: Option<Vec<u32>>,
 }
 
 /// A texture slot: its view, its sampler unless fetched, and whether it is
 /// a depth target (read as unfilterable floats, with a non-filtering sampler).
-struct Slot {
-    view: wgpu::TextureView,
-    sampler: Option<wgpu::Sampler>,
+pub(crate) struct Slot {
+    pub(crate) view: wgpu::TextureView,
+    pub(crate) sampler: Option<wgpu::Sampler>,
     depth: bool,
     dimension: wgpu::TextureViewDimension,
 }
 
 impl Bindings {
     /// The layout these bindings take in a stage.
-    fn layout(&self, visibility: wgpu::ShaderStages) -> Vec<wgpu::BindGroupLayoutEntry> {
+    pub(crate) fn layout(&self, visibility: wgpu::ShaderStages) -> Vec<wgpu::BindGroupLayoutEntry> {
         let buffer = |binding: u32, size: u64| wgpu::BindGroupLayoutEntry {
             binding,
             visibility,
@@ -416,16 +417,7 @@ impl Surfaces {
 
     /// A stage's constant banks (64 KiB each, as bound) and textures.
     fn stage_bindings(&mut self, d: &Draw, stage: usize, t: &Translation, attached: &[u64], mem: Mem) -> Result<Bindings, String> {
-        let mut handle_banks = BTreeSet::new();
-        for x in &t.interface.textures {
-            match &x.handle {
-                Handle::CBuf { bank, .. } => {
-                    handle_banks.insert(*bank);
-                }
-                Handle::Uniform(e) => e.banks(&mut handle_banks),
-                _ => {}
-            }
-        }
+        let handle_banks = Self::handle_banks(t);
         let mut banks = BTreeMap::new();
         for b in t.interface.cbufs.iter().copied().chain(handle_banks) {
             let (addr, size) = d.cbufs[stage].get(usize::from(b)).copied().flatten().ok_or_else(|| format!("constant bank {b} not bound"))?;
@@ -436,6 +428,30 @@ impl Surfaces {
             }
             banks.insert(b, data);
         }
+        let (textures, swizzles) = self.texture_slots(t, &banks, d.headers, d.samplers, d.sampler_binding, attached, mem)?;
+        let cbufs = banks.into_iter().filter(|(b, _)| t.interface.cbufs.contains(b)).collect();
+        Ok(Bindings { cbufs, textures, swizzles: t.interface.swizzles.then_some(swizzles) })
+    }
+
+    /// The constant banks a program's texture handles live in.
+    pub(crate) fn handle_banks(t: &Translation) -> BTreeSet<u8> {
+        let mut banks = BTreeSet::new();
+        for x in &t.interface.textures {
+            match &x.handle {
+                Handle::CBuf { bank, .. } => {
+                    banks.insert(*bank);
+                }
+                Handle::Uniform(e) => e.banks(&mut banks),
+                _ => {}
+            }
+        }
+        banks
+    }
+
+    /// A program's texture slots (view, sampler) and swizzle codes, from its
+    /// handles in `banks` and the header and sampler pools.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn texture_slots(&mut self, t: &Translation, banks: &BTreeMap<u8, Vec<u8>>, headers: Pool, samplers: Pool, binding: SamplerBinding, attached: &[u64], mem: Mem) -> Result<(Vec<Slot>, Vec<u32>), String> {
         let mut textures = Vec::new();
         let mut swizzles = vec![0u32; t.interface.textures.len().next_multiple_of(4)];
         for (slot, x) in t.interface.textures.iter().enumerate() {
@@ -456,7 +472,7 @@ impl Surfaces {
                 return Err(format!("texture {:?} (compare {})", x.dim, x.compare));
             }
             let mut header = [0u8; 32];
-            if !mem(d.headers.entry(handle.header).ok_or("texture index past the pool")?, &mut header) {
+            if !mem(headers.entry(handle.header).ok_or("texture index past the pool")?, &mut header) {
                 return Err("texture header not readable".into());
             }
             let tic = textures::tic(&header).ok_or("texture header layout")?;
@@ -482,12 +498,12 @@ impl Surfaces {
             let sampler = match x.fetch {
                 true => None,
                 false => {
-                    let index = match d.sampler_binding {
+                    let index = match binding {
                         SamplerBinding::Independently => handle.sampler,
                         SamplerBinding::ViaHeaderBinding => handle.header,
                     };
                     let mut bytes = [0u8; 32];
-                    if !mem(d.samplers.entry(index).ok_or("sampler index past the pool")?, &mut bytes) {
+                    if !mem(samplers.entry(index).ok_or("sampler index past the pool")?, &mut bytes) {
                         return Err("sampler header not readable".into());
                     }
                     Some(self.sampler(bytes, !depth))
@@ -496,8 +512,7 @@ impl Surfaces {
             let dimension = if x.dim == TexDim::D3 { wgpu::TextureViewDimension::D3 } else { wgpu::TextureViewDimension::D2 };
             textures.push(Slot { view, sampler, depth, dimension });
         }
-        let cbufs = banks.into_iter().filter(|(b, _)| t.interface.cbufs.contains(b)).collect();
-        Ok(Bindings { cbufs, textures, swizzles: t.interface.swizzles.then_some(swizzles) })
+        Ok((textures, swizzles))
     }
 
     /// A 2D or 3D texture from guest memory: the level the view starts at, layer 0.

@@ -1,16 +1,17 @@
 //! Compute dispatches on wgpu: a QMD's program, translated to a WGSL compute
-//! shader, runs over its grid with the QMD's constant banks; the images it
-//! writes are host storage textures kept by GPU address, which later draws
-//! sample instead of guest memory.
+//! shader, runs over its grid with the QMD's constant banks and the compute
+//! class's texture pools; the images it writes are host storage textures kept
+//! by GPU address, which later draws sample instead of guest memory.
 //!
 //! ponytail: images written whole (SUST with all four channels), float
-//! storage formats only, no sampled textures or shared memory yet; image
-//! contents stay on the host (never written back to guest memory).
+//! storage formats only, no shared memory yet; image contents stay on the
+//! host (never written back to guest memory).
 
-use crate::draw::Mem;
+use crate::draw::{Bindings, Mem};
+use crate::pushbuf::Pools;
 use crate::shader::{self, Handle, IMAGE_BINDING, Options, Translation};
 use crate::state::qmd::Launch;
-use crate::state::resources::{Pool, TexHandle};
+use crate::state::resources::TexHandle;
 use crate::state::textures::{self, TextureType};
 use crate::surfaces::Surfaces;
 use std::collections::BTreeMap;
@@ -18,7 +19,9 @@ use std::collections::BTreeMap;
 /// The bytes of a constant bank as the translated programs declare it.
 const CBUF_BYTES: usize = 0x10000;
 
-/// The WGSL storage format of a wgpu format a compute program may write.
+/// The WGSL storage format of a wgpu format a compute program may write
+/// (float and normalized ones: SUST stores floats). Beyond WebGPU's own,
+/// they need the adapter's support (TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES).
 fn storage_format(f: wgpu::TextureFormat) -> Option<&'static str> {
     use wgpu::TextureFormat as T;
     Some(match f {
@@ -28,16 +31,25 @@ fn storage_format(f: wgpu::TextureFormat) -> Option<&'static str> {
         T::Rg32Float => "rg32float",
         T::Rgba8Unorm => "rgba8unorm",
         T::Rgba8Snorm => "rgba8snorm",
+        T::R8Unorm => "r8unorm",
+        T::Rg8Unorm => "rg8unorm",
+        T::R16Float => "r16float",
+        T::Rg16Float => "rg16float",
+        T::R16Unorm => "r16unorm",
+        T::Rg16Unorm => "rg16unorm",
+        T::Rgba16Unorm => "rgba16unorm",
+        T::Rgb10a2Unorm => "rgb10a2unorm",
+        T::Rg11b10Ufloat => "rg11b10ufloat",
         _ => return None,
     })
 }
 
-/// A compiled compute program for one block size and set of image formats.
-type Compiled = Result<(Translation, wgpu::ComputePipeline, wgpu::BindGroupLayout), String>;
+/// A translated compute program for one block size and set of image formats.
+pub(crate) type Compiled = Result<(Translation, wgpu::ShaderModule), String>;
 
 impl Surfaces {
     /// Runs a dispatch; an empty grid does nothing.
-    pub fn dispatch(&mut self, l: &Launch, headers: Pool, mem: Mem) -> Result<(), String> {
+    pub fn dispatch(&mut self, l: &Launch, pools: Pools, mem: Mem) -> Result<(), String> {
         if l.grid.contains(&0) || l.program == 0 {
             return Ok(());
         }
@@ -53,8 +65,8 @@ impl Surfaces {
             }
         }
         .ok_or("compute program not readable")?;
-        if l.shared != 0 {
-            return Err("compute program with shared memory".into());
+        if l.shared > self.device.limits().max_compute_workgroup_storage_size {
+            return Err(format!("{:#x} bytes of shared memory", l.shared));
         }
         let mut banks = BTreeMap::new();
         for &(bank, addr, size) in &l.cbufs {
@@ -72,12 +84,12 @@ impl Surfaces {
             Some(u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
         };
         // The images: their headers give the formats the translation needs.
-        let first = self.compute_program(key, l.block, Vec::new())?.0;
+        let first = self.compute_program(key, l, Vec::new())?.0;
         let mut images = Vec::new();
         for img in &first.interface.images {
             let handle = TexHandle::new(word(&banks, &img.handle).ok_or_else(|| format!("image handle {:?}", img.handle))?);
             let mut header = [0u8; 32];
-            if !mem(headers.entry(handle.header).ok_or("image index past the pool")?, &mut header) {
+            if !mem(pools.headers.entry(handle.header).ok_or("image index past the pool")?, &mut header) {
                 return Err("image header not readable".into());
             }
             let tic = textures::tic(&header).ok_or("image header layout")?;
@@ -85,7 +97,10 @@ impl Surfaces {
             let name = storage_format(format).ok_or_else(|| format!("image format {format:?} as storage"))?;
             images.push((tic, format, name.to_string()));
         }
-        let (t, pipeline, layout) = self.compute_program(key, l.block, images.iter().map(|i| i.2.clone()).collect())?;
+        let (t, module) = self.compute_program(key, l, images.iter().map(|i| i.2.clone()).collect())?;
+        if let Some(b) = t.interface.cbufs.iter().chain(&Self::handle_banks(&t)).find(|b| !banks.contains_key(b)) {
+            return Err(format!("compute constant bank {b} not bound"));
+        }
 
         // Host storage textures, by address.
         let mut views = Vec::new();
@@ -108,15 +123,56 @@ impl Surfaces {
             }
             views.push(self.cache.images[&tic.address].create_view(&Default::default()));
         }
-        let buffers: Vec<(u32, wgpu::Buffer)> = banks
-            .iter()
-            .filter(|(b, _)| t.interface.cbufs.contains(b))
-            .map(|(b, data)| (u32::from(*b), wgpu::util::DeviceExt::create_buffer_init(&self.device, &wgpu::util::BufferInitDescriptor { label: None, contents: data, usage: wgpu::BufferUsages::UNIFORM })))
-            .collect();
-        if let Some(b) = t.interface.cbufs.iter().find(|b| !banks.contains_key(b)) {
-            return Err(format!("compute constant bank {b} not bound"));
+
+        // Bindings: constant banks, textures and swizzles as for draws, then the images.
+        let (textures, swizzles) = self.texture_slots(&t, &banks, pools.headers, pools.samplers, pools.sampler_binding, &[], mem)?;
+        let cbufs: BTreeMap<u8, Vec<u8>> = banks.into_iter().filter(|(b, _)| t.interface.cbufs.contains(b)).collect();
+        let bindings = Bindings { cbufs, textures, swizzles: t.interface.swizzles.then_some(swizzles) };
+        let mut layout_entries = bindings.layout(wgpu::ShaderStages::COMPUTE);
+        for (i, (img, (_, format, _))) in t.interface.images.iter().zip(&images).enumerate() {
+            let view_dimension = match img.dim {
+                crate::sass::memory::ImageDim::D3 => wgpu::TextureViewDimension::D3,
+                crate::sass::memory::ImageDim::D1 => wgpu::TextureViewDimension::D1,
+                _ => wgpu::TextureViewDimension::D2,
+            };
+            layout_entries.push(wgpu::BindGroupLayoutEntry {
+                binding: IMAGE_BINDING + i as u32,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::StorageTexture { access: wgpu::StorageTextureAccess::WriteOnly, format: *format, view_dimension },
+                count: None,
+            });
+        }
+        let id = format!("{key:x}/{:?}/{:#x}/{layout_entries:?}", l.block, l.shared);
+        let (pipeline, layout) = match self.cache.compute_pipelines.get(&id) {
+            Some(p) => p.clone(),
+            None => {
+                let layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &layout_entries });
+                let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&layout)], ..Default::default() });
+                let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(&format!("{key:016x}")),
+                    layout: Some(&pipeline_layout),
+                    module: &module,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                });
+                self.cache.compute_pipelines.insert(id, (pipeline.clone(), layout.clone()));
+                (pipeline, layout)
+            }
+        };
+        let uniform = |device: &wgpu::Device, contents: &[u8]| wgpu::util::DeviceExt::create_buffer_init(device, &wgpu::util::BufferInitDescriptor { label: None, contents, usage: wgpu::BufferUsages::UNIFORM });
+        let mut buffers: Vec<(u32, wgpu::Buffer)> = bindings.cbufs.iter().map(|(b, data)| (u32::from(*b), uniform(&self.device, data))).collect();
+        if let Some(codes) = &bindings.swizzles {
+            let bytes: Vec<u8> = codes.iter().flat_map(|c| c.to_le_bytes()).collect();
+            buffers.push((shader::SWIZZLE_BINDING, uniform(&self.device, &bytes)));
         }
         let mut entries: Vec<wgpu::BindGroupEntry> = buffers.iter().map(|(b, buffer)| wgpu::BindGroupEntry { binding: *b, resource: buffer.as_entire_binding() }).collect();
+        for (slot, s) in bindings.textures.iter().enumerate() {
+            entries.push(wgpu::BindGroupEntry { binding: 32 + 2 * slot as u32, resource: wgpu::BindingResource::TextureView(&s.view) });
+            if let Some(sampler) = &s.sampler {
+                entries.push(wgpu::BindGroupEntry { binding: 33 + 2 * slot as u32, resource: wgpu::BindingResource::Sampler(sampler) });
+            }
+        }
         for (i, view) in views.iter().enumerate() {
             entries.push(wgpu::BindGroupEntry { binding: IMAGE_BINDING + i as u32, resource: wgpu::BindingResource::TextureView(view) });
         }
@@ -132,62 +188,21 @@ impl Surfaces {
         Ok(())
     }
 
-    /// The translation, pipeline and bind group layout of a compute program
-    /// for a block size and image formats.
-    fn compute_program(&mut self, key: u64, block: [u32; 3], images: Vec<String>) -> Compiled {
-        let id = format!("{key:x}/{block:?}/{images:?}");
+    /// The translation and module of a compute program for a launch's block
+    /// and shared memory sizes, and image formats.
+    fn compute_program(&mut self, key: u64, l: &Launch, images: Vec<String>) -> Compiled {
+        let id = format!("{key:x}/{:?}/{:#x}/{images:?}", l.block, l.shared);
         if let Some(c) = self.cache.compute.get(&id) {
             return c.clone();
         }
-        let options = Options { workgroup: block, images: images.clone(), ..Default::default() };
+        let options = Options { workgroup: l.block, shared: l.shared, images, ..Default::default() };
         let made = shader::translate_with(&self.cache.code[&key], &options).map_err(|e| format!("compute program {key:016x}: {e}")).and_then(|t| {
             if let Err(e) = shader::validate(&t.wgsl) {
                 self.error(format!("compute program {key:016x}: {e}"));
                 return Err(format!("compute program {key:016x}: invalid WGSL"));
             }
-            if !t.interface.textures.is_empty() {
-                return Err("compute program sampling textures".into());
-            }
             let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(&format!("{key:016x}")), source: wgpu::ShaderSource::Wgsl(t.wgsl.as_str().into()) });
-            let visibility = wgpu::ShaderStages::COMPUTE;
-            let mut entries: Vec<wgpu::BindGroupLayoutEntry> = t
-                .interface
-                .cbufs
-                .iter()
-                .map(|b| wgpu::BindGroupLayoutEntry {
-                    binding: u32::from(*b),
-                    visibility,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: wgpu::BufferSize::new(CBUF_BYTES as u64) },
-                    count: None,
-                })
-                .collect();
-            for (i, img) in t.interface.images.iter().enumerate() {
-                let format = match images.get(i).map(String::as_str) {
-                    Some("rgba32float") => wgpu::TextureFormat::Rgba32Float,
-                    Some("r32float") => wgpu::TextureFormat::R32Float,
-                    Some("rg32float") => wgpu::TextureFormat::Rg32Float,
-                    Some("rgba8unorm") => wgpu::TextureFormat::Rgba8Unorm,
-                    Some("rgba8snorm") => wgpu::TextureFormat::Rgba8Snorm,
-                    _ => wgpu::TextureFormat::Rgba16Float,
-                };
-                let view_dimension = match img.dim {
-                    crate::sass::memory::ImageDim::D3 => wgpu::TextureViewDimension::D3,
-                    crate::sass::memory::ImageDim::D1 => wgpu::TextureViewDimension::D1,
-                    _ => wgpu::TextureViewDimension::D2,
-                };
-                entries.push(wgpu::BindGroupLayoutEntry { binding: IMAGE_BINDING + i as u32, visibility, ty: wgpu::BindingType::StorageTexture { access: wgpu::StorageTextureAccess::WriteOnly, format, view_dimension }, count: None });
-            }
-            let layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &entries });
-            let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&layout)], ..Default::default() });
-            let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some(&format!("{key:016x}")),
-                layout: Some(&pipeline_layout),
-                module: &module,
-                entry_point: Some("main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-            Ok((t, pipeline, layout))
+            Ok((t, module))
         });
         self.cache.compute.insert(id, made.clone());
         made

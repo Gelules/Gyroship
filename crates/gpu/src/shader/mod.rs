@@ -27,11 +27,11 @@
 pub mod sph;
 pub mod uexpr;
 
-use crate::sass::control::ControlOp;
+use crate::sass::control::{BarMode, ControlOp};
 use crate::sass::fp16::Fp16Op;
 use crate::sass::fp32::{self, Fp32Op, MufuFn, Rnd};
 use crate::sass::int::{self, IntOp};
-use crate::sass::memory::{ImageDim, InterpFreq, InterpLoc, LdcMode, MemType, MemoryOp};
+use crate::sass::memory::{Addr, AtomOp, AtomType, ImageDim, InterpFreq, InterpLoc, LdcMode, MemType, MemoryOp, Stride};
 use crate::sass::moves::{self, MovesOp};
 use crate::sass::operand::{Operand, PT, Pred, RZ, Src, URZ};
 use crate::sass::texture::{LodMode, TexDim, TexHandle, TexQuery, TextureOp};
@@ -132,6 +132,8 @@ pub struct Options {
     pub varyings: BTreeMap<u8, Interp>,
     /// Compute: the block size (the QMD's CTA_THREAD_DIMENSION).
     pub workgroup: [u32; 3],
+    /// Compute: the shared memory bytes (the QMD's SHARED_MEMORY_SIZE).
+    pub shared: u32,
     /// Compute: the WGSL storage format of each image slot (from its texture
     /// header); a missing one is `rgba16float`.
     pub images: Vec<String>,
@@ -169,6 +171,27 @@ pub fn translate_with(code: &[u8], options: &Options) -> Result<Translation, Err
     Ok(Translation { key, stage, wgsl: cx.module(&body, options), interface: cx.iface })
 }
 
+/// A sub-word access's bits and signedness.
+fn small_mem(ty: MemType) -> Option<(u32, bool)> {
+    match ty {
+        MemType::U8 => Some((8, false)),
+        MemType::S8 => Some((8, true)),
+        MemType::U16 => Some((16, false)),
+        MemType::S16 => Some((16, true)),
+        _ => None,
+    }
+}
+
+/// The 32-bit words of a word-sized or wider access.
+fn mem_words(ty: MemType) -> Result<u32, String> {
+    match ty {
+        MemType::B32 => Ok(1),
+        MemType::B64 => Ok(2),
+        MemType::B128 => Ok(4),
+        other => Err(format!("a {other:?} access")),
+    }
+}
+
 fn interp_attribute(mode: Interp) -> &'static str {
     match mode {
         Interp::Constant => "flat",
@@ -204,11 +227,50 @@ struct Cx {
     uexpr: BTreeMap<u8, UExpr>,
     /// Compute: the storage format of each image slot (`Options::images`).
     images: Vec<String>,
+    /// Compute: the program uses shared memory (`shm`, words as atomics so
+    /// that ATOMS and plain accesses can share it).
+    shm: bool,
 }
+
+/// Shared memory read-modify-writes WGSL has no atomic for, by `op`: signed
+/// min (0) and max (1), wrapping increment (2) and decrement (3).
+const SHM_CAS: &str = "fn shm_cas(i: u32, op: u32, v: u32) -> u32 {
+    var old: u32;
+    loop {
+        old = atomicLoad(&shm[i]);
+        var next = old;
+        switch op {
+            case 0u: { next = bitcast<u32>(min(bitcast<i32>(old), bitcast<i32>(v))); }
+            case 1u: { next = bitcast<u32>(max(bitcast<i32>(old), bitcast<i32>(v))); }
+            case 2u: { next = select(old + 1u, 0u, old >= v); }
+            default: { next = select(old - 1u, v, old == 0u || old > v); }
+        }
+        if atomicCompareExchangeWeak(&shm[i], old, next).exchanged { break; }
+    }
+    return old;
+}
+";
 
 impl Cx {
     fn new(sph: Sph) -> Cx {
-        Cx { sph, regs: BTreeSet::new(), preds: BTreeSet::new(), uregs: BTreeSet::new(), upreds: BTreeSet::new(), iface: Interface::default(), decls: String::new(), helpers: BTreeSet::new(), temps: 0, uexpr: BTreeMap::new(), images: Vec::new() }
+        Cx { sph, regs: BTreeSet::new(), preds: BTreeSet::new(), uregs: BTreeSet::new(), upreds: BTreeSet::new(), iface: Interface::default(), decls: String::new(), helpers: BTreeSet::new(), temps: 0, uexpr: BTreeMap::new(), images: Vec::new(), shm: false }
+    }
+
+    /// A shared memory access's byte address, `reg × stride + ureg + offset`, as a new `let`.
+    fn shared_addr(&mut self, out: &mut String, a: &Addr, stride: Stride) -> R<String> {
+        let scale = match stride {
+            Stride::X1 => 1,
+            Stride::X4 => 4,
+            Stride::X8 => 8,
+            Stride::X16 => 16,
+            Stride::Other(s) => return Err(format!("shared memory stride {s}")),
+        };
+        self.shm = true;
+        let reg = self.r(a.reg);
+        let ureg = a.ureg.map_or_else(|| "0u".to_string(), |u| self.ur(u));
+        let t = self.temp();
+        let _ = writeln!(out, "let {t} = {reg} * {scale}u + {ureg} + {:#x}u;", a.offset as u32);
+        Ok(t)
     }
 
     fn group(&self) -> u32 {
@@ -369,10 +431,12 @@ impl Cx {
     fn program(&mut self, words: &[Word], ops: &[Op]) -> Result<String, Error> {
         let at = |i: usize| move |what: String| Error { at: Some(16 * i), what };
         let target = |i: usize, offset: i64| -> Option<usize> { usize::try_from((16 * (i as i64 + 1) + offset) / 16).ok() };
-        let mut leaders = BTreeSet::from([0usize]);
+        // An indirect jump (RET, BRX) may land on any instruction: each starts a block then.
+        let indirect = ops.iter().any(|o| matches!(o, Op::Control(ControlOp::Ret { .. } | ControlOp::Brx { .. })));
+        let mut leaders: BTreeSet<usize> = if indirect { (0..ops.len()).collect() } else { BTreeSet::from([0usize]) };
         for (i, op) in ops.iter().enumerate() {
             match op {
-                Op::Control(ControlOp::Bra { offset, .. }) if *offset != -16 => {
+                Op::Control(ControlOp::Bra { offset, .. } | ControlOp::Call { offset, .. }) if *offset != -16 => {
                     leaders.insert(target(i, *offset).filter(|t| *t < ops.len()).ok_or_else(|| at(i)("branch outside the program".into()))?);
                     leaders.insert(i + 1);
                 }
@@ -381,7 +445,9 @@ impl Cx {
                 Op::Control(ControlOp::Exit { cond, .. }) if !(words[i].always() && *cond == Pred::TRUE) => {
                     leaders.insert(i + 1);
                 }
-                Op::Control(c @ (ControlOp::Call { .. } | ControlOp::Ret { .. } | ControlOp::Brx { .. })) => return Err(at(i)(format!("unsupported control flow: {c:?}"))),
+                Op::Control(ControlOp::Ret { .. } | ControlOp::Brx { .. }) => {
+                    leaders.insert(i + 1);
+                }
                 _ => {}
             }
         }
@@ -435,7 +501,28 @@ impl Cx {
                 out.push_str(&exit);
                 return Ok(true);
             }
-            Op::Control(ControlOp::Bra { offset, cond, .. }) => {
+            // RET and BRX: to next + offset + the register (an absolute byte offset when
+            // offset = -next, as the game does), as an instruction index.
+            Op::Control(ControlOp::Ret { target: r, offset, cond, .. } | ControlOp::Brx { target: r, offset, cond }) => {
+                if target.is_none() {
+                    return Err("indirect jump in straight-line code".into());
+                }
+                let base = (16 * (i as i64 + 1) + offset) as u32;
+                let reg = self.r(*r);
+                let e = format!("(({reg} + {base}u) >> 4u)");
+                match both(self, *cond) {
+                    None => {
+                        let _ = writeln!(out, "pc = {e};");
+                    }
+                    Some(c) => {
+                        let _ = writeln!(out, "if ({c}) {{ pc = {e}; }} else {{ pc = {}u; }}", i + 1);
+                    }
+                }
+                return Ok(true);
+            }
+            // CALL.NOINC: the compiler keeps the return offset in a register for RET,
+            // so the call itself is a jump.
+            Op::Control(ControlOp::Bra { offset, cond, .. } | ControlOp::Call { offset, cond, .. }) => {
                 let t = target.and_then(|f| f(i, *offset)).ok_or("branch in straight-line code")?;
                 match both(self, *cond) {
                     None => {
@@ -540,6 +627,9 @@ impl Cx {
             let _ = writeln!(locals, "var up{p}: bool;");
         }
         if self.sph.stage == Stage::Compute {
+            if self.shm {
+                let _ = writeln!(m, "var<workgroup> shm: array<atomic<u32>, {}>;", options.shared.div_ceil(4).max(1));
+            }
             let [x, y, z] = options.workgroup.map(|n| n.max(1));
             let _ = write!(m, "\n@compute @workgroup_size({x}, {y}, {z})\nfn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {{\n{locals}{body}}}\n");
         } else if self.sph.stage == Stage::Vertex {
@@ -620,6 +710,11 @@ impl Cx {
                 }
                 // Warp convergence, scoreboards and NOPs: nothing per thread.
                 ControlOp::Bssy { .. } | ControlOp::Bsync { .. } | ControlOp::Break { .. } | ControlOp::WarpSync { .. } | ControlOp::DepBar { .. } | ControlOp::Nop => Ok(()),
+                // BAR.SYNC 0: the whole block waits, and sees the shared memory written before.
+                ControlOp::Bar { mode: BarMode::Sync, red_op: 0 } if self.sph.stage == Stage::Compute => {
+                    out.push_str("workgroupBarrier();\n");
+                    Ok(())
+                }
                 other => Err(format!("unsupported: {other:?}")),
             },
             other => Err(format!("unsupported: {other:?}")),
@@ -906,7 +1001,7 @@ impl Cx {
             MovesOp::Cs2r { dst, sr: 0xff, wide } => {
                 self.set(out, *dst, "0u");
                 if *wide {
-                    self.set(out, dst + 1, "0u");
+                    self.set(out, dst.saturating_add(1), "0u");
                 }
             }
             MovesOp::Plop3 { dst, src, src2_uniform, lut } => {
@@ -1029,13 +1124,13 @@ impl Cx {
                         0x2fc => "i.vid".to_string(),
                         _ => return Err(format!("ALD of attribute {a:#x}")),
                     };
-                    self.set(out, dst + k as u8, &e);
+                    self.set(out, dst.saturating_add(k as u8), &e);
                 }
             }
             MemoryOp::Ast { data, offset: RZ, vtx: RZ, attr, comps, patch: false, phys: false } if self.sph.stage == Stage::Vertex => {
                 for k in 0..u16::from(*comps) {
                     let a = attr + 4 * k;
-                    let v = self.r(data + k as u8);
+                    let v = if *data == RZ { "0u".to_string() } else { self.r(data + k as u8) };
                     match a {
                         0x70..=0x7c => {
                             let _ = writeln!(out, "o.pos[{}] = f({v});", (a - 0x70) / 4);
@@ -1056,6 +1151,29 @@ impl Cx {
                     }
                 }
             }
+            // SULD: a typed image load, as a texel fetch of the image's texture; the enabled
+            // channels go to consecutive registers, and no access faults.
+            MemoryOp::Suld { dst, coord, handle, dim, mask, pred_dst, .. } => {
+                let (coords, tdim, ty) = match dim {
+                    ImageDim::D1 => (1, TexDim::D1, "texture_1d<f32>"),
+                    ImageDim::D2 => (2, TexDim::D2, "texture_2d<f32>"),
+                    ImageDim::D3 => (3, TexDim::D3, "texture_3d<f32>"),
+                    d => return Err(format!("SULD from a {d:?} image")),
+                };
+                let slot = self.texture_slot(TexHandle::CBuf { bank: handle.bank, offset: handle.offset }, tdim, ty, false, true);
+                let reg = |cx: &mut Cx, base: u8, k: u8| if base == RZ { "0u".to_string() } else { cx.r(base + k) };
+                let cs: Vec<String> = (0..coords).map(|k| format!("i32({})", reg(self, *coord, k))).collect();
+                let at = if coords == 1 { cs[0].clone() } else { format!("vec{coords}<i32>({})", cs.join(", ")) };
+                let v = self.swizzled(slot, &format!("bitcast<vec4<u32>>(textureLoad(tex{slot}, {at}, 0))"));
+                let t = self.temp();
+                let _ = writeln!(out, "let {t} = {v};");
+                for (k, c) in (0..4u8).filter(|c| mask >> c & 1 != 0).enumerate() {
+                    if *dst != RZ {
+                        self.set(out, dst.saturating_add(k as u8), &format!("{t}[{c}]"));
+                    }
+                }
+                self.set_p(out, *pred_dst, "false");
+            }
             MemoryOp::Sust { coord, data, handle, dim, mask: 0xf, .. } if self.sph.stage == Stage::Compute => {
                 let (coords, ty) = match dim {
                     ImageDim::D1 => (1, "texture_storage_1d"),
@@ -1074,15 +1192,75 @@ impl Cx {
                 let v: Vec<String> = (0..4).map(|k| format!("f({})", reg(self, *data, k))).collect();
                 let _ = writeln!(out, "textureStore(img{slot}, {at}, vec4<f32>({}));", v.join(", "));
             }
-            MemoryOp::Ldc { dst, index, bank, offset, mode: LdcMode::Indexed, ty } => {
-                let small = match ty {
-                    MemType::U8 => Some((8, false)),
-                    MemType::S8 => Some((8, true)),
-                    MemType::U16 => Some((16, false)),
-                    MemType::S16 => Some((16, true)),
-                    _ => None,
+            // Shared memory: words of `shm`; a byte or half-word is a part of its word.
+            MemoryOp::Lds { dst, addr, ty, stride } if self.sph.stage == Stage::Compute => {
+                let t = self.shared_addr(out, addr, *stride)?;
+                let word = |k: u32| format!("atomicLoad(&shm[({t} >> 2u) + {k}u])");
+                match small_mem(*ty) {
+                    Some((bits, signed)) => {
+                        let e = if signed { format!("bitcast<u32>(extractBits(bitcast<i32>({}), ({t} & 3u) * 8u, {bits}u))", word(0)) } else { format!("extractBits({}, ({t} & 3u) * 8u, {bits}u)", word(0)) };
+                        self.set(out, *dst, &e);
+                    }
+                    None => {
+                        let n = mem_words(*ty)?;
+                        let v = self.temp();
+                        let loads: Vec<String> = (0..n).map(word).collect();
+                        let _ = writeln!(out, "let {v} = array<u32, {n}>({});", loads.join(", "));
+                        for k in 0..n {
+                            if *dst != RZ {
+                                self.set(out, dst.saturating_add(k as u8), &format!("{v}[{k}]"));
+                            }
+                        }
+                    }
+                }
+            }
+            MemoryOp::Sts { data, addr, ty, stride } if self.sph.stage == Stage::Compute => {
+                let t = self.shared_addr(out, addr, *stride)?;
+                match small_mem(*ty) {
+                    Some((bits, _)) => {
+                        let d = self.r(*data);
+                        let _ = writeln!(out, "atomicAnd(&shm[{t} >> 2u], ~({:#x}u << (({t} & 3u) * 8u)));", (1u32 << bits) - 1);
+                        let _ = writeln!(out, "atomicOr(&shm[{t} >> 2u], ({d} & {:#x}u) << (({t} & 3u) * 8u));", (1u32 << bits) - 1);
+                    }
+                    None => {
+                        for k in 0..mem_words(*ty)? {
+                            let d = if *data == RZ { "0u".to_string() } else { self.r(data + k as u8) };
+                            let _ = writeln!(out, "atomicStore(&shm[({t} >> 2u) + {k}u], {d});");
+                        }
+                    }
+                }
+            }
+            MemoryOp::Atoms { dst, data, addr, op, ty: ty @ (AtomType::U32 | AtomType::S32), stride } if self.sph.stage == Stage::Compute => {
+                let t = self.shared_addr(out, addr, *stride)?;
+                let d = self.r(*data);
+                let at = format!("&shm[{t} >> 2u]");
+                let signed = *ty == AtomType::S32;
+                let e = match op {
+                    AtomOp::Add => format!("atomicAdd({at}, {d})"),
+                    AtomOp::And => format!("atomicAnd({at}, {d})"),
+                    AtomOp::Or => format!("atomicOr({at}, {d})"),
+                    AtomOp::Xor => format!("atomicXor({at}, {d})"),
+                    AtomOp::Exch => format!("atomicExchange({at}, {d})"),
+                    AtomOp::Min if !signed => format!("atomicMin({at}, {d})"),
+                    AtomOp::Max if !signed => format!("atomicMax({at}, {d})"),
+                    AtomOp::Min | AtomOp::Max | AtomOp::Inc | AtomOp::Dec => {
+                        self.helpers.insert(SHM_CAS);
+                        let code = match op {
+                            AtomOp::Min => 0,
+                            AtomOp::Max => 1,
+                            AtomOp::Inc => 2,
+                            _ => 3,
+                        };
+                        format!("shm_cas({t} >> 2u, {code}u, {d})")
+                    }
+                    AtomOp::Other(o) => return Err(format!("ATOMS operation {o}")),
                 };
-                if let (Some((bits, signed)), RZ) = (small, *index) {
+                let v = self.temp();
+                let _ = writeln!(out, "let {v} = {e};");
+                self.set(out, *dst, &v);
+            }
+            MemoryOp::Ldc { dst, index, bank, offset, mode: LdcMode::Indexed, ty } => {
+                if let (Some((bits, signed)), RZ) = (small_mem(*ty), *index) {
                     let e = self.cb_small(*bank, u32::from(*offset), bits, signed)?;
                     self.set(out, *dst, &e);
                     return Ok(());
@@ -1095,7 +1273,7 @@ impl Cx {
                 if *index == RZ {
                     for k in 0..words {
                         let e = self.cb(*bank, u32::from(*offset) + 4 * k)?;
-                        self.set(out, dst + k as u8, &e);
+                        self.set(out, dst.saturating_add(k as u8), &e);
                     }
                 } else {
                     let ix = self.r(*index);
@@ -1103,7 +1281,7 @@ impl Cx {
                     for k in 0..words {
                         let t = self.temp();
                         let _ = writeln!(out, "let {t} = ({ix} + {}u) & 0xffffu;", u32::from(*offset) + 4 * k);
-                        self.set(out, dst + k as u8, &format!("cb{bank}[{t} >> 4u][({t} >> 2u) & 3u]"));
+                        self.set(out, dst.saturating_add(k as u8), &format!("cb{bank}[{t} >> 4u][({t} >> 2u) & 3u]"));
                     }
                 }
             }
@@ -1581,6 +1759,27 @@ mod tests {
         assert_eq!(t.stage, Stage::Compute);
         assert_eq!(t.interface.images, vec![Image { handle: Handle::CBuf { bank: 0, offset: 0x20 }, dim: ImageDim::D3 }]);
         for want in ["@workgroup_size(8, 8, 1)", "r0 = lid.x;", "r2 = wid.z;", "texture_storage_3d<rgba16float, write>", "textureStore(img0, vec3<i32>(i32(r0), i32(r1), i32(r2))"] {
+            assert!(t.wgsl.contains(want), "{want}\n{}", t.wgsl);
+        }
+    }
+
+    #[test]
+    fn shared_memory_stores_loads_atomics_and_barriers() {
+        // S2R R0 = tid.x; STS [R0 x4] = R0; BAR.SYNC; ATOMS.ADD R1 = [0x40], R0;
+        // ATOMS.MAX.S32 R2 = [0x44], R0; LDS.U8 R3 = [R0 + 1]; EXIT.
+        let s2r = w(0x919, &[(16, 0), (72, 0x21)]);
+        let sts = w(0x388, &[(24, 0), (32, 0), (73, 4), (78, 1)]);
+        let bar = w(0xb1d, &[]);
+        let add = w(0x38c, &[(16, 1), (24, 255), (32, 0), (40, 0x40)]);
+        let max = w(0x38c, &[(16, 2), (24, 255), (32, 0), (40, 0x44), (73, 1), (87, 2)]);
+        let lds = w(0x984, &[(16, 3), (24, 0), (40, 1)]);
+        let mut code = Vec::new();
+        for i in [s2r, sts, bar, add, max, lds, exit(), bra(-16)] {
+            code.extend(i);
+        }
+        let t = translate_with(&code, &Options { workgroup: [64, 1, 1], shared: 0x48, ..Default::default() }).unwrap_or_else(|e| panic!("{e}"));
+        validate(&t.wgsl).unwrap_or_else(|e| panic!("{e}\n{}", t.wgsl));
+        for want in ["var<workgroup> shm: array<atomic<u32>, 18>;", "* 4u +", "atomicStore(&shm[(t1 >> 2u) + 0u], r0);", "workgroupBarrier();", "atomicAdd(&shm[t2 >> 2u], r0)", "shm_cas(t4 >> 2u, 1u, r0)", "extractBits(atomicLoad(&shm[(t6 >> 2u) + 0u]), (t6 & 3u) * 8u, 8u)"] {
             assert!(t.wgsl.contains(want), "{want}\n{}", t.wgsl);
         }
     }

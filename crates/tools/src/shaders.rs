@@ -98,9 +98,11 @@ pub fn run(zip: &Path, samples: Option<&Path>) -> super::Result<bool> {
 /// instruction, decoded.
 pub fn list(path: &Path) -> super::Result<()> {
     let code = std::fs::read(path)?;
-    let sph: Vec<String> = code.get(..sass::SPH_SIZE).unwrap_or_default().as_chunks::<4>().0.iter().map(|w| format!("{:08x}", u32::from_le_bytes(*w))).collect();
-    println!("sph {}", sph.join(" "));
-    let program = sass::program(code.get(sass::SPH_SIZE..).unwrap_or_default()).ok_or("no closing self-branch")?;
+    // Compute programs have no SPH.
+    let start = if sass::stage(&code) == sass::Stage::Compute { 0 } else { sass::SPH_SIZE };
+    let sph: Vec<String> = code.get(..start).unwrap_or_default().as_chunks::<4>().0.iter().map(|w| format!("{:08x}", u32::from_le_bytes(*w))).collect();
+    println!("sph {}", if sph.is_empty() { "none (compute)".to_string() } else { sph.join(" ") });
+    let program = sass::program(code.get(start..).unwrap_or_default()).ok_or("no closing self-branch")?;
     for (i, w) in sass::words(program).enumerate() {
         let (p, not) = w.guard();
         let guard = if w.always() { String::new() } else { format!("@{}P{p} ", if not { "!" } else { "" }) };
