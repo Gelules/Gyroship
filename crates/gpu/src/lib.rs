@@ -5,6 +5,7 @@
 use std::path::Path;
 
 pub mod datazip;
+pub mod draw;
 pub mod mme;
 pub mod pushbuf;
 pub mod sass;

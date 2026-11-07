@@ -57,6 +57,8 @@ pub fn run(dir: &Path, first: u32, last: u32, methods: bool) -> super::Result<()
                 Effect::MacroFault { index, fault } => println!("  macro {index} fault {fault:?}"),
                 Effect::Clear(c) => println!("  clear {c:?}"),
                 Effect::Draw(d) => println!("  draw {d:x?}"),
+                Effect::Write(w) => stats.written += w.data.len(),
+                Effect::Unsupported(u) => println!("  not applied: {u:x?}"),
                 Effect::Ignored { class, method, value } => *stats.ignored.entry((class, method, value)).or_default() += 1,
             }
         }
@@ -69,6 +71,8 @@ pub fn run(dir: &Path, first: u32, last: u32, methods: bool) -> super::Result<()
 struct Stats {
     words: usize,
     methods: usize,
+    /// Bytes the 3D stream wrote to memory.
+    written: usize,
     by_macro: BTreeMap<usize, usize>,
     ignored: BTreeMap<(u32, u32, u32), usize>,
 }
@@ -78,7 +82,7 @@ impl Stats {
         let Some(submit) = submit else { return };
         let from_macros: usize = self.by_macro.values().sum();
         let macros: Vec<String> = self.by_macro.iter().map(|(m, n)| format!("{m}:{n}")).collect();
-        println!("submit {submit}: {} words, {} methods, {from_macros} of them from macros [{}]", self.words, self.methods, macros.join(" "));
+        println!("submit {submit}: {} words, {} methods, {from_macros} of them from macros [{}], {} bytes written", self.words, self.methods, macros.join(" "), self.written);
         for ((class, method, value), n) in &self.ignored {
             println!("  not executed: class {class:#x} method {method:#x} = {value:#x} x{n}");
         }

@@ -163,6 +163,7 @@ impl TexHandle {
 }
 
 /// An inline-to-memory upload started by LAUNCH_DMA, fed by LOAD_INLINE_DATA.
+#[derive(Clone, Debug)]
 struct Upload {
     address: u64,
     line_length: u64,
@@ -173,16 +174,19 @@ struct Upload {
 }
 
 /// Constant-buffer bindings and the stream's own memory writes.
-#[derive(Default)]
+#[derive(Default, Clone, Debug)]
 pub struct Resources {
-    banks: [[Option<(u64, u32)>; BANKS]; STAGES],
+    banks: Bindings,
     /// LOAD_CONSTANT_BUFFER_OFFSET_V (15:0), advanced by 4 per data dword.
     cbuf_offset: u32,
     upload: Option<Upload>,
-    /// Everything not turned into effects, in stream order.
-    // ponytail: grows without bound; drain it per frame once integrated.
+    /// Everything not turned into effects, in stream order (the command
+    /// processor drains it after each method).
     pub unsupported: Vec<Unsupported>,
 }
+
+/// The constant buffers bound to every stage and bank: (address, size).
+pub type Bindings = [[Option<(u64, u32)>; BANKS]; STAGES];
 
 impl Resources {
     /// Feeds one 3D method; `r` reads the register file after this write.
@@ -207,6 +211,10 @@ impl Resources {
             _ => {}
         }
         Vec::new()
+    }
+
+    pub fn bindings(&self) -> Bindings {
+        self.banks
     }
 
     /// (address, size) bound to bank `bank` of stage `stage`.

@@ -364,27 +364,15 @@ impl Nvdrv {
         if let Some(key) = self.programs.get(&gpu) {
             return format!("{key:016x}");
         }
-        let at = k.gpu_to_cpu(space, gpu);
-        let mut code = Vec::new();
-        let found = loop {
-            let mut chunk = vec![0u8; 0x1000];
-            if code.len() >= 0x4_0000 || k.mem.read(at + code.len() as u64, &mut chunk).is_err() {
-                break None;
-            }
-            code.extend(chunk);
-            if let Some(found) = gyroship_gpu::sass::program_key(&code) {
-                break Some(found);
-            }
-        };
-        let Some((key, len)) = found else {
-            return format!("program at {gpu:#x}: no end found in {:#x} readable bytes", code.len());
+        let Some((key, code)) = gyroship_gpu::draw::read_program(&mut |gpu, buf| k.read_gpu(space, gpu, buf), gpu) else {
+            return format!("program at {gpu:#x}: no end found in readable memory");
         };
         self.programs.insert(gpu, key);
         if self.keys.insert(key) {
-            k.log(&format!("gpu: program {key:016x}: {len} bytes at {gpu:#x}"));
+            k.log(&format!("gpu: program {key:016x}: {} bytes at {gpu:#x}", code.len()));
             if let Some(dir) = &k.config.shaders_dump {
                 let _ = std::fs::create_dir_all(dir);
-                let _ = std::fs::write(dir.join(format!("{key:016x}.bin")), &code[..len]);
+                let _ = std::fs::write(dir.join(format!("{key:016x}.bin")), &code);
             }
         }
         format!("{key:016x}")
@@ -441,9 +429,31 @@ impl Nvdrv {
                     Effect::Draw(d) => {
                         self.draws += 1;
                         let keys: Vec<String> = d.programs.iter().enumerate().filter_map(|(stage, p)| Some(format!("stage {stage} {}", self.program(k, space, (*p)?)))).collect();
+                        let mut outcome = String::new();
+                        if let Some(mut s) = k.surfaces.take() {
+                            outcome = match s.draw(&d, &mut |gpu, buf| k.read_gpu(space, gpu, buf)) {
+                                Ok(()) => " -> drawn".into(),
+                                Err(why) => format!(" -> not drawn: {why}"),
+                            };
+                            k.surfaces = Some(s);
+                        }
                         // The first frames' draws, one line each.
                         if k.gs.presents < 3 || self.draws <= 64 {
-                            k.log(&format!("gpu: draw {}: topology {} count {} index {:x?} first {}: {}", self.draws, d.topology, d.count, d.index, d.first, keys.join(", ")));
+                            let index = d.index.as_ref().map(|i| (i.address, i.bytes_per_index, i.first));
+                            let targets: Vec<String> = d.targets.iter().map(|t| format!("{:#x} {:#x} {}x{}", t.addr, t.format, t.width, t.height)).collect();
+                            k.log(&format!("gpu: draw {}: topology {} count {} index {index:x?} first {}: {}; targets [{}]{outcome}", self.draws, d.topology, d.count, d.first, keys.join(", "), targets.join(", ")));
+                        }
+                    }
+                    // The GPU writes whatever the CPU's permissions.
+                    Effect::Write(w) => {
+                        let at = k.gpu_to_cpu(space, w.address);
+                        if k.mem.write_object(at, &w.data).is_err() && k.journal.few("gpu write", 4) {
+                            k.log(&format!("gpu: {} bytes at {:#x} (cpu {at:#x}) not writable", w.data.len(), w.address));
+                        }
+                    }
+                    Effect::Unsupported(u) => {
+                        if k.journal.few("gpu unsupported", 8) {
+                            k.log(&format!("gpu: not applied: {u:x?}"));
                         }
                     }
                     Effect::MacroFault { index, fault } => {

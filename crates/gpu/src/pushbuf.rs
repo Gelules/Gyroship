@@ -4,12 +4,17 @@
 //! macros (MME64), and reports what the CPU side waits for: semaphore
 //! releases, from the host (SEMAPHOREA..D, SEM_ADDR..SEM_EXECUTE), 3D and
 //! compute (SET_REPORT_SEMAPHORE_A..D) and the copy engine (LAUNCH_DMA).
-//! Addresses are GPU addresses; the caller translates them.
+//! Addresses are GPU addresses; the caller translates them. The 3D class's
+//! clears and draws come out with the state they use, and the memory its
+//! method stream writes (constant-buffer loads, inline uploads) comes out
+//! in stream order.
 //!
-//! ponytail: semaphores only; drawing, copies and inline writes come with
-//! the renderer (M3).
+//! ponytail: copies (copy engine, 2D) are reported, not executed.
 
 use crate::mme::{self, Mme};
+use crate::state::raster::{self, RenderState};
+use crate::state::resources::{self, Bindings, MemWrite, Pool, Resources, SamplerBinding, Unsupported};
+use crate::state::vertex::{self, Attribute, IndexBuffer, Stream};
 
 /// A semaphore release: `value` (4 or 8 bytes) at `addr`; with `timestamp`,
 /// a u64 GPU time at `addr + 8` (and zero in between for a 4-byte value).
@@ -24,7 +29,7 @@ pub struct Release {
 }
 
 /// What a segment did besides storing methods.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Effect {
     Release(Release),
     /// A method the fake does not execute but that matters (a copy, an
@@ -35,23 +40,39 @@ pub enum Effect {
     /// CLEAR_SURFACE.
     Clear(Clear),
     /// DRAW_INDEX_BUFFER or DRAW_VERTEX_ARRAY.
-    Draw(Draw),
+    Draw(Box<Draw>),
+    /// Bytes the 3D method stream writes to memory, before what follows reads it.
+    Write(MemWrite),
+    /// A 3D resource method whose effect is not applied.
+    Unsupported(Unsupported),
 }
 
-/// A draw, with the state it names.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A draw, with the state it uses.
+#[derive(Clone, Debug, PartialEq)]
 pub struct Draw {
     /// BEGIN's primitive (4 = triangles).
     pub topology: u32,
-    /// Index buffer: GPU address, bytes per index, first index.
-    pub index: Option<(u64, u8, u32)>,
+    pub index: Option<IndexBuffer>,
     /// First vertex (vertex arrays).
     pub first: u32,
     pub count: u32,
+    pub base_vertex: i32,
     /// The GPU address of each enabled pipeline stage's program (SPH then
     /// SASS): 0 vertex before fetch, 1 vertex, 2 tessellation init, 3
     /// tessellation, 4 geometry, 5 pixel.
     pub programs: [Option<u64>; 6],
+    pub streams: Vec<Stream>,
+    pub attributes: Vec<Attribute>,
+    pub render: RenderState,
+    /// The color target of each output location (SET_CT_SELECT).
+    pub targets: Vec<Surface>,
+    /// The depth-stencil target, when SET_ZT_SELECT enables one.
+    pub depth: Option<Surface>,
+    /// Constant buffers by stage (0 vertex .. 4 pixel) and bank.
+    pub cbufs: Bindings,
+    pub headers: Pool,
+    pub samplers: Pool,
+    pub sampler_binding: SamplerBinding,
 }
 
 /// A render target as the 3D class describes it.
@@ -128,7 +149,6 @@ const CLEAR_SURFACE: u32 = 0x19d0;
 const VERTEX_ARRAY_START: u32 = 0xd74;
 const DRAW_VERTEX_ARRAY: u32 = 0xd78;
 const BEGIN: u32 = 0x1618;
-const INDEX_BUFFER_A: u32 = 0x17c8; // B + 4, E (size) + 0x10, F (first) + 0x14
 const DRAW_INDEX_BUFFER: u32 = 0x17e0;
 const PIPELINE_SHADER: u32 = 0x2000; // + 64 j; PROGRAM_ADDRESS_A/B at + 0x14/0x18
 /// Draw methods not executed yet: reported, not silently dropped.
@@ -153,6 +173,8 @@ pub struct Channel {
     call: Option<(usize, usize, Vec<u32>)>,
     /// The macro running now, if any.
     running: Option<usize>,
+    /// The 3D class's constant-buffer bindings and memory writes.
+    resources: Resources,
     /// Every method executed, when set (for study tools).
     pub trace: Option<Vec<Traced>>,
 }
@@ -187,6 +209,7 @@ impl Default for Channel {
             mme: Some(Box::default()),
             call: None,
             running: None,
+            resources: Resources::default(),
             trace: None,
         }
     }
@@ -321,6 +344,11 @@ impl Channel {
                 _ => {}
             }
         }
+        if three_d {
+            let regs = &self.engine[subchannel * 0x1000..(subchannel + 1) * 0x1000];
+            effects.extend(self.resources.method(method, value, &|m| regs.get((m / 4) as usize).copied().unwrap_or(0)).into_iter().map(Effect::Write));
+            effects.extend(self.resources.unsupported.drain(..).map(Effect::Unsupported));
+        }
         if let Some(e) = self.engine_effect(subchannel, method, value) {
             effects.push(e);
         }
@@ -369,21 +397,26 @@ impl Channel {
 
     /// CLEAR_SURFACE: Z (bit 0), stencil (1), R..A (2..5), MRT index (9:6),
     /// array layer (25:10); the MRT index goes through SET_CT_SELECT.
+    /// The color target output location `location` writes (SET_CT_SELECT).
+    fn color_target(&self, sub: usize, location: u32) -> Surface {
+        let reg = |m: u32| self.reg(sub, m);
+        let j = reg(CT_SELECT) >> (4 + 3 * location) & 7;
+        let t = COLOR_TARGET + 64 * j;
+        Surface { addr: u64::from(reg(t)) << 32 | u64::from(reg(t + 4)), width: reg(t + 8), height: reg(t + 0xc), format: reg(t + 0x10) & 0xff, layers: (reg(t + 0x18) & 0xfff_ffff).max(1) }
+    }
+
+    /// The depth-stencil target, if SET_ZT_SELECT enables one.
+    fn depth_target(&self, sub: usize) -> Option<Surface> {
+        let reg = |m: u32| self.reg(sub, m);
+        (reg(ZT_SELECT) & 1 != 0).then(|| Surface { addr: u64::from(reg(ZT_A)) << 32 | u64::from(reg(ZT_A + 4)), width: reg(ZT_SIZE_A), height: reg(ZT_SIZE_A + 4), format: reg(ZT_A + 8) & 0x1f, layers: (reg(ZT_SIZE_A + 8) & 0xffff).max(1) })
+    }
+
     fn clear(&self, sub: usize, value: u32) -> Clear {
         let reg = |m: u32| self.reg(sub, m);
         let mask = (value >> 2 & 0xf) as u8;
-        let color = (mask != 0).then(|| {
-            let mrt = value >> 6 & 0xf;
-            let j = reg(CT_SELECT) >> (4 + 3 * mrt) & 7;
-            let t = COLOR_TARGET + 64 * j;
-            let surface = Surface { addr: u64::from(reg(t)) << 32 | u64::from(reg(t + 4)), width: reg(t + 8), height: reg(t + 0xc), format: reg(t + 0x10) & 0xff, layers: (reg(t + 0x18) & 0xfff_ffff).max(1) };
-            (surface, [0, 1, 2, 3].map(|i| reg(COLOR_CLEAR_VALUE + 4 * i)), mask)
-        });
+        let color = (mask != 0).then(|| (self.color_target(sub, value >> 6 & 0xf), [0, 1, 2, 3].map(|i| reg(COLOR_CLEAR_VALUE + 4 * i)), mask));
         let (z, s) = (value & 1 != 0, value & 2 != 0);
-        let depth = ((z || s) && reg(ZT_SELECT) & 1 != 0).then(|| {
-            let surface = Surface { addr: u64::from(reg(ZT_A)) << 32 | u64::from(reg(ZT_A + 4)), width: reg(ZT_SIZE_A), height: reg(ZT_SIZE_A + 4), format: reg(ZT_A + 8) & 0x1f, layers: (reg(ZT_SIZE_A + 8) & 0xffff).max(1) };
-            (surface, z.then(|| reg(Z_CLEAR_VALUE)), s.then(|| reg(STENCIL_CLEAR_VALUE) as u8))
-        });
+        let depth = self.depth_target(sub).filter(|_| z || s).map(|surface| (surface, z.then(|| reg(Z_CLEAR_VALUE)), s.then(|| reg(STENCIL_CLEAR_VALUE) as u8)));
         // Scissor 0 bounds the clear when SET_CLEAR_SURFACE_CONTROL says so and it is on.
         let scissor = (reg(CLEAR_SURFACE_CONTROL) & 0x100 != 0 && reg(SCISSOR_ENABLE) & 1 != 0).then(|| {
             let (h, v) = (reg(SCISSOR_ENABLE + 4), reg(SCISSOR_ENABLE + 8));
@@ -395,12 +428,30 @@ impl Channel {
 
     fn draw(&self, sub: usize, method: u32, count: u32) -> Draw {
         let reg = |m: u32| self.reg(sub, m);
-        let index = (method == DRAW_INDEX_BUFFER).then(|| (u64::from(reg(INDEX_BUFFER_A) & 0xff) << 32 | u64::from(reg(INDEX_BUFFER_A + 4)), 1u8 << (reg(INDEX_BUFFER_A + 0x10) & 3), reg(INDEX_BUFFER_A + 0x14)));
+        let indexed = method == DRAW_INDEX_BUFFER;
         let programs = std::array::from_fn(|j| {
             let p = PIPELINE_SHADER + 64 * j as u32;
             (reg(p) & 1 != 0).then(|| u64::from(reg(p + 0x14) & 0xff) << 32 | u64::from(reg(p + 0x18)))
         });
-        Draw { topology: reg(BEGIN) & 0xffff, index, first: if index.is_some() { 0 } else { reg(VERTEX_ARRAY_START) }, count, programs }
+        let (streams, attributes) = vertex::vertex_input(&reg);
+        let render = raster::render_state(&reg);
+        Draw {
+            topology: reg(BEGIN) & 0xffff,
+            index: indexed.then(|| vertex::index_buffer(&reg)),
+            first: if indexed { 0 } else { reg(VERTEX_ARRAY_START) },
+            count,
+            base_vertex: if indexed { vertex::base_vertex(&reg) } else { 0 },
+            programs,
+            streams,
+            attributes,
+            targets: render.outputs.iter().map(|o| self.color_target(sub, o.location)).collect(),
+            render,
+            depth: self.depth_target(sub),
+            cbufs: self.resources.bindings(),
+            headers: resources::header_pool(&reg),
+            samplers: resources::sampler_pool(&reg),
+            sampler_binding: resources::sampler_binding(&reg),
+        }
     }
 
     fn engine_effect(&self, subchannel: usize, method: u32, value: u32) -> Option<Effect> {
@@ -419,7 +470,7 @@ impl Channel {
                 _ => ignored,
             }),
             (0x97, CLEAR_SURFACE) => Some(Effect::Clear(self.clear(subchannel, value))),
-            (0x97, DRAW_INDEX_BUFFER | DRAW_VERTEX_ARRAY) => Some(Effect::Draw(self.draw(subchannel, method, value))),
+            (0x97, DRAW_INDEX_BUFFER | DRAW_VERTEX_ARRAY) => Some(Effect::Draw(Box::new(self.draw(subchannel, method, value)))),
             (0x97, m) if OTHER_DRAWS.contains(&m) => Some(ignored),
             // Copy engine: a copy (ignored), then a semaphore by bits 4:3 (1 one word, 2 four).
             (0xb5, DMA_LAUNCH) => Some(match value >> 3 & 3 {
@@ -440,6 +491,8 @@ impl Channel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// SET_INDEX_BUFFER_A; B + 4, E (size) + 0x10, F (first) + 0x14.
+    const INDEX_BUFFER_A: u32 = 0x17c8;
 
     /// A method header: operation, count (or immediate value), subchannel, byte offset.
     fn header(op: u32, count: u32, subchannel: u32, method: u32) -> u32 {
@@ -580,8 +633,41 @@ mod tests {
         let mut programs = [None; 6];
         programs[1] = Some(0x10_6ab9_0900);
         programs[5] = Some(0x11_5987_6400);
-        let want = Draw { topology: 4, index: Some((0x81_0000_2000, 2, 6)), first: 0, count: 3, programs };
-        assert_eq!(c.run(&words), vec![Effect::Draw(want)]);
+        let effects = c.run(&words);
+        let [Effect::Draw(d)] = &effects[..] else { panic!("{effects:?}") };
+        assert_eq!((d.topology, d.first, d.count, d.programs), (4, 0, 3, programs));
+        let ib = d.index.as_ref().unwrap();
+        assert_eq!((ib.address, ib.bytes_per_index, ib.first), (0x81_0000_2000, 2, 6));
+    }
+
+    #[test]
+    fn constant_buffer_loads_come_out_in_stream_order_and_bind_to_draws() {
+        let mut c = Channel::default();
+        let words = [
+            header(1, 1, 0, SET_OBJECT),
+            0xc797,
+            // SET_CONSTANT_BUFFER_SELECTOR_A..C: 0x100 bytes at 0x12_3456_7800.
+            header(1, 3, 0, 0x2380),
+            0x100,
+            0x12,
+            0x3456_7800,
+            // Bind it to the pixel stage's bank 2, then load two words at 0x70.
+            header(1, 1, 0, 0x2410 + 4 * 32),
+            0x21,
+            header(1, 1, 0, 0x238c),
+            0x70,
+            header(3, 2, 0, 0x2390),
+            0x1111_1111,
+            0x2222_2222,
+            header(1, 1, 0, DRAW_VERTEX_ARRAY),
+            3,
+        ];
+        let effects = c.run(&words);
+        let writes: Vec<(u64, Vec<u8>)> = effects.iter().filter_map(|e| if let Effect::Write(w) = e { Some((w.address, w.data.clone())) } else { None }).collect();
+        assert_eq!(writes, vec![(0x12_3456_7870, vec![0x11; 4]), (0x12_3456_7874, vec![0x22; 4])]);
+        let Some(Effect::Draw(d)) = effects.last() else { panic!("{effects:?}") };
+        assert_eq!(d.cbufs[4][2], Some((0x12_3456_7800, 0x100)));
+        assert!(d.index.is_none());
     }
 
     #[test]

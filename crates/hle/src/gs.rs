@@ -51,6 +51,15 @@ impl crate::Kernel {
             None => gpu,
         }
     }
+
+    /// Reads guest memory at a GPU address for the GPU; false if a byte is
+    /// not readable.
+    // ponytail: a read crossing into another GPU mapping follows the first
+    // one's CPU range; split the read per mapping if a buffer ever does.
+    pub fn read_gpu(&mut self, space: u32, gpu: u64, out: &mut [u8]) -> bool {
+        let at = self.gpu_to_cpu(space, gpu);
+        self.mem.read(at, out).is_ok()
+    }
 }
 
 /// The user partition of every GPU address space (gpu 203), bounds
@@ -370,15 +379,20 @@ impl Kernel {
             self.log(&format!("vi2: present #{n} layer {layer:#x} image {image} acquire fence ({fence_id}, {fence}) interval {interval}"));
         }
         // The render targets this frame touched, as PNG files (game output: never committed).
-        if let (Some(dir), Some(s)) = (self.config.frames_dump.clone(), self.surfaces.as_mut()) {
+        let every = self.config.dump_every;
+        if let (Some(dir), Some(s)) = (self.config.frames_dump.clone(), self.surfaces.as_mut())
+            && n.is_multiple_of(every)
+        {
             let line = match s.dump(&dir, &format!("frame-{n:04}")) {
                 Ok(count) => {
                     let errors = s.errors.lock().map(|e| e.clone()).unwrap_or_default();
-                    format!("gpu: frame {n}: {count} render targets dumped; not done so far: {:?}; wgpu errors: {errors:?}", s.skipped)
+                    format!("gpu: frame {n}: {count} render targets dumped; {} draws done, not done so far: {:?}; wgpu errors: {errors:?}", s.drawn, s.skipped)
                 }
                 Err(e) => format!("gpu: frame {n}: dump failed: {e}"),
             };
             self.log(&line);
+        } else if let Some(s) = self.surfaces.as_mut() {
+            s.untouch();
         }
         if self.config.frames.is_some_and(|f| n >= f) {
             self.stop(0, &format!("{n} frames presented"));

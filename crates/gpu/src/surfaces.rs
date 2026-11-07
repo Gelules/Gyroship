@@ -3,8 +3,7 @@
 //! the targets a frame touched can be written out as PNG files.
 //!
 //! ponytail: whole-target clears only (full channel mask, no scissor smaller
-//! than the target); the others are counted in `skipped`. Draws come with
-//! the shader translator.
+//! than the target); the others are counted in `skipped`. Draws: `draw.rs`.
 
 use crate::pushbuf::{Clear, Surface};
 use std::collections::{BTreeMap, BTreeSet};
@@ -12,7 +11,7 @@ use std::path::Path;
 
 /// The wgpu format of a 3D-class color target format (clc797.h), for the
 /// renderable formats.
-fn color_format(f: u32) -> Option<wgpu::TextureFormat> {
+pub(crate) fn color_format(f: u32) -> Option<wgpu::TextureFormat> {
     use wgpu::TextureFormat as T;
     Some(match f {
         0xc0 => T::Rgba32Float,
@@ -39,7 +38,7 @@ fn color_format(f: u32) -> Option<wgpu::TextureFormat> {
 }
 
 /// The wgpu format of a depth target format (SET_ZT_FORMAT).
-fn depth_format(f: u32) -> Option<wgpu::TextureFormat> {
+pub(crate) fn depth_format(f: u32) -> Option<wgpu::TextureFormat> {
     use wgpu::TextureFormat as T;
     Some(match f {
         0x0a => T::Depth32Float,
@@ -67,21 +66,24 @@ fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
 }
 "#;
 
-struct Entry {
-    surface: Surface,
-    texture: wgpu::Texture,
+pub(crate) struct Entry {
+    pub(crate) surface: Surface,
+    pub(crate) texture: wgpu::Texture,
 }
 
 pub struct Surfaces {
     adapter: wgpu::Adapter,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    map: BTreeMap<(u64, u32), Entry>,
+    pub(crate) device: wgpu::Device,
+    pub(crate) queue: wgpu::Queue,
+    pub(crate) map: BTreeMap<(u64, u32), Entry>,
     /// Color targets written since the last dump.
-    touched: BTreeSet<(u64, u32)>,
+    pub(crate) touched: BTreeSet<(u64, u32)>,
     blit: (wgpu::RenderPipeline, wgpu::BindGroupLayout),
+    pub(crate) cache: crate::draw::Cache,
+    /// Draws done.
+    pub drawn: u64,
     /// Operations not done, by reason.
-    pub skipped: BTreeMap<&'static str, u64>,
+    pub skipped: BTreeMap<String, u64>,
     /// wgpu validation errors (the first ones): reported, never fatal to the game.
     pub errors: Arc<Mutex<Vec<String>>>,
 }
@@ -90,7 +92,8 @@ use std::sync::{Arc, Mutex};
 
 impl Surfaces {
     /// A headless device with the adapter's own limits (targets reach 11264
-    /// pixels) and the 16-bit normalized and D32S8 formats when available.
+    /// pixels) and, when available, the 16-bit normalized, D32S8 and BC
+    /// formats, filterable f32 textures and border-color clamping.
     pub fn headless(backend: crate::Backend) -> Result<Surfaces, String> {
         let instance = crate::Renderer::instance_for(backend);
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -105,7 +108,10 @@ impl Surfaces {
         let wanted = wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
             | wgpu::Features::DEPTH32FLOAT_STENCIL8
             | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
-            | wgpu::Features::RG11B10UFLOAT_RENDERABLE;
+            | wgpu::Features::RG11B10UFLOAT_RENDERABLE
+            | wgpu::Features::TEXTURE_COMPRESSION_BC
+            | wgpu::Features::FLOAT32_FILTERABLE
+            | wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER;
         let descriptor = wgpu::DeviceDescriptor { required_features: adapter.features() & wanted, required_limits: adapter.limits(), ..Default::default() };
         let (device, queue) = pollster::block_on(adapter.request_device(&descriptor)).map_err(|e| format!("cannot open the GPU device: {e}"))?;
         let errors = Arc::new(Mutex::new(Vec::new()));
@@ -139,11 +145,11 @@ impl Surfaces {
             multiview_mask: None,
             cache: None,
         });
-        Ok(Surfaces { adapter, device, queue, map: BTreeMap::new(), touched: BTreeSet::new(), blit: (pipeline, layout), skipped: BTreeMap::new(), errors })
+        Ok(Surfaces { adapter, device, queue, map: BTreeMap::new(), touched: BTreeSet::new(), blit: (pipeline, layout), cache: Default::default(), drawn: 0, skipped: BTreeMap::new(), errors })
     }
 
     /// Whether this device can render to `format` (and read it back).
-    fn renderable(&self, format: wgpu::TextureFormat) -> bool {
+    pub(crate) fn renderable(&self, format: wgpu::TextureFormat) -> bool {
         let features = if self.device.features().contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES) {
             self.adapter.get_texture_format_features(format)
         } else {
@@ -152,12 +158,21 @@ impl Surfaces {
         features.allowed_usages.contains(wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC)
     }
 
-    fn skip(&mut self, why: &'static str) {
-        *self.skipped.entry(why).or_default() += 1;
+    pub(crate) fn skip(&mut self, why: impl Into<String>) {
+        *self.skipped.entry(why.into()).or_default() += 1;
+    }
+
+    /// Keeps a message with the wgpu errors (the first ones).
+    pub(crate) fn error(&self, what: String) {
+        if let Ok(mut v) = self.errors.lock()
+            && v.len() < 16
+        {
+            v.push(what);
+        }
     }
 
     /// The texture of a target, made (or remade, if its size changed) on demand.
-    fn texture(&mut self, s: &Surface, format: wgpu::TextureFormat) -> wgpu::TextureView {
+    pub(crate) fn texture(&mut self, s: &Surface, format: wgpu::TextureFormat) -> wgpu::TextureView {
         let key = (s.addr, s.format);
         let stale = self.map.get(&key).is_none_or(|e| e.surface != *s);
         if stale {
@@ -239,6 +254,11 @@ impl Surfaces {
             crate::write_png(&dir.join(name), w, h, &rgba).map_err(|e| e.to_string())?;
         }
         Ok(keys.len())
+    }
+
+    /// Forgets which targets were written (a frame not dumped).
+    pub fn untouch(&mut self) {
+        self.touched.clear();
     }
 
     /// Layer 0 of a color target as tightly packed RGBA8.

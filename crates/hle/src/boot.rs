@@ -227,6 +227,7 @@ pub fn main(table: Vec<rt::Entry>) {
         vsync: !flag("--no-vsync"),
         gpfifo_dump: value("--dump-gpfifo").map(std::path::PathBuf::from),
         frames_dump: value("--dump-frames").map(std::path::PathBuf::from),
+        dump_every: value("--dump-every").and_then(|s| s.parse().ok()).filter(|&k| k > 0).unwrap_or(1),
         shaders_dump: value("--dump-shaders").map(std::path::PathBuf::from),
         ..Config::default()
     };
