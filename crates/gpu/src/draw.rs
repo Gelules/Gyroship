@@ -53,7 +53,9 @@ fn read_until(mem: Mem, gpu: u64, key: fn(&[u8]) -> Option<(u64, usize)>) -> Opt
     None
 }
 
-type Module = Result<(Translation, wgpu::ShaderModule), String>;
+/// A translation and its module, shared: draws take a reference count, not a copy
+/// of the WGSL (some programs are 300 KB of text, drawn a dozen times a frame).
+type Module = Result<std::sync::Arc<(Translation, wgpu::ShaderModule)>, String>;
 
 #[derive(Default)]
 pub struct Cache {
@@ -63,13 +65,13 @@ pub struct Cache {
     /// Compute program keys by GPU address, compiled compute programs, and the
     /// images compute programs wrote, by GPU address (see `compute.rs`).
     pub(crate) compute_programs: HashMap<u64, Option<u64>>,
-    pub(crate) compute: HashMap<String, Result<(Translation, wgpu::ShaderModule), String>>,
+    pub(crate) compute: HashMap<String, crate::compute::Compiled>,
     pub(crate) compute_pipelines: HashMap<String, (wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
     pub(crate) images: HashMap<u64, wgpu::Texture>,
     /// Translations by (program key, key of the pixel program it pairs with,
     /// mask of the attributes fetched as integers, hash of the jump targets or 0).
     modules: HashMap<(u64, Option<u64>, u64, u64), Module>,
-    pipelines: HashMap<String, (wgpu::RenderPipeline, Vec<wgpu::BindGroupLayout>)>,
+    pipelines: HashMap<PipelineKey, (wgpu::RenderPipeline, Vec<wgpu::BindGroupLayout>)>,
     /// Uploaded textures by address and header, with the end of the memory they came from.
     textures: HashMap<(u64, [u8; 32]), (wgpu::Texture, u64)>,
     /// Samplers by header, filtering and compare.
@@ -83,6 +85,9 @@ pub struct Cache {
     /// Color textures from memory read with a depth compare: their R channel as
     /// depth, by address and header; forgotten with any invalidation.
     compare_depths: HashMap<(u64, [u8; 32]), wgpu::Texture>,
+    /// GPU writes to guest memory not yet applied to `textures`, as (start, end):
+    /// applied once before the next read of the cache (`drain_invalidations`).
+    pending: Vec<(u64, u64)>,
     /// Color targets read through a smaller texture header, cropped to it, by
     /// (address, format, width, height), with the target's write stamp when copied.
     crops: HashMap<(u64, u32, u32, u32), (u64, wgpu::Texture)>,
@@ -110,6 +115,47 @@ fn jump_targets(tables: &[(u8, u32)], banks: &[Option<(u64, u32)>], mem: Mem, co
     Some(targets)
 }
 
+/// `ranges` (start, end) sorted and merged where they touch or overlap.
+fn merged(ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut sorted = ranges.to_vec();
+    sorted.sort_unstable();
+    let mut out: Vec<(u64, u64)> = Vec::with_capacity(sorted.len());
+    for (start, end) in sorted {
+        match out.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => out.push((start, end)),
+        }
+    }
+    out
+}
+
+/// Whether `[a, b)` overlaps one of the sorted, merged `ranges` (the test
+/// `invalidate` applied range by range: `b > start && a < end`).
+fn overlaps(ranges: &[(u64, u64)], a: u64, b: u64) -> bool {
+    let i = ranges.partition_point(|r| r.1 <= a);
+    ranges.get(i).is_some_and(|r| r.0 < b)
+}
+
+/// An index of `size` little-endian bytes.
+fn index_value(c: &[u8]) -> u32 {
+    c.iter().rev().fold(0, |v, b| v << 8 | u32::from(*b))
+}
+
+/// The largest of the little-endian indices in `raw` (`size` bytes each), the
+/// restart value excluded when there is one; 0 when none is left. The restart
+/// value counts as 0, which gives the same maximum without a branch per index.
+fn index_max(raw: &[u8], size: usize, restart: Option<u32>) -> u32 {
+    let r = restart.unwrap_or(u32::MAX);
+    let skip = |i: u32| if restart.is_some() && i == r { 0 } else { i };
+    match size {
+        4 => raw.as_chunks::<4>().0.iter().map(|b| skip(u32::from_le_bytes(*b))).max(),
+        2 => raw.as_chunks::<2>().0.iter().map(|b| skip(u32::from(u16::from_le_bytes(*b)))).max(),
+        1 => raw.iter().map(|&b| skip(u32::from(b))).max(),
+        _ => raw.chunks_exact(size).map(|c| skip(index_value(c))).max(),
+    }
+    .unwrap_or(0)
+}
+
 /// The float format with the bits of a 32-bit integer format.
 fn float_format(f: wgpu::TextureFormat) -> Option<wgpu::TextureFormat> {
     use wgpu::TextureFormat as F;
@@ -120,6 +166,21 @@ fn float_format(f: wgpu::TextureFormat) -> Option<wgpu::TextureFormat> {
         _ => return None,
     })
 }
+
+/// What a render pipeline is made from, as a hashable key: the vertex program
+/// (key, WGSL length), the pixel program's, the vertex buffer layouts (stream,
+/// step, stride, attributes), the primitive, color and depth states, and the
+/// bind group layouts. The WGSL lengths tell a program's module with exact
+/// jump-table blocks from its first one.
+type PipelineKey = (
+    (u64, usize),
+    Option<(u64, usize)>,
+    Vec<(u8, wgpu::VertexStepMode, u64, Vec<wgpu::VertexAttribute>)>,
+    wgpu::PrimitiveState,
+    Vec<Option<wgpu::ColorTargetState>>,
+    Option<wgpu::DepthStencilState>,
+    Vec<Vec<wgpu::BindGroupLayoutEntry>>,
+);
 
 /// A stage's bindings.
 pub(crate) struct Bindings {
@@ -175,16 +236,18 @@ impl Surfaces {
     /// The guest memory each uploaded texture came from, as GPU address ranges
     /// (start, end): the HLE forgets those the CPU has written since.
     pub fn texture_ranges(&self) -> Vec<(u64, u64)> {
-        self.cache.textures.iter().map(|((addr, _), (_, end))| (*addr, *end)).collect()
+        let written = merged(&self.cache.pending);
+        self.cache.textures.iter().map(|((addr, _), (_, end))| (*addr, *end)).filter(|&(a, b)| !overlaps(&written, a, b)).collect()
     }
 
     /// What the host keeps, by kind, for the summary line (growth shows a leak).
     pub fn cache_sizes(&self) -> String {
         let c = &self.cache;
+        let written = merged(&c.pending);
         format!(
             "targets {}, textures {}, samplers {}, programs {}, modules {}, pipelines {}, compute pipelines {}, images {}",
             self.map.len(),
-            c.textures.len(),
+            c.textures.keys().filter(|(addr, header)| !overlaps(&written, *addr, c.textures[&(*addr, *header)].1)).count(),
             c.samplers.len(),
             c.code.len(),
             c.modules.len(),
@@ -198,6 +261,7 @@ impl Surfaces {
     /// reason, and the reason returned.
     pub fn draw(&mut self, d: &Draw, mem: Mem) -> Result<(), String> {
         self.textures_read.clear();
+        self.drain_invalidations();
         let result = self.try_draw(d, mem);
         match &result {
             Ok(()) => self.drawn += 1,
@@ -231,7 +295,8 @@ impl Surfaces {
         let vs = self.module(mem, d.programs[1].ok_or("no vertex program")?, ps.as_ref().map(|p| &p.0), &ints, &d.cbufs[0])?;
 
         // Attachments: the locations the pixel program writes, and depth when tested.
-        let written = ps.as_ref().map(|p| p.0.interface.targets.clone()).unwrap_or_default();
+        let none = BTreeMap::new();
+        let written = ps.as_ref().map_or(&none, |p| &p.0.interface.targets);
         let mut colors: Vec<Option<(Surface, wgpu::TextureFormat)>> = Vec::new();
         for (location, s) in d.targets.iter().enumerate() {
             let used = written.contains_key(&(location as u8)) && d.render.outputs.get(location).is_some_and(|o| o.write_mask != 0);
@@ -289,12 +354,12 @@ impl Surfaces {
                 if !mem(ib.address + u64::from(ib.first) * size as u64, &mut raw) {
                     return Err("index buffer not readable".into());
                 }
-                let values: Vec<u32> = raw.chunks_exact(size).map(|c| c.iter().rev().fold(0, |v, b| v << 8 | u32::from(*b))).collect();
-                let max = values.iter().filter(|&&i| !(ib.restart_enable && i == ib.restart_index)).max().copied().unwrap_or(0);
+                let max = index_max(&raw, size, ib.restart_enable.then_some(ib.restart_index));
                 let (bytes, format) = match size {
                     4 => (raw, wgpu::IndexFormat::Uint32),
                     2 => (raw, wgpu::IndexFormat::Uint16),
-                    _ => (values.iter().flat_map(|&i| (i as u16).to_le_bytes()).collect(), wgpu::IndexFormat::Uint16),
+                    1 => (raw.iter().flat_map(|&b| u16::from(b).to_le_bytes()).collect(), wgpu::IndexFormat::Uint16),
+                    _ => (raw.chunks_exact(size).flat_map(|c| (index_value(c) as u16).to_le_bytes()).collect(), wgpu::IndexFormat::Uint16),
                 };
                 (Some((bytes, format)), (i64::from(d.base_vertex) + i64::from(max)).max(0) as u64)
             }
@@ -363,14 +428,15 @@ impl Surfaces {
         };
         // Bind groups: 0 vertex, 1 pixel; constant banks at their bank, textures at 32 + 2i, samplers at 33 + 2i.
         let visibility = [wgpu::ShaderStages::VERTEX, wgpu::ShaderStages::FRAGMENT];
-        let group_layouts: Vec<Vec<wgpu::BindGroupLayoutEntry>> = stages.iter().zip(visibility).map(|(b, v)| b.layout(v)).collect();
+        let mut group_layouts: Vec<Vec<wgpu::BindGroupLayoutEntry>> = stages.iter().zip(visibility).map(|(b, v)| b.layout(v)).collect();
         let groups = group_layouts.iter().rposition(|e| !e.is_empty()).map_or(0, |g| g + 1);
-        // The WGSL lengths tell a program's module with exact jump-table blocks from the first one.
-        let key = format!("{:x}.{}/{:x?}/{layouts:?}/{primitive:?}/{color_states:?}/{depth_state:?}/{:?}", vs.0.key, vs.0.wgsl.len(), ps.as_ref().map(|p| (p.0.key, p.0.wgsl.len())), &group_layouts[..groups]);
+        group_layouts.truncate(groups);
+        let key: PipelineKey = ((vs.0.key, vs.0.wgsl.len()), ps.as_ref().map(|p| (p.0.key, p.0.wgsl.len())), layouts, primitive, color_states, depth_state, group_layouts);
         let (pipeline, bind_layouts) = match self.cache.pipelines.get(&key) {
             Some(p) => p.clone(),
             None => {
-                let bind_layouts: Vec<wgpu::BindGroupLayout> = group_layouts[..groups].iter().map(|entries| self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries })).collect();
+                let (_, _, layouts, primitive, color_states, depth_state, group_layouts) = &key;
+                let bind_layouts: Vec<wgpu::BindGroupLayout> = group_layouts.iter().map(|entries| self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries })).collect();
                 let refs: Vec<Option<&wgpu::BindGroupLayout>> = bind_layouts.iter().map(Some).collect();
                 let layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &refs, ..Default::default() });
                 let buffers: Vec<Option<wgpu::VertexBufferLayout>> = layouts.iter().map(|(_, step, stride, attributes)| Some(wgpu::VertexBufferLayout { array_stride: *stride, step_mode: *step, attributes })).collect();
@@ -378,9 +444,9 @@ impl Surfaces {
                     label: None,
                     layout: Some(&layout),
                     vertex: wgpu::VertexState { module: &vs.1, entry_point: Some("main"), compilation_options: Default::default(), buffers: &buffers },
-                    fragment: ps.as_ref().map(|p| wgpu::FragmentState { module: &p.1, entry_point: Some("main"), compilation_options: Default::default(), targets: &color_states }),
-                    primitive,
-                    depth_stencil: depth_state,
+                    fragment: ps.as_ref().map(|p| wgpu::FragmentState { module: &p.1, entry_point: Some("main"), compilation_options: Default::default(), targets: color_states }),
+                    primitive: *primitive,
+                    depth_stencil: depth_state.clone(),
                     multisample: Default::default(),
                     multiview_mask: None,
                     cache: None,
@@ -480,13 +546,13 @@ impl Surfaces {
         .ok_or("program not readable")?;
         let pair = pixel.map(|p| p.key);
         let mask = ints.iter().fold(0u64, |m, (&l, &signed)| m | 1 << (l % 32) | u64::from(signed) << (32 + l % 32));
-        let mut options = Options { varyings: pixel.map(|p| p.interface.varyings.clone()).unwrap_or_default(), int_attributes: ints.clone(), ..Default::default() };
         // Jump tables: the translation without them says where they are; the bound
         // banks' words give the targets, and the module with exact blocks is keyed
         // by them too (another table content, another module).
         let mut id = (key, pair, mask, 0);
-        if let Some(Ok((t, _))) = self.cache.modules.get(&id)
-            && let Some(tables) = &t.interface.jump_tables
+        let mut jump = None;
+        if let Some(Ok(m)) = self.cache.modules.get(&id)
+            && let Some(tables) = &m.0.interface.jump_tables
             && let Some(targets) = jump_targets(tables, banks, mem, self.cache.code[&key].len())
         {
             id.3 = {
@@ -495,25 +561,35 @@ impl Surfaces {
                 targets.hash(&mut h);
                 h.finish() | 1
             };
-            options.jump_targets = Some(targets);
+            jump = Some(targets);
         }
         if !self.cache.modules.contains_key(&id) {
+            let options = Options { varyings: pixel.map(|p| p.interface.varyings.clone()).unwrap_or_default(), int_attributes: ints.clone(), jump_targets: jump, ..Default::default() };
             let made = shader::translate_with(&self.cache.code[&key], &options).map_err(|e| format!("program {key:016x}: {e}")).and_then(|mut t| {
                 // GYROSHIP_WGSL_OVERRIDE=<dir>: <dir>/<key>.wgsl replaces the translation (a
                 // debugging aid: a program edited to show its intermediate values).
                 if let Some(text) = std::env::var_os("GYROSHIP_WGSL_OVERRIDE").and_then(|d| std::fs::read_to_string(std::path::Path::new(&d).join(format!("{key:016x}.wgsl"))).ok()) {
                     t.wgsl = text;
                 }
-                if let Err(e) = shader::validate(&t.wgsl) {
-                    self.error(format!("program {key:016x}: {e}"));
-                    return Err(format!("program {key:016x}: invalid WGSL"));
-                }
-                let m = self.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(&format!("{key:016x}")), source: wgpu::ShaderSource::Wgsl(t.wgsl.as_str().into()) });
-                Ok((t, m))
+                let m = self.shader_module(&format!("{key:016x}"), &t.wgsl).map_err(|()| format!("program {key:016x}: invalid WGSL"))?;
+                Ok(std::sync::Arc::new((t, m)))
             });
             self.cache.modules.insert(id, made);
         }
         self.cache.modules[&id].clone()
+    }
+
+    /// A module from translated WGSL, parsed and validated once, by wgpu; refused
+    /// when wgpu reports an error (its message is then among the wgpu errors).
+    /// A module is never used in a pipeline before this check: one invalid
+    /// pipeline would void the frame's single command encoder.
+    pub(crate) fn shader_module(&self, label: &str, wgsl: &str) -> Result<wgpu::ShaderModule, ()> {
+        let m = self.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(wgsl.into()) });
+        let info = pollster::block_on(m.get_compilation_info());
+        match info.messages.iter().any(|m| m.message_type == wgpu::CompilationMessageType::Error) {
+            true => Err(()),
+            false => Ok(m),
+        }
     }
 
     /// A stage's constant banks (64 KiB each, as bound) and textures.
@@ -893,12 +969,31 @@ impl Surfaces {
         depth
     }
 
-    /// Forgets the uploaded textures whose memory `[start, start + len)` overlaps:
-    /// the GPU wrote there.
+    /// The GPU wrote guest memory `[start, start + len)`: the uploaded textures it
+    /// overlaps are forgotten before the cache is next read. Recorded only (the GPU
+    /// writes a few bytes at a time, thousands of times a frame); contiguous writes
+    /// merge.
     pub fn invalidate(&mut self, start: u64, len: u64) {
         let end = start.saturating_add(len);
-        self.cache.textures.retain(|(addr, _), (_, last)| *last <= start || *addr >= end);
-        self.cache.compare_depths.clear();
+        match self.cache.pending.last_mut() {
+            Some(last) if start <= last.1 && end >= last.0 => *last = (last.0.min(start), last.1.max(end)),
+            _ => self.cache.pending.push((start, end)),
+        }
+    }
+
+    /// Applies the recorded GPU writes: one pass over the uploaded textures drops
+    /// those they overlap, then the depth copies made from them.
+    pub(crate) fn drain_invalidations(&mut self) {
+        if self.cache.pending.is_empty() {
+            return;
+        }
+        let written = merged(&std::mem::take(&mut self.cache.pending));
+        let before = self.cache.textures.len();
+        self.cache.textures.retain(|(addr, _), (_, last)| !overlaps(&written, *addr, *last));
+        if self.cache.textures.len() != before {
+            let textures = &self.cache.textures;
+            self.cache.compare_depths.retain(|k, _| textures.contains_key(k));
+        }
     }
 
     /// The sampler of a header; a non-filtering one (nearest everywhere) for
@@ -1096,6 +1191,53 @@ mod tests {
         let mut memory = 0.5f32.to_le_bytes().repeat(size / 4);
         memory[size - 4..].copy_from_slice(&0.25f32.to_le_bytes());
         assert_eq!(run(&mut s, x, tic, tsc, vec![(ATLAS, memory)], wgsl, 3), vec![0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn a_module_wgpu_refuses_is_refused_and_its_error_kept() {
+        let Ok(s) = Surfaces::headless(crate::Backend::Auto) else {
+            eprintln!("no GPU adapter: test skipped");
+            return;
+        };
+        assert!(s.shader_module("ok", "@compute @workgroup_size(1) fn main() {}").is_ok());
+        assert!(s.errors.lock().unwrap().is_empty());
+        assert!(s.shader_module("bad", "@compute @workgroup_size(1) fn main() { let x: u32 = 1.5; }").is_err());
+        assert_eq!(s.errors.lock().unwrap().len(), 1, "{:?}", s.errors);
+    }
+
+    #[test]
+    fn merged_writes_overlap_what_each_write_overlapped() {
+        // Writes, some touching, overlapping, empty or nested; textures as [a, b).
+        let writes = [(100u64, 104u64), (104, 108), (300, 300), (50, 60), (55, 58), (1000, 2000), (1500, 1504), (2000, 2004), (7, 9)];
+        let one_by_one = |a: u64, b: u64| writes.iter().any(|&(start, end)| b > start && a < end);
+        let all = merged(&writes);
+        for a in (0..2100).step_by(3) {
+            for len in [0u64, 1, 4, 7, 50, 400] {
+                assert_eq!(overlaps(&all, a, a + len), one_by_one(a, a + len), "[{a}, {})", a + len);
+            }
+        }
+        assert!(!overlaps(&merged(&[]), 0, u64::MAX));
+    }
+
+    #[test]
+    fn index_max_matches_the_decode_then_filter_formula() {
+        // The former formula: decode every index, drop the restart value, take the max.
+        let former = |raw: &[u8], size: usize, restart: Option<u32>| -> u32 {
+            let values: Vec<u32> = raw.chunks_exact(size).map(index_value).collect();
+            values.iter().filter(|&&i| restart != Some(i)).max().copied().unwrap_or(0)
+        };
+        let words: Vec<u32> = (0..257u32).map(|i| i.wrapping_mul(2_654_435_761) >> (i % 29)).collect();
+        for size in [1usize, 2, 4] {
+            let raw: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()[..size].to_vec()).collect();
+            let top = former(&raw, size, None);
+            for restart in [None, Some(0), Some(top), Some(1), Some(u32::MAX)] {
+                assert_eq!(index_max(&raw, size, restart), former(&raw, size, restart), "size {size} restart {restart:?}");
+            }
+            assert_eq!(index_max(&[], size, None), 0);
+            // Only restart values: none is left.
+            let only = top.to_le_bytes()[..size].repeat(5);
+            assert_eq!(index_max(&only, size, Some(top)), 0);
+        }
     }
 
     #[test]

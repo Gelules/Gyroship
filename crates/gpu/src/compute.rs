@@ -58,12 +58,13 @@ fn storage_format(f: wgpu::TextureFormat) -> Option<(wgpu::TextureFormat, &'stat
 }
 
 /// A translated compute program for one block size and set of image formats.
-pub(crate) type Compiled = Result<(Translation, wgpu::ShaderModule), String>;
+pub(crate) type Compiled = Result<std::sync::Arc<(Translation, wgpu::ShaderModule)>, String>;
 
 impl Surfaces {
     /// Runs a dispatch; an empty grid does nothing.
     pub fn dispatch(&mut self, l: &Launch, pools: Pools, mem: Mem) -> Result<(), String> {
         self.textures_read.clear();
+        self.drain_invalidations();
         // A dispatch may write the images: their float twins are stale.
         self.cache.twins.clear();
         if l.grid.contains(&0) || l.program == 0 {
@@ -107,9 +108,9 @@ impl Surfaces {
             textures::tic(&header).ok_or_else(|| "image header layout".into())
         };
         // The images and queried textures: their headers give the formats and types the translation needs.
-        let first = self.compute_program(key, l, Vec::new(), BTreeMap::new())?.0;
+        let first = self.compute_program(key, l, Vec::new(), BTreeMap::new())?;
         let mut images = Vec::new();
-        for img in &first.interface.images {
+        for img in &first.0.interface.images {
             let tic = tic_of(&img.handle)?;
             let header = textures::wgpu_texture_format(&tic).ok_or_else(|| format!("image format {:?}", tic.components))?;
             let (format, name) = storage_format(header).ok_or_else(|| format!("image format {header:?} as storage, at {:#x} ({:?} {}x{}x{})", tic.address, tic.texture_type, tic.width, tic.height, textures::layers(&tic)))?;
@@ -119,13 +120,14 @@ impl Surfaces {
             images.push((tic, format, name.to_string(), header));
         }
         let mut queried = BTreeMap::new();
-        for (slot, x) in first.interface.textures.iter().enumerate().filter(|(_, x)| x.query) {
+        for (slot, x) in first.0.interface.textures.iter().enumerate().filter(|(_, x)| x.query) {
             if tic_of(&x.handle).is_ok_and(|t| t.texture_type == TextureType::ThreeD) {
                 queried.insert(slot, TexDim::D3);
             }
         }
-        let (t, module) = self.compute_program(key, l, images.iter().map(|i| i.2.clone()).collect(), queried)?;
-        if let Some(b) = t.interface.cbufs.iter().chain(&Self::handle_banks(&t)).find(|b| !banks.contains_key(b)) {
+        let compiled = self.compute_program(key, l, images.iter().map(|i| i.2.clone()).collect(), queried)?;
+        let (t, module) = (&compiled.0, &compiled.1);
+        if let Some(b) = t.interface.cbufs.iter().chain(&Self::handle_banks(t)).find(|b| !banks.contains_key(b)) {
             return Err(format!("compute constant bank {b} not bound"));
         }
 
@@ -205,7 +207,7 @@ impl Surfaces {
         }
 
         // Bindings: constant banks, textures and swizzles as for draws, then the images.
-        let (textures, swizzles) = self.texture_slots(&t, &banks, pools.headers, pools.samplers, pools.sampler_binding, &[], mem)?;
+        let (textures, swizzles) = self.texture_slots(t, &banks, pools.headers, pools.samplers, pools.sampler_binding, &[], mem)?;
         let cbufs: BTreeMap<u8, Vec<u8>> = banks.into_iter().filter(|(b, _)| t.interface.cbufs.contains(b)).collect();
         let bindings = Bindings { cbufs, textures, swizzles: t.interface.swizzles.then_some(swizzles) };
         let mut layout_entries = bindings.layout(wgpu::ShaderStages::COMPUTE);
@@ -240,7 +242,7 @@ impl Surfaces {
                 let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: Some(&format!("{key:016x}")),
                     layout: Some(&pipeline_layout),
-                    module: &module,
+                    module,
                     entry_point: Some("main"),
                     compilation_options: Default::default(),
                     cache: None,
@@ -293,12 +295,8 @@ impl Surfaces {
         }
         let options = Options { workgroup: l.block, shared: l.shared, images, queried, ..Default::default() };
         let made = shader::translate_with(&self.cache.code[&key], &options).map_err(|e| format!("compute program {key:016x}: {e}")).and_then(|t| {
-            if let Err(e) = shader::validate(&t.wgsl) {
-                self.error(format!("compute program {key:016x}: {e}"));
-                return Err(format!("compute program {key:016x}: invalid WGSL"));
-            }
-            let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(&format!("{key:016x}")), source: wgpu::ShaderSource::Wgsl(t.wgsl.as_str().into()) });
-            Ok((t, module))
+            let module = self.shader_module(&format!("{key:016x}"), &t.wgsl).map_err(|()| format!("compute program {key:016x}: invalid WGSL"))?;
+            Ok(std::sync::Arc::new((t, module)))
         });
         self.cache.compute.insert(id, made.clone());
         made

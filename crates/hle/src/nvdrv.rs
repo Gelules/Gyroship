@@ -484,15 +484,14 @@ fn note_wait(k: &mut Kernel, fd: u32, space: u32, before: Option<gyroship_gpu::p
 
 impl Gpu {
     /// The key of the graphics program at a GPU address (read from guest
-    /// memory once, until its closing self-branch); new programs go to
+    /// memory once, until its closing self-branch), None when no end is found
+    /// in readable memory; new programs are journaled and go to
     /// `--dump-shaders DIR` (game code: never committed).
-    fn program(&mut self, k: &mut Kernel, space: u32, gpu: u64) -> String {
+    fn program(&mut self, k: &mut Kernel, space: u32, gpu: u64) -> Option<u64> {
         if let Some(key) = self.programs.get(&gpu) {
-            return format!("{key:016x}");
+            return Some(*key);
         }
-        let Some((key, code)) = gyroship_gpu::draw::read_program(&mut |gpu, buf| k.read_gpu(space, gpu, buf), gpu) else {
-            return format!("program at {gpu:#x}: no end found in readable memory");
-        };
+        let (key, code) = gyroship_gpu::draw::read_program(&mut |gpu, buf| k.read_gpu(space, gpu, buf), gpu)?;
         self.programs.insert(gpu, key);
         if self.keys.insert(key) {
             k.log(&format!("gpu: program {key:016x}: {} bytes at {gpu:#x}", code.len()));
@@ -501,7 +500,7 @@ impl Gpu {
                 let _ = std::fs::write(dir.join(format!("{key:016x}.bin")), &code);
             }
         }
-        format!("{key:016x}")
+        Some(key)
     }
 
     /// Performs a channel's effects in guest memory and on the host GPU, in order.
@@ -537,13 +536,20 @@ impl Gpu {
                 }
                 Effect::Draw(d) => {
                     let draw = k.count("draws");
-                    let keys: Vec<String> = d.programs.iter().enumerate().filter_map(|(stage, p)| Some(format!("stage {stage} {}", self.program(k, space, (*p)?)))).collect();
+                    // The programs first (a new one is journaled and dumped before the draw);
+                    // the draw's line, and the strings it needs, only on the frames it is written.
+                    let programs: Vec<(usize, u64, Option<u64>)> = d.programs.iter().enumerate().filter_map(|(stage, p)| Some((stage, (*p)?, self.program(k, space, (*p)?)))).collect();
+                    let dumped = k.config.frames_dump.is_some() && (k.gs.presents + 1).is_multiple_of(k.config.dump_every);
+                    let logged = k.gs.presents < 3 || draw <= 64 || dumped;
                     let mut outcome = String::new();
                     if let Some(mut s) = k.surfaces.take() {
-                        outcome = match s.draw(&d, &mut |gpu, buf| k.read_gpu(space, gpu, buf)) {
-                            Ok(()) => format!(" -> drawn{}", if s.textures_read.is_empty() { String::new() } else { format!(", textures {:x?}", s.textures_read) }),
-                            Err(why) => format!(" -> not drawn: {why}"),
-                        };
+                        let result = s.draw(&d, &mut |gpu, buf| k.read_gpu(space, gpu, buf));
+                        if logged {
+                            outcome = match result {
+                                Ok(()) => format!(" -> drawn{}", if s.textures_read.is_empty() { String::new() } else { format!(", textures {:x?}", s.textures_read) }),
+                                Err(why) => format!(" -> not drawn: {why}"),
+                            };
+                        }
                         // One frame, draw by draw (game output: never committed).
                         if let (Some(dir), Some(n)) = (&k.config.frames_dump, k.config.dump_draws)
                             && k.gs.presents + 1 == n
@@ -553,8 +559,14 @@ impl Gpu {
                         k.surfaces = Some(s);
                     }
                     // The first frames' draws, one line each.
-                    let dumped = k.config.frames_dump.is_some() && (k.gs.presents + 1).is_multiple_of(k.config.dump_every);
-                    if k.gs.presents < 3 || draw <= 64 || dumped {
+                    if logged {
+                        let keys: Vec<String> = programs
+                            .iter()
+                            .map(|&(stage, gpu, key)| match key {
+                                Some(key) => format!("stage {stage} {key:016x}"),
+                                None => format!("stage {stage} program at {gpu:#x}: no end found in readable memory"),
+                            })
+                            .collect();
                         let index = d.index.as_ref().map(|i| (i.address, i.bytes_per_index, i.first));
                         let targets: Vec<String> = d.targets.iter().map(|t| format!("{:#x} {:#x} {}x{}", t.addr, t.format, t.width, t.height)).collect();
                         let outputs: Vec<String> = d.render.outputs.iter().map(|o| format!("{}->{} mask {:x}{}", o.location, o.target, o.write_mask, if o.blend.is_some() { " blend" } else { "" })).collect();

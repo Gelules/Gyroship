@@ -526,15 +526,6 @@ impl Surfaces {
         *self.skipped.entry(why.into()).or_default() += 1;
     }
 
-    /// Keeps a message with the wgpu errors (the first ones).
-    pub(crate) fn error(&self, what: String) {
-        if let Ok(mut v) = self.errors.lock()
-            && v.len() < 16
-        {
-            v.push(what);
-        }
-    }
-
     /// The texture of a target, made (or remade, if its size changed) on demand.
     pub(crate) fn texture(&mut self, s: &Surface, format: wgpu::TextureFormat) -> wgpu::TextureView {
         let key = (s.addr, s.format);
