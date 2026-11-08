@@ -219,8 +219,10 @@ impl Fs {
                     k.stop(crate::STOP_EXIT, &format!("RomFS read at {offset:#x}+{size:#x}: {e}"));
                 }
                 if k.mem.write(b.addr, &bytes).is_err() {
+                    k.anomaly("romfs read buffer", &format!("{size:#x} bytes at {offset:#x} into {:#x}+{:#x}: not writable", b.addr, b.size));
                     return Some(Reply::error(crate::result::INVALID_POINTER));
                 }
+                k.count("romfs reads");
                 Reply::ok()
             }
             (Fs::RomStorage, 4) => Reply::with(&k.romfs.as_ref()?.size().to_le_bytes()),

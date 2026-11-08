@@ -159,10 +159,24 @@ pub fn audio(sdl: Arc<Sdl>, channels: i32, rate: i32) -> Option<gyroship_hle::Au
             return None;
         }
     };
-    let mut dropped = 0u64;
+    let (mut dropped, mut starved, mut first) = (0u64, 0u64, true);
+    let start = std::time::Instant::now();
     Some(Box::new(move |frames: &[f32], gain: f32| {
         let s = &stream;
-        if sdl.queued(s.0) > MAX_QUEUED {
+        let queued = sdl.queued(s.0);
+        // An empty queue: the device ran dry (a gap, but at the start). A tick of
+        // silence goes first, so the queue holds one to two ticks (D30: about 85 ms)
+        // and the ticks' jitter (they come at frames, ±16 ms) no longer reaches it.
+        if queued == 0 {
+            if !std::mem::take(&mut first) {
+                starved += 1;
+                if starved.is_power_of_two() {
+                    eprintln!("gyroship: sound: {starved} gaps, the last at {:.1} s (the game ran slower than real time)", start.elapsed().as_secs_f32());
+                }
+            }
+            sdl.put(s.0, &vec![0.0; frames.len()]);
+        }
+        if queued > MAX_QUEUED {
             dropped += 1;
             if dropped.is_power_of_two() {
                 eprintln!("gyroship: sound: {dropped} ticks dropped (the host is ahead)");
