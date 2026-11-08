@@ -239,8 +239,8 @@ pub fn run(table: Vec<rt::Entry>, window: Option<HostWindow>) {
     journal.all_svcs = flag("--all-svcs");
     let value = |f: &str| args.iter().position(|a| a == f).and_then(|i| args.get(i + 1)).cloned();
     let frames: Option<u64> = value("--frames").and_then(|s| s.parse().ok());
-    // A virtual time limit: --seconds, else 60 s unless --frames bounds the run or a window does.
-    let seconds: Option<u64> = value("--seconds").and_then(|s| s.parse().ok()).or(if frames.is_some() || window.is_some() { None } else { Some(60) });
+    // A virtual time limit: --seconds, else 60 s unless --frames, a window or a replay (its end) bounds the run.
+    let seconds: Option<u64> = value("--seconds").and_then(|s| s.parse().ok()).or(if frames.is_some() || window.is_some() || value("--replay").is_some() { None } else { Some(60) });
     let save_dir = value("--save").map(std::path::PathBuf::from);
     let config = Config {
         explore: flag("--explore"),
