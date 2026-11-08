@@ -67,7 +67,8 @@ pub struct Cache {
     pub(crate) compute_pipelines: HashMap<String, (wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
     pub(crate) images: HashMap<u64, wgpu::Texture>,
     /// Translations by (program key, key of the pixel program it pairs with).
-    modules: HashMap<(u64, Option<u64>), Module>,
+    /// (program key, paired pixel program key, integer attributes mask).
+    modules: HashMap<(u64, Option<u64>, u64), Module>,
     pipelines: HashMap<String, (wgpu::RenderPipeline, Vec<wgpu::BindGroupLayout>)>,
     /// Uploaded textures by address and header, with the end of the memory they came from.
     textures: HashMap<(u64, [u8; 32]), (wgpu::Texture, u64)>,
@@ -179,10 +180,12 @@ impl Surfaces {
             return Err("vertex-A, tessellation or geometry program".into());
         }
         let ps = match d.programs[5] {
-            Some(at) => Some(self.module(mem, at, None)?),
+            Some(at) => Some(self.module(mem, at, None, &BTreeMap::new())?),
             None => None,
         };
-        let vs = self.module(mem, d.programs[1].ok_or("no vertex program")?, ps.as_ref().map(|p| &p.0))?;
+        // Attributes fetched as integers: the vertex program declares them so.
+        let ints: BTreeMap<u8, bool> = d.attributes.iter().filter(|a| !a.constant && matches!(a.format.kind, AttrKind::Uint | AttrKind::Sint)).map(|a| (a.location, a.format.kind == AttrKind::Sint)).collect();
+        let vs = self.module(mem, d.programs[1].ok_or("no vertex program")?, ps.as_ref().map(|p| &p.0), &ints)?;
 
         // Attachments: the locations the pixel program writes, and depth when tested.
         let written = ps.as_ref().map(|p| p.0.interface.targets.clone()).unwrap_or_default();
@@ -222,9 +225,6 @@ impl Surfaces {
             let a = d.attributes.iter().find(|a| a.location == location).ok_or_else(|| format!("vertex attribute {location} not programmed"))?;
             if a.constant {
                 return Err("constant vertex attribute".into());
-            }
-            if matches!(a.format.kind, AttrKind::Uint | AttrKind::Sint) {
-                return Err("integer vertex attribute".into());
             }
             let format = wgpu_vertex_format(&a.format).ok_or_else(|| format!("vertex attribute format {:#x}", a.raw))?;
             let s = d.streams.iter().find(|s| s.index == a.stream).ok_or("vertex attribute on a disabled stream")?;
@@ -413,7 +413,7 @@ impl Surfaces {
 
     /// The translation and WGSL module of the program at `at`; a vertex
     /// program pairs with its pixel program's varyings.
-    fn module(&mut self, mem: Mem, at: u64, pixel: Option<&Translation>) -> Module {
+    fn module(&mut self, mem: Mem, at: u64, pixel: Option<&Translation>, ints: &BTreeMap<u8, bool>) -> Module {
         let key = match self.cache.programs.get(&at) {
             Some(key) => *key,
             None => {
@@ -427,8 +427,10 @@ impl Surfaces {
         }
         .ok_or("program not readable")?;
         let pair = pixel.map(|p| p.key);
-        if !self.cache.modules.contains_key(&(key, pair)) {
-            let options = Options { varyings: pixel.map(|p| p.interface.varyings.clone()).unwrap_or_default(), ..Default::default() };
+        let mask = ints.iter().fold(0u64, |m, (&l, &signed)| m | 1 << (l % 32) | u64::from(signed) << (32 + l % 32));
+        let id = (key, pair, mask);
+        if !self.cache.modules.contains_key(&id) {
+            let options = Options { varyings: pixel.map(|p| p.interface.varyings.clone()).unwrap_or_default(), int_attributes: ints.clone(), ..Default::default() };
             let made = shader::translate_with(&self.cache.code[&key], &options).map_err(|e| format!("program {key:016x}: {e}")).and_then(|t| {
                 if let Err(e) = shader::validate(&t.wgsl) {
                     self.error(format!("program {key:016x}: {e}"));
@@ -437,9 +439,9 @@ impl Surfaces {
                 let m = self.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(&format!("{key:016x}")), source: wgpu::ShaderSource::Wgsl(t.wgsl.as_str().into()) });
                 Ok((t, m))
             });
-            self.cache.modules.insert((key, pair), made);
+            self.cache.modules.insert(id, made);
         }
-        self.cache.modules[&(key, pair)].clone()
+        self.cache.modules[&id].clone()
     }
 
     /// A stage's constant banks (64 KiB each, as bound) and textures.
@@ -562,7 +564,13 @@ impl Surfaces {
                     let aspect = if depth { wgpu::TextureAspect::DepthOnly } else { wgpu::TextureAspect::All };
                     (crate::surfaces::view_as(&e.texture, textures::wgpu_texture_format(&tic), wgpu::TextureUsages::TEXTURE_BINDING, view_desc(aspect)), depth, "target")
                 }
-                None if x.compare => return Err("depth-compare texture not in a depth target".into()),
+                None if x.compare => {
+                    // Where the nearest depth targets are, to tell a missing shadow pass from an offset view.
+                    let mut near: Vec<(u64, u32, u32, u32)> = self.map.values().filter(|e| e.texture.format().is_depth_stencil_format()).map(|e| (e.surface.addr, e.surface.width, e.surface.height, e.surface.layers)).collect();
+                    near.sort_by_key(|n| n.0.abs_diff(tic.address));
+                    near.truncate(3);
+                    return Err(format!("depth-compare texture not in a depth target: {:#x} {:?} {:?} {}x{}x{}; nearest depth targets {near:x?}", tic.address, tic.texture_type, tic.components, tic.width, tic.height, textures::layers(&tic)));
+                }
                 None => (self.upload(&tic, header, mem)?.create_view(&view_desc(wgpu::TextureAspect::All)), false, "memory"),
             };
             if x.compare && !depth {

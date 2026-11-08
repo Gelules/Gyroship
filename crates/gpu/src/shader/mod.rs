@@ -151,6 +151,9 @@ pub struct Options {
     /// The type of each texture slot that TXQ queries, from its header (D2 or
     /// D3), by slot; a missing one is D2.
     pub queried: BTreeMap<usize, TexDim>,
+    /// Vertex: the attributes fetched as integers, by location (true: signed):
+    /// declared vec4<u32> or vec4<i32>, their bits read as they are.
+    pub int_attributes: BTreeMap<u8, bool>,
 }
 
 /// Translates a graphics program on its own.
@@ -182,6 +185,7 @@ pub fn translate_with(code: &[u8], options: &Options) -> Result<Translation, Err
     let mut cx = Cx::new(sph);
     cx.images = options.images.clone();
     cx.queried = options.queried.clone();
+    cx.int_attributes = options.int_attributes.clone();
     // Images the program both stores to and loads from: their loads read the image itself.
     let handles = |load: bool| -> BTreeSet<(u8, u16)> {
         ops.iter()
@@ -299,6 +303,7 @@ struct Cx {
     read_write: BTreeSet<(u8, u16)>,
     /// `Options::queried`.
     queried: BTreeMap<usize, TexDim>,
+    int_attributes: BTreeMap<u8, bool>,
     /// Compute: the program uses shared memory (`shm`, words as atomics so
     /// that ATOMS and plain accesses can share it).
     shm: bool,
@@ -345,7 +350,7 @@ const SHM_CAS: &str = "fn shm_cas(i: u32, op: u32, v: u32) -> u32 {
 
 impl Cx {
     fn new(sph: Sph) -> Cx {
-        Cx { sph, regs: BTreeSet::new(), preds: BTreeSet::new(), uregs: BTreeSet::new(), upreds: BTreeSet::new(), iface: Interface::default(), decls: String::new(), helpers: BTreeSet::new(), temps: 0, uexpr: BTreeMap::new(), gexpr: BTreeMap::new(), images: Vec::new(), queried: BTreeMap::new(), read_write: BTreeSet::new(), shm: false, lane: false, roots: BTreeMap::new() }
+        Cx { sph, regs: BTreeSet::new(), preds: BTreeSet::new(), uregs: BTreeSet::new(), upreds: BTreeSet::new(), iface: Interface::default(), decls: String::new(), helpers: BTreeSet::new(), temps: 0, uexpr: BTreeMap::new(), gexpr: BTreeMap::new(), images: Vec::new(), queried: BTreeMap::new(), int_attributes: BTreeMap::new(), read_write: BTreeSet::new(), shm: false, lane: false, roots: BTreeMap::new() }
     }
 
     /// A shared memory access's byte address, `reg × stride + ureg + offset`, as a new `let`.
@@ -782,7 +787,12 @@ impl Cx {
             for (v, mask) in self.sph.inputs().into_iter().enumerate() {
                 if mask != 0 {
                     self.iface.attributes.insert(v as u8, mask);
-                    let _ = writeln!(vin, "@location({v}) a{v}: vec4<f32>,");
+                    let ty = match self.int_attributes.get(&(v as u8)) {
+                        Some(true) => "vec4<i32>",
+                        Some(false) => "vec4<u32>",
+                        None => "vec4<f32>",
+                    };
+                    let _ = writeln!(vin, "@location({v}) a{v}: {ty},");
                 }
             }
             vin.push_str("};\n");
@@ -1476,7 +1486,11 @@ impl Cx {
                 for k in 0..u16::from(*comps) {
                     let a = attr + 4 * k;
                     let e = match a {
-                        0x80..=0x27c => format!("u(i.a{}[{}])", (a - 0x80) / 16, a / 4 % 4),
+                        0x80..=0x27c => {
+                            let v = (a - 0x80) / 16;
+                            // An integer attribute's bits are its value; a float one's are reinterpreted.
+                            if self.int_attributes.contains_key(&(v as u8)) { format!("bitcast<u32>(i.a{v}[{}])", a / 4 % 4) } else { format!("u(i.a{v}[{}])", a / 4 % 4) }
+                        }
                         0x2f8 => "i.iid".to_string(),
                         0x2fc => "i.vid".to_string(),
                         _ => return Err(format!("ALD of attribute {a:#x}")),
