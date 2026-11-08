@@ -135,6 +135,13 @@ pub fn runtime_path() -> String {
     crate_path("runtime")
 }
 
+/// A patched dependency in the repository's `vendor` folder, for generated
+/// projects (never committed).
+pub fn vendor_path(name: &str) -> String {
+    let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join("vendor").join(name);
+    plain(&p.canonicalize().unwrap_or(p))
+}
+
 /// A crate next to this one, for generated projects (never committed).
 pub fn crate_path(name: &str) -> String {
     let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join(name);

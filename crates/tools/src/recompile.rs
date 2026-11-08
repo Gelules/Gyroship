@@ -7,7 +7,7 @@
 //! indirect jump to one runs the real code, which reads its GOT slot. A slot
 //! that rtld binds lazily points at PLT0 until then.
 
-use crate::experiment::{crate_path, plain, runtime_path};
+use crate::experiment::{crate_path, plain, runtime_path, vendor_path};
 use gyroship_analysis::{cfg, decode, discover};
 use gyroship_recomp::ir::Op;
 use gyroship_recomp::{Callee, Input, clif, lift};
@@ -152,10 +152,14 @@ pub fn run(exefs: &Path, out: &Path, threads: usize, verify: bool, probes: Optio
     );
     // Line tables: `--profile` then names every host function from the PDB, not
     // only its public symbols (each private function was charged to the public
-    // one before it). The guest's own objects are linked as they are.
+    // one before it). The guest's own objects are linked as they are. The
+    // repository's patched naga, as in its own workspace.
     std::fs::write(
         out.join("Cargo.toml"),
-        "[workspace]\nresolver = \"3\"\nmembers = [\"harness\"]\n\n[profile.release]\ndebug = \"line-tables-only\"\nincremental = false\n",
+        format!(
+            "[workspace]\nresolver = \"3\"\nmembers = [\"harness\"]\n\n[profile.release]\ndebug = \"line-tables-only\"\nincremental = false\n\n[patch.crates-io]\nnaga = {{ path = \"{}\" }}\n",
+            vendor_path("naga")
+        ),
     )?;
     std::fs::write(
         out.join("harness/Cargo.toml"),

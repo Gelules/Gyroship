@@ -7,6 +7,12 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+# naga 30.0.1 with front::Typifier::grow made linear (it was quadratic in a
+# function's expression count: seconds per large translated shader). The change
+# is marked "Gyroship patch" in vendor/naga/src/front/mod.rs.
+[patch.crates-io]
+naga = { path = "vendor/naga" }
+
 [workspace.dependencies]
 clap = { version = "4.6", features = ["derive"] }
 sha2 = "0.11"
