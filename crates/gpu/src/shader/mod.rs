@@ -1555,12 +1555,15 @@ impl Cx {
             MemoryOp::Sust { coord, data, handle, dim, mask: 0xf, .. } if self.sph.stage == Stage::Compute => {
                 let slot = self.image_slot(*handle, *dim)?;
                 let (at, coords, layer) = self.image_coords(*coord, *dim)?;
-                let v: Vec<String> = (0..4).map(|k| if *data == RZ { "0.0".to_string() } else { format!("f({})", self.r(data + k)) }).collect();
+                // The image's texel type: float, or the register bits for integer formats.
+                let format = self.images.get(slot).cloned().unwrap_or_default();
+                let (ty, zero, cast) = if format.ends_with("uint") { ("vec4<u32>", "0u", "") } else if format.ends_with("sint") { ("vec4<i32>", "0i", "bitcast<i32>") } else { ("vec4<f32>", "0.0", "f") };
+                let v: Vec<String> = (0..4).map(|k| if *data == RZ { zero.to_string() } else { format!("{cast}({})", self.r(data + k)) }).collect();
                 // A store outside the image is dropped, as on the console: WGSL may instead
                 // write any texel (the edge, racing with its own store).
                 let inside = image_inside(slot, &at, coords, layer.as_deref());
                 let layer = layer.map(|l| format!(", {l}")).unwrap_or_default();
-                let _ = writeln!(out, "if ({inside}) {{ textureStore(img{slot}, {at}{layer}, vec4<f32>({})); }}", v.join(", "));
+                let _ = writeln!(out, "if ({inside}) {{ textureStore(img{slot}, {at}{layer}, {ty}({})); }}", v.join(", "));
             }
             // LDG through a pointer from a constant bank: the address minus that pointer
             // indexes the buffer bound for it (`Interface::buffers`). Buffers are under 4 GiB:
@@ -1842,7 +1845,7 @@ impl Cx {
         let (io, dim, fetch, lod, scr, aoffi, dc, f16, gather) = match op {
             TextureOp::Tex { io, dim, lod, scr, aoffi, dc, f16, .. } => (io, *dim, false, *lod, *scr, *aoffi, *dc, *f16, None),
             TextureOp::Tld { io, dim, lod, scr, aoffi, ms: false, f16 } => (io, *dim, true, *lod, *scr, *aoffi, false, *f16, None),
-            TextureOp::Tld4 { io, dim: dim @ (TexDim::D2 | TexDim::Array2D | TexDim::Cube | TexDim::ArrayCube), comp, offset: Tld4Offset::None, scr, dc } => (io, *dim, false, LodMode::Auto, *scr, false, *dc, false, Some(*comp)),
+            TextureOp::Tld4 { io, dim: dim @ (TexDim::D2 | TexDim::Array2D | TexDim::Cube | TexDim::ArrayCube), comp, offset: offset @ (Tld4Offset::None | Tld4Offset::AOffI), scr, dc } => (io, *dim, false, LodMode::Auto, *scr, matches!(offset, Tld4Offset::AOffI), *dc, false, Some(*comp)),
             TextureOp::Txd { io, dim, aoffi } => return self.txd(out, io, *dim, *aoffi),
             // The size of a level (the texture is taken as 2D): width, height, 1, levels.
             // TXQ: the texture declared as the type its header has (`Options::queried`).
@@ -1981,7 +1984,10 @@ impl Cx {
                     return Err("cube texture sample with an offset".into());
                 }
                 let off = get(Item::Offset)?;
-                let parts: Vec<String> = (0..coords).map(|c| format!("f32(extractBits(bitcast<i32>({off}), {}u, 4u))", 4 * c)).collect();
+                // TEX: signed 4-bit offsets, x lowest. TLD4: signed 6-bit offsets, one per
+                // byte (the wider gather range; as Mesa's NAK packs them, not proved here).
+                let (stride, bits) = if gather.is_some() { (8, 6) } else { (4, 4) };
+                let parts: Vec<String> = (0..coords).map(|c| format!("f32(extractBits(bitcast<i32>({off}), {}u, {bits}u))", stride * c)).collect();
                 uv = if coords == 1 {
                     format!("({uv} + {} / f32(textureDimensions(tex{slot}, 0)))", parts[0])
                 } else {
@@ -2343,6 +2349,12 @@ mod tests {
         for want in ["@workgroup_size(8, 8, 1)", "r0 = lid.x;", "r2 = wid.z;", "texture_storage_3d<rgba16float, write>", "textureStore(img0, vec3<i32>(i32(r0), i32(r1), i32(r2))"] {
             assert!(t.wgsl.contains(want), "{want}\n{}", t.wgsl);
         }
+        // Integer images store the register bits.
+        for (format, want) in [("r32uint", "vec4<u32>((r4), (r5), (r6), (r7))"), ("r32sint", "vec4<i32>(bitcast<i32>(r4), bitcast<i32>(r5),")] {
+            let t = translate_with(&code, &Options { images: vec![format.into()], ..options.clone() }).unwrap_or_else(|e| panic!("{e}"));
+            validate(&t.wgsl).unwrap_or_else(|e| panic!("{e}\n{}", t.wgsl));
+            assert!(t.wgsl.contains(&format!("texture_storage_3d<{format}, write>")) && t.wgsl.contains(want), "{want}\n{}", t.wgsl);
+        }
     }
 
     #[test]
@@ -2401,6 +2413,12 @@ mod tests {
         let t = compute(&[tld4], &Options { workgroup: [8, 8, 1], ..Default::default() });
         assert_eq!(t.interface.textures, vec![Texture { handle: Handle::CBuf { bank: 0, offset: 0x28 }, dim: TexDim::Array2D, compare: false, fetch: false, query: false }]);
         for want in ["texture_2d_array<f32>", "textureGather(0, tex0, smp0, vec2<f32>(f(r33), f(r43)), i32(r32))", "textureGather(3, tex0", "(swizzles[0][0] >> 3u) & 7u", "r28 =", "r29 =", "r22 =", "r23 ="] {
+            assert!(t.wgsl.contains(want), "{want}\n{}", t.wgsl);
+        }
+        // .AOFFI: the offset follows y in b (R44), 6-bit fields one byte apart.
+        let tld4 = w(0xb63, &[(16, 28), (24, 32), (32, 43), (64, 22), (40, 0x28 / 4), (54, 0), (61, 5), (60, 1), (72, 0xf), (76, 1), (81, 7), (84, 1), (87, 1)]);
+        let t = compute(&[tld4], &Options { workgroup: [8, 8, 1], ..Default::default() });
+        for want in ["extractBits(bitcast<i32>(r44), 0u, 6u)", "extractBits(bitcast<i32>(r44), 8u, 6u)", "textureGather(0, tex0, smp0, (vec2<f32>(f(r33), f(r43)) + "] {
             assert!(t.wgsl.contains(want), "{want}\n{}", t.wgsl);
         }
     }

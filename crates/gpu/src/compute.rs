@@ -47,6 +47,12 @@ fn storage_format(f: wgpu::TextureFormat) -> Option<(wgpu::TextureFormat, &'stat
         T::Rgba16Unorm => "rgba16unorm",
         T::Rgb10a2Unorm => "rgb10a2unorm",
         T::Rg11b10Ufloat => "rg11b10ufloat",
+        T::R32Uint => "r32uint",
+        T::R32Sint => "r32sint",
+        T::Rg32Uint => "rg32uint",
+        T::Rg32Sint => "rg32sint",
+        T::Rgba32Uint => "rgba32uint",
+        T::Rgba32Sint => "rgba32sint",
         _ => return None,
     }))
 }
