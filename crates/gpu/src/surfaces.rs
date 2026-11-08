@@ -104,6 +104,10 @@ enum Fill {
 pub(crate) struct Entry {
     pub(crate) surface: Surface,
     pub(crate) texture: wgpu::Texture,
+    /// When it was last written (`Surfaces::stamp`; 0: never). The game puts targets
+    /// of different formats at one address (a depth buffer, then a color target): a
+    /// read takes the latest, as the shared memory would hold.
+    pub(crate) written: u64,
 }
 
 pub struct Surfaces {
@@ -111,6 +115,8 @@ pub struct Surfaces {
     pub(crate) device: wgpu::Device,
     pub(crate) queue: wgpu::Queue,
     pub(crate) map: BTreeMap<(u64, u32), Entry>,
+    /// The count of target writes, for `Entry::written`.
+    stamp: u64,
     /// Color targets written since the last dump.
     pub(crate) touched: BTreeSet<(u64, u32)>,
     blit: (wgpu::RenderPipeline, wgpu::BindGroupLayout),
@@ -326,7 +332,7 @@ impl Surfaces {
         let arena = (arena_buffer(&device, 16 << 20), Vec::new());
         let window = window.map(|(surface, size)| Window::new(&adapter, &device, surface, size));
         let timing = crate::timing::Timing::new(&device, &queue);
-        Ok(Surfaces { adapter, device, queue, map: BTreeMap::new(), touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pending: None, timing, arena, staged: HashMap::new(), last_color: None, window })
+        Ok(Surfaces { adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pending: None, timing, arena, staged: HashMap::new(), last_color: None, window })
     }
 
     /// Shows the presented image (the color target written last, its top-left
@@ -450,6 +456,20 @@ impl Surfaces {
     pub(crate) fn wrote(&mut self, key: (u64, u32)) {
         self.touched.insert(key);
         self.last_color = Some(key);
+        self.mark(key);
+    }
+
+    /// A target (color or depth) was written: it is now the latest at its address.
+    pub(crate) fn mark(&mut self, key: (u64, u32)) {
+        self.stamp += 1;
+        if let Some(e) = self.map.get_mut(&key) {
+            e.written = self.stamp;
+        }
+    }
+
+    /// The target a read at `addr` sees in `map`: the one written last there.
+    pub(crate) fn latest_at(map: &BTreeMap<(u64, u32), Entry>, addr: u64) -> Option<&Entry> {
+        map.range((addr, 0)..=(addr, u32::MAX)).map(|(_, e)| e).max_by_key(|e| e.written)
     }
 
     /// A 64-bit FNV-1a hash of the image a present shows: the color target
@@ -538,7 +558,7 @@ impl Surfaces {
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC | storage,
                 view_formats: if base == format { &[] } else { std::slice::from_ref(&format) },
             });
-            self.map.insert(key, Entry { surface: *s, texture });
+            self.map.insert(key, Entry { surface: *s, texture, written: 0 });
         }
         view_as(&self.map[&key].texture, Some(format), wgpu::TextureUsages::RENDER_ATTACHMENT, wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2), array_layer_count: Some(1), ..Default::default() })
     }
@@ -555,8 +575,9 @@ impl Surfaces {
                 Some(f) if !self.renderable(f) => self.skip("color clear: format not renderable here"),
                 Some(format) if *mask != 0xf || !covers(s) => {
                     let color = value.map(f32::from_bits);
-                    self.fill(s, format, Fill::Color { mask: *mask }, c.scissor, color, 0.0, 0);
-                    self.wrote((s.addr, s.format));
+                    if self.fill(s, format, Fill::Color { mask: *mask }, c.scissor, color, 0.0, 0) {
+                        self.wrote((s.addr, s.format));
+                    }
                 }
                 Some(format) => {
                     let view = self.texture(s, format);
@@ -582,8 +603,11 @@ impl Surfaces {
                 None => self.skip("depth clear: unsupported format"),
                 Some(f) if !self.renderable(f) => self.skip("depth clear: format not renderable here"),
                 Some(format) if !covers(s) => {
+                    let writes = z.is_some() || (stencil.is_some() && format.has_stencil_aspect());
                     let fill = Fill::Depth { depth: z.is_some(), stencil: stencil.is_some() && format.has_stencil_aspect() };
-                    self.fill(s, format, fill, c.scissor, [0.0; 4], z.map_or(0.0, f32::from_bits), stencil.unwrap_or(0));
+                    if self.fill(s, format, fill, c.scissor, [0.0; 4], z.map_or(0.0, f32::from_bits), stencil.unwrap_or(0)) && writes {
+                        self.mark((s.addr, s.format));
+                    }
                 }
                 Some(format) => {
                     let view = self.texture(s, format);
@@ -596,19 +620,23 @@ impl Surfaces {
                         ..Default::default()
                     });
                     self.record(encoder);
+                    if z.is_some() || (stencil.is_some() && format.has_stencil_aspect()) {
+                        self.mark((s.addr, s.format));
+                    }
                 }
             }
         }
     }
 
     /// Fills `rect` (all of the target when None) of a target: a color
-    /// with a channel mask, or a depth and/or stencil value.
+    /// with a channel mask, or a depth and/or stencil value. False when the
+    /// rect clips to nothing (no pass recorded).
     #[allow(clippy::too_many_arguments)]
-    fn fill(&mut self, s: &Surface, format: wgpu::TextureFormat, fill: Fill, rect: Option<[u32; 4]>, color: [f32; 4], depth: f32, stencil: u8) {
+    fn fill(&mut self, s: &Surface, format: wgpu::TextureFormat, fill: Fill, rect: Option<[u32; 4]>, color: [f32; 4], depth: f32, stencil: u8) -> bool {
         let [x, y, w, h] = rect.unwrap_or([0, 0, s.width, s.height]);
         let (x1, y1) = (x.saturating_add(w).min(s.width), y.saturating_add(h).min(s.height));
         if x >= x1 || y >= y1 {
-            return;
+            return false;
         }
         let pipeline = match self.fill.2.get(&(format, fill)) {
             Some(p) => p.clone(),
@@ -663,6 +691,7 @@ impl Surfaces {
             pass.draw(0..3, 0..1);
         }
         self.record(encoder);
+        true
     }
 
     /// Writes every color target touched since the last call as
@@ -670,7 +699,11 @@ impl Surfaces {
     pub fn dump(&mut self, dir: &Path, prefix: &str) -> Result<usize, String> {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         self.flush();
-        let keys = std::mem::take(&mut self.touched);
+        let mut keys = std::mem::take(&mut self.touched);
+        // GYROSHIP_DUMP_ONLY=<hex address>: that target alone (dumps every few frames).
+        if let Some(only) = std::env::var("GYROSHIP_DUMP_ONLY").ok().and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()) {
+            keys.retain(|k| k.0 == only);
+        }
         for key in &keys {
             let e = &self.map[key];
             let (w, h) = (e.surface.width.max(1), e.surface.height.max(1));

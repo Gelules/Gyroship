@@ -452,6 +452,11 @@ impl Surfaces {
         for (s, _) in colors.iter().flatten() {
             self.wrote((s.addr, s.format));
         }
+        if let Some((s, _)) = &depth
+            && (ds.depth_write || ds.stencil_test)
+        {
+            self.mark((s.addr, s.format));
+        }
         Ok(())
     }
 
@@ -490,7 +495,12 @@ impl Surfaces {
             options.jump_targets = Some(targets);
         }
         if !self.cache.modules.contains_key(&id) {
-            let made = shader::translate_with(&self.cache.code[&key], &options).map_err(|e| format!("program {key:016x}: {e}")).and_then(|t| {
+            let made = shader::translate_with(&self.cache.code[&key], &options).map_err(|e| format!("program {key:016x}: {e}")).and_then(|mut t| {
+                // GYROSHIP_WGSL_OVERRIDE=<dir>: <dir>/<key>.wgsl replaces the translation (a
+                // debugging aid: a program edited to show its intermediate values).
+                if let Some(text) = std::env::var_os("GYROSHIP_WGSL_OVERRIDE").and_then(|d| std::fs::read_to_string(std::path::Path::new(&d).join(format!("{key:016x}.wgsl"))).ok()) {
+                    t.wgsl = text;
+                }
                 if let Err(e) = shader::validate(&t.wgsl) {
                     self.error(format!("program {key:016x}: {e}"));
                     return Err(format!("program {key:016x}: invalid WGSL"));
@@ -605,7 +615,7 @@ impl Surfaces {
                 continue;
             }
             // An image a compute program wrote, or a render target at that address: its host texture.
-            let (view, depth, source) = match self.map.values().find(|e| e.surface.addr == tic.address) {
+            let (view, depth, source) = match Self::latest_at(&self.map, tic.address) {
                 // With the header's format when the image allows it as a view (sRGB over linear storage).
                 _ if self.cache.images.contains_key(&tic.address) => {
                     let image = match self.cache.twins.get(&tic.address) {
@@ -1045,5 +1055,33 @@ mod tests {
         let mut memory = 0.5f32.to_le_bytes().repeat(size / 4);
         memory[size - 4..].copy_from_slice(&0.25f32.to_le_bytes());
         assert_eq!(run(&mut s, x, tic, tsc, vec![(ATLAS, memory)], wgsl, 3), vec![0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn a_read_sees_the_target_written_last_at_its_address() {
+        let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
+            eprintln!("no GPU adapter: test skipped");
+            return;
+        };
+        // A depth target and an RGBA16F color target share an address, as the game's
+        // transient memory does; a fetch there reads whichever was written last.
+        const AT: u64 = 0x80_0000;
+        let depth = Surface { addr: AT, width: 4, height: 4, format: 0x0a, layers: 1 };
+        let color = Surface { addr: AT, width: 4, height: 4, format: 0xca, layers: 1 };
+        let mut tic = [0u8; 32];
+        put(&mut tic, &[(6, 0, 0x2f), (9, 7, 7), (12, 10, 7), (15, 13, 7), (18, 16, 7), (21, 19, 2), (24, 22, 0), (27, 25, 0), (30, 28, 7)]);
+        put(&mut tic, &[(63, 41, (AT >> 9) as u32), (87, 85, 3), (144, 128, 3), (175, 160, 3), (154, 151, 1), (191, 191, 1)]);
+        let x = Texture { handle: Handle::CBuf { bank: 0, offset: 0 }, dim: TexDim::D2, compare: false, fetch: true, query: false };
+        let wgsl = "@group(0) @binding(32) var tex0: texture_2d<f32>;
+            @group(0) @binding(1) var<storage, read_write> out: array<f32>;
+            @compute @workgroup_size(1) fn main() { out[0] = textureLoad(tex0, vec2<i32>(1, 1), 0).r; }";
+        let clear_depth = |s: &mut Surfaces, z: f32| s.clear(&Clear { layer: 0, color: None, depth: Some((depth, Some(z.to_bits()), None)), scissor: None });
+        let clear_color = |s: &mut Surfaces, r: f32| s.clear(&Clear { layer: 0, color: Some((color, [r.to_bits(), 0, 0, 1f32.to_bits()], 0xf)), depth: None, scissor: None });
+        clear_depth(&mut s, 0.5);
+        clear_color(&mut s, 0.25);
+        assert_eq!(run(&mut s, x.clone(), tic, [0; 32], Vec::new(), wgsl, 1), vec![0.25]);
+        clear_depth(&mut s, 0.75);
+        assert_eq!(run(&mut s, x, tic, [0; 32], Vec::new(), wgsl, 1), vec![0.75]);
+        assert!(s.skipped.is_empty(), "{:?}", s.skipped);
     }
 }

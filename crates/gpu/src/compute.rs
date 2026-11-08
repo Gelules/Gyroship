@@ -133,6 +133,7 @@ impl Surfaces {
         // one (the game draws glyphs, then filters them in place), else one kept for images.
         // An array image (SULD/SUST .D2Array) is a 2D texture of the header's layers.
         let mut views = Vec::new();
+        let mut written = Vec::new();
         for ((tic, format, _, header), img) in images.iter().zip(&t.interface.images) {
             let three_d = tic.texture_type == TextureType::ThreeD;
             let array = img.dim == ImageDim::D2Array;
@@ -143,6 +144,9 @@ impl Surfaces {
             });
             if let Some(e) = target {
                 views.push(e.texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2), array_layer_count: Some(1), ..Default::default() }));
+                // Stamped once the dispatch is recorded: its own texture reads (and a
+                // dispatch that fails before) still see the targets as they were.
+                written.push((e.surface.addr, e.surface.format));
                 self.cache.images.remove(&tic.address);
                 continue;
             }
@@ -274,6 +278,9 @@ impl Surfaces {
             pass.dispatch_workgroups(l.grid[0], l.grid[1], l.grid[2]);
         }
         self.record(encoder);
+        for key in written {
+            self.mark(key);
+        }
         Ok(())
     }
 
