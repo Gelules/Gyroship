@@ -2,7 +2,9 @@
 //! every millisecond another thread suspends it, reads its instruction
 //! pointer and resumes it. At the end, dbghelp names each address from the
 //! executable's PDB (recompiled functions are `f_<guest address>`), and a
-//! report lists the samples by symbol, most first.
+//! report lists the samples by module, then by symbol, most first. A module
+//! without a PDB (a driver) names its addresses after its nearest export: its
+//! module name is the reliable part.
 //!
 //! The sampler never allocates nor locks while the thread is suspended (it
 //! could hold the allocator's lock).
@@ -128,14 +130,24 @@ pub fn finish(guest: &dyn Fn(u64) -> String) {
     let Ok(samples) = p.sampler.join() else { return };
     let total: u64 = samples.values().sum();
     let mut by_symbol: HashMap<String, u64> = HashMap::new();
+    let mut by_module: HashMap<String, u64> = HashMap::new();
     for (rip, n) in samples {
-        *by_symbol.entry(symbol(rip)).or_insert(0) += n;
+        let module = module(rip);
+        *by_module.entry(module.clone()).or_insert(0) += n;
+        *by_symbol.entry(format!("[{module}] {}", symbol(rip))).or_insert(0) += n;
     }
+    let mut out = format!("# gyroship profile: {total} samples of 1 ms of the guest's host thread\n# samples  percent  module\n");
+    let mut modules: Vec<(String, u64)> = by_module.into_iter().collect();
+    modules.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    for (name, n) in modules {
+        out += &format!("{n:9} {:7.2}%  {name}\n", 100.0 * n as f64 / total.max(1) as f64);
+    }
+    out += "# samples  percent  [module] symbol\n";
     let mut rows: Vec<(String, u64)> = by_symbol.into_iter().collect();
     rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    let mut out = format!("# gyroship profile: {total} samples of 1 ms of the guest's host thread\n# samples  percent  symbol\n");
     for (name, n) in rows {
-        let guest = name.strip_prefix("f_").and_then(|a| u64::from_str_radix(a, 16).ok()).map_or(String::new(), |a| format!("  {}", guest(a)));
+        let bare = name.split_once("] ").map_or(name.as_str(), |(_, s)| s);
+        let guest = bare.strip_prefix("f_").and_then(|a| u64::from_str_radix(a, 16).ok()).map_or(String::new(), |a| format!("  {}", guest(a)));
         out += &format!("{n:9} {:7.2}%  {name}{guest}\n", 100.0 * n as f64 / total.max(1) as f64);
     }
     // The interpreter's instructions, by opcode, then the most frequent words.
@@ -205,4 +217,27 @@ fn symbol(rip: u64) -> String {
 #[cfg(not(windows))]
 fn symbol(rip: u64) -> String {
     format!("? {rip:#x}")
+}
+
+/// The name of the module (executable or DLL) holding host address `rip`, as
+/// dbghelp loaded it ([`symbol`] runs first and initializes dbghelp).
+#[cfg(windows)]
+fn module(rip: u64) -> String {
+    use windows_sys::Win32::System::Diagnostics::Debug::{IMAGEHLP_MODULEW64, SymGetModuleInfoW64};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let _ = symbol(0);
+    // SAFETY: a zeroed IMAGEHLP_MODULEW64 with its size set, as dbghelp asks.
+    let mut info: IMAGEHLP_MODULEW64 = unsafe { std::mem::zeroed() };
+    info.SizeOfStruct = size_of::<IMAGEHLP_MODULEW64>() as u32;
+    // SAFETY: the struct is as large as SizeOfStruct says.
+    if unsafe { SymGetModuleInfoW64(GetCurrentProcess(), rip, &mut info) } == 0 {
+        return "?".into();
+    }
+    let len = info.ModuleName.iter().position(|&c| c == 0).unwrap_or(info.ModuleName.len());
+    String::from_utf16_lossy(&info.ModuleName[..len])
+}
+
+#[cfg(not(windows))]
+fn module(_rip: u64) -> String {
+    "?".into()
 }

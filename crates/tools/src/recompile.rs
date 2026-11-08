@@ -150,9 +150,12 @@ pub fn run(exefs: &Path, out: &Path, threads: usize, verify: bool, probes: Optio
         "{{ rt::install_probes(vec![{names}]); unsafe {{ {}.collect() }} }}",
         parts_expr.join(".chain(") + &")".repeat(parts.len() - 1)
     );
+    // Line tables: `--profile` then names every host function from the PDB, not
+    // only its public symbols (each private function was charged to the public
+    // one before it). The guest's own objects are linked as they are.
     std::fs::write(
         out.join("Cargo.toml"),
-        "[workspace]\nresolver = \"3\"\nmembers = [\"harness\"]\n\n[profile.release]\ndebug = false\nincremental = false\n",
+        "[workspace]\nresolver = \"3\"\nmembers = [\"harness\"]\n\n[profile.release]\ndebug = \"line-tables-only\"\nincremental = false\n",
     )?;
     std::fs::write(
         out.join("harness/Cargo.toml"),
