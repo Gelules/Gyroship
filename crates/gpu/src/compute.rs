@@ -86,9 +86,8 @@ impl Surfaces {
         }
         let mut banks = BTreeMap::new();
         for &(bank, addr, size) in &l.cbufs {
-            let mut data = vec![0u8; CBUF_BYTES];
-            let n = (size as usize).min(CBUF_BYTES);
-            if !mem(addr, &mut data[..n]) {
+            let mut data = vec![0u8; (size as usize).min(CBUF_BYTES)];
+            if !mem(addr, &mut data) {
                 return Err("compute constant buffer not readable".into());
             }
             banks.insert(bank, data);
@@ -246,7 +245,7 @@ impl Surfaces {
                 (pipeline, layout)
             }
         };
-        let mut buffers: Vec<(u32, (wgpu::Buffer, u64, u64))> = bindings.cbufs.iter().map(|(b, data)| (u32::from(*b), self.stage(data))).collect();
+        let mut buffers: Vec<(u32, (wgpu::Buffer, u64, u64))> = bindings.cbufs.iter().map(|(b, data)| (u32::from(*b), self.stage_window(data, CBUF_BYTES))).collect();
         if let Some(codes) = &bindings.swizzles {
             let bytes: Vec<u8> = codes.iter().flat_map(|c| c.to_le_bytes()).collect();
             buffers.push((shader::SWIZZLE_BINDING, self.stage(&bytes)));

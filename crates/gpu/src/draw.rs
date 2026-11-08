@@ -390,7 +390,7 @@ impl Surfaces {
         let mut bind_groups = Vec::new();
         for (g, layout) in bind_layouts.iter().enumerate() {
             let Bindings { cbufs, textures, swizzles } = &stages[g];
-            let mut buffers: Vec<(u32, (wgpu::Buffer, u64, u64))> = cbufs.iter().map(|(b, data)| (u32::from(*b), self.stage(data))).collect();
+            let mut buffers: Vec<(u32, (wgpu::Buffer, u64, u64))> = cbufs.iter().map(|(b, data)| (u32::from(*b), self.stage_window(data, CBUF_BYTES))).collect();
             if let Some(codes) = swizzles {
                 let bytes: Vec<u8> = codes.iter().flat_map(|c| c.to_le_bytes()).collect();
                 buffers.push((shader::SWIZZLE_BINDING, self.stage(&bytes)));
@@ -509,9 +509,9 @@ impl Surfaces {
         let mut banks = BTreeMap::new();
         for b in t.interface.cbufs.iter().copied().chain(handle_banks) {
             let (addr, size) = d.cbufs[stage].get(usize::from(b)).copied().flatten().ok_or_else(|| format!("constant bank {b} not bound"))?;
-            let mut data = vec![0u8; CBUF_BYTES];
-            let n = (size as usize).min(CBUF_BYTES);
-            if !mem(addr, &mut data[..n]) {
+            // Its bound size only: binding it as 64 KiB is `stage_window`'s.
+            let mut data = vec![0u8; (size as usize).min(CBUF_BYTES)];
+            if !mem(addr, &mut data) {
                 return Err("constant buffer not readable".into());
             }
             banks.insert(b, data);
