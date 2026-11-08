@@ -80,6 +80,9 @@ pub struct Cache {
     depth_copy: Option<wgpu::RenderPipeline>,
     /// Float twins of integer compute images, by address, until the next dispatch.
     pub(crate) twins: HashMap<u64, wgpu::Texture>,
+    /// Color textures from memory read with a depth compare: their R channel as
+    /// depth, by address and header; forgotten with any invalidation.
+    compare_depths: HashMap<(u64, [u8; 32]), wgpu::Texture>,
 }
 
 /// The float format with the bits of a 32-bit integer format.
@@ -586,6 +589,19 @@ impl Surfaces {
                     (crate::surfaces::view_as(&e.texture, textures::wgpu_texture_format(&tic), wgpu::TextureUsages::TEXTURE_BINDING, view_desc(aspect)), depth, "target")
                 }
                 None => match self.upload(&tic, header, mem) {
+                    // A color texture read with a compare (the 1x1 stand-in bound when
+                    // there is no shadow): the hardware compares with its R channel.
+                    Ok(texture) if x.compare && !texture.format().is_depth_stencil_format() && texture.dimension() == wgpu::TextureDimension::D2 => {
+                        let depth = match self.cache.compare_depths.get(&(tic.address, header)) {
+                            Some(d) => d.clone(),
+                            None => {
+                                let d = self.as_depth(&texture);
+                                self.cache.compare_depths.insert((tic.address, header), d.clone());
+                                d
+                            }
+                        };
+                        (depth.create_view(&view_desc(wgpu::TextureAspect::DepthOnly)), true, "memory")
+                    }
                     Ok(texture) => {
                         let depth = texture.format().is_depth_stencil_format();
                         (texture.create_view(&view_desc(if depth { wgpu::TextureAspect::DepthOnly } else { wgpu::TextureAspect::All })), depth, "memory")
@@ -731,8 +747,8 @@ impl Surfaces {
         Ok(twin)
     }
 
-    /// A Depth32Float copy of an R32Float texture, every layer, by a pass that
-    /// writes each texel as fragment depth.
+    /// A Depth32Float copy of a float texture's R channel, every layer, by a pass
+    /// that writes each texel as fragment depth.
     fn as_depth(&mut self, floats: &wgpu::Texture) -> wgpu::Texture {
         let device = &self.device;
         let pipeline = self.cache.depth_copy.get_or_insert_with(|| {
@@ -790,6 +806,7 @@ impl Surfaces {
     pub fn invalidate(&mut self, start: u64, len: u64) {
         let end = start.saturating_add(len);
         self.cache.textures.retain(|(addr, _), (_, last)| *last <= start || *addr >= end);
+        self.cache.compare_depths.clear();
     }
 
     /// The sampler of a header; a non-filtering one (nearest everywhere) for

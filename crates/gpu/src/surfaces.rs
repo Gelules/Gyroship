@@ -402,12 +402,9 @@ impl Surfaces {
     /// the buffer and the range they will occupy when the frame is submitted.
     pub(crate) fn stage(&mut self, bytes: &[u8]) -> (wgpu::Buffer, u64, u64) {
         let size = bytes.len().next_multiple_of(4).max(4);
-        let hash = {
-            use std::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            bytes.hash(&mut h);
-            h.finish()
-        };
+        // A fast word hash (SipHash cost 5% of a tutorial frame); bytes are compared after.
+        let (words, tail) = bytes.as_chunks::<8>();
+        let hash = words.iter().map(|w| u64::from_le_bytes(*w)).chain(tail.iter().map(|&b| u64::from(b))).fold(bytes.len() as u64, |h, w| (h.rotate_left(5) ^ w).wrapping_mul(0x517c_c1b7_2722_0a95));
         if let Some(&at) = self.staged.get(&hash).and_then(|v| v.iter().find(|&&at| self.arena.1.get(at..at + bytes.len()) == Some(bytes) && self.arena.1.len() >= at + size)) {
             return (self.arena.0.clone(), at as u64, size as u64);
         }
