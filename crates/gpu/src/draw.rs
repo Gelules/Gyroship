@@ -83,6 +83,9 @@ pub struct Cache {
     /// Color textures from memory read with a depth compare: their R channel as
     /// depth, by address and header; forgotten with any invalidation.
     compare_depths: HashMap<(u64, [u8; 32]), wgpu::Texture>,
+    /// Color targets read through a smaller texture header, cropped to it, by
+    /// (address, format, width, height), with the target's write stamp when copied.
+    crops: HashMap<(u64, u32, u32, u32), (u64, wgpu::Texture)>,
 }
 
 /// The instructions a program's jump tables may send it to: every word of each
@@ -632,12 +635,19 @@ impl Surfaces {
                 Some(e) => {
                     fits(&e.texture)?;
                     let depth = e.texture.format().is_depth_stencil_format();
+                    let (key, stamp, texture) = ((e.surface.addr, e.surface.format), e.written, e.texture.clone());
                     // A color target read counts as touched: frame dumps show what the frame sampled.
                     if !depth {
-                        self.touched.insert((e.surface.addr, e.surface.format));
+                        self.touched.insert(key);
                     }
+                    // The game sizes a target to an aligned width and samples it through a
+                    // header of its real size: coordinates normalize to the header's size.
+                    // ponytail: depth targets stay whole (WebGPU copies only whole depth
+                    // subresources); a depth-writing crop pass if one is read so.
+                    let (w, h) = (tic.width.min(texture.width()), tic.height.min(texture.height()));
+                    let texture = if !depth && w > 0 && h > 0 && (w, h) != (texture.width(), texture.height()) { self.cropped(key, stamp, &texture, w, h) } else { texture };
                     let aspect = if depth { wgpu::TextureAspect::DepthOnly } else { wgpu::TextureAspect::All };
-                    (crate::surfaces::view_as(&e.texture, textures::wgpu_texture_format(&tic), wgpu::TextureUsages::TEXTURE_BINDING, view_desc(aspect)), depth, "target")
+                    (crate::surfaces::view_as(&texture, textures::wgpu_texture_format(&tic), wgpu::TextureUsages::TEXTURE_BINDING, view_desc(aspect)), depth, "target")
                 }
                 None => match self.upload(&tic, header, mem) {
                     // A color texture read with a compare (the 1x1 stand-in bound when
@@ -796,6 +806,37 @@ impl Surfaces {
         encoder.copy_buffer_to_texture(wgpu::TexelCopyBufferInfo { buffer: &buffer, layout }, twin.as_image_copy(), size);
         self.record(encoder);
         Ok(twin)
+    }
+
+    /// The top-left `w` × `h` of a color target, every layer, as a texture of that
+    /// size: copied again only when the target was written since.
+    fn cropped(&mut self, key: (u64, u32), stamp: u64, t: &wgpu::Texture, w: u32, h: u32) -> wgpu::Texture {
+        let id = (key.0, key.1, w, h);
+        if let Some((s, c)) = self.cache.crops.get(&id)
+            && *s == stamp
+        {
+            return c.clone();
+        }
+        let size = wgpu::Extent3d { width: w, height: h, depth_or_array_layers: t.depth_or_array_layers() };
+        // Read through an sRGB or linear view as the target itself may be.
+        let f = t.format();
+        let other = if f.is_srgb() { f.remove_srgb_suffix() } else { f.add_srgb_suffix() };
+        let view_formats = if other == f { Vec::new() } else { vec![other] };
+        let crop = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("crop"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: f,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &view_formats,
+        });
+        let mut encoder = self.encoder();
+        encoder.copy_texture_to_texture(t.as_image_copy(), crop.as_image_copy(), size);
+        self.record(encoder);
+        self.cache.crops.insert(id, (stamp, crop.clone()));
+        crop
     }
 
     /// A Depth32Float copy of a float texture's R channel, every layer, by a pass
@@ -1082,6 +1123,37 @@ mod tests {
         assert_eq!(run(&mut s, x.clone(), tic, [0; 32], Vec::new(), wgsl, 1), vec![0.25]);
         clear_depth(&mut s, 0.75);
         assert_eq!(run(&mut s, x, tic, [0; 32], Vec::new(), wgsl, 1), vec![0.75]);
+        assert!(s.skipped.is_empty(), "{:?}", s.skipped);
+    }
+
+    #[test]
+    fn a_target_read_through_a_smaller_header_samples_the_header_size() {
+        let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
+            eprintln!("no GPU adapter: test skipped");
+            return;
+        };
+        // An 8x4 RGBA16F target (an aligned width): columns 0..4 hold 0.25, 4..8 hold 1.0.
+        // Read through a 4x4 header, u = 0.9 is texel 3 of 4, not texel 7 of 8.
+        const AT: u64 = 0x90_0000;
+        let color = Surface { addr: AT, width: 8, height: 4, format: 0xca, layers: 1 };
+        let value = |v: f32| [v.to_bits(), 0, 0, 1f32.to_bits()];
+        s.clear(&Clear { layer: 0, color: Some((color, value(0.25), 0xf)), depth: None, scissor: None });
+        s.clear(&Clear { layer: 0, color: Some((color, value(1.0), 0xf)), depth: None, scissor: Some([4, 0, 4, 4]) });
+        let mut tic = [0u8; 32];
+        put(&mut tic, &[(6, 0, 0x2f), (9, 7, 7), (12, 10, 7), (15, 13, 7), (18, 16, 7), (21, 19, 2), (24, 22, 0), (27, 25, 0), (30, 28, 7)]);
+        put(&mut tic, &[(63, 41, (AT >> 9) as u32), (87, 85, 3), (144, 128, 3), (175, 160, 3), (154, 151, 1), (191, 191, 1)]);
+        // Point filters.
+        let mut tsc = [0u8; 32];
+        put(&mut tsc, &[(34, 32, 1), (37, 36, 1), (39, 38, 1)]);
+        let x = Texture { handle: Handle::CBuf { bank: 0, offset: 0 }, dim: TexDim::D2, compare: false, fetch: false, query: false };
+        let wgsl = "@group(0) @binding(32) var tex0: texture_2d<f32>;
+            @group(0) @binding(33) var smp0: sampler;
+            @group(0) @binding(1) var<storage, read_write> out: array<f32>;
+            @compute @workgroup_size(1) fn main() {
+                out[0] = textureSampleLevel(tex0, smp0, vec2<f32>(0.9, 0.5), 0.0).r;
+                out[1] = f32(textureDimensions(tex0).x);
+            }";
+        assert_eq!(run(&mut s, x, tic, tsc, Vec::new(), wgsl, 2), vec![0.25, 4.0]);
         assert!(s.skipped.is_empty(), "{:?}", s.skipped);
     }
 }
