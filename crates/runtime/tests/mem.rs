@@ -69,6 +69,22 @@ fn bad_ranges_are_refused() {
     assert_eq!(m.protect(HEAP - 0x1000, 0x2000, perm::R), Err(Error::InvalidState));
 }
 
+/// The write watch sees a write to a page (by the host here; the guest's
+/// stores are plain stores too), only in the range asked, until it is reset.
+#[test]
+fn written_pages_are_seen_until_reset() {
+    let mut m = Memory::new().unwrap();
+    m.map(HEAP, 0x3000, Block::new(state::NORMAL, perm::RW)).unwrap();
+    m.reset_written(HEAP, 0x3000);
+    assert!(!m.written(HEAP, 0x3000));
+    m.write(HEAP + 0x1010, &[1, 2, 3]).unwrap();
+    assert!(m.written(HEAP, 0x3000));
+    assert!(m.written(HEAP + 0x1000, 0x10), "the page written");
+    assert!(!m.written(HEAP, 0x1000) && !m.written(HEAP + 0x2000, 0x1000), "its neighbours");
+    m.reset_written(HEAP, 0x3000);
+    assert!(!m.written(HEAP, 0x3000));
+}
+
 #[test]
 fn protect_splits_then_merges() {
     let mut m = Memory::new().unwrap();

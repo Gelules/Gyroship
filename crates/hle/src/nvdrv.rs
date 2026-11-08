@@ -368,6 +368,7 @@ impl Nvdrv {
 /// words at bits 42..63) through the channel's command processor, as far as
 /// its semaphore acquires allow, and performs what they did.
 fn run_gpfifo(k: &mut Kernel, fd: u32, space: u32, entries: &[u8]) {
+    forget_written_textures(k, space);
     let mut gpu = std::mem::take(&mut k.gpu);
     for (rank, e) in entries.as_chunks::<8>().0.iter().map(|e| u64::from_le_bytes(*e)).enumerate() {
         let (at, len) = (e & 0xffff_fffc | (e >> 32 & 0xff) << 32, (e >> 42 & 0x1f_ffff) as usize);
@@ -394,6 +395,25 @@ fn run_gpfifo(k: &mut Kernel, fd: u32, space: u32, entries: &[u8]) {
         gpu.effects(k, space, effects);
     }
     k.gpu = gpu;
+}
+
+/// The host's copies of textures whose guest memory was written since they
+/// were made (the CPU drawing glyphs into a font atlas, say) are dropped
+/// before the GPU work that may use them: they upload afresh. Every range is
+/// checked before any watch is reset, so textures sharing a page all see it.
+fn forget_written_textures(k: &mut Kernel, space: u32) {
+    let Some(ranges) = k.surfaces.as_ref().map(|s| s.texture_ranges()) else { return };
+    let cpu: Vec<(u64, u64, u64)> = ranges.iter().map(|&(start, end)| (start, end, k.gpu_to_cpu(space, start))).collect();
+    let written: Vec<(u64, u64)> = cpu.iter().filter(|&&(start, end, at)| k.mem.written(at, end - start)).map(|&(start, end, _)| (start, end)).collect();
+    for &(start, end, at) in &cpu {
+        k.mem.reset_written(at, end - start);
+    }
+    if let Some(s) = k.surfaces.as_mut() {
+        for (start, end) in written {
+            s.invalidate(start, end - start);
+            k.counts.entry("textures rewritten").and_modify(|c| *c += 1).or_insert(1);
+        }
+    }
 }
 
 /// Lets the channels that wait on a semaphore go on, once the CPU has

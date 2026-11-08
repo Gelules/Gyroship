@@ -122,6 +122,12 @@ impl Bindings {
 }
 
 impl Surfaces {
+    /// The guest memory each uploaded texture came from, as GPU address ranges
+    /// (start, end): the HLE forgets those the CPU has written since.
+    pub fn texture_ranges(&self) -> Vec<(u64, u64)> {
+        self.cache.textures.iter().map(|((addr, _), (_, end))| (*addr, *end)).collect()
+    }
+
     /// What the host keeps, by kind, for the summary line (growth shows a leak).
     pub fn cache_sizes(&self) -> String {
         let c = &self.cache;

@@ -13,8 +13,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use windows_sys::Win32::Foundation::EXCEPTION_ACCESS_VIOLATION;
 use windows_sys::Win32::System::Diagnostics::Debug::{AddVectoredExceptionHandler, EXCEPTION_CONTINUE_SEARCH, EXCEPTION_POINTERS};
+/// MEM_WRITE_WATCH (winnt.h), which windows-sys does not list.
+const MEM_WRITE_WATCH: windows_sys::Win32::System::Memory::VIRTUAL_ALLOCATION_TYPE = 0x0020_0000;
 use windows_sys::Win32::System::Memory::{
-    MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_PROTECTION_FLAGS, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualProtect,
+    GetWriteWatch, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_PROTECTION_FLAGS, PAGE_READONLY, PAGE_READWRITE, ResetWriteWatch, VirtualAlloc, VirtualFree, VirtualProtect,
 };
 
 /// Size of the guest address space (39 bits, from the NPDM).
@@ -132,12 +134,32 @@ impl Memory {
     /// the newest reservation.
     pub fn new() -> Result<Memory, Error> {
         // SAFETY: a fresh reservation, no existing memory is touched.
-        let base = unsafe { VirtualAlloc(std::ptr::null(), (SPACE + GUARD) as usize, MEM_RESERVE, PAGE_NOACCESS) } as *mut u8;
+        // Write-watched: the kernel notes the pages written, so the host knows when
+        // memory it copied (textures) changed, without faults or hashing.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), (SPACE + GUARD) as usize, MEM_RESERVE | MEM_WRITE_WATCH, PAGE_NOACCESS) } as *mut u8;
         if base.is_null() {
             return Err(Error::Host(last_error()));
         }
         RESERVATION.store(base as usize, Ordering::Release);
         Ok(Memory { base, blocks: BTreeMap::new() })
+    }
+
+    /// Whether a page of `[addr, addr + len)` was written since its watch was
+    /// last reset (by the guest or the host alike).
+    pub fn written(&self, addr: u64, len: u64) -> bool {
+        let Some(end) = addr.checked_add(len).filter(|&e| e <= SPACE && len > 0) else { return false };
+        let (mut page, mut count, mut granularity) = (std::ptr::null_mut::<core::ffi::c_void>(), 1usize, 0u32);
+        // SAFETY: a range of our reservation; room for one address.
+        let r = unsafe { GetWriteWatch(0, self.base.add(addr as usize).cast(), (end - addr) as usize, &mut page, &mut count, &mut granularity) };
+        r == 0 && count > 0
+    }
+
+    /// Starts watching `[addr, addr + len)` afresh.
+    pub fn reset_written(&self, addr: u64, len: u64) {
+        if addr.checked_add(len).is_some_and(|e| e <= SPACE) && len > 0 {
+            // SAFETY: a range of our reservation.
+            unsafe { ResetWriteWatch(self.base.add(addr as usize).cast(), len as usize) };
+        }
     }
 
     /// Host address of guest address 0 (`Cpu.mem`).
