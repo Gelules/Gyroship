@@ -72,6 +72,11 @@ pub struct Interface {
     /// derives addresses from: the constant-bank word (bank, byte offset)
     /// holding the buffer's 64-bit address, in binding order (`BUFFER_BINDING` + i).
     pub buffers: Vec<(u8, u16)>,
+    /// The program jumps indirectly (RET, BRX) only to targets read just before from
+    /// a constant bank (a compiled switch's table): (bank, byte base the word is
+    /// added to), per jump. With the bank's words, `Options::jump_targets` gives
+    /// the exact blocks; else every instruction starts one (a switch case each).
+    pub jump_tables: Option<Vec<(u8, u32)>>,
 }
 
 /// The binding of global-memory buffer 0; buffer i is at `BUFFER_BINDING + i`.
@@ -154,6 +159,59 @@ pub struct Options {
     /// Vertex: the attributes fetched as integers, by location (true: signed):
     /// declared vec4<u32> or vec4<i32>, their bits read as they are.
     pub int_attributes: BTreeMap<u8, bool>,
+    /// The instructions the indirect jumps of `Interface::jump_tables` may land on,
+    /// from the bound banks' words: only they (and direct targets) start blocks.
+    pub jump_targets: Option<BTreeSet<usize>>,
+}
+
+/// Per indirect jump (RET, BRX), the constant bank and byte base its target comes
+/// from, when each one's register is loaded by a 32-bit LDC a few instructions
+/// before, with nothing between that writes it or is a branch target (a compiled
+/// switch: the table's words are byte offsets). None if one is not so.
+/// ponytail: "writes it" is read from the ops' Debug text (any `dst*` field within
+/// the four registers up to it); a register-writes table if ops ever need one.
+fn jump_tables(ops: &[Op], target: &impl Fn(usize, i64) -> Option<usize>) -> Option<Vec<(u8, u32)>> {
+    let landing: BTreeSet<usize> = ops
+        .iter()
+        .enumerate()
+        .filter_map(|(i, op)| match op {
+            Op::Control(ControlOp::Bra { offset, .. } | ControlOp::Call { offset, .. }) if *offset != -16 => target(i, *offset),
+            _ => None,
+        })
+        .collect();
+    let writes = |op: &Op, r: u8| {
+        let text = format!("{op:?}");
+        text.match_indices("dst").any(|(at, _)| {
+            let rest = &text[at..];
+            let digits: String = rest.split_once(": ").map(|(_, v)| v.chars().take_while(char::is_ascii_digit).collect()).unwrap_or_default();
+            digits.parse::<u8>().is_ok_and(|d| d <= r && r - d < 4)
+        })
+    };
+    let mut tables = Vec::new();
+    for (i, op) in ops.iter().enumerate() {
+        let (r, offset) = match op {
+            Op::Control(ControlOp::Ret { target: r, offset, .. } | ControlOp::Brx { target: r, offset, .. }) => (*r, *offset),
+            _ => continue,
+        };
+        let base = u32::try_from(16 * (i as i64 + 1) + offset).ok()?;
+        let mut found = None;
+        for j in (i.saturating_sub(8)..i).rev() {
+            if landing.contains(&(j + 1)) {
+                break;
+            }
+            match &ops[j] {
+                Op::Memory(MemoryOp::Ldc { dst, bank, mode: LdcMode::Indexed, ty: MemType::B32, .. }) if *dst == r => {
+                    found = Some((*bank, base));
+                    break;
+                }
+                Op::Control(_) => break,
+                other if writes(other, r) => break,
+                _ => {}
+            }
+        }
+        tables.push(found?);
+    }
+    Some(tables)
 }
 
 /// Translates a graphics program on its own.
@@ -186,6 +244,7 @@ pub fn translate_with(code: &[u8], options: &Options) -> Result<Translation, Err
     cx.images = options.images.clone();
     cx.queried = options.queried.clone();
     cx.int_attributes = options.int_attributes.clone();
+    cx.jump_targets = options.jump_targets.clone();
     // Images the program both stores to and loads from: their loads read the image itself.
     let handles = |load: bool| -> BTreeSet<(u8, u16)> {
         ops.iter()
@@ -304,6 +363,7 @@ struct Cx {
     /// `Options::queried`.
     queried: BTreeMap<usize, TexDim>,
     int_attributes: BTreeMap<u8, bool>,
+    jump_targets: Option<BTreeSet<usize>>,
     /// Compute: the program uses shared memory (`shm`, words as atomics so
     /// that ATOMS and plain accesses can share it).
     shm: bool,
@@ -350,7 +410,7 @@ const SHM_CAS: &str = "fn shm_cas(i: u32, op: u32, v: u32) -> u32 {
 
 impl Cx {
     fn new(sph: Sph) -> Cx {
-        Cx { sph, regs: BTreeSet::new(), preds: BTreeSet::new(), uregs: BTreeSet::new(), upreds: BTreeSet::new(), iface: Interface::default(), decls: String::new(), helpers: BTreeSet::new(), temps: 0, uexpr: BTreeMap::new(), gexpr: BTreeMap::new(), images: Vec::new(), queried: BTreeMap::new(), int_attributes: BTreeMap::new(), read_write: BTreeSet::new(), shm: false, lane: false, roots: BTreeMap::new() }
+        Cx { sph, regs: BTreeSet::new(), preds: BTreeSet::new(), uregs: BTreeSet::new(), upreds: BTreeSet::new(), iface: Interface::default(), decls: String::new(), helpers: BTreeSet::new(), temps: 0, uexpr: BTreeMap::new(), gexpr: BTreeMap::new(), images: Vec::new(), queried: BTreeMap::new(), int_attributes: BTreeMap::new(), jump_targets: None, read_write: BTreeSet::new(), shm: false, lane: false, roots: BTreeMap::new() }
     }
 
     /// A shared memory access's byte address, `reg × stride + ureg + offset`, as a new `let`.
@@ -556,7 +616,14 @@ impl Cx {
         let target = |i: usize, offset: i64| -> Option<usize> { usize::try_from((16 * (i as i64 + 1) + offset) / 16).ok() };
         // An indirect jump (RET, BRX) may land on any instruction: each starts a block then.
         let indirect = ops.iter().any(|o| matches!(o, Op::Control(ControlOp::Ret { .. } | ControlOp::Brx { .. })));
-        let mut leaders: BTreeSet<usize> = if indirect { (0..ops.len()).collect() } else { BTreeSet::from([0usize]) };
+        // A table's targets known from the banks: only they start blocks.
+        let tables = if indirect { jump_tables(ops, &target) } else { None };
+        self.iface.jump_tables = tables.clone();
+        let mut leaders: BTreeSet<usize> = match (&self.jump_targets, &tables) {
+            _ if !indirect => BTreeSet::from([0usize]),
+            (Some(t), Some(_)) => t.iter().copied().chain([0]).collect(),
+            _ => (0..ops.len()).collect(),
+        };
         for (i, op) in ops.iter().enumerate() {
             match op {
                 Op::Control(ControlOp::Bra { offset, .. } | ControlOp::Call { offset, .. }) if *offset != -16 => {
@@ -2421,6 +2488,26 @@ mod tests {
         for want in ["extractBits(bitcast<i32>(r44), 0u, 6u)", "extractBits(bitcast<i32>(r44), 8u, 6u)", "textureGather(0, tex0, smp0, (vec2<f32>(f(r33), f(r43)) + "] {
             assert!(t.wgsl.contains(want), "{want}\n{}", t.wgsl);
         }
+    }
+
+    #[test]
+    fn a_jump_table_read_from_a_bank_gives_exact_blocks_once_its_targets_are_known() {
+        // S2R R20 = tid.x; LDC R54 = c[1][R20]; BRX R54 (absolute: base 0); then two
+        // blocks at instructions 3 and 5, each S2R then EXIT.
+        let s2r = |dst: u128| w(0x919, &[(16, dst), (72, 0x21)]);
+        let ldc = w(0xb82, &[(16, 54), (24, 20), (54, 1), (73, 4)]);
+        let brx = w(0x949, &[(24, 54), (34, ((-48i64 / 4) as u64 as u128) & ((1 << 48) - 1)), (87, 7)]);
+        let body = [s2r(20), ldc, brx, s2r(1), exit(), s2r(2), exit()];
+        let options = Options { workgroup: [8, 1, 1], ..Default::default() };
+        let t = compute(&body, &options);
+        assert_eq!(t.interface.jump_tables, Some(vec![(1, 0)]));
+        let cases = |t: &Translation| t.wgsl.matches("case ").count();
+        assert!(cases(&t) >= body.len(), "{}", t.wgsl);
+        let t = compute(&body, &Options { jump_targets: Some(BTreeSet::from([3, 5])), ..options.clone() });
+        assert_eq!(cases(&t), 3, "{}", t.wgsl);
+        // R54 written between the load and the jump: not a table.
+        let body = [s2r(20), ldc, s2r(54), brx, s2r(1), exit()];
+        assert_eq!(compute(&body, &options).interface.jump_tables, None);
     }
 
     #[test]

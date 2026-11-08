@@ -265,9 +265,11 @@ impl Surfaces {
             entries.push(wgpu::BindGroupEntry { binding: shader::BUFFER_BINDING + i as u32, resource: buffer.as_entire_binding() });
         }
         let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &layout, entries: &entries });
+        let timed = self.timing.as_mut().and_then(|t| t.next(format!("compute {key:016x}")));
         let mut encoder = self.encoder();
         {
-            let mut pass = encoder.begin_compute_pass(&Default::default());
+            let timestamp_writes = timed.zip(self.timing.as_ref()).map(|(i, t)| wgpu::ComputePassTimestampWrites { query_set: &t.set, beginning_of_pass_write_index: Some(i), end_of_pass_write_index: Some(i + 1) });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("dispatch"), timestamp_writes });
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &group, &[]);
             pass.dispatch_workgroups(l.grid[0], l.grid[1], l.grid[2]);

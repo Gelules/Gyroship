@@ -127,6 +127,8 @@ pub struct Surfaces {
     pub errors: Arc<Mutex<Vec<String>>>,
     /// The work recorded since the last [`Surfaces::flush`], in order.
     pending: Option<wgpu::CommandEncoder>,
+    /// GPU time per program, when asked for (`timing.rs`).
+    pub(crate) timing: Option<crate::timing::Timing>,
     /// This frame's vertex, index and constant data: one buffer, written at flush.
     arena: (wgpu::Buffer, Vec<u8>),
     /// Offsets of the arena's staged blocks by content hash: draws share identical
@@ -272,7 +274,8 @@ impl Surfaces {
             | wgpu::Features::TEXTURE_COMPRESSION_BC
             | wgpu::Features::FLOAT32_FILTERABLE
             | wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER
-            | wgpu::Features::SUBGROUP;
+            | wgpu::Features::SUBGROUP
+            | crate::timing::Timing::wanted();
         let info = adapter.get_info();
         check_adapter(adapter.features(), info.subgroup_min_size, info.subgroup_max_size).map_err(|e| format!("{} ({:?}): {e}", info.name, info.backend))?;
         let descriptor = wgpu::DeviceDescriptor { required_features: (adapter.features() & wanted) | NEEDED, required_limits: adapter.limits(), ..Default::default() };
@@ -322,7 +325,8 @@ impl Surfaces {
         let fill = (fill_module, fill_layout, Default::default());
         let arena = (arena_buffer(&device, 16 << 20), Vec::new());
         let window = window.map(|(surface, size)| Window::new(&adapter, &device, surface, size));
-        Ok(Surfaces { adapter, device, queue, map: BTreeMap::new(), touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pending: None, arena, staged: HashMap::new(), last_color: None, window })
+        let timing = crate::timing::Timing::new(&device, &queue);
+        Ok(Surfaces { adapter, device, queue, map: BTreeMap::new(), touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pending: None, timing, arena, staged: HashMap::new(), last_color: None, window })
     }
 
     /// Shows the presented image (the color target written last, its top-left
@@ -393,8 +397,14 @@ impl Surfaces {
             self.arena.1.clear();
             self.staged.clear();
         }
-        if let Some(e) = self.pending.take() {
+        if let Some(mut e) = self.pending.take() {
+            if let Some(t) = &self.timing {
+                t.resolve(&mut e);
+            }
             self.queue.submit([e.finish()]);
+            if let Some(t) = &mut self.timing {
+                t.collect(&self.device);
+            }
         }
     }
 

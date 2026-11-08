@@ -67,8 +67,8 @@ pub struct Cache {
     pub(crate) compute_pipelines: HashMap<String, (wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
     pub(crate) images: HashMap<u64, wgpu::Texture>,
     /// Translations by (program key, key of the pixel program it pairs with,
-    /// mask of the attributes fetched as integers).
-    modules: HashMap<(u64, Option<u64>, u64), Module>,
+    /// mask of the attributes fetched as integers, hash of the jump targets or 0).
+    modules: HashMap<(u64, Option<u64>, u64, u64), Module>,
     pipelines: HashMap<String, (wgpu::RenderPipeline, Vec<wgpu::BindGroupLayout>)>,
     /// Uploaded textures by address and header, with the end of the memory they came from.
     textures: HashMap<(u64, [u8; 32]), (wgpu::Texture, u64)>,
@@ -83,6 +83,28 @@ pub struct Cache {
     /// Color textures from memory read with a depth compare: their R channel as
     /// depth, by address and header; forgotten with any invalidation.
     compare_depths: HashMap<(u64, [u8; 32]), wgpu::Texture>,
+}
+
+/// The instructions a program's jump tables may send it to: every word of each
+/// table's bank (as bound) that, added to the jump's base, is an instruction's
+/// byte offset (a 16-byte multiple inside the program). Words that are not table
+/// entries only split blocks more. None if a bank is unbound or unreadable.
+fn jump_targets(tables: &[(u8, u32)], banks: &[Option<(u64, u32)>], mem: Mem, code_len: usize) -> Option<BTreeSet<usize>> {
+    let mut targets = BTreeSet::new();
+    for &(bank, base) in tables {
+        let (addr, size) = (*banks.get(usize::from(bank))?)?;
+        let mut data = vec![0u8; (size as usize).min(CBUF_BYTES)];
+        if !mem(addr, &mut data) {
+            return None;
+        }
+        for w in data.as_chunks::<4>().0 {
+            let at = u32::from_le_bytes(*w).wrapping_add(base);
+            if at % 16 == 0 && (at as usize) < code_len {
+                targets.insert(at as usize / 16);
+            }
+        }
+    }
+    Some(targets)
 }
 
 /// The float format with the bits of a 32-bit integer format.
@@ -198,12 +220,12 @@ impl Surfaces {
             return Err("vertex-A, tessellation or geometry program".into());
         }
         let ps = match d.programs[5] {
-            Some(at) => Some(self.module(mem, at, None, &BTreeMap::new())?),
+            Some(at) => Some(self.module(mem, at, None, &BTreeMap::new(), &d.cbufs[4])?),
             None => None,
         };
         // Attributes fetched as integers: the vertex program declares them so.
         let ints: BTreeMap<u8, bool> = d.attributes.iter().filter(|a| !a.constant && matches!(a.format.kind, AttrKind::Uint | AttrKind::Sint)).map(|a| (a.location, a.format.kind == AttrKind::Sint)).collect();
-        let vs = self.module(mem, d.programs[1].ok_or("no vertex program")?, ps.as_ref().map(|p| &p.0), &ints)?;
+        let vs = self.module(mem, d.programs[1].ok_or("no vertex program")?, ps.as_ref().map(|p| &p.0), &ints, &d.cbufs[0])?;
 
         // Attachments: the locations the pixel program writes, and depth when tested.
         let written = ps.as_ref().map(|p| p.0.interface.targets.clone()).unwrap_or_default();
@@ -340,7 +362,8 @@ impl Surfaces {
         let visibility = [wgpu::ShaderStages::VERTEX, wgpu::ShaderStages::FRAGMENT];
         let group_layouts: Vec<Vec<wgpu::BindGroupLayoutEntry>> = stages.iter().zip(visibility).map(|(b, v)| b.layout(v)).collect();
         let groups = group_layouts.iter().rposition(|e| !e.is_empty()).map_or(0, |g| g + 1);
-        let key = format!("{:x}/{:x?}/{layouts:?}/{primitive:?}/{color_states:?}/{depth_state:?}/{:?}", vs.0.key, ps.as_ref().map(|p| p.0.key), &group_layouts[..groups]);
+        // The WGSL lengths tell a program's module with exact jump-table blocks from the first one.
+        let key = format!("{:x}.{}/{:x?}/{layouts:?}/{primitive:?}/{color_states:?}/{depth_state:?}/{:?}", vs.0.key, vs.0.wgsl.len(), ps.as_ref().map(|p| (p.0.key, p.0.wgsl.len())), &group_layouts[..groups]);
         let (pipeline, bind_layouts) = match self.cache.pipelines.get(&key) {
             Some(p) => p.clone(),
             None => {
@@ -386,14 +409,17 @@ impl Surfaces {
         // The pass.
         let color_views: Vec<Option<wgpu::TextureView>> = colors.iter().map(|c| c.map(|(s, f)| self.texture(&s, f))).collect();
         let depth_view = depth.map(|(s, f)| (self.texture(&s, f), f));
+        let timed = self.timing.as_mut().and_then(|t| t.next(format!("draw vs {:016x} ps {}", vs.0.key, ps.as_ref().map_or("none".into(), |p| format!("{:016x}", p.0.key)))));
         let mut encoder = self.encoder();
         {
             let load = wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store };
             let attachments: Vec<Option<wgpu::RenderPassColorAttachment>> = color_views.iter().map(|v| v.as_ref().map(|view| wgpu::RenderPassColorAttachment { view, depth_slice: None, resolve_target: None, ops: load })).collect();
             // Without a pixel program the pipeline has no color targets: neither may the pass.
             let attachments = if ps.is_none() { Vec::new() } else { attachments };
+            let timestamp_writes = timed.zip(self.timing.as_ref()).map(|(i, t)| wgpu::RenderPassTimestampWrites { query_set: &t.set, beginning_of_pass_write_index: Some(i), end_of_pass_write_index: Some(i + 1) });
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("draw"),
+                timestamp_writes,
                 color_attachments: &attachments,
                 depth_stencil_attachment: depth_view.as_ref().map(|(view, f)| wgpu::RenderPassDepthStencilAttachment {
                     view,
@@ -431,7 +457,7 @@ impl Surfaces {
 
     /// The translation and WGSL module of the program at `at`; a vertex
     /// program pairs with its pixel program's varyings.
-    fn module(&mut self, mem: Mem, at: u64, pixel: Option<&Translation>, ints: &BTreeMap<u8, bool>) -> Module {
+    fn module(&mut self, mem: Mem, at: u64, pixel: Option<&Translation>, ints: &BTreeMap<u8, bool>, banks: &[Option<(u64, u32)>]) -> Module {
         let key = match self.cache.programs.get(&at) {
             Some(key) => *key,
             None => {
@@ -446,9 +472,24 @@ impl Surfaces {
         .ok_or("program not readable")?;
         let pair = pixel.map(|p| p.key);
         let mask = ints.iter().fold(0u64, |m, (&l, &signed)| m | 1 << (l % 32) | u64::from(signed) << (32 + l % 32));
-        let id = (key, pair, mask);
+        let mut options = Options { varyings: pixel.map(|p| p.interface.varyings.clone()).unwrap_or_default(), int_attributes: ints.clone(), ..Default::default() };
+        // Jump tables: the translation without them says where they are; the bound
+        // banks' words give the targets, and the module with exact blocks is keyed
+        // by them too (another table content, another module).
+        let mut id = (key, pair, mask, 0);
+        if let Some(Ok((t, _))) = self.cache.modules.get(&id)
+            && let Some(tables) = &t.interface.jump_tables
+            && let Some(targets) = jump_targets(tables, banks, mem, self.cache.code[&key].len())
+        {
+            id.3 = {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                targets.hash(&mut h);
+                h.finish() | 1
+            };
+            options.jump_targets = Some(targets);
+        }
         if !self.cache.modules.contains_key(&id) {
-            let options = Options { varyings: pixel.map(|p| p.interface.varyings.clone()).unwrap_or_default(), int_attributes: ints.clone(), ..Default::default() };
             let made = shader::translate_with(&self.cache.code[&key], &options).map_err(|e| format!("program {key:016x}: {e}")).and_then(|t| {
                 if let Err(e) = shader::validate(&t.wgsl) {
                     self.error(format!("program {key:016x}: {e}"));
