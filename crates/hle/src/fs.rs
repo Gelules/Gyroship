@@ -11,7 +11,7 @@
 use crate::Kernel;
 use crate::ipc::{Reply, Request};
 use crate::service::Service;
-use std::io::{Read, Seek, SeekFrom};
+use std::cell::OnceCell;
 use std::path::{Path, PathBuf};
 
 const HEADER: u64 = 0x50;
@@ -34,6 +34,9 @@ pub struct RomFs {
     tables_at: u64,
     files: Vec<File>,
     size: u64,
+    /// Each file's host handle, opened at its first read and kept (host state,
+    /// rebuilt on demand: never part of the guest's).
+    open: Vec<OnceCell<std::fs::File>>,
 }
 
 /// RomFS hash of an entry name under its parent's offset.
@@ -154,7 +157,8 @@ impl RomFs {
         }
         header.extend(DATA.to_le_bytes());
         let size = tables_at + tables.len() as u64;
-        Ok(RomFs { header, tables, tables_at, files, size })
+        let open = files.iter().map(|_| OnceCell::new()).collect();
+        Ok(RomFs { header, tables, tables_at, files, size, open })
     }
 
     pub fn size(&self) -> u64 {
@@ -173,16 +177,35 @@ impl RomFs {
         };
         copy(0, &self.header);
         copy(self.tables_at, &self.tables);
-        for f in &self.files {
+        for (f, open) in self.files.iter().zip(&self.open) {
             let (lo, hi) = (offset.max(f.offset), end.min(f.offset + f.size));
             if lo < hi {
-                let mut file = std::fs::File::open(&f.path)?;
-                file.seek(SeekFrom::Start(lo - f.offset))?;
-                file.read_exact(&mut out[(lo - offset) as usize..(hi - offset) as usize])?;
+                if open.get().is_none() {
+                    let _ = open.set(std::fs::File::open(&f.path)?);
+                }
+                let file = open.get().ok_or_else(|| std::io::Error::other("RomFS file not open"))?;
+                read_at(file, lo - f.offset, &mut out[(lo - offset) as usize..(hi - offset) as usize])?;
             }
         }
         Ok(())
     }
+}
+
+/// Fills `buf` from `file` at `at`, a positional read (the handle stays open
+/// between requests, the OS's read-ahead with it).
+fn read_at(file: &std::fs::File, mut at: u64, mut buf: &mut [u8]) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        #[cfg(windows)]
+        let n = std::os::windows::fs::FileExt::seek_read(file, buf, at)?;
+        #[cfg(unix)]
+        let n = std::os::unix::fs::FileExt::read_at(file, buf, at)?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        buf = &mut buf[n..];
+        at += n as u64;
+    }
+    Ok(())
 }
 
 #[derive(Debug)]

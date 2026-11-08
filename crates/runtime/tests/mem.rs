@@ -83,6 +83,12 @@ fn written_pages_are_seen_until_reset() {
     assert!(!m.written(HEAP, 0x1000) && !m.written(HEAP + 0x2000, 0x1000), "its neighbours");
     m.reset_written(HEAP, 0x3000);
     assert!(!m.written(HEAP, 0x3000));
+    // Several written pages in the range: still written.
+    m.write(HEAP + 0x10, &[1]).unwrap();
+    m.write(HEAP + 0x2010, &[2]).unwrap();
+    assert!(m.written(HEAP, 0x3000), "two pages written");
+    m.reset_written(HEAP, 0x3000);
+    assert!(!m.written(HEAP, 0x3000));
 }
 
 #[test]

@@ -85,6 +85,10 @@ pub struct Cache {
     /// Color textures from memory read with a depth compare: their R channel as
     /// depth, by address and header; forgotten with any invalidation.
     compare_depths: HashMap<(u64, [u8; 32]), wgpu::Texture>,
+    /// Per program (key, paired pixel key, integer mask): the jump tables' bank
+    /// bytes last seen and the module variant (id.3) they gave; the same bytes
+    /// give the same variant without scanning them again.
+    jumps: JumpMemo,
     /// GPU writes to guest memory not yet applied to `textures`, as (start, end):
     /// applied once before the next read of the cache (`drain_invalidations`).
     pending: Vec<(u64, u64)>,
@@ -93,18 +97,28 @@ pub struct Cache {
     crops: HashMap<(u64, u32, u32, u32), (u64, wgpu::Texture)>,
 }
 
-/// The instructions a program's jump tables may send it to: every word of each
-/// table's bank (as bound) that, added to the jump's base, is an instruction's
-/// byte offset (a 16-byte multiple inside the program). Words that are not table
-/// entries only split blocks more. None if a bank is unbound or unreadable.
-fn jump_targets(tables: &[(u8, u32)], banks: &[Option<(u64, u32)>], mem: Mem, code_len: usize) -> Option<BTreeSet<usize>> {
-    let mut targets = BTreeSet::new();
-    for &(bank, base) in tables {
+/// The bytes of each jump table's bank, as bound, in table order; None if a
+/// bank is unbound or unreadable.
+fn jump_banks(tables: &[(u8, u32)], banks: &[Option<(u64, u32)>], mem: Mem) -> Option<Vec<Vec<u8>>> {
+    let mut out = Vec::with_capacity(tables.len());
+    for &(bank, _) in tables {
         let (addr, size) = (*banks.get(usize::from(bank))?)?;
         let mut data = vec![0u8; (size as usize).min(CBUF_BYTES)];
         if !mem(addr, &mut data) {
             return None;
         }
+        out.push(data);
+    }
+    Some(out)
+}
+
+/// The instructions a program's jump tables may send it to: every word of each
+/// table's bank (`jump_banks`) that, added to the jump's base, is an
+/// instruction's byte offset (a 16-byte multiple inside the program). Words that
+/// are not table entries only split blocks more.
+fn jump_targets(tables: &[(u8, u32)], bytes: &[Vec<u8>], code_len: usize) -> BTreeSet<usize> {
+    let mut targets = BTreeSet::new();
+    for (&(_, base), data) in tables.iter().zip(bytes) {
         for w in data.as_chunks::<4>().0 {
             let at = u32::from_le_bytes(*w).wrapping_add(base);
             if at % 16 == 0 && (at as usize) < code_len {
@@ -112,7 +126,7 @@ fn jump_targets(tables: &[(u8, u32)], banks: &[Option<(u64, u32)>], mem: Mem, co
             }
         }
     }
-    Some(targets)
+    targets
 }
 
 /// `ranges` (start, end) sorted and merged where they touch or overlap.
@@ -166,6 +180,10 @@ fn float_format(f: wgpu::TextureFormat) -> Option<wgpu::TextureFormat> {
         _ => return None,
     })
 }
+
+/// Per program (key, paired pixel key, integer mask): jump-table bank bytes and the
+/// module variant they gave.
+type JumpMemo = HashMap<(u64, Option<u64>, u64), (Vec<Vec<u8>>, u64)>;
 
 /// What a render pipeline is made from, as a hashable key: the vertex program
 /// (key, WGSL length), the pixel program's, the vertex buffer layouts (stream,
@@ -552,16 +570,24 @@ impl Surfaces {
         let mut id = (key, pair, mask, 0);
         let mut jump = None;
         if let Some(Ok(m)) = self.cache.modules.get(&id)
-            && let Some(tables) = &m.0.interface.jump_tables
-            && let Some(targets) = jump_targets(tables, banks, mem, self.cache.code[&key].len())
+            && let Some(tables) = m.0.interface.jump_tables.clone()
+            && let Some(bytes) = jump_banks(&tables, banks, mem)
         {
-            id.3 = {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                targets.hash(&mut h);
-                h.finish() | 1
-            };
-            jump = Some(targets);
+            match self.cache.jumps.get(&(key, pair, mask)) {
+                // The variant these bytes gave: its module is in the cache since.
+                Some((seen, variant)) if *seen == bytes => id.3 = *variant,
+                _ => {
+                    let targets = jump_targets(&tables, &bytes, self.cache.code[&key].len());
+                    id.3 = {
+                        use std::hash::{Hash, Hasher};
+                        let mut h = std::collections::hash_map::DefaultHasher::new();
+                        targets.hash(&mut h);
+                        h.finish() | 1
+                    };
+                    self.cache.jumps.insert((key, pair, mask), (bytes, id.3));
+                    jump = Some(targets);
+                }
+            }
         }
         if !self.cache.modules.contains_key(&id) {
             let options = Options { varyings: pixel.map(|p| p.interface.varyings.clone()).unwrap_or_default(), int_attributes: ints.clone(), jump_targets: jump, ..Default::default() };

@@ -403,10 +403,23 @@ fn run_gpfifo(k: &mut Kernel, fd: u32, space: u32, entries: &[u8]) {
 /// checked before any watch is reset, so textures sharing a page all see it.
 fn forget_written_textures(k: &mut Kernel, space: u32) {
     let Some(ranges) = k.surfaces.as_ref().map(|s| s.texture_ranges()) else { return };
-    let cpu: Vec<(u64, u64, u64)> = ranges.iter().map(|&(start, end)| (start, end, k.gpu_to_cpu(space, start))).collect();
-    let written: Vec<(u64, u64)> = cpu.iter().filter(|&&(start, end, at)| k.mem.written(at, end - start)).map(|&(start, end, _)| (start, end)).collect();
-    for &(start, end, at) in &cpu {
-        k.mem.reset_written(at, end - start);
+    // (GPU start, GPU end, CPU address) by CPU address, in spans whose pages touch:
+    // one write-watch query per span, its textures tested one by one only when the
+    // span was written, and only written spans watched afresh (a clean page stays
+    // clean), as a query and a reset per texture would do.
+    let mut cpu: Vec<(u64, u64, u64)> = ranges.iter().map(|&(start, end)| (start, end, k.gpu_to_cpu(space, start))).collect();
+    cpu.sort_unstable_by_key(|c| c.2);
+    let mut written = Vec::new();
+    let mut dirty = Vec::new();
+    for span in page_spans(&cpu) {
+        let (first, last) = (span[0].2, span.iter().map(|&(start, end, at)| at + (end - start)).max().unwrap_or(0));
+        if k.mem.written(first, last - first) {
+            written.extend(span.iter().filter(|&&(start, end, at)| span.len() == 1 || k.mem.written(at, end - start)).map(|&(start, end, _)| (start, end)));
+            dirty.push((first, last));
+        }
+    }
+    for (first, last) in dirty {
+        k.mem.reset_written(first, last - first);
     }
     if let Some(s) = k.surfaces.as_mut() {
         for (start, end) in written {
@@ -414,6 +427,26 @@ fn forget_written_textures(k: &mut Kernel, space: u32) {
             k.counts.entry("textures rewritten").and_modify(|c| *c += 1).or_insert(1);
         }
     }
+}
+
+/// `ranges` (GPU start, GPU end, CPU address), sorted by CPU address, cut into
+/// runs whose 4 KiB pages touch or overlap: a run's pages are its members' pages.
+fn page_spans(ranges: &[(u64, u64, u64)]) -> Vec<&[(u64, u64, u64)]> {
+    const PAGE: u64 = 0x1000;
+    let mut spans = Vec::new();
+    let mut from = 0;
+    let mut reach = 0u64;
+    for (i, &(start, end, at)) in ranges.iter().enumerate() {
+        if i > from && at > reach.next_multiple_of(PAGE) {
+            spans.push(&ranges[from..i]);
+            from = i;
+        }
+        reach = if i == from { at + (end - start) } else { reach.max(at + (end - start)) };
+    }
+    if from < ranges.len() {
+        spans.push(&ranges[from..]);
+    }
+    spans
 }
 
 /// Lets the channels that wait on a semaphore go on, once the CPU has
@@ -714,5 +747,21 @@ mod tests {
         assert_ne!(flags & 1 << 8, 0, "TSG");
         assert_ne!(flags & 1 << 34, 0, "mapping modify");
         assert_eq!(flags & (1 << 22 | 1 << 30), 0);
+    }
+}
+
+#[cfg(test)]
+mod page_span_tests {
+    use super::page_spans;
+
+    #[test]
+    fn spans_join_ranges_whose_pages_touch() {
+        // (GPU start, GPU end, CPU address); CPU ranges [at, at + len).
+        let r = [(0, 0x100, 0x1000), (0, 0x10, 0x1f00), (0, 0x2000, 0x2000), (0, 0x10, 0x5000), (0, 0x10, 0x6ff0), (0, 0x20, 0x9000)];
+        let spans: Vec<Vec<u64>> = page_spans(&r).iter().map(|s| s.iter().map(|x| x.2).collect()).collect();
+        // 0x1000.. and 0x1f00.. share a page; 0x2000.. starts at the next page boundary
+        // (touching); 0x5000 starts a page after the run's last page; 0x6ff0 too.
+        assert_eq!(spans, vec![vec![0x1000, 0x1f00, 0x2000], vec![0x5000], vec![0x6ff0], vec![0x9000]]);
+        assert!(page_spans(&[]).is_empty());
     }
 }
