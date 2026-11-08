@@ -140,6 +140,9 @@ pub struct Thread {
     pub on_timeout: u32,
     /// Ticks spent running, for `GetThreadTickCount` (TLR + 0x108).
     pub cpu_time: u64,
+    /// Host time spent while it was the current thread, HLE work done on its
+    /// behalf included (`--perf` reports it; host state, never the guest's).
+    pub host: std::time::Duration,
     pub fiber: Option<Fiber>,
     pub wait: Wait,
     /// Arrival order among waiters of equal priority.
@@ -190,6 +193,8 @@ pub enum TimerAction {
 pub struct Sched {
     pub threads: Vec<Thread>,
     pub current: Option<usize>,
+    /// When the current thread's host time was last charged.
+    pub host_mark: Option<std::time::Instant>,
     pub clocks: [u64; CORES],
     /// The thread that runs on each core, and since when.
     on_core: [Option<(usize, u64)>; CORES],
@@ -271,6 +276,7 @@ impl Kernel {
             deadline: None,
             on_timeout: 0,
             cpu_time: 0,
+            host: std::time::Duration::ZERO,
             fiber: None,
             wait: Wait::None,
             wait_seq: 0,
@@ -384,6 +390,12 @@ impl Kernel {
     /// Chooses what runs next; returns the fiber to switch to, or `None` to
     /// keep running the current thread.
     pub fn reschedule(&mut self) -> Option<Fiber> {
+        // Host time since the last switch point goes to the thread that ran.
+        let now = std::time::Instant::now();
+        if let (Some(cur), Some(mark)) = (self.sched.current, self.sched.host_mark) {
+            self.sched.threads[cur].host += now - mark;
+        }
+        self.sched.host_mark = Some(now);
         let Some(next) = self.pick() else {
             self.finish();
             return self.sched.boot;

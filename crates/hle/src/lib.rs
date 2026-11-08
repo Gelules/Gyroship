@@ -294,6 +294,12 @@ impl Kernel {
             if let Some(s) = &self.surfaces {
                 eprintln!("gyroship: staging over {} presents: {:?}", self.gs.presents, s.staging);
             }
+            // Host time by guest thread, most first (HLE work on a thread's behalf included).
+            let total: f64 = self.sched.threads.iter().map(|t| t.host.as_secs_f64()).sum();
+            let mut by: Vec<(usize, f64)> = self.sched.threads.iter().enumerate().map(|(i, t)| (i + 1, t.host.as_secs_f64())).collect();
+            by.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let rows: Vec<String> = by.iter().filter(|r| r.1 > 0.0005).map(|(i, s)| format!("thread {i} {:.1} s ({:.1}%)", s, 100.0 * s / total.max(1e-9))).collect();
+            eprintln!("gyroship: host time by guest thread over {} presents: {}", self.gs.presents, rows.join(", "));
         }
         if let (Some(path), Some(samples)) = (&self.config.audio_dump, &self.audio_samples)
             && let Err(e) = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::write(path, audio::wav(samples, self.audio_format.0, self.audio_format.1)))
