@@ -366,6 +366,8 @@ impl Surfaces {
         {
             let load = wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store };
             let attachments: Vec<Option<wgpu::RenderPassColorAttachment>> = color_views.iter().map(|v| v.as_ref().map(|view| wgpu::RenderPassColorAttachment { view, depth_slice: None, resolve_target: None, ops: load })).collect();
+            // Without a pixel program the pipeline has no color targets: neither may the pass.
+            let attachments = if ps.is_none() { Vec::new() } else { attachments };
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("draw"),
                 color_attachments: &attachments,

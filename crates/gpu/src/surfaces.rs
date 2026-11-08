@@ -30,6 +30,7 @@ pub(crate) fn color_format(f: u32) -> Option<wgpu::TextureFormat> {
         0xe0 => T::Rg11b10Ufloat,
         0xe5 => T::R32Float,
         0xea => T::Rg8Unorm,
+        0xeb => T::Rg8Snorm,
         0xee => T::R16Unorm,
         0xf2 => T::R16Float,
         0xf3 => T::R8Unorm,
@@ -693,7 +694,7 @@ impl Surfaces {
         );
         self.queue.submit([encoder.finish()]);
         let slice = buffer.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |r| r.expect("readback mapping failed"));
+        slice.map_async(wgpu::MapMode::Read, |_| ());
         self.device.poll(wgpu::PollType::wait_indefinitely()).map_err(|e| format!("GPU poll failed: {e}"))?;
         let mapped = slice.get_mapped_range().map_err(|e| format!("readback mapping failed: {e:?}"))?;
         let mut pixels = Vec::with_capacity((row * h) as usize);
