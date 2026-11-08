@@ -430,6 +430,10 @@ impl Kernel {
             let skipped = std::mem::take(&mut s.skipped);
             let errors = s.errors.lock().map(|mut e| std::mem::take(&mut *e)).unwrap_or_default();
             for (why, count) in skipped {
+                // Each distinct reason is journaled once, past the anomaly's first few lines.
+                if self.journal.first(&format!("gpu not done {why}")) {
+                    self.log(&format!("gpu: first refusal of its kind, frame {n}: {why}"));
+                }
                 self.anomaly("gpu operation not done", &format!("frame {n}: {why} ({count} times)"));
             }
             for e in errors {

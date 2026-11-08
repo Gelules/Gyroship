@@ -105,7 +105,7 @@ impl Surfaces {
         for img in &first.interface.images {
             let tic = tic_of(&img.handle)?;
             let header = textures::wgpu_texture_format(&tic).ok_or_else(|| format!("image format {:?}", tic.components))?;
-            let (format, name) = storage_format(header).ok_or_else(|| format!("image format {header:?} as storage"))?;
+            let (format, name) = storage_format(header).ok_or_else(|| format!("image format {header:?} as storage, at {:#x} ({:?} {}x{}x{})", tic.address, tic.texture_type, tic.width, tic.height, textures::layers(&tic)))?;
             if img.read && !self.adapter.get_texture_format_features(format).flags.contains(wgpu::TextureFormatFeatureFlags::STORAGE_READ_WRITE) {
                 return Err(format!("image format {format:?} both read and written"));
             }
