@@ -62,6 +62,12 @@ pub struct Interface {
     pub writes_depth: bool,
     /// Constant banks read.
     pub cbufs: BTreeSet<u8>,
+    /// The bytes of each bank the program may read: up to the last 16-byte
+    /// word read at a fixed offset, or 0x10000 (all of it) when one read is
+    /// indexed. Banks stay declared and bound as 64 KiB (smaller declarations
+    /// made the driver's compile of the large programs a hundred times slower);
+    /// only these bytes must hold the bank, then zeros.
+    pub cbuf_sizes: BTreeMap<u8, u32>,
     /// Texture slots, in binding order.
     pub textures: Vec<Texture>,
     /// The swizzle codes are read (at `SWIZZLE_BINDING`).
@@ -462,7 +468,14 @@ impl Cx {
             return Err(format!("unaligned constant c[{bank}][{offset:#x}]"));
         }
         self.iface.cbufs.insert(bank);
+        self.reach(bank, (offset / 16 + 1) * 16);
         Ok(format!("cb{bank}[{}u][{}u]", offset / 16, offset / 4 % 4))
+    }
+
+    /// Bank `bank` is read up to byte `end` (0x10000: anywhere, an indexed read).
+    fn reach(&mut self, bank: u8, end: u32) {
+        let e = self.iface.cbuf_sizes.entry(bank).or_insert(0);
+        *e = (*e).max(end.min(0x10000));
     }
 
     /// An 8- or 16-bit constant, zero- or sign-extended to 32 bits.
@@ -1782,6 +1795,7 @@ impl Cx {
                         // ponytail: a half-word straddling two words reads only the first.
                         let ix = self.r(*index);
                         self.iface.cbufs.insert(*bank);
+                        self.reach(*bank, 0x10000);
                         let t = self.temp();
                         let _ = writeln!(out, "let {t} = ({ix} + {}u) & 0xffffu;", u32::from(*offset));
                         let word = format!("cb{bank}[{t} >> 4u][({t} >> 2u) & 3u]");
@@ -1805,6 +1819,7 @@ impl Cx {
                 } else {
                     let ix = self.r(*index);
                     self.iface.cbufs.insert(*bank);
+                    self.reach(*bank, 0x10000);
                     for k in 0..words {
                         let t = self.temp();
                         let _ = writeln!(out, "let {t} = ({ix} + {}u) & 0xffffu;", u32::from(*offset) + 4 * k);
@@ -2486,6 +2501,20 @@ mod tests {
         let tld4 = w(0xb63, &[(16, 28), (24, 32), (32, 43), (64, 22), (40, 0x28 / 4), (54, 0), (61, 5), (60, 1), (72, 0xf), (76, 1), (81, 7), (84, 1), (87, 1)]);
         let t = compute(&[tld4], &Options { workgroup: [8, 8, 1], ..Default::default() });
         for want in ["extractBits(bitcast<i32>(r44), 0u, 6u)", "extractBits(bitcast<i32>(r44), 8u, 6u)", "textureGather(0, tex0, smp0, (vec2<f32>(f(r33), f(r43)) + "] {
+            assert!(t.wgsl.contains(want), "{want}\n{}", t.wgsl);
+        }
+    }
+
+    #[test]
+    fn banks_are_declared_as_far_as_the_program_reads_them() {
+        // LDC R4 = c[3][0x24] (a fixed offset); S2R R20 = tid.x; LDC R5 = c[1][R20] (indexed).
+        let fixed = w(0xb82, &[(16, 4), (24, 255), (54, 3), (38, 0x24), (73, 4)]);
+        let s2r = w(0x919, &[(16, 20), (72, 0x21)]);
+        let indexed = w(0xb82, &[(16, 5), (24, 20), (54, 1), (73, 4)]);
+        let t = compute(&[fixed, s2r, indexed], &Options { workgroup: [1, 1, 1], ..Default::default() });
+        assert_eq!(t.interface.cbuf_sizes, BTreeMap::from([(1, 0x10000), (3, 0x30)]));
+        // Both still declared as 64 KiB.
+        for want in ["var<uniform> cb3: array<vec4<u32>, 4096>;", "var<uniform> cb1: array<vec4<u32>, 4096>;"] {
             assert!(t.wgsl.contains(want), "{want}\n{}", t.wgsl);
         }
     }

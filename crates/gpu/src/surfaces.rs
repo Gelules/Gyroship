@@ -436,22 +436,31 @@ impl Surfaces {
     /// Copies `bytes` (padded to 4) into this frame's upload arena; returns
     /// the buffer and the range they will occupy when the frame is submitted.
     pub(crate) fn stage(&mut self, bytes: &[u8]) -> (wgpu::Buffer, u64, u64) {
-        self.stage_window(bytes, 0)
+        self.stage_window(bytes, 0, 0)
+    }
+
+    /// A constant bank: `bytes` then zeros up to `zeros` bytes (what the program
+    /// may read), bound as 64 KiB, its declared size; past `zeros` the range holds
+    /// whatever the arena does, never read.
+    pub(crate) fn stage_bank(&mut self, bytes: &[u8], zeros: usize) -> (wgpu::Buffer, u64, u64) {
+        self.stage_window(bytes, zeros, 0x10000)
     }
 
     /// As [`Surfaces::stage`], the range given being at least `window` bytes: a
     /// constant bank is bound as 64 KiB but only its bound size is hashed and
     /// compared; the rest of its window is zeros, as the console reads past a bank's
     /// size (text vanished when it held the arena's next blocks).
-    pub(crate) fn stage_window(&mut self, bytes: &[u8], window: usize) -> (wgpu::Buffer, u64, u64) {
+    pub(crate) fn stage_window(&mut self, bytes: &[u8], zeros: usize, window: usize) -> (wgpu::Buffer, u64, u64) {
         let size = bytes.len().next_multiple_of(4).max(4);
-        let range = size.max(window);
+        // Filled: the bytes, then zeros up to `zeros`; bound: `window` at least.
+        let fill = size.max(zeros);
+        let range = fill.max(window);
         // A fast word hash (SipHash cost 5% of a tutorial frame); bytes are compared after.
         let (words, tail) = bytes.as_chunks::<8>();
         let hash = words.iter().map(|w| u64::from_le_bytes(*w)).chain(tail.iter().map(|&b| u64::from(b))).fold(bytes.len() as u64, |h, w| (h.rotate_left(5) ^ w).wrapping_mul(0x517c_c1b7_2722_0a95));
         let capacity = self.arena.0.size();
         self.staging.calls += 1;
-        if let Some(&(at, _)) = self.staged.get(&hash).and_then(|v| v.iter().find(|&&(at, zeros)| zeros >= range && self.arena.1.get(at..at + bytes.len()) == Some(bytes))) {
+        if let Some(&(at, _)) = self.staged.get(&hash).and_then(|v| v.iter().find(|&&(at, filled)| filled >= fill && (at + range) as u64 <= capacity && self.arena.1.get(at..at + bytes.len()) == Some(bytes))) {
             self.staging.hits += 1;
             return (self.arena.0.clone(), at as u64, range as u64);
         }
@@ -464,18 +473,18 @@ impl Surfaces {
             let capacity = (capacity * 2).max((range as u64).next_power_of_two());
             self.arena = (arena_buffer(&self.device, capacity), Vec::new());
             self.staged.clear();
-            return self.stage_window(bytes, window);
+            return self.stage_window(bytes, zeros, window);
         }
         match window {
             0 => self.staging.data_bytes += size as u64,
             _ => self.staging.bank_bytes += size as u64,
         }
-        self.staging.zero_bytes += (range - size) as u64;
+        self.staging.zero_bytes += (fill - size) as u64;
         let data = &mut self.arena.1;
         data.resize(at, 0);
         data.extend_from_slice(bytes);
-        data.resize(at + range, 0);
-        self.staged.entry(hash).or_default().push((at, range));
+        data.resize(at + fill, 0);
+        self.staged.entry(hash).or_default().push((at, fill));
         (self.arena.0.clone(), at as u64, range as u64)
     }
 

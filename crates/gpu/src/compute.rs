@@ -209,7 +209,7 @@ impl Surfaces {
         // Bindings: constant banks, textures and swizzles as for draws, then the images.
         let (textures, swizzles) = self.texture_slots(t, &banks, pools.headers, pools.samplers, pools.sampler_binding, &[], mem)?;
         let cbufs: BTreeMap<u8, Vec<u8>> = banks.into_iter().filter(|(b, _)| t.interface.cbufs.contains(b)).collect();
-        let bindings = Bindings { cbufs, textures, swizzles: t.interface.swizzles.then_some(swizzles) };
+        let bindings = Bindings { cbufs, textures, swizzles: t.interface.swizzles.then_some(swizzles), windows: crate::draw::windows(t) };
         let mut layout_entries = bindings.layout(wgpu::ShaderStages::COMPUTE);
         for (i, (img, (_, format, _, _))) in t.interface.images.iter().zip(&images).enumerate() {
             let view_dimension = match img.dim {
@@ -251,7 +251,14 @@ impl Surfaces {
                 (pipeline, layout)
             }
         };
-        let mut buffers: Vec<(u32, (wgpu::Buffer, u64, u64))> = bindings.cbufs.iter().map(|(b, data)| (u32::from(*b), self.stage_window(data, CBUF_BYTES))).collect();
+        let mut buffers: Vec<(u32, (wgpu::Buffer, u64, u64))> = bindings
+            .cbufs
+            .iter()
+            .map(|(b, data)| {
+                let (len, zeros) = bindings.staged(*b, data);
+                (u32::from(*b), self.stage_bank(&data[..len], zeros))
+            })
+            .collect();
         if let Some(codes) = &bindings.swizzles {
             let bytes: Vec<u8> = codes.iter().flat_map(|c| c.to_le_bytes()).collect();
             buffers.push((shader::SWIZZLE_BINDING, self.stage(&bytes)));

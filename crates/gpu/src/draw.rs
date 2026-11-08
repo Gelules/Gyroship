@@ -150,6 +150,11 @@ fn overlaps(ranges: &[(u64, u64)], a: u64, b: u64) -> bool {
     ranges.get(i).is_some_and(|r| r.0 < b)
 }
 
+/// The binding size of each bank a program reads (`Interface::cbuf_sizes`).
+pub(crate) fn windows(t: &Translation) -> BTreeMap<u8, u64> {
+    t.interface.cbufs.iter().map(|&b| (b, u64::from(t.interface.cbuf_sizes.get(&b).copied().unwrap_or(0x10000)))).collect()
+}
+
 /// An index of `size` little-endian bytes.
 fn index_value(c: &[u8]) -> u32 {
     c.iter().rev().fold(0, |v, b| v << 8 | u32::from(*b))
@@ -207,6 +212,11 @@ pub(crate) struct Bindings {
     pub(crate) textures: Vec<Slot>,
     /// Each slot's header swizzle, when the program reads them.
     pub(crate) swizzles: Option<Vec<u32>>,
+    /// The bytes of each bank the program may read (`Interface::cbuf_sizes`):
+    /// staged as bound, then zeros up to there, as the console reads past a
+    /// bank's size. The binding spans 64 KiB; what lies past these bytes is
+    /// never read.
+    pub(crate) windows: BTreeMap<u8, u64>,
 }
 
 /// A texture slot: its view, its sampler unless fetched, and whether it is
@@ -221,6 +231,18 @@ pub(crate) struct Slot {
 }
 
 impl Bindings {
+    /// The bytes of bank `bank` the program may read.
+    pub(crate) fn window(&self, bank: u8) -> u64 {
+        self.windows.get(&bank).copied().unwrap_or(CBUF_BYTES as u64)
+    }
+
+    /// The bank's bytes to stage (what the program may read of them) and the
+    /// bytes that must read as the bank then zeros.
+    pub(crate) fn staged(&self, bank: u8, data: &[u8]) -> (usize, usize) {
+        let window = self.window(bank) as usize;
+        (data.len().min(window), window)
+    }
+
     /// The layout these bindings take in a stage.
     pub(crate) fn layout(&self, visibility: wgpu::ShaderStages) -> Vec<wgpu::BindGroupLayoutEntry> {
         let buffer = |binding: u32, size: u64| wgpu::BindGroupLayoutEntry {
@@ -476,8 +498,14 @@ impl Surfaces {
 
         let mut bind_groups = Vec::new();
         for (g, layout) in bind_layouts.iter().enumerate() {
-            let Bindings { cbufs, textures, swizzles } = &stages[g];
-            let mut buffers: Vec<(u32, (wgpu::Buffer, u64, u64))> = cbufs.iter().map(|(b, data)| (u32::from(*b), self.stage_window(data, CBUF_BYTES))).collect();
+            let Bindings { cbufs, textures, swizzles, .. } = &stages[g];
+            let mut buffers: Vec<(u32, (wgpu::Buffer, u64, u64))> = cbufs
+                .iter()
+                .map(|(b, data)| {
+                    let (len, zeros) = stages[g].staged(*b, data);
+                    (u32::from(*b), self.stage_bank(&data[..len], zeros))
+                })
+                .collect();
             if let Some(codes) = swizzles {
                 let bytes: Vec<u8> = codes.iter().flat_map(|c| c.to_le_bytes()).collect();
                 buffers.push((shader::SWIZZLE_BINDING, self.stage(&bytes)));
@@ -633,7 +661,7 @@ impl Surfaces {
         }
         let (textures, swizzles) = self.texture_slots(t, &banks, d.headers, d.samplers, d.sampler_binding, attached, mem)?;
         let cbufs = banks.into_iter().filter(|(b, _)| t.interface.cbufs.contains(b)).collect();
-        Ok(Bindings { cbufs, textures, swizzles: t.interface.swizzles.then_some(swizzles) })
+        Ok(Bindings { cbufs, textures, swizzles: t.interface.swizzles.then_some(swizzles), windows: windows(t) })
     }
 
     /// The constant banks a program's texture handles live in.
@@ -1104,7 +1132,7 @@ mod tests {
         };
         let banks = BTreeMap::from([(0u8, vec![0u8; 16])]);
         let (slots, _) = s.texture_slots(&t, &banks, resources::header_pool(&reg), resources::sampler_pool(&reg), resources::sampler_binding(&reg), &[], &mut mem).unwrap_or_else(|e| panic!("{e}"));
-        let bindings = Bindings { cbufs: BTreeMap::new(), textures: slots, swizzles: None };
+        let bindings = Bindings { cbufs: BTreeMap::new(), textures: slots, swizzles: None, windows: BTreeMap::new() };
         let mut entries = bindings.layout(wgpu::ShaderStages::COMPUTE);
         let storage = wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None };
         entries.push(wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::COMPUTE, ty: storage, count: None });
