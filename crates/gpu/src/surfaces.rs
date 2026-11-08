@@ -133,7 +133,7 @@ pub struct Surfaces {
     arena: (wgpu::Buffer, Vec<u8>),
     /// Offsets of the arena's staged blocks by content hash: draws share identical
     /// constant banks (64 KiB each) instead of staging each copy.
-    staged: HashMap<u64, Vec<usize>>,
+    staged: HashMap<u64, Vec<(usize, usize)>>,
     /// The color target written last (the presented image at a present).
     last_color: Option<(u64, u32)>,
     /// The window the presented images go to, if any.
@@ -415,9 +415,9 @@ impl Surfaces {
     }
 
     /// As [`Surfaces::stage`], the range given being at least `window` bytes: a
-    /// constant bank is bound as 64 KiB but only its bound size is staged. Bytes past
-    /// it read what the arena holds there (later blocks, or zeros).
-    /// ponytail: the console's out-of-bounds bank reads are not reproduced.
+    /// constant bank is bound as 64 KiB but only its bound size is hashed and
+    /// compared; the rest of its window is zeros, as the console reads past a bank's
+    /// size (text vanished when it held the arena's next blocks).
     pub(crate) fn stage_window(&mut self, bytes: &[u8], window: usize) -> (wgpu::Buffer, u64, u64) {
         let size = bytes.len().next_multiple_of(4).max(4);
         let range = size.max(window);
@@ -425,7 +425,7 @@ impl Surfaces {
         let (words, tail) = bytes.as_chunks::<8>();
         let hash = words.iter().map(|w| u64::from_le_bytes(*w)).chain(tail.iter().map(|&b| u64::from(b))).fold(bytes.len() as u64, |h, w| (h.rotate_left(5) ^ w).wrapping_mul(0x517c_c1b7_2722_0a95));
         let capacity = self.arena.0.size();
-        if let Some(&at) = self.staged.get(&hash).and_then(|v| v.iter().find(|&&at| self.arena.1.get(at..at + bytes.len()) == Some(bytes) && self.arena.1.len() >= at + size && (at + range) as u64 <= capacity)) {
+        if let Some(&(at, _)) = self.staged.get(&hash).and_then(|v| v.iter().find(|&&(at, zeros)| zeros >= range && self.arena.1.get(at..at + bytes.len()) == Some(bytes))) {
             return (self.arena.0.clone(), at as u64, range as u64);
         }
         let at = self.arena.1.len().next_multiple_of(ARENA_ALIGN);
@@ -441,8 +441,8 @@ impl Surfaces {
         let data = &mut self.arena.1;
         data.resize(at, 0);
         data.extend_from_slice(bytes);
-        data.resize(at + size, 0);
-        self.staged.entry(hash).or_default().push(at);
+        data.resize(at + range, 0);
+        self.staged.entry(hash).or_default().push((at, range));
         (self.arena.0.clone(), at as u64, range as u64)
     }
 
