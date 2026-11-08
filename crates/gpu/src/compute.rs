@@ -10,6 +10,7 @@
 use crate::draw::{Bindings, Mem};
 use crate::pushbuf::Pools;
 use crate::shader::{self, Handle, IMAGE_BINDING, Options, Translation};
+use crate::sass::memory::ImageDim;
 use crate::sass::texture::TexDim;
 use crate::state::qmd::Launch;
 use crate::state::resources::TexHandle;
@@ -123,13 +124,15 @@ impl Surfaces {
 
         // Host storage textures, by address: a render target's own texture when the image is
         // one (the game draws glyphs, then filters them in place), else one kept for images.
+        // An array image (SULD/SUST .D2Array) is a 2D texture of the header's layers.
         let mut views = Vec::new();
-        for (tic, format, _, header) in &images {
+        for ((tic, format, _, header), img) in images.iter().zip(&t.interface.images) {
             let three_d = tic.texture_type == TextureType::ThreeD;
-            let size = wgpu::Extent3d { width: tic.width, height: tic.height, depth_or_array_layers: if three_d { tic.depth } else { 1 } };
+            let array = img.dim == ImageDim::D2Array;
+            let size = wgpu::Extent3d { width: tic.width, height: tic.height, depth_or_array_layers: if three_d || array { tic.depth.max(1) } else { 1 } };
             let target = self.map.values().find(|e| {
                 let t = &e.texture;
-                e.surface.addr == tic.address && t.format() == *format && t.width() == size.width && t.height() == size.height && !three_d && t.usage().contains(wgpu::TextureUsages::STORAGE_BINDING)
+                e.surface.addr == tic.address && t.format() == *format && t.width() == size.width && t.height() == size.height && !three_d && !array && t.usage().contains(wgpu::TextureUsages::STORAGE_BINDING)
             });
             if let Some(e) = target {
                 views.push(e.texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2), array_layer_count: Some(1), ..Default::default() }));
@@ -150,7 +153,8 @@ impl Surfaces {
                 });
                 self.cache.images.insert(tic.address, texture);
             }
-            views.push(self.cache.images[&tic.address].create_view(&Default::default()));
+            let dimension = array.then_some(wgpu::TextureViewDimension::D2Array);
+            views.push(self.cache.images[&tic.address].create_view(&wgpu::TextureViewDescriptor { dimension, ..Default::default() }));
         }
 
         // Global memory (LDG): each pointer's buffer, read from guest memory. The constant
@@ -196,8 +200,9 @@ impl Surfaces {
         let mut layout_entries = bindings.layout(wgpu::ShaderStages::COMPUTE);
         for (i, (img, (_, format, _, _))) in t.interface.images.iter().zip(&images).enumerate() {
             let view_dimension = match img.dim {
-                crate::sass::memory::ImageDim::D3 => wgpu::TextureViewDimension::D3,
-                crate::sass::memory::ImageDim::D1 => wgpu::TextureViewDimension::D1,
+                ImageDim::D3 => wgpu::TextureViewDimension::D3,
+                ImageDim::D1 => wgpu::TextureViewDimension::D1,
+                ImageDim::D2Array => wgpu::TextureViewDimension::D2Array,
                 _ => wgpu::TextureViewDimension::D2,
             };
             layout_entries.push(wgpu::BindGroupLayoutEntry {
@@ -319,8 +324,12 @@ mod tests {
     /// Runs `code` (closed by EXIT and the self-branch) as one 32-lane warp with
     /// `shared` bytes of shared memory. c[0][0x80] points at `global` (its size at
     /// 0x88); c[0][0x20] is the handle of a 32 × `rows` RGBA32F image, read back as
-    /// words, texel after texel. None without a GPU.
+    /// words, texel after texel. None without a GPU. `consts` fill c[0] from 0x100.
     fn run_warp(code: &[[u8; 16]], global: Vec<u8>, rows: u32, shared: u32) -> Option<Vec<u32>> {
+        run_warp_with(code, global, rows, shared, &[])
+    }
+
+    fn run_warp_with(code: &[[u8; 16]], global: Vec<u8>, rows: u32, shared: u32, consts: &[u8]) -> Option<Vec<u32>> {
         let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
             eprintln!("no GPU adapter: test skipped");
             return None;
@@ -336,6 +345,7 @@ mod tests {
         let mut cbuf = vec![0u8; 0x10000];
         cbuf[0x80..0x88].copy_from_slice(&GLOBAL.to_le_bytes());
         cbuf[0x88..0x8c].copy_from_slice(&(global.len() as u32).to_le_bytes());
+        cbuf[0x100..0x100 + consts.len()].copy_from_slice(consts);
         // Header 0: a 32 × rows pitch RGBA32F image at IMAGE.
         let mut header = [0u8; 32];
         for (hi, lo, v) in [(6, 0, 0x01), (9, 7, 7), (12, 10, 7), (15, 13, 7), (18, 16, 7), (21, 19, 2), (24, 22, 3), (27, 25, 4), (30, 28, 5)] {
@@ -453,6 +463,248 @@ mod tests {
         let Some(words) = run_warp(&code, global, 1, 0) else { return };
         for (l, &x) in values.iter().enumerate() {
             assert_eq!(words[4 * l..4 * l + 4], [unsigned(x), signed(x), sh(unsigned(x)), unsigned(!x)], "lane {l}: {x:#x}");
+        }
+    }
+
+    /// S2R R0 = lane; S2R R1 = tid.y (0); MOV R5 = `stride`; IMAD R2 = R0 * R5 +
+    /// c[0][0x80]; LDG R4.. (`ty`: 4 = 32 bits, 5 = 64) = [R2.64]: lane l's data.
+    fn load_per_lane(stride: u128, ty: u128) -> Vec<[u8; 16]> {
+        vec![
+            w(0x919, &[(16, 0), (72, 0)]),
+            w(0x919, &[(16, 1), (72, 0x22)]),
+            w(0x802, &[(16, 5), (32, stride), (72, 0xf)]),
+            w(0x624, &[(16, 2), (24, 0), (64, 5), (38, 0x80), (54, 0), (81, 7), (87, 7)]),
+            w(0x381, &[(16, 4), (24, 2), (72, 1), (40, 0), (73, ty), (81, 7)]),
+        ]
+    }
+
+    /// SUST of R`data`..+3 to texel (lane, `row`) (coordinates in R24, R25).
+    fn store_row(row: u128, data: u128) -> Vec<[u8; 16]> {
+        vec![
+            w(0x202, &[(16, 24), (32, 0), (72, 0xf)]),
+            w(0x802, &[(16, 25), (32, row), (72, 0xf)]),
+            w(0xb9b, &[(24, 24), (32, data), (40, 0x20 / 4), (54, 0), (61, 3), (72, 0xf)]),
+        ]
+    }
+
+    /// SEL R`dst` = P`p` ? 1 : 0 (R30 holds 1).
+    fn sel(dst: u128, p: u128, not: bool) -> [u8; 16] {
+        w(0x807, &[(16, dst), (24, 30), (32, 0), (87, p), (90, u128::from(not))])
+    }
+
+    /// A word under guard @P`p`.
+    fn guarded(word: [u8; 16], p: u128) -> [u8; 16] {
+        (u128::from_le_bytes(word) & !(0xf << 12) | p << 12).to_le_bytes()
+    }
+
+    /// F2I to 8, 16 and 32 bits, signed and not, in the four rounding modes, on
+    /// edge values (NaN, infinities, ties, out of range), as PTX cvt.rni etc.
+    #[test]
+    fn f2i_saturates_to_small_widths_as_ptx_cvt() {
+        let values: [f32; 32] = [
+            f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, -0.0, 0.5, 1.5, 2.5, -0.5, -1.5, -2.5, 65535.4, 65535.5, 65536.0, 70000.0, -1.0,
+            -32768.4, -32768.6, 32767.5, 127.5, 128.0, -128.5, -129.0, 255.9, 256.0, 1e10, -1e10, 3e9, -3e9, 2147483520.0, 4294967040.0, 1.0000001,
+        ];
+        // (bits, signed, rounding: 0 nearest even, 1 down, 2 up, 3 toward zero)
+        let forms: [(u32, bool, u8); 8] = [(16, false, 0), (16, true, 0), (8, false, 3), (8, true, 1), (32, false, 2), (32, true, 0), (16, true, 3), (16, false, 2)];
+        let reference = |x: f32, (bits, signed, rnd): (u32, bool, u8)| -> u32 {
+            if x.is_nan() {
+                return 0;
+            }
+            let r = f64::from(match rnd {
+                0 => x.round_ties_even(),
+                1 => x.floor(),
+                2 => x.ceil(),
+                _ => x.trunc(),
+            });
+            let (lo, hi) = if signed { (-(2f64.powi(bits as i32 - 1)), 2f64.powi(bits as i32 - 1) - 1.0) } else { (0.0, 2f64.powi(bits as i32) - 1.0) };
+            r.clamp(lo, hi) as i64 as u32
+        };
+        let f2i = |dst: u128, (bits, signed, rnd): (u32, bool, u8)| {
+            w(0x305, &[(16, dst), (32, 4), (72, u128::from(signed)), (75, u128::from((bits / 8).ilog2())), (77, 1), (78, u128::from(rnd)), (80, 1), (84, 2)])
+        };
+        let mut code = load_per_lane(4, 4);
+        code.extend(forms.iter().enumerate().map(|(k, f)| f2i(12 + k as u128, *f)));
+        code.extend(store_row(0, 12));
+        code.extend(store_row(1, 16));
+        let global = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let Some(words) = run_warp(&code, global, 2, 0) else { return };
+        for (l, &x) in values.iter().enumerate() {
+            for (k, f) in forms.iter().enumerate() {
+                assert_eq!(words[(k / 4) * 128 + 4 * l + k % 4], reference(x, *f), "{x} as {f:?}");
+            }
+        }
+    }
+
+    /// An f16 to f32, for the reference.
+    fn f16(h: u16) -> f32 {
+        let (sign, exp, frac) = (if h >> 15 != 0 { -1.0 } else { 1.0 }, i32::from(h >> 10 & 0x1f), f32::from(h & 0x3ff));
+        sign * match exp {
+            0 => frac * 2f32.powi(-24),
+            31 if frac == 0.0 => f32::INFINITY,
+            31 => f32::NAN,
+            e => (1.0 + frac / 1024.0) * 2f32.powi(e - 15),
+        }
+    }
+
+    /// HSETP2 per half, with .H_AND and lane selectors, combined with
+    /// accumulators, on halves including NaN, infinities, zeros and denormals.
+    #[test]
+    fn hsetp2_compares_each_half_and_combines_them() {
+        let halves: [u16; 12] = [0x0000, 0x8000, 0x3c00, 0xbc00, 0x7c00, 0xfc00, 0x7e00, 0x3555, 0x0001, 0x7bff, 0x4000, 0xc000];
+        let pair = |l: usize| -> (u32, u32) {
+            let h = |k: usize| u32::from(halves[k % 12]);
+            (h(5 * l + 1) | h(7 * l + 3) << 16, h(3 * l) | h(11 * l + 2) << 16)
+        };
+        let global = (0..32).flat_map(|l| [pair(l).0, pair(l).1]).flat_map(|v| v.to_le_bytes()).collect();
+        // R4 = a, R5 = b. P0, P1 = a > b per half; P2, P3 = .H_AND of a <u b (unordered),
+        // or'ed with P0; P4 = (a.H0_H0 != b.H1_H1) xor !P1.
+        let hsetp2 = |fields: &[(u32, u128)]| w(0x234, &[&[(24, 4), (32, 5)][..], fields].concat());
+        let mut code = load_per_lane(8, 5);
+        code.extend([
+            w(0x802, &[(16, 30), (32, 1), (72, 0xf)]),
+            hsetp2(&[(76, 4), (81, 0), (84, 1), (87, 7)]),
+            hsetp2(&[(69, 1), (71, 1), (76, 9), (81, 2), (84, 3), (87, 0)]),
+            hsetp2(&[(74, 2), (60, 3), (69, 2), (76, 5), (81, 4), (84, 7), (87, 1), (90, 1)]),
+        ]);
+        code.extend((0..4).map(|p| sel(12 + p, p, false)));
+        code.extend((0..4).map(|k| sel(16 + k, 4, false)));
+        code.extend(store_row(0, 12));
+        code.extend(store_row(1, 16));
+        let Some(words) = run_warp(&code, global, 2, 0) else { return };
+        for l in 0..32 {
+            let (a, b) = pair(l);
+            let (alo, ahi, blo, bhi) = (f16(a as u16), f16((a >> 16) as u16), f16(b as u16), f16((b >> 16) as u16));
+            let (p0, p1) = (alo > blo, ahi > bhi);
+            // Unordered less-than (true on NaN) and ordered not-equal (false on NaN).
+            let ltu = |x: f32, y: f32| x.partial_cmp(&y).is_none_or(|o| o.is_lt());
+            let both = ltu(alo, blo) && ltu(ahi, bhi);
+            let ne = alo.partial_cmp(&bhi).is_some_and(|o| o.is_ne());
+            let want = [p0, p1, both || p0, !both || p0, ne != !p1].map(u32::from);
+            assert_eq!([words[4 * l], words[4 * l + 1], words[4 * l + 2], words[4 * l + 3], words[128 + 4 * l]], want, "lane {l}: {a:#x} {b:#x}");
+        }
+    }
+
+    /// LDC of U16, S16, U8 and S8 at a register index, from bytes with their sign bits set or not.
+    #[test]
+    fn ldc_of_small_types_at_a_register_index_extends_them() {
+        let consts: Vec<u8> = (0..64u32).map(|i| (i * 73 + 41) as u8).collect();
+        let ldc = |dst: u128, index: u128, offset: u128, ty: u128| w(0xb82, &[(16, dst), (24, index), (38, offset), (54, 0), (73, ty)]);
+        // R3 = lane × 2; R12 = U16 c[0][R3 + 0x100]; R13 = S16 there; R14 = U8 c[0][R0 + 0x101];
+        // R15 = S8 c[0][R0 + 0x120].
+        let code = [
+            w(0x919, &[(16, 0), (72, 0)]),
+            w(0x919, &[(16, 1), (72, 0x22)]),
+            w(0x802, &[(16, 5), (32, 2), (72, 0xf)]),
+            w(0x224, &[(16, 3), (24, 0), (32, 5), (64, 255), (81, 7), (87, 7)]),
+            ldc(12, 3, 0x100, 2),
+            ldc(13, 3, 0x100, 3),
+            ldc(14, 0, 0x101, 0),
+            ldc(15, 0, 0x120, 1),
+            w(0xb9b, &[(24, 0), (32, 12), (40, 0x20 / 4), (54, 0), (61, 3), (72, 0xf)]),
+        ];
+        let Some(words) = run_warp_with(&code, Vec::new(), 1, 0, &consts) else { return };
+        for l in 0..32 {
+            let h = u16::from_le_bytes([consts[2 * l], consts[2 * l + 1]]);
+            let want = [u32::from(h), h as i16 as i32 as u32, u32::from(consts[l + 1]), consts[l + 0x20] as i8 as i32 as u32];
+            assert_eq!(words[4 * l..4 * l + 4], want, "lane {l}");
+        }
+    }
+
+    /// VOTE all, any and eq into predicates and ballots, VOTEU into a uniform
+    /// register and predicate, and votes under a guard counting only its lanes.
+    #[test]
+    fn vote_counts_the_active_lanes_as_ptx_vote() {
+        // Lane l: P0 = l % 3 == 0, P1 = true, P2 = false, P3 = l < 16, P4 = l >= 16.
+        let bits = |l: u32| u32::from(l.is_multiple_of(3)) | 2 | u32::from(l < 16) << 3 | u32::from(l >= 16) << 4;
+        let global = (0..32).flat_map(|l| bits(l).to_le_bytes()).collect();
+        let vote = |dst: u128, mode: u128, p: u128, not: bool| w(0x806, &[(16, dst), (72, mode), (81, 5), (87, p), (90, u128::from(not))]);
+        let x = 0x1234_5678u32;
+        let mov = |dst: u128, v: u32| w(0x802, &[(16, dst), (32, u128::from(v)), (72, 0xf)]);
+        let mut code = load_per_lane(4, 4);
+        code.extend([
+            w(0x804, &[(24, 4), (32, 0x1f)]),
+            mov(30, 1),
+            mov(13, x),
+            mov(14, x),
+            mov(22, x),
+            mov(23, x),
+            vote(12, 0, 0, false), // ballot P0; all P0
+            sel(16, 5, false),
+            vote(255, 1, 2, false), // any P2
+            sel(17, 5, false),
+            vote(255, 2, 0, false), // eq P0
+            sel(18, 5, false),
+            vote(255, 2, 2, true), // eq !P2
+            sel(19, 5, false),
+            vote(255, 1, 0, false), // any P0
+            sel(20, 5, false),
+            // VOTEU.ALL UR5, UP5 = P0; PLOP3 P5 = UP5; MOV R15 = UR5.
+            w(0x886, &[(16, 5), (72, 0), (81, 5), (87, 0)]),
+            w(0x81c, &[(81, 5), (84, 7), (87, 7), (77, 7), (68, 5), (67, 1), (64, 2), (72, 0x15)]),
+            sel(21, 5, false),
+            w(0xc02, &[(16, 15), (32, 5), (72, 0xf)]),
+            // Lanes < 16 only: ballot and all of P1; eq of P4 (false on all of them).
+            guarded(vote(13, 0, 1, false), 3),
+            guarded(sel(14, 5, false), 3),
+            guarded(vote(255, 2, 4, false), 3),
+            guarded(sel(22, 5, false), 3),
+        ]);
+        code.extend(store_row(0, 12));
+        code.extend(store_row(1, 16));
+        code.extend(store_row(2, 20));
+        let Some(words) = run_warp(&code, global, 3, 0) else { return };
+        let ballot = (0..32).filter(|l| l % 3 == 0).fold(0u32, |b, l| b | 1 << l);
+        for l in 0..32 {
+            let low = l < 16;
+            let want = [
+                [ballot, if low { 0xffff } else { x }, if low { 1 } else { x }, ballot],
+                [0, 0, 0, 1],
+                [1, 0, if low { 1 } else { x }, x],
+            ];
+            for (row, want) in want.iter().enumerate() {
+                assert_eq!(words[row * 128 + 4 * l..row * 128 + 4 * l + 4], *want, "lane {l}, row {row}");
+            }
+        }
+    }
+
+    /// P2R: predicates packed under a mask over a register's other bits.
+    #[test]
+    fn p2r_packs_predicates_under_its_mask() {
+        let values: Vec<u32> = (0..32u32).map(|i| 0x9e37_79b9u32.wrapping_mul(i + 1)).collect();
+        let p2r = |dst: u128, a: u128, mask: u128| w(0x803, &[(16, dst), (24, a), (32, mask)]);
+        let mut code = load_per_lane(4, 4);
+        code.extend([w(0x804, &[(24, 4), (32, 0x7f)]), w(0x802, &[(16, 6), (32, 0xffff_ffff), (72, 0xf)]), p2r(12, 255, 0x40), p2r(13, 6, 0x2a), p2r(14, 255, 0x7f), p2r(15, 4, 0)]);
+        code.extend(store_row(0, 12));
+        let global = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let Some(words) = run_warp(&code, global, 1, 0) else { return };
+        for (l, &v) in values.iter().enumerate() {
+            assert_eq!(words[4 * l..4 * l + 4], [v & 0x40, !0x2a | v & 0x2a, v & 0x7f, v], "lane {l}: {v:#x}");
+        }
+    }
+
+    /// LDG from a uniform register pair (ULDC.64 of the pointer) plus a 32-bit register.
+    #[test]
+    fn ldg_from_a_uniform_base_reads_the_pointers_buffer() {
+        let values: Vec<u32> = (0..35u32).map(|i| 0x4000_0000 | i.wrapping_mul(0x0101_0101)).collect();
+        let ldg = |dst: u128, offset: u128, ty: u128| w(0x981, &[(16, dst), (24, 2), (32, 4), (91, 1), (72, 1), (40, offset), (73, ty), (81, 7)]);
+        // ULDC.64 UR4 = c[0][0x80]; S2R R0 = lane; MOV R5 = 4; IMAD R2 = R0 * R5 + RZ;
+        // LDG R12 = [R2 + UR4]; LDG R13 = [R2 + UR4 + 4]; LDG.64 R14 = [R2 + UR4 + 8].
+        let code = [
+            w(0xab9, &[(16, 4), (38, 0x80), (54, 0), (73, 5)]),
+            w(0x919, &[(16, 0), (72, 0)]),
+            w(0x919, &[(16, 1), (72, 0x22)]),
+            w(0x802, &[(16, 5), (32, 4), (72, 0xf)]),
+            w(0x224, &[(16, 2), (24, 0), (32, 5), (64, 255), (81, 7), (87, 7)]),
+            ldg(12, 0, 4),
+            ldg(13, 4, 4),
+            ldg(14, 8, 5),
+            w(0xb9b, &[(24, 0), (32, 12), (40, 0x20 / 4), (54, 0), (61, 3), (72, 0xf)]),
+        ];
+        let global = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let Some(words) = run_warp(&code, global, 1, 0) else { return };
+        for l in 0..32 {
+            assert_eq!(words[4 * l..4 * l + 4], values[l..l + 4], "lane {l}");
         }
     }
 

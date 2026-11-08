@@ -34,7 +34,7 @@ use crate::sass::int::{self, IntOp};
 use crate::sass::memory::{Addr, AtomOp, AtomType, CbHandle, ImageDim, InterpFreq, InterpLoc, LdcMode, MemType, MemoryOp, Stride};
 use crate::sass::moves::{self, MovesOp};
 use crate::sass::operand::{Operand, PT, Pred, RZ, Src, URZ};
-use crate::sass::texture::{LodMode, TexDim, TexHandle, TexQuery, TextureOp};
+use crate::sass::texture::{LodMode, TexDim, TexHandle, TexQuery, TextureOp, Tld4Offset};
 use crate::sass::{self, Op, SPH_SIZE, Stage, Word};
 use sph::{Interp, Sph};
 use uexpr::UExpr;
@@ -197,9 +197,14 @@ pub fn translate_with(code: &[u8], options: &Options) -> Result<Translation, Err
     Ok(Translation { key, stage, wgsl: cx.module(&body, options), interface: cx.iface })
 }
 
-/// Whether integer image coordinates `at` (`coords` of them) fall inside image `slot`.
-fn image_inside(slot: usize, at: &str, coords: usize) -> String {
-    if coords == 1 { format!("(u32({at}) < textureDimensions(img{slot}))") } else { format!("all(vec{coords}<u32>({at}) < textureDimensions(img{slot}))") }
+/// Whether integer image coordinates `at` (`coords` of them, and the layer of
+/// an array image) fall inside image `slot`.
+fn image_inside(slot: usize, at: &str, coords: usize, layer: Option<&str>) -> String {
+    let inside = if coords == 1 { format!("(u32({at}) < textureDimensions(img{slot}))") } else { format!("all(vec{coords}<u32>({at}) < textureDimensions(img{slot}))") };
+    match layer {
+        Some(l) => format!("({inside} && u32({l}) < textureNumLayers(img{slot}))"),
+        None => inside,
+    }
 }
 
 /// A sub-word access's bits and signedness.
@@ -943,6 +948,23 @@ impl Cx {
                 self.set(out, *dst, &format!("pack2x16float({acc}[0])"));
                 self.set(out, dst.saturating_add(1), &format!("pack2x16float({acc}[1])"));
             }
+            // HSETP2: each half compared (in f32, exact for halves), then combined with the
+            // accumulator; .H_AND: dst0 gets both halves' and, dst1 its negation (NAK
+            // `OpHSetP2::horizontal`). Both results are computed before either is written,
+            // as a destination may also be the accumulator.
+            Fp16Op::Hsetp2 { dst0, dst1, a, b, cmp, bop, accum, h_and, .. } if *bop != fp16::BoolOp::Reserved3 => {
+                let (x, y, lo, hi) = (self.temp(), self.temp(), self.temp(), self.temp());
+                let (ex, ey) = (self.h2(a)?, self.h2(b)?);
+                let cmp = fcmp16(*cmp);
+                let _ = writeln!(out, "let {x} = {ex};\nlet {y} = {ey};");
+                let _ = writeln!(out, "let {lo} = {};\nlet {hi} = {};", fcmp(cmp, &format!("{x}.x"), &format!("{y}.x")), fcmp(cmp, &format!("{x}.y"), &format!("{y}.y")));
+                let acc = self.p(*accum);
+                let (c0, c1) = if *h_and { (format!("({lo} && {hi})"), format!("!({lo} && {hi})")) } else { (lo, hi) };
+                let (r0, r1) = (self.temp(), self.temp());
+                let _ = writeln!(out, "let {r0} = {};\nlet {r1} = {};", bool_op(*bop as u8, &c0, &acc), bool_op(*bop as u8, &c1, &acc));
+                self.set_p(out, *dst0, &r0);
+                self.set_p(out, *dst1, &r1);
+            }
             // F2FP.PACK_AB: a to the high half, b to the low one.
             Fp16Op::F2fp { dst, a, b, c: RZ, merge_c: false, rnd: fp16::Round::NearestEven, .. } => {
                 let (x, y) = (self.f(a)?, self.f(b)?);
@@ -1012,7 +1034,12 @@ impl Cx {
                 let (x, y) = (self.f(a)?, self.f(b)?);
                 let t = self.temp();
                 let _ = writeln!(out, "let {t} = {};", fcmp(*cmp, &x, &y));
-                let acc = self.p(*acc);
+                // A copy: the first destination may be the accumulator itself.
+                let acc = {
+                    let (a, v) = (self.p(*acc), self.temp());
+                    let _ = writeln!(out, "let {v} = {a};");
+                    v
+                };
                 let comb = |c: &str| bool_op(*bop as u8, c, &acc);
                 let (e1, e2) = (comb(&t), comb(&format!("!{t}")));
                 self.set_p(out, *p, &e1);
@@ -1040,10 +1067,25 @@ impl Cx {
                 };
                 self.set(out, *dst, &format!("u({e})"));
             }
-            Fp32Op::F2i { dst, src, signed, dst_bits: 32, src_bits: 32, rnd, .. } => {
-                let x = format!("{}({})", round_fn(*rnd), self.f(src)?);
-                // WGSL's float to integer conversions saturate, as F2I does; NaN gives 0.
-                let e = if *signed { format!("bitcast<u32>(i32({x}))") } else { format!("u32({x})") };
+            // F2I to 8, 16 or 32 bits: rounded, then saturated to the destination's range
+            // (PTX cvt.rni.u16.f32 and the like), written zero- or sign-extended to 32 bits.
+            // NaN gives 0 (.NTZ; without it the QMD's FP32_F2I_NAN_BEHAVIOR may give
+            // 0x80000000 instead: NAK's own test accepts both). The extension of the small
+            // signed forms is assumed (NAK leaves a 16-bit value's high bits unspecified).
+            // ponytail: .FTZ is not applied; it only matters for ceil/floor of denormals.
+            Fp32Op::F2i { dst, src, signed, dst_bits: bits @ (8 | 16 | 32), src_bits: 32, rnd, .. } => {
+                let (x, t, nan) = (self.temp(), self.temp(), self.temp());
+                // NaN tested on the bits: drivers may fold `x != x` away.
+                let _ = writeln!(out, "let {x} = {};\nlet {t} = {}({x});\nlet {nan} = (u({x}) & 0x7fffffffu) > 0x7f800000u;", self.f(src)?, round_fn(*rnd));
+                // Bounds as exact float literals; the conversions see only in-range values.
+                let n = u32::from(*bits);
+                let e = if *signed {
+                    let h = 1u64 << (n - 1);
+                    format!("select(bitcast<u32>(select(i32(max({t}, -{h}.0)), {}i, {t} >= {h}.0)), 0u, {nan})", h - 1)
+                } else {
+                    let h = 1u64 << n;
+                    format!("select(select(u32(max({t}, 0.0)), {}u, {t} >= {h}.0), 0u, {nan})", h - 1)
+                };
                 self.set(out, *dst, &e);
             }
             Fp32Op::I2f { dst, src, signed, dst_bits: 32, src_bits, sel, .. } => {
@@ -1108,7 +1150,12 @@ impl Cx {
                 let (x, y) = if *signed { (format!("bitcast<i32>({x})"), format!("bitcast<i32>({y})")) } else { (x, y) };
                 let t = self.temp();
                 let _ = writeln!(out, "let {t} = {};", icmp(*cmp as u8, &x, &y));
-                let acc = self.p(*accum);
+                // A copy: the first destination may be the accumulator itself.
+                let acc = {
+                    let (a, v) = (self.p(*accum), self.temp());
+                    let _ = writeln!(out, "let {v} = {a};");
+                    v
+                };
                 let (e1, e2) = (bool_op(*op as u8, &t, &acc), bool_op(*op as u8, &format!("!{t}"), &acc));
                 self.set_p(out, *dst, &e1);
                 self.set_p(out, *dst1, &e2);
@@ -1316,6 +1363,39 @@ impl Cx {
                     }
                 }
             }
+            // P2R: the mask's bits of the register replaced by predicates P0..P6 (bit i =
+            // Pi). Guessed from Maxwell's P2R (no NAK encoder): a byte-select form, if
+            // Ampere has one, is not decoded; a mask past P6 is refused.
+            MovesOp::P2r { dst, a, mask } if *mask <= 0x7f => {
+                let x = self.r(*a);
+                let mut e = format!("({x} & {:#x}u)", !*mask);
+                for i in (0..7u8).filter(|i| mask >> i & 1 != 0) {
+                    let p = self.p(Pred { reg: i, not: false });
+                    e = format!("{e} | select(0u, {:#x}u, {p})", 1u32 << i);
+                }
+                self.set(out, *dst, &format!("({e})"));
+            }
+            // VOTE / VOTEU: all, any or all-equal of the predicate over the warp's active
+            // lanes (WGSL subgroup operations count only active invocations, as the
+            // hardware does), and its ballot (VOTEU: to a uniform register and predicate;
+            // RZ / URZ / PT: not written).
+            MovesOp::Vote { uniform, dst, mode, vote, pred } if *mode != moves::VoteMode::Reserved3 => {
+                let p = self.p(*pred);
+                let (v, b) = (self.temp(), self.temp());
+                let e = match mode {
+                    moves::VoteMode::All => format!("subgroupAll({p})"),
+                    moves::VoteMode::Any => format!("subgroupAny({p})"),
+                    _ => format!("(subgroupAll({p}) || !subgroupAny({p}))"),
+                };
+                let _ = writeln!(out, "let {v} = {e};\nlet {b} = subgroupBallot({p}).x;");
+                if *uniform {
+                    self.set_up(out, *vote, &v);
+                    self.set_ur(out, *dst, &b);
+                } else {
+                    self.set_p(out, *vote, &v);
+                    self.set(out, *dst, &b);
+                }
+            }
             // As LOP3, on the uniform datapath.
             MovesOp::ULop3 { dst, a, b, c, lut, pand, pdst, psrc } => {
                 let known = self.uvals([a, b, c]).map(|x| UExpr::Lop3(*lut, Box::new(x)));
@@ -1432,21 +1512,22 @@ impl Cx {
             // channels go to consecutive registers, and no access faults.
             // From an image the program also stores to, the load reads the image itself.
             MemoryOp::Suld { dst, coord, handle, dim, mask, pred_dst, .. } => {
-                let (coords, tdim, ty) = match dim {
-                    ImageDim::D1 => (1, TexDim::D1, "texture_1d<f32>"),
-                    ImageDim::D2 => (2, TexDim::D2, "texture_2d<f32>"),
-                    ImageDim::D3 => (3, TexDim::D3, "texture_3d<f32>"),
+                let (tdim, ty) = match dim {
+                    ImageDim::D1 => (TexDim::D1, "texture_1d<f32>"),
+                    ImageDim::D2 => (TexDim::D2, "texture_2d<f32>"),
+                    ImageDim::D3 => (TexDim::D3, "texture_3d<f32>"),
+                    ImageDim::D2Array => (TexDim::Array2D, "texture_2d_array<f32>"),
                     d => return Err(format!("SULD from a {d:?} image")),
                 };
-                let at = self.image_coords(*coord, coords);
+                let (at, coords, layer) = self.image_coords(*coord, *dim)?;
                 let v = if self.read_write.contains(&(handle.bank, handle.offset)) {
                     let slot = self.image_slot(*handle, *dim)?;
                     // Outside the image: zeros (WGSL may return any texel there).
-                    let inside = image_inside(slot, &at, coords);
-                    format!("select(vec4<u32>(0u), bitcast<vec4<u32>>(textureLoad(img{slot}, {at})), {inside})")
+                    let inside = image_inside(slot, &at, coords, layer.as_deref());
+                    format!("select(vec4<u32>(0u), bitcast<vec4<u32>>(textureLoad(img{slot}, {at}{})), {inside})", layer.as_ref().map(|l| format!(", {l}")).unwrap_or_default())
                 } else {
                     let slot = self.texture_slot(TexHandle::CBuf { bank: handle.bank, offset: handle.offset }, tdim, ty, false, true);
-                    self.swizzled(slot, &format!("bitcast<vec4<u32>>(textureLoad(tex{slot}, {at}, 0))"))
+                    self.swizzled(slot, &format!("bitcast<vec4<u32>>(textureLoad(tex{slot}, {at}{}, 0))", layer.as_ref().map(|l| format!(", {l}")).unwrap_or_default()))
                 };
                 let t = self.temp();
                 let _ = writeln!(out, "let {t} = {v};");
@@ -1459,23 +1540,31 @@ impl Cx {
             }
             MemoryOp::Sust { coord, data, handle, dim, mask: 0xf, .. } if self.sph.stage == Stage::Compute => {
                 let slot = self.image_slot(*handle, *dim)?;
-                let coords = match dim {
-                    ImageDim::D1 => 1,
-                    ImageDim::D3 => 3,
-                    _ => 2,
-                };
-                let at = self.image_coords(*coord, coords);
+                let (at, coords, layer) = self.image_coords(*coord, *dim)?;
                 let v: Vec<String> = (0..4).map(|k| if *data == RZ { "0.0".to_string() } else { format!("f({})", self.r(data + k)) }).collect();
                 // A store outside the image is dropped, as on the console: WGSL may instead
                 // write any texel (the edge, racing with its own store).
-                let inside = image_inside(slot, &at, coords);
-                let _ = writeln!(out, "if ({inside}) {{ textureStore(img{slot}, {at}, vec4<f32>({})); }}", v.join(", "));
+                let inside = image_inside(slot, &at, coords, layer.as_deref());
+                let layer = layer.map(|l| format!(", {l}")).unwrap_or_default();
+                let _ = writeln!(out, "if ({inside}) {{ textureStore(img{slot}, {at}{layer}, vec4<f32>({})); }}", v.join(", "));
             }
             // LDG through a pointer from a constant bank: the address minus that pointer
             // indexes the buffer bound for it (`Interface::buffers`). Buffers are under 4 GiB:
-            // the low words are enough.
-            MemoryOp::Ldg { dst, addr: Addr { reg, reg64: true, ureg: None, offset, .. }, ty, pred, pred_dst, .. } if self.sph.stage == Stage::Compute && *pred == Pred::TRUE => {
-                let &(bank, at) = self.roots.get(reg).ok_or("LDG from an address not derived from a constant-bank pointer")?;
+            // the low words are enough. The base is a register pair derived from the pointer,
+            // or a uniform pair holding it (ULDC.64) plus a 32-bit register, taken as
+            // unsigned (NAK's uniform-plus-register global address).
+            MemoryOp::Ldg { dst, addr: Addr { reg, reg64, ureg, ureg64, offset }, ty, pred, pred_dst, .. } if self.sph.stage == Stage::Compute && *pred == Pred::TRUE => {
+                let ((bank, at), reg) = match (*reg64, *ureg) {
+                    (true, None) => (*self.roots.get(reg).ok_or("LDG from an address not derived from a constant-bank pointer")?, self.r(*reg)),
+                    (false, Some(u)) if *ureg64 => {
+                        let root = match (self.uexpr.get(&u), self.uexpr.get(&u.saturating_add(1))) {
+                            (Some(&UExpr::CBuf(b, o)), Some(&UExpr::CBuf(b1, o1))) if o % 8 == 0 && b1 == b && o.checked_add(4) == Some(o1) => (b, o),
+                            _ => return Err("LDG from a uniform base not loaded from a constant-bank pointer".into()),
+                        };
+                        (root, format!("({} + {})", self.ur(u), self.r(*reg)))
+                    }
+                    _ => return Err(format!("LDG address form {:?}", (reg64, ureg, ureg64))),
+                };
                 let n = match self.iface.buffers.iter().position(|b| *b == (bank, at)) {
                     Some(n) => n,
                     None => {
@@ -1487,9 +1576,8 @@ impl Cx {
                     }
                 };
                 let base = self.cb(bank, u32::from(at))?;
-                let r = self.r(*reg);
                 let t = self.temp();
-                let _ = writeln!(out, "let {t} = {r} + {:#x}u - {base};", *offset as u32);
+                let _ = writeln!(out, "let {t} = {reg} + {:#x}u - {base};", *offset as u32);
                 match small_mem(*ty) {
                     Some((bits, signed)) => {
                         let w = format!("gm{n}[{t} >> 2u]");
@@ -1602,8 +1690,19 @@ impl Cx {
                 self.set(out, *dst, &v);
             }
             MemoryOp::Ldc { dst, index, bank, offset, mode: LdcMode::Indexed, ty } => {
-                if let (Some((bits, signed)), RZ) = (small_mem(*ty), *index) {
-                    let e = self.cb_small(*bank, u32::from(*offset), bits, signed)?;
+                if let Some((bits, signed)) = small_mem(*ty) {
+                    let e = if *index == RZ {
+                        self.cb_small(*bank, u32::from(*offset), bits, signed)?
+                    } else {
+                        // The byte address wraps in the bank, as the word loads below.
+                        // ponytail: a half-word straddling two words reads only the first.
+                        let ix = self.r(*index);
+                        self.iface.cbufs.insert(*bank);
+                        let t = self.temp();
+                        let _ = writeln!(out, "let {t} = ({ix} + {}u) & 0xffffu;", u32::from(*offset));
+                        let word = format!("cb{bank}[{t} >> 4u][({t} >> 2u) & 3u]");
+                        if signed { format!("bitcast<u32>(extractBits(bitcast<i32>({word}), ({t} & 3u) * 8u, {bits}u))") } else { format!("extractBits({word}, ({t} & 3u) * 8u, {bits}u)") }
+                    };
                     self.set(out, *dst, &e);
                     return Ok(());
                 }
@@ -1641,6 +1740,7 @@ impl Cx {
             ImageDim::D1 => "texture_storage_1d",
             ImageDim::D2 => "texture_storage_2d",
             ImageDim::D3 => "texture_storage_3d",
+            ImageDim::D2Array => "texture_storage_2d_array",
             d => return Err(format!("a {d:?} image")),
         };
         let h = Handle::CBuf { bank: handle.bank, offset: handle.offset };
@@ -1657,10 +1757,21 @@ impl Cx {
         Ok(slot)
     }
 
-    /// An image access's integer coordinates, from `coords` registers at `base`.
-    fn image_coords(&mut self, base: u8, coords: usize) -> String {
-        let cs: Vec<String> = (0..coords as u8).map(|k| format!("i32({})", if base == RZ { "0u".to_string() } else { self.r(base + k) })).collect();
-        if coords == 1 { cs[0].clone() } else { format!("vec{coords}<i32>({})", cs.join(", ")) }
+    /// An image access's integer coordinates from the registers at `base`: the
+    /// position (and how many components it has), then the layer of an array
+    /// image (x, y, layer: surface instructions put the layer last).
+    fn image_coords(&mut self, base: u8, dim: ImageDim) -> R<(String, usize, Option<String>)> {
+        let (coords, layered) = match dim {
+            ImageDim::D1 => (1, false),
+            ImageDim::D2 => (2, false),
+            ImageDim::D3 => (3, false),
+            ImageDim::D2Array => (2, true),
+            d => return Err(format!("a {d:?} image")),
+        };
+        let mut cs: Vec<String> = (0..coords as u8 + u8::from(layered)).map(|k| format!("i32({})", if base == RZ { "0u".to_string() } else { self.r(base + k) })).collect();
+        let layer = layered.then(|| cs.pop()).flatten();
+        let at = if coords == 1 { cs[0].clone() } else { format!("vec{coords}<i32>({})", cs.join(", ")) };
+        Ok((at, coords, layer))
     }
 
     /// A texture slot for an instruction's handle: its declaration, and its
@@ -1713,9 +1824,11 @@ impl Cx {
     }
 
     fn texture(&mut self, out: &mut String, op: &TextureOp) -> R<()> {
-        let (io, dim, fetch, lod, scr, aoffi, dc, f16) = match op {
-            TextureOp::Tex { io, dim, lod, scr, aoffi, dc, f16, .. } => (io, *dim, false, *lod, *scr, *aoffi, *dc, *f16),
-            TextureOp::Tld { io, dim, lod, scr, aoffi, ms: false, f16 } => (io, *dim, true, *lod, *scr, *aoffi, false, *f16),
+        // `gather`: TLD4's component (its sources are TEX's, without a LOD).
+        let (io, dim, fetch, lod, scr, aoffi, dc, f16, gather) = match op {
+            TextureOp::Tex { io, dim, lod, scr, aoffi, dc, f16, .. } => (io, *dim, false, *lod, *scr, *aoffi, *dc, *f16, None),
+            TextureOp::Tld { io, dim, lod, scr, aoffi, ms: false, f16 } => (io, *dim, true, *lod, *scr, *aoffi, false, *f16, None),
+            TextureOp::Tld4 { io, dim: dim @ (TexDim::D2 | TexDim::Array2D | TexDim::Cube | TexDim::ArrayCube), comp, offset: Tld4Offset::None, scr, dc } => (io, *dim, false, LodMode::Auto, *scr, false, *dc, false, Some(*comp)),
             TextureOp::Txd { io, dim, aoffi } => return self.txd(out, io, *dim, *aoffi),
             // The size of a level (the texture is taken as 2D): width, height, 1, levels.
             // TXQ: the texture declared as the type its header has (`Options::queried`).
@@ -1862,6 +1975,9 @@ impl Cx {
                 };
             }
             match (dc, lod) {
+                // TLD4: the gather's arguments after the component, used below.
+                (false, _) if gather.is_some() => format!("tex{slot}, smp{slot}, {uv}{arr}"),
+                (true, _) if gather.is_some() => format!("textureGatherCompare(tex{slot}, smp{slot}, {uv}{arr}, f({}))", get(Item::Dref)?),
                 (false, LodMode::Auto) => format!("textureSample(tex{slot}, smp{slot}, {uv}{arr})"),
                 (false, LodMode::Zero) => format!("textureSampleLevel(tex{slot}, smp{slot}, {uv}{arr}, 0.0)"),
                 (false, LodMode::Lod) => format!("textureSampleLevel(tex{slot}, smp{slot}, {uv}{arr}, f({}))", get(Item::Lod)?),
@@ -1872,12 +1988,25 @@ impl Cx {
             }
         };
         let t = self.temp();
-        if dc {
+        if let (Some(comp), false) = (gather, dc) {
+            // The texture header's swizzle picks the gathered component (or a constant),
+            // as it does for a sample; WGSL wants the component as a constant, so all
+            // four are gathered and one chosen. Assumed, not proved on the console: the
+            // swizzle applies before the component selection (as in OpenGL).
+            self.iface.swizzles = true;
+            let (k, g) = (self.temp(), self.temp());
+            let _ = writeln!(out, "let {k} = (swizzles[{}][{}] >> {}u) & 7u;", slot / 4, slot % 4, 3 * u32::from(comp));
+            let gathers: Vec<String> = (0..4).map(|c| format!("bitcast<vec4<u32>>(textureGather({c}, {call}))")).collect();
+            let _ = writeln!(out, "let {g} = array<vec4<u32>, 4>({});", gathers.join(", "));
+            let _ = writeln!(out, "let {t} = select(vec4<u32>(select(select(0u, 1u, {k} == 6u), 0x3f800000u, {k} == 7u)), {g}[({k} + 2u) & 3u], {k} >= 2u && {k} <= 5u);");
+        } else if gather.is_some() {
+            let _ = writeln!(out, "let {t} = bitcast<vec4<u32>>({call});");
+        } else if dc {
             let _ = writeln!(out, "let {t} = bitcast<u32>({call});");
         } else {
             let _ = writeln!(out, "let {t} = {};", self.swizzled(slot, &format!("bitcast<vec4<u32>>({call})")));
         }
-        self.tex_results(out, &t, dc, io.mask, (io.dst, io.dst2), f16)
+        self.tex_results(out, &t, dc && gather.is_none(), io.mask, (io.dst, io.dst2), f16)
     }
 
     /// A sampled or fetched value with its texture header's swizzle applied.
@@ -1952,6 +2081,12 @@ fn fcmp(c: fp32::FCmp, a: &str, b: &str) -> String {
         Geu => format!("!({a} < {b})"),
         T => "true".into(),
     }
+}
+
+/// The fp16 family's comparison as the fp32 one (the same 4-bit codes).
+fn fcmp16(c: fp16::FloatCmp) -> fp32::FCmp {
+    use fp32::FCmp::*;
+    [F, Lt, Eq, Le, Gt, Ne, Ge, Num, Nan, Ltu, Equ, Leu, Gtu, Neu, Geu, T][c as usize]
 }
 
 /// An integer comparison by its 3-bit code (false, lt, eq, le, gt, ne, ge, true).
@@ -2211,6 +2346,47 @@ mod tests {
         assert_eq!(t.interface.images, vec![Image { handle: Handle::CBuf { bank: 0, offset: 0x30 }, dim: ImageDim::D2, read: true }]);
         assert!(t.interface.textures.is_empty());
         for want in ["texture_storage_2d<rgba16float, read_write>", "textureLoad(img0, vec2<i32>(i32(r0), i32(r1)))", "textureStore(img0,"] {
+            assert!(t.wgsl.contains(want), "{want}\n{}", t.wgsl);
+        }
+    }
+
+    fn compute(insns: &[[u8; 16]], options: &Options) -> Translation {
+        let mut code = Vec::new();
+        for i in insns.iter().chain(&[exit(), bra(-16)]) {
+            code.extend(i);
+        }
+        let t = translate_with(&code, options).unwrap_or_else(|e| panic!("{e}"));
+        validate(&t.wgsl).unwrap_or_else(|e| panic!("{e}\n{}", t.wgsl));
+        t
+    }
+
+    #[test]
+    fn array_images_take_their_layer_after_the_position() {
+        // S2R R4, R5, R6 = tid.x, tid.y, ctaid.z; SULD.D2Array R8..R11 = image c[0][0x30]
+        // at (R4, R5) layer R6, SUST it back, and SUST it to c[0][0x40] (write only).
+        let s2r = |dst: u128, sr: u128| w(0x919, &[(16, dst), (72, sr)]);
+        let suld = w(0xb97, &[(16, 8), (24, 4), (40, 0x30 / 4), (54, 0), (61, 4), (72, 0xf), (81, 7)]);
+        let sust = |h: u128| w(0xb9b, &[(24, 4), (32, 8), (40, h / 4), (54, 0), (61, 4), (72, 0xf)]);
+        let t = compute(&[s2r(4, 0x21), s2r(5, 0x22), s2r(6, 0x27), suld, sust(0x30), sust(0x40)], &Options { workgroup: [8, 8, 1], ..Default::default() });
+        assert_eq!(t.interface.images.iter().map(|i| (i.dim, i.read)).collect::<Vec<_>>(), [(ImageDim::D2Array, true), (ImageDim::D2Array, false)]);
+        for want in [
+            "texture_storage_2d_array<rgba16float, read_write>",
+            "texture_storage_2d_array<rgba16float, write>",
+            "textureLoad(img0, vec2<i32>(i32(r4), i32(r5)), i32(r6))",
+            "u32(i32(r6)) < textureNumLayers(img0)",
+            "textureStore(img1, vec2<i32>(i32(r4), i32(r5)), i32(r6), vec4<f32>(f(r8),",
+        ] {
+            assert!(t.wgsl.contains(want), "{want}\n{}", t.wgsl);
+        }
+    }
+
+    #[test]
+    fn tld4_on_an_array_texture_gathers_the_swizzled_component_with_its_layer() {
+        // TLD4.G.SCR R28, R22 = c[0][0x28] Array2D at a = (R32 layer, R33 x), b = (R43 y).
+        let tld4 = w(0xb63, &[(16, 28), (24, 32), (32, 43), (64, 22), (40, 0x28 / 4), (54, 0), (61, 5), (60, 1), (72, 0xf), (81, 7), (84, 1), (87, 1)]);
+        let t = compute(&[tld4], &Options { workgroup: [8, 8, 1], ..Default::default() });
+        assert_eq!(t.interface.textures, vec![Texture { handle: Handle::CBuf { bank: 0, offset: 0x28 }, dim: TexDim::Array2D, compare: false, fetch: false, query: false }]);
+        for want in ["texture_2d_array<f32>", "textureGather(0, tex0, smp0, vec2<f32>(f(r33), f(r43)), i32(r32))", "textureGather(3, tex0", "(swizzles[0][0] >> 3u) & 7u", "r28 =", "r29 =", "r22 =", "r23 ="] {
             assert!(t.wgsl.contains(want), "{want}\n{}", t.wgsl);
         }
     }
