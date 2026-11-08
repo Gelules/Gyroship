@@ -66,8 +66,8 @@ pub struct Cache {
     pub(crate) compute: HashMap<String, Result<(Translation, wgpu::ShaderModule), String>>,
     pub(crate) compute_pipelines: HashMap<String, (wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
     pub(crate) images: HashMap<u64, wgpu::Texture>,
-    /// Translations by (program key, key of the pixel program it pairs with).
-    /// (program key, paired pixel program key, integer attributes mask).
+    /// Translations by (program key, key of the pixel program it pairs with,
+    /// mask of the attributes fetched as integers).
     modules: HashMap<(u64, Option<u64>, u64), Module>,
     pipelines: HashMap<String, (wgpu::RenderPipeline, Vec<wgpu::BindGroupLayout>)>,
     /// Uploaded textures by address and header, with the end of the memory they came from.
@@ -76,6 +76,21 @@ pub struct Cache {
     samplers: HashMap<([u8; 32], bool, bool), wgpu::Sampler>,
     /// Stand-ins for textures only queried, by width, height, depth and levels.
     queried: HashMap<(u32, u32, u32, u32), wgpu::Texture>,
+    /// The pass that writes R32Float texels as depth (ZF32 uploads).
+    depth_copy: Option<wgpu::RenderPipeline>,
+    /// Float twins of integer compute images, by address, until the next dispatch.
+    pub(crate) twins: HashMap<u64, wgpu::Texture>,
+}
+
+/// The float format with the bits of a 32-bit integer format.
+fn float_format(f: wgpu::TextureFormat) -> Option<wgpu::TextureFormat> {
+    use wgpu::TextureFormat as F;
+    Some(match f {
+        F::R32Uint | F::R32Sint => F::R32Float,
+        F::Rg32Uint | F::Rg32Sint => F::Rg32Float,
+        F::Rgba32Uint | F::Rgba32Sint => F::Rgba32Float,
+        _ => return None,
+    })
 }
 
 /// A stage's bindings.
@@ -549,7 +564,13 @@ impl Surfaces {
             let (view, depth, source) = match self.map.values().find(|e| e.surface.addr == tic.address) {
                 // With the header's format when the image allows it as a view (sRGB over linear storage).
                 _ if self.cache.images.contains_key(&tic.address) => {
-                    let image = &self.cache.images[&tic.address];
+                    let image = match self.cache.twins.get(&tic.address) {
+                        Some(twin) => twin,
+                        None => {
+                            let twin = self.float_twin(&self.cache.images[&tic.address].clone())?;
+                            self.cache.twins.entry(tic.address).or_insert(twin)
+                        }
+                    };
                     fits(image)?;
                     let view = crate::surfaces::view_as(image, textures::wgpu_texture_format(&tic), wgpu::TextureUsages::TEXTURE_BINDING, view_desc(wgpu::TextureAspect::All));
                     (view, false, "image")
@@ -564,14 +585,20 @@ impl Surfaces {
                     let aspect = if depth { wgpu::TextureAspect::DepthOnly } else { wgpu::TextureAspect::All };
                     (crate::surfaces::view_as(&e.texture, textures::wgpu_texture_format(&tic), wgpu::TextureUsages::TEXTURE_BINDING, view_desc(aspect)), depth, "target")
                 }
-                None if x.compare => {
-                    // Where the nearest depth targets are, to tell a missing shadow pass from an offset view.
-                    let mut near: Vec<(u64, u32, u32, u32)> = self.map.values().filter(|e| e.texture.format().is_depth_stencil_format()).map(|e| (e.surface.addr, e.surface.width, e.surface.height, e.surface.layers)).collect();
-                    near.sort_by_key(|n| n.0.abs_diff(tic.address));
-                    near.truncate(3);
-                    return Err(format!("depth-compare texture not in a depth target: {:#x} {:?} {:?} {}x{}x{}; nearest depth targets {near:x?}", tic.address, tic.texture_type, tic.components, tic.width, tic.height, textures::layers(&tic)));
-                }
-                None => (self.upload(&tic, header, mem)?.create_view(&view_desc(wgpu::TextureAspect::All)), false, "memory"),
+                None => match self.upload(&tic, header, mem) {
+                    Ok(texture) => {
+                        let depth = texture.format().is_depth_stencil_format();
+                        (texture.create_view(&view_desc(if depth { wgpu::TextureAspect::DepthOnly } else { wgpu::TextureAspect::All })), depth, "memory")
+                    }
+                    Err(why) if x.compare => {
+                        // Where the nearest depth targets are, to tell a missing shadow pass from an offset view.
+                        let mut near: Vec<(u64, u32, u32, u32)> = self.map.values().filter(|e| e.texture.format().is_depth_stencil_format()).map(|e| (e.surface.addr, e.surface.width, e.surface.height, e.surface.layers)).collect();
+                        near.sort_by_key(|n| n.0.abs_diff(tic.address));
+                        near.truncate(3);
+                        return Err(format!("depth-compare texture not in a depth target: {:#x} {:?} {:?} {}x{}x{}; nearest depth targets {near:x?}; {why}", tic.address, tic.texture_type, tic.components, tic.width, tic.height, textures::layers(&tic)));
+                    }
+                    Err(why) => return Err(why),
+                },
             };
             if x.compare && !depth {
                 return Err(format!("depth-compare texture in a color {source}"));
@@ -599,19 +626,23 @@ impl Surfaces {
     }
 
     /// A 2D, 3D, 2D array or cube texture from guest memory: the level the view
-    /// starts at, every layer (block linear: one every `layer_stride`).
+    /// starts at, every layer (block linear: one every `layer_stride`). ZF32 is
+    /// uploaded as R32Float then written as depth by a pass (WebGPU copies no
+    /// buffer into Depth32Float): a shadow map the game samples but never renders.
     fn upload(&mut self, tic: &textures::Tic, header: [u8; 32], mem: Mem) -> Result<wgpu::Texture, String> {
         if let Some((t, _)) = self.cache.textures.get(&(tic.address, header)) {
             return Ok(t.clone());
         }
         let three_d = tic.texture_type == TextureType::ThreeD;
         let format = textures::wgpu_texture_format(tic).ok_or_else(|| format!("texture format {:?}", tic.components))?;
-        if let Some(note) = textures::format_notes(tic).into_iter().find(|n| !n.starts_with("needs Features::")) {
+        let zf32 = format == wgpu::TextureFormat::Depth32Float && !three_d;
+        if let Some(note) = textures::format_notes(tic).into_iter().find(|n| !n.starts_with("needs Features::")).filter(|_| !zf32) {
             return Err(format!("texture format {:?}: {note}", tic.components));
         }
-        if format.is_depth_stencil_format() || !self.device.features().contains(format.required_features()) {
+        if (format.is_depth_stencil_format() && !zf32) || !self.device.features().contains(format.required_features()) {
             return Err(format!("texture format {format:?}"));
         }
+        let format = if zf32 { wgpu::TextureFormat::R32Float } else { float_format(format).unwrap_or(format) };
         let (bpe, bw, bh) = tic.components.element().ok_or("texture element size")?;
         let level = tic.view_levels.map_or(0, |v| v.0);
         let (width, height) = ((tic.width >> level).max(1), (tic.height >> level).max(1));
@@ -666,8 +697,92 @@ impl Surfaces {
             wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(columns * bpe), rows_per_image: Some(rows) },
             texture.size(),
         );
+        let texture = if zf32 { self.as_depth(&texture) } else { texture };
+        // A large upload's staging memory is freed once the GPU is past it: at once, so
+        // that two such uploads in a frame (a 128 MiB shadow atlas and a 128 MiB light
+        // probe texture in the tutorial) do not exhaust it.
+        if data.len() >= 32 << 20 {
+            self.flush();
+            let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        }
         self.cache.textures.insert((tic.address, header), (texture.clone(), end));
         Ok(texture)
+    }
+
+    /// A texture with 32-bit integer channels as a float one with the same bits, level 0:
+    /// programs declare every sampled texture as float and bitcast what they load.
+    /// ponytail: a copy per image and dispatch; integer texture declarations if it costs.
+    fn float_twin(&mut self, t: &wgpu::Texture) -> Result<wgpu::Texture, String> {
+        let Some(format) = float_format(t.format()) else {
+            return match t.format().sample_type(None, None) {
+                Some(wgpu::TextureSampleType::Uint | wgpu::TextureSampleType::Sint) => Err(format!("integer texture {:?} sampled", t.format())),
+                _ => Ok(t.clone()),
+            };
+        };
+        let size = t.size();
+        let row = (size.width * format.block_copy_size(None).unwrap_or(4)).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("float twin"), size: u64::from(row * size.height * size.depth_or_array_layers), usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let twin = self.device.create_texture(&wgpu::TextureDescriptor { label: Some("float twin"), size, mip_level_count: 1, sample_count: 1, dimension: t.dimension(), format, usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST, view_formats: &[] });
+        let layout = wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(size.height) };
+        let mut encoder = self.encoder();
+        encoder.copy_texture_to_buffer(t.as_image_copy(), wgpu::TexelCopyBufferInfo { buffer: &buffer, layout }, size);
+        encoder.copy_buffer_to_texture(wgpu::TexelCopyBufferInfo { buffer: &buffer, layout }, twin.as_image_copy(), size);
+        self.record(encoder);
+        Ok(twin)
+    }
+
+    /// A Depth32Float copy of an R32Float texture, every layer, by a pass that
+    /// writes each texel as fragment depth.
+    fn as_depth(&mut self, floats: &wgpu::Texture) -> wgpu::Texture {
+        let device = &self.device;
+        let pipeline = self.cache.depth_copy.get_or_insert_with(|| {
+            let wgsl = "@group(0) @binding(0) var src: texture_2d<f32>;
+                @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+                    return vec4<f32>(f32(i & 1u) * 4.0 - 1.0, f32(i >> 1u) * 4.0 - 1.0, 0.0, 1.0);
+                }
+                @fragment fn fs(@builtin(position) p: vec4<f32>) -> @builtin(frag_depth) f32 {
+                    return textureLoad(src, vec2<i32>(p.xy), 0).r;
+                }";
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("depth copy"), source: wgpu::ShaderSource::Wgsl(wgsl.into()) });
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("depth copy"),
+                layout: None,
+                vertex: wgpu::VertexState { module: &module, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[] },
+                primitive: Default::default(),
+                depth_stencil: Some(wgpu::DepthStencilState { format: wgpu::TextureFormat::Depth32Float, depth_write_enabled: Some(true), depth_compare: Some(wgpu::CompareFunction::Always), stencil: Default::default(), bias: Default::default() }),
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState { module: &module, entry_point: Some("fs"), compilation_options: Default::default(), targets: &[] }),
+                multiview_mask: None,
+                cache: None,
+            })
+        }).clone();
+        let depth = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("zf32"),
+            size: floats.size(),
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let mut encoder = self.encoder();
+        for layer in 0..floats.size().depth_or_array_layers {
+            let one = |t: &wgpu::Texture| t.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2), base_array_layer: layer, array_layer_count: Some(1), ..Default::default() });
+            let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &pipeline.get_bind_group_layout(0), entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&one(floats)) }] });
+            let view = one(&depth);
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("depth copy"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &view, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Store }), stencil_ops: None }),
+                ..Default::default()
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        self.record(encoder);
+        depth
     }
 
     /// Forgets the uploaded textures whose memory `[start, start + len)` overlaps:
@@ -863,6 +978,14 @@ mod tests {
         assert_eq!(run(&mut s, x.clone(), tic, tsc, Vec::new(), wgsl, 3), vec![1.0, 1.0, 0.0]);
         // ZC_GREATER: only the reference above the depth passes (a second cached sampler).
         put(&mut tsc, &[(12, 10, 4)]);
-        assert_eq!(run(&mut s, x, tic, tsc, Vec::new(), wgsl, 3), vec![0.0, 0.0, 1.0]);
+        assert_eq!(run(&mut s, x.clone(), tic, tsc, Vec::new(), wgsl, 3), vec![0.0, 0.0, 1.0]);
+        // No target at another address: ZF32 texels from memory, here 0.5 but for the
+        // last texel (0.25, sampled nowhere), give the same compares.
+        const ATLAS: u64 = 0x70_0000;
+        put(&mut tic, &[(63, 41, (ATLAS >> 9) as u32)]);
+        let size = textures::tic_level(&textures::tic(&tic).unwrap(), 0).unwrap().size() as usize;
+        let mut memory = 0.5f32.to_le_bytes().repeat(size / 4);
+        memory[size - 4..].copy_from_slice(&0.25f32.to_le_bytes());
+        assert_eq!(run(&mut s, x, tic, tsc, vec![(ATLAS, memory)], wgsl, 3), vec![0.0, 0.0, 1.0]);
     }
 }

@@ -6,7 +6,7 @@
 //! than the target); the others are counted in `skipped`. Draws: `draw.rs`.
 
 use crate::pushbuf::{Clear, Surface};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 /// The wgpu format of a 3D-class color target format (clc797.h), for the
@@ -129,6 +129,9 @@ pub struct Surfaces {
     pending: Option<wgpu::CommandEncoder>,
     /// This frame's vertex, index and constant data: one buffer, written at flush.
     arena: (wgpu::Buffer, Vec<u8>),
+    /// Offsets of the arena's staged blocks by content hash: draws share identical
+    /// constant banks (64 KiB each) instead of staging each copy.
+    staged: HashMap<u64, Vec<usize>>,
     /// The color target written last (the presented image at a present).
     last_color: Option<(u64, u32)>,
     /// The window the presented images go to, if any.
@@ -280,7 +283,8 @@ impl Surfaces {
             if let Ok(mut v) = sink.lock()
                 && v.len() < 16
             {
-                v.push(e.to_string());
+                // Debug: the Display alone is "Validation Error", without its description.
+                v.push(format!("{e:?}"));
             }
         }));
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("blit"), source: wgpu::ShaderSource::Wgsl(BLIT.into()) });
@@ -318,7 +322,7 @@ impl Surfaces {
         let fill = (fill_module, fill_layout, Default::default());
         let arena = (arena_buffer(&device, 16 << 20), Vec::new());
         let window = window.map(|(surface, size)| Window::new(&adapter, &device, surface, size));
-        Ok(Surfaces { adapter, device, queue, map: BTreeMap::new(), touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pending: None, arena, last_color: None, window })
+        Ok(Surfaces { adapter, device, queue, map: BTreeMap::new(), touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pending: None, arena, staged: HashMap::new(), last_color: None, window })
     }
 
     /// Shows the presented image (the color target written last, its top-left
@@ -387,6 +391,7 @@ impl Surfaces {
         if !self.arena.1.is_empty() {
             self.queue.write_buffer(&self.arena.0, 0, &self.arena.1);
             self.arena.1.clear();
+            self.staged.clear();
         }
         if let Some(e) = self.pending.take() {
             self.queue.submit([e.finish()]);
@@ -397,6 +402,15 @@ impl Surfaces {
     /// the buffer and the range they will occupy when the frame is submitted.
     pub(crate) fn stage(&mut self, bytes: &[u8]) -> (wgpu::Buffer, u64, u64) {
         let size = bytes.len().next_multiple_of(4).max(4);
+        let hash = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            bytes.hash(&mut h);
+            h.finish()
+        };
+        if let Some(&at) = self.staged.get(&hash).and_then(|v| v.iter().find(|&&at| self.arena.1.get(at..at + bytes.len()) == Some(bytes) && self.arena.1.len() >= at + size)) {
+            return (self.arena.0.clone(), at as u64, size as u64);
+        }
         let at = self.arena.1.len().next_multiple_of(ARENA_ALIGN);
         if (at + size) as u64 > self.arena.0.size() {
             // Full: its bytes are written now (it is not reused this frame) and a
@@ -404,12 +418,14 @@ impl Surfaces {
             self.queue.write_buffer(&self.arena.0, 0, &self.arena.1);
             let capacity = (self.arena.0.size() * 2).max((size as u64).next_power_of_two());
             self.arena = (arena_buffer(&self.device, capacity), Vec::new());
+            self.staged.clear();
             return self.stage(bytes);
         }
         let data = &mut self.arena.1;
         data.resize(at, 0);
         data.extend_from_slice(bytes);
         data.resize(at + size, 0);
+        self.staged.entry(hash).or_default().push(at);
         (self.arena.0.clone(), at as u64, size as u64)
     }
 
@@ -719,6 +735,24 @@ mod tests {
         assert!(check_adapter(wgpu::Features::empty(), 32, 32).unwrap_err().contains("SUBGROUP"));
         assert!(check_adapter(sub, 64, 64).unwrap_err().contains("64 to 64"));
         assert!(check_adapter(sub, 8, 32).unwrap_err().contains("exactly 32"));
+    }
+
+    /// Identical blocks staged in a frame share one range; others, and blocks
+    /// after a flush, take new ones. Needs a GPU adapter.
+    #[test]
+    fn identical_staged_blocks_share_their_range() {
+        let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
+            eprintln!("no GPU adapter: test skipped");
+            return;
+        };
+        let (a, b) = (vec![1u8; 4096], vec![2u8; 4096]);
+        let first = s.stage(&a).1;
+        assert_eq!(s.stage(&a).1, first);
+        assert_ne!(s.stage(&b).1, first);
+        assert_eq!(s.stage(&a[..100]).2, 100);
+        s.flush();
+        assert_eq!(s.arena.1.len(), 0);
+        assert_eq!(s.stage(&b).1, 0);
     }
 
     /// A clear reaches the texture: 4x2 targets in RF16_GF16_BF16_AF16 and in

@@ -58,6 +58,8 @@ impl Surfaces {
     /// Runs a dispatch; an empty grid does nothing.
     pub fn dispatch(&mut self, l: &Launch, pools: Pools, mem: Mem) -> Result<(), String> {
         self.textures_read.clear();
+        // A dispatch may write the images: their float twins are stale.
+        self.cache.twins.clear();
         if l.grid.contains(&0) || l.program == 0 {
             return Ok(());
         }
