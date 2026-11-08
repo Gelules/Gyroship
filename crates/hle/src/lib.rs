@@ -291,6 +291,9 @@ impl Kernel {
         gyroship_runtime::profile::finish(&|a| self.symbolize(a));
         if let Some(path) = &self.config.perf {
             gyroship_runtime::profile::write_perf(path, self.config.profile.as_ref().map_or(600, |p| p.1 as usize));
+            if let Some(s) = &self.surfaces {
+                eprintln!("gyroship: staging over {} presents: {:?}", self.gs.presents, s.staging);
+            }
         }
         if let (Some(path), Some(samples)) = (&self.config.audio_dump, &self.audio_samples)
             && let Err(e) = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::write(path, audio::wav(samples, self.audio_format.0, self.audio_format.1)))

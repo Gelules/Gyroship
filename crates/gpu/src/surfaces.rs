@@ -129,6 +129,8 @@ pub struct Surfaces {
     pub textures_read: Vec<(u64, &'static str)>,
     /// Operations not done, by reason.
     pub skipped: BTreeMap<String, u64>,
+    /// What the upload arena carried, for `--perf` (host statistics).
+    pub staging: Staging,
     /// wgpu validation errors (the first ones), which the HLE takes as anomalies.
     pub errors: Arc<Mutex<Vec<String>>>,
     /// The work recorded since the last [`Surfaces::flush`], in order.
@@ -213,6 +215,21 @@ impl Window {
         });
         Window { surface, config, pipeline, layout }
     }
+}
+
+/// What the upload arena carried since the start: staged blocks (and those an
+/// identical block already in the frame's arena served), their bytes by kind
+/// (constant banks, other data), the zeros completing bank windows, and the
+/// bytes and count of the arena uploads.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Staging {
+    pub calls: u64,
+    pub hits: u64,
+    pub bank_bytes: u64,
+    pub data_bytes: u64,
+    pub zero_bytes: u64,
+    pub flushed: u64,
+    pub flushes: u64,
 }
 
 /// Offsets in the upload arena: the uniform binding alignment wgpu allows at most.
@@ -332,7 +349,7 @@ impl Surfaces {
         let arena = (arena_buffer(&device, 16 << 20), Vec::new());
         let window = window.map(|(surface, size)| Window::new(&adapter, &device, surface, size));
         let timing = crate::timing::Timing::new(&device, &queue);
-        Ok(Surfaces { adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pending: None, timing, arena, staged: HashMap::new(), last_color: None, window })
+        Ok(Surfaces { adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pending: None, timing, arena, staging: Staging::default(), staged: HashMap::new(), last_color: None, window })
     }
 
     /// Shows the presented image (the color target written last, its top-left
@@ -399,6 +416,8 @@ impl Surfaces {
         // The arena's writes land before this submit's commands, and after the
         // previous frame's, which read the same bytes: queue order.
         if !self.arena.1.is_empty() {
+            self.staging.flushed += self.arena.1.len() as u64;
+            self.staging.flushes += 1;
             self.queue.write_buffer(&self.arena.0, 0, &self.arena.1);
             self.arena.1.clear();
             self.staged.clear();
@@ -431,19 +450,27 @@ impl Surfaces {
         let (words, tail) = bytes.as_chunks::<8>();
         let hash = words.iter().map(|w| u64::from_le_bytes(*w)).chain(tail.iter().map(|&b| u64::from(b))).fold(bytes.len() as u64, |h, w| (h.rotate_left(5) ^ w).wrapping_mul(0x517c_c1b7_2722_0a95));
         let capacity = self.arena.0.size();
+        self.staging.calls += 1;
         if let Some(&(at, _)) = self.staged.get(&hash).and_then(|v| v.iter().find(|&&(at, zeros)| zeros >= range && self.arena.1.get(at..at + bytes.len()) == Some(bytes))) {
+            self.staging.hits += 1;
             return (self.arena.0.clone(), at as u64, range as u64);
         }
         let at = self.arena.1.len().next_multiple_of(ARENA_ALIGN);
         if (at + range) as u64 > capacity {
             // Full: its bytes are written now (it is not reused this frame) and a
             // buffer twice as large takes over; recorded work keeps the old one alive.
+            self.staging.flushed += self.arena.1.len() as u64;
             self.queue.write_buffer(&self.arena.0, 0, &self.arena.1);
             let capacity = (capacity * 2).max((range as u64).next_power_of_two());
             self.arena = (arena_buffer(&self.device, capacity), Vec::new());
             self.staged.clear();
             return self.stage_window(bytes, window);
         }
+        match window {
+            0 => self.staging.data_bytes += size as u64,
+            _ => self.staging.bank_bytes += size as u64,
+        }
+        self.staging.zero_bytes += (range - size) as u64;
         let data = &mut self.arena.1;
         data.resize(at, 0);
         data.extend_from_slice(bytes);
