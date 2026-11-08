@@ -945,6 +945,16 @@ pub fn layer_stride(t: &Tic) -> Option<u64> {
     layout(t).map(|l| l.1)
 }
 
+/// Layers the header's texture has: its slices for a 2D array, six faces per
+/// cube (`DEPTH_MINUS_ONE` counts cubes), else 1.
+pub fn layers(t: &Tic) -> u32 {
+    match t.texture_type {
+        TextureType::TwoDArray => t.depth,
+        TextureType::Cubemap | TextureType::CubemapArray => 6 * t.depth,
+        _ => 1,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1218,5 +1228,26 @@ mod tests {
         let t = tic(&header(&[(6, 0, 0x1d), (87, 85, 3), (101, 99, 2), (104, 102, 3), (127, 124, 1), (144, 128, 31), (175, 160, 31), (189, 176, 7), (154, 151, 2)])).unwrap();
         assert_eq!(level_offsets(&t), vec![0, 64 * 32 * 8]); // level 1: 16x16x4 = 64 B x 16 rows x 4 slices
         assert_eq!(tic_level(&t, 1).unwrap().size(), 64 * 16 * 4);
+    }
+
+    #[test]
+    fn array_layers_and_stride() {
+        // 2D array, 3 layers of 40x24 RGBA8, 2 levels, 4-GOB-high tiles. Level 0: 160 B
+        // wide = 3 GOBs, 24 rows clamp the tile to 4 GOBs (32 rows): 3 x 512 x 4 = 6144;
+        // level 1: 80 B, 12 rows, tile clamped to 2 GOBs: 2 x 512 x 2 = 2048. 8192 is
+        // a whole number of level-0 tiles (2048 B), so it is the stride.
+        let t = tic(&header(&[(6, 0, 0x08), (87, 85, 3), (101, 99, 2), (127, 124, 1), (144, 128, 39), (175, 160, 23), (189, 176, 2), (154, 151, 5)])).unwrap();
+        assert_eq!((t.texture_type, layers(&t)), (TextureType::TwoDArray, 3));
+        assert_eq!(level_offsets(&t), vec![0, 6144]);
+        assert_eq!(layer_stride(&t), Some(8192));
+        // Levels that do not add up to a whole level-0 tile: 64x40 R8 in 8-GOB tiles (40 rows
+        // = 5 GOBs, below 8): 4096; level 1, 32x20, tile clamped to 4 GOBs: 2048; 6144
+        // aligned to the 4096-byte level-0 tile = 8192.
+        let t = tic(&header(&[(6, 0, 0x1d), (87, 85, 3), (101, 99, 3), (127, 124, 1), (144, 128, 63), (175, 160, 39), (189, 176, 1), (154, 151, 5)])).unwrap();
+        assert_eq!(level_offsets(&t), vec![0, 4096]);
+        assert_eq!(layer_stride(&t), Some(8192));
+        // A cube counts six faces per DEPTH_MINUS_ONE + 1.
+        let t = tic(&header(&[(6, 0, 0x08), (87, 85, 3), (189, 176, 1), (154, 151, 8)])).unwrap();
+        assert_eq!(layers(&t), 12);
     }
 }

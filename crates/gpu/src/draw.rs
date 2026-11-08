@@ -7,9 +7,8 @@
 //! ponytail: one encoder and fresh buffers per draw (ordering for free; a
 //! ring buffer when draw counts make it slow); textures cached by address
 //! and header, dropped when the GPU writes their memory (not when the CPU
-//! does); float vertex attributes; no
-//! depth-compare textures;
-//! pipelines keyed by a Debug string. Each draw not done counts its reason
+//! does); float vertex attributes; depth-compare textures only from depth
+//! targets; pipelines keyed by a Debug string. Each draw not done counts its reason
 //! in `Surfaces::skipped`.
 
 use crate::pushbuf::{Draw, Surface};
@@ -72,7 +71,8 @@ pub struct Cache {
     pipelines: HashMap<String, (wgpu::RenderPipeline, Vec<wgpu::BindGroupLayout>)>,
     /// Uploaded textures by address and header, with the end of the memory they came from.
     textures: HashMap<(u64, [u8; 32]), (wgpu::Texture, u64)>,
-    samplers: HashMap<([u8; 32], bool), wgpu::Sampler>,
+    /// Samplers by header, filtering and compare.
+    samplers: HashMap<([u8; 32], bool, bool), wgpu::Sampler>,
     /// Stand-ins for textures only queried, by width, height, depth and levels.
     queried: HashMap<(u32, u32, u32, u32), wgpu::Texture>,
 }
@@ -87,11 +87,13 @@ pub(crate) struct Bindings {
 }
 
 /// A texture slot: its view, its sampler unless fetched, and whether it is
-/// a depth target (read as unfilterable floats, with a non-filtering sampler).
+/// a depth target (read as unfilterable floats, with a non-filtering sampler)
+/// or a depth target sampled with a comparison (depth texture and sampler).
 pub(crate) struct Slot {
     pub(crate) view: wgpu::TextureView,
     pub(crate) sampler: Option<wgpu::Sampler>,
     depth: bool,
+    compare: bool,
     dimension: wgpu::TextureViewDimension,
 }
 
@@ -110,10 +112,14 @@ impl Bindings {
         }
         for (i, s) in self.textures.iter().enumerate() {
             let filterable = s.sampler.is_some() && !s.depth;
-            let sample_type = wgpu::TextureSampleType::Float { filterable };
+            let sample_type = if s.compare { wgpu::TextureSampleType::Depth } else { wgpu::TextureSampleType::Float { filterable } };
             entries.push(wgpu::BindGroupLayoutEntry { binding: 32 + 2 * i as u32, visibility, ty: wgpu::BindingType::Texture { sample_type, view_dimension: s.dimension, multisampled: false }, count: None });
             if s.sampler.is_some() {
-                let ty = if s.depth { wgpu::SamplerBindingType::NonFiltering } else { wgpu::SamplerBindingType::Filtering };
+                let ty = match (s.compare, s.depth) {
+                    (true, _) => wgpu::SamplerBindingType::Comparison,
+                    (false, true) => wgpu::SamplerBindingType::NonFiltering,
+                    (false, false) => wgpu::SamplerBindingType::Filtering,
+                };
                 entries.push(wgpu::BindGroupLayoutEntry { binding: 33 + 2 * i as u32, visibility, ty: wgpu::BindingType::Sampler(ty), count: None });
             }
         }
@@ -489,9 +495,15 @@ impl Surfaces {
                 }
                 .ok_or("texture handle offset")?,
             );
-            if x.compare || !matches!(x.dim, TexDim::D2 | TexDim::D3) {
-                return Err(format!("texture {:?} (compare {})", x.dim, x.compare));
-            }
+            use wgpu::TextureViewDimension as V;
+            let (dimension, types): (V, &[TextureType]) = match x.dim {
+                TexDim::D2 => (V::D2, &[TextureType::TwoD, TextureType::TwoDNoMipmap]),
+                TexDim::D3 => (V::D3, &[TextureType::ThreeD]),
+                TexDim::Array2D => (V::D2Array, &[TextureType::TwoDArray]),
+                TexDim::Cube => (V::Cube, &[TextureType::Cubemap]),
+                TexDim::ArrayCube => (V::CubeArray, &[TextureType::CubemapArray]),
+                other => return Err(format!("texture {other:?} (compare {})", x.compare)),
+            };
             let mut header = [0u8; 32];
             if !mem(headers.entry(handle.header).ok_or("texture index past the pool")?, &mut header) {
                 return Err("texture header not readable".into());
@@ -500,14 +512,26 @@ impl Surfaces {
             if attached.contains(&tic.address) {
                 return Err("texture is a target of the same draw".into());
             }
-            let want = if x.dim == TexDim::D3 { TextureType::ThreeD } else { TextureType::TwoD };
-            if want != tic.texture_type && !(want == TextureType::TwoD && tic.texture_type == TextureType::TwoDNoMipmap) {
+            if !types.contains(&tic.texture_type) {
                 return Err(format!("{:?} texture read as {:?}", tic.texture_type, x.dim));
             }
+            let layers = textures::layers(&tic);
+            if matches!(dimension, V::Cube | V::CubeArray) && tic.width != tic.height {
+                return Err(format!("cube texture of {}x{}", tic.width, tic.height));
+            }
+            // A host texture fits the view when it has its dimension and enough layers.
+            let fits = |t: &wgpu::Texture| -> Result<(), String> {
+                let three_d = t.dimension() == wgpu::TextureDimension::D3;
+                if three_d != (dimension == V::D3) || (!three_d && t.depth_or_array_layers() < layers) {
+                    return Err(format!("{:?} texture of {} layers read as {:?} of {layers}", t.dimension(), t.depth_or_array_layers(), x.dim));
+                }
+                Ok(())
+            };
+            let view_desc = |aspect| wgpu::TextureViewDescriptor { dimension: Some(dimension), aspect, array_layer_count: Some(layers), mip_level_count: Some(1), ..Default::default() };
             // Only queried (TXQ): a stand-in of its size and levels, as the texture itself
             // may be an image the same dispatch writes, which wgpu cannot also bind for reading.
             if x.query {
-                let three_d = want == TextureType::ThreeD;
+                let three_d = dimension == V::D3;
                 let size = wgpu::Extent3d { width: tic.width.max(1), height: tic.height.max(1), depth_or_array_layers: if three_d { tic.depth.max(1) } else { 1 } };
                 let dim = if three_d { wgpu::TextureDimension::D3 } else { wgpu::TextureDimension::D2 };
                 let levels = (tic.max_mip_level + 1).min(size.max_mips(dim));
@@ -515,29 +539,35 @@ impl Surfaces {
                 let texture = self.cache.queried.entry((size.width, size.height, size.depth_or_array_layers, levels)).or_insert_with(|| {
                     device.create_texture(&wgpu::TextureDescriptor { label: Some("queried"), size, mip_level_count: levels, sample_count: 1, dimension: dim, format: wgpu::TextureFormat::R8Unorm, usage: wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[] })
                 });
-                let dimension = if three_d { wgpu::TextureViewDimension::D3 } else { wgpu::TextureViewDimension::D2 };
-                textures.push(Slot { view: texture.create_view(&Default::default()), sampler: None, depth: false, dimension });
+                let dimension = if three_d { V::D3 } else { V::D2 };
+                textures.push(Slot { view: texture.create_view(&Default::default()), sampler: None, depth: false, compare: false, dimension });
                 continue;
             }
             // An image a compute program wrote, or a render target at that address: its host texture.
             let (view, depth, source) = match self.map.values().find(|e| e.surface.addr == tic.address) {
                 // With the header's format when the image allows it as a view (sRGB over linear storage).
                 _ if self.cache.images.contains_key(&tic.address) => {
-                    let view = crate::surfaces::view_as(&self.cache.images[&tic.address], textures::wgpu_texture_format(&tic), wgpu::TextureUsages::TEXTURE_BINDING, Default::default());
+                    let image = &self.cache.images[&tic.address];
+                    fits(image)?;
+                    let view = crate::surfaces::view_as(image, textures::wgpu_texture_format(&tic), wgpu::TextureUsages::TEXTURE_BINDING, view_desc(wgpu::TextureAspect::All));
                     (view, false, "image")
                 }
                 Some(e) => {
+                    fits(&e.texture)?;
                     let depth = e.texture.format().is_depth_stencil_format();
                     // A color target read counts as touched: frame dumps show what the frame sampled.
                     if !depth {
                         self.touched.insert((e.surface.addr, e.surface.format));
                     }
                     let aspect = if depth { wgpu::TextureAspect::DepthOnly } else { wgpu::TextureAspect::All };
-                    let desc = wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2), aspect, array_layer_count: Some(1), mip_level_count: Some(1), ..Default::default() };
-                    (crate::surfaces::view_as(&e.texture, textures::wgpu_texture_format(&tic), wgpu::TextureUsages::TEXTURE_BINDING, desc), depth, "target")
+                    (crate::surfaces::view_as(&e.texture, textures::wgpu_texture_format(&tic), wgpu::TextureUsages::TEXTURE_BINDING, view_desc(aspect)), depth, "target")
                 }
-                None => (self.upload(&tic, header, mem)?.create_view(&Default::default()), false, "memory"),
+                None if x.compare => return Err("depth-compare texture not in a depth target".into()),
+                None => (self.upload(&tic, header, mem)?.create_view(&view_desc(wgpu::TextureAspect::All)), false, "memory"),
             };
+            if x.compare && !depth {
+                return Err(format!("depth-compare texture in a color {source}"));
+            }
             swizzles[slot] = textures::swizzle_code(&tic);
             self.textures_read.push((tic.address, source));
             let sampler = match x.fetch {
@@ -551,16 +581,17 @@ impl Surfaces {
                     if !mem(samplers.entry(index).ok_or("sampler index past the pool")?, &mut bytes) {
                         return Err("sampler header not readable".into());
                     }
-                    Some(self.sampler(bytes, !depth))
+                    // A comparison sampler filters (PCF) whatever the depth format.
+                    Some(self.sampler(bytes, !depth || x.compare, x.compare))
                 }
             };
-            let dimension = if x.dim == TexDim::D3 { wgpu::TextureViewDimension::D3 } else { wgpu::TextureViewDimension::D2 };
-            textures.push(Slot { view, sampler, depth, dimension });
+            textures.push(Slot { view, sampler, depth, compare: x.compare, dimension });
         }
         Ok((textures, swizzles))
     }
 
-    /// A 2D or 3D texture from guest memory: the level the view starts at, layer 0.
+    /// A 2D, 3D, 2D array or cube texture from guest memory: the level the view
+    /// starts at, every layer (block linear: one every `layer_stride`).
     fn upload(&mut self, tic: &textures::Tic, header: [u8; 32], mem: Mem) -> Result<wgpu::Texture, String> {
         if let Some((t, _)) = self.cache.textures.get(&(tic.address, header)) {
             return Ok(t.clone());
@@ -577,20 +608,29 @@ impl Surfaces {
         let level = tic.view_levels.map_or(0, |v| v.0);
         let (width, height) = ((tic.width >> level).max(1), (tic.height >> level).max(1));
         let (columns, rows) = (width.div_ceil(bw), height.div_ceil(bh));
-        let depth = if three_d { (tic.depth >> level).max(1) } else { 1 };
+        let layers = textures::layers(tic);
+        if layers == 0 || layers > self.device.limits().max_texture_array_layers {
+            return Err(format!("texture of {layers} layers"));
+        }
+        let depth = if three_d { (tic.depth >> level).max(1) } else { layers };
         let end;
         let data = match tic.layout {
             Layout::BlockLinear => {
                 let l = textures::tic_level(tic, level).ok_or("texture level")?;
                 let offset = *textures::level_offsets(tic).get(level as usize).ok_or("texture level")?;
+                let stride = textures::layer_stride(tic).ok_or("texture layer stride")?;
                 let mut raw = vec![0u8; l.size() as usize];
-                if !mem(tic.address + offset, &mut raw) {
-                    return Err("texture not readable".into());
+                let mut data = Vec::new();
+                for layer in 0..u64::from(layers) {
+                    if !mem(tic.address + layer * stride + offset, &mut raw) {
+                        return Err("texture not readable".into());
+                    }
+                    data.extend(l.deswizzle(&raw));
                 }
-                end = tic.address + offset + raw.len() as u64;
-                l.deswizzle(&raw)
+                end = tic.address + u64::from(layers - 1) * stride + offset + raw.len() as u64;
+                data
             }
-            Layout::Pitch if level == 0 && !three_d => {
+            Layout::Pitch if level == 0 && !three_d && layers == 1 => {
                 let row = (columns * bpe) as usize;
                 let mut raw = vec![0u8; tic.pitch as usize * (rows as usize - 1) + row];
                 if !mem(tic.address, &mut raw) {
@@ -630,9 +670,11 @@ impl Surfaces {
     }
 
     /// The sampler of a header; a non-filtering one (nearest everywhere) for
-    /// unfilterable textures.
-    fn sampler(&mut self, bytes: [u8; 32], filtering: bool) -> wgpu::Sampler {
-        if let Some(s) = self.cache.samplers.get(&(bytes, filtering)) {
+    /// unfilterable textures; with `compare`, a comparison sampler with the
+    /// header's TEXSAMP0_DEPTH_COMPARE_FUNC (taken even when its
+    /// TEXSAMP0_DEPTH_COMPARE bit is clear: the program asked for a compare).
+    fn sampler(&mut self, bytes: [u8; 32], filtering: bool, compare: bool) -> wgpu::Sampler {
+        if let Some(s) = self.cache.samplers.get(&(bytes, filtering, compare)) {
             return s.clone();
         }
         let t = textures::tsc(&bytes);
@@ -659,11 +701,160 @@ impl Surfaces {
             mipmap_filter: mip,
             lod_min_clamp,
             lod_max_clamp: lod_max_clamp.max(lod_min_clamp),
-            compare: None,
+            compare: compare.then(|| t.compare_func.wgpu()),
             anisotropy_clamp: if linear { t.max_anisotropy.clamp(1, 16) } else { 1 },
             border_color: address.contains(&wgpu::AddressMode::ClampToBorder).then(|| t.wgpu_border_color().unwrap_or(wgpu::SamplerBorderColor::TransparentBlack)),
         });
-        self.cache.samplers.insert((bytes, filtering), s.clone());
+        self.cache.samplers.insert((bytes, filtering, compare), s.clone());
         s
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pushbuf::Clear;
+    use crate::sass::Stage;
+    use crate::shader::{Interface, Texture};
+    use crate::state::resources;
+
+    const HEADERS: u64 = 0x40_0000;
+    const SAMPLERS: u64 = 0x41_0000;
+
+    /// Sets bits hi..=lo of a 32-byte header.
+    fn put(h: &mut [u8; 32], fields: &[(u32, u32, u32)]) {
+        for &(hi, lo, v) in fields {
+            for (i, b) in (lo..=hi).enumerate() {
+                let byte = &mut h[(b / 8) as usize];
+                *byte = *byte & !(1 << (b % 8)) | ((v >> i & 1) as u8) << (b % 8);
+            }
+        }
+    }
+
+    /// Binds texture slot `x` (handle 0 at c[0][0]: header 0, sampler 0) through
+    /// `texture_slots`, from `memory` plus the two headers, and runs `wgsl` (declaring
+    /// `out: array<f32>` at binding 1) as one compute thread; `n` floats of `out` back.
+    fn run(s: &mut Surfaces, x: Texture, tic: [u8; 32], tsc: [u8; 32], memory: Vec<(u64, Vec<u8>)>, wgsl: &str, n: usize) -> Vec<f32> {
+        let t = Translation { key: 0, stage: Stage::Compute, wgsl: wgsl.into(), interface: Interface { textures: vec![x], ..Default::default() } };
+        let regions = [memory, vec![(HEADERS, tic.to_vec()), (SAMPLERS, tsc.to_vec())]].concat();
+        let mut mem = |addr: u64, out: &mut [u8]| {
+            regions.iter().any(|(at, data)| {
+                let Some(src) = addr.checked_sub(*at).and_then(|o| data.get(o as usize..o as usize + out.len())) else { return false };
+                out.copy_from_slice(src);
+                true
+            })
+        };
+        let reg = |m: u32| match m {
+            0x1578 => HEADERS as u32,
+            0x1560 => SAMPLERS as u32,
+            _ => 0,
+        };
+        let banks = BTreeMap::from([(0u8, vec![0u8; 16])]);
+        let (slots, _) = s.texture_slots(&t, &banks, resources::header_pool(&reg), resources::sampler_pool(&reg), resources::sampler_binding(&reg), &[], &mut mem).unwrap_or_else(|e| panic!("{e}"));
+        let bindings = Bindings { cbufs: BTreeMap::new(), textures: slots, swizzles: None };
+        let mut entries = bindings.layout(wgpu::ShaderStages::COMPUTE);
+        let storage = wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None };
+        entries.push(wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::COMPUTE, ty: storage, count: None });
+        let d = &s.device;
+        let layout = d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &entries });
+        let pipeline_layout = d.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&layout)], ..Default::default() });
+        let module = d.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(wgsl.into()) });
+        let pipeline = d.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: Some(&pipeline_layout), module: &module, entry_point: Some("main"), compilation_options: Default::default(), cache: None });
+        let size = 4 * n as u64;
+        let out = d.create_buffer(&wgpu::BufferDescriptor { label: None, size, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let read = d.create_buffer(&wgpu::BufferDescriptor { label: None, size, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+        let slot = &bindings.textures[0];
+        let mut group = vec![wgpu::BindGroupEntry { binding: 32, resource: wgpu::BindingResource::TextureView(&slot.view) }, wgpu::BindGroupEntry { binding: 1, resource: out.as_entire_binding() }];
+        if let Some(sampler) = &slot.sampler {
+            group.push(wgpu::BindGroupEntry { binding: 33, resource: wgpu::BindingResource::Sampler(sampler) });
+        }
+        let group = d.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &layout, entries: &group });
+        let mut encoder = d.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&out, 0, &read, 0, size);
+        s.flush();
+        s.queue.submit([encoder.finish()]);
+        read.slice(..).map_async(wgpu::MapMode::Read, |r| r.expect("readback mapping failed"));
+        s.device.poll(wgpu::PollType::wait_indefinitely()).expect("GPU poll");
+        let bytes = read.slice(..).get_mapped_range().expect("mapped").to_vec();
+        assert!(s.errors.lock().unwrap().is_empty(), "{:?}", s.errors);
+        bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect()
+    }
+
+    #[test]
+    fn a_block_linear_2d_array_is_uploaded_with_every_layer() {
+        let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
+            eprintln!("no GPU adapter: test skipped");
+            return;
+        };
+        // 3 layers of 8x8 RGBA8 with 2 levels: level 0 one GOB, level 1 (4x4) another, so
+        // layers are 1024 bytes apart. Texel (x, y) of layer l is (40 l + x, y, l, 255).
+        const TEX: u64 = 0x50_0000;
+        let mut tic = [0u8; 32];
+        put(&mut tic, &[(6, 0, 0x08), (9, 7, 2), (12, 10, 2), (15, 13, 2), (18, 16, 2), (21, 19, 2), (24, 22, 3), (27, 25, 4), (30, 28, 5)]);
+        put(&mut tic, &[(63, 41, (TEX >> 9) as u32), (87, 85, 3), (127, 124, 1), (144, 128, 7), (175, 160, 7), (189, 176, 2), (154, 151, 5), (191, 191, 1)]);
+        let t = textures::tic(&tic).unwrap();
+        assert_eq!(textures::layer_stride(&t), Some(1024));
+        let level = textures::tic_level(&t, 0).unwrap();
+        let mut memory = vec![0u8; 3 * 1024];
+        for l in 0..3u32 {
+            for (x, y) in (0..8).flat_map(|x| (0..8).map(move |y| (x, y))) {
+                let at = 1024 * l as usize + level.offset(4 * x, y, 0) as usize;
+                memory[at..at + 4].copy_from_slice(&[(40 * l + x) as u8, y as u8, l as u8, 255]);
+            }
+        }
+        let x = Texture { handle: Handle::CBuf { bank: 0, offset: 0 }, dim: TexDim::Array2D, compare: false, fetch: true, query: false };
+        let wgsl = "@group(0) @binding(32) var tex0: texture_2d_array<f32>;
+            @group(0) @binding(1) var<storage, read_write> out: array<f32>;
+            @compute @workgroup_size(1) fn main() {
+                for (var l = 0u; l < 3u; l++) {
+                    let c = textureLoad(tex0, vec2<i32>(3, 5), l, 0);
+                    out[4u * l] = c.r; out[4u * l + 1u] = c.g; out[4u * l + 2u] = c.b; out[4u * l + 3u] = f32(textureNumLayers(tex0));
+                }
+            }";
+        let got = run(&mut s, x, tic, [0; 32], vec![(TEX, memory)], wgsl, 12);
+        for l in 0..3 {
+            let texel: Vec<u32> = got[4 * l..4 * l + 3].iter().map(|v| (v * 255.0).round() as u32).collect();
+            assert_eq!(texel, vec![40 * l as u32 + 3, 5, l as u32], "layer {l}");
+            assert_eq!(got[4 * l + 3], 3.0);
+        }
+        // The cached range covers the three layers (level 0 of the last one).
+        assert_eq!(s.texture_ranges(), vec![(TEX, TEX + 2 * 1024 + 512)]);
+    }
+
+    #[test]
+    fn a_depth_compare_slot_compares_with_the_samplers_function() {
+        let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
+            eprintln!("no GPU adapter: test skipped");
+            return;
+        };
+        // A 4x4 Depth32Float target cleared to 0.5, read through a ZF32 header.
+        const DEPTH: u64 = 0x60_0000;
+        let target = Surface { addr: DEPTH, width: 4, height: 4, format: 0x0a, layers: 1 };
+        s.clear(&Clear { layer: 0, color: None, depth: Some((target, Some(0.5f32.to_bits()), None)), scissor: None });
+        assert!(s.skipped.is_empty(), "{:?}", s.skipped);
+        let mut tic = [0u8; 32];
+        put(&mut tic, &[(6, 0, 0x2f), (9, 7, 7), (12, 10, 7), (15, 13, 7), (18, 16, 7), (21, 19, 2), (24, 22, 0), (27, 25, 0), (30, 28, 7)]);
+        put(&mut tic, &[(63, 41, (DEPTH >> 9) as u32), (87, 85, 3), (144, 128, 3), (175, 160, 3), (154, 151, 1), (191, 191, 1)]);
+        // DEPTH_COMPARE on, ZC_LEQUAL (the reference <= depth passes), point filters.
+        let mut tsc = [0u8; 32];
+        put(&mut tsc, &[(9, 9, 1), (12, 10, 3), (34, 32, 1), (37, 36, 1), (39, 38, 1)]);
+        let x = Texture { handle: Handle::CBuf { bank: 0, offset: 0 }, dim: TexDim::D2, compare: true, fetch: false, query: false };
+        let wgsl = "@group(0) @binding(32) var tex0: texture_depth_2d;
+            @group(0) @binding(33) var smp0: sampler_comparison;
+            @group(0) @binding(1) var<storage, read_write> out: array<f32>;
+            @compute @workgroup_size(1) fn main() {
+                let refs = array<f32, 3>(0.25, 0.5, 0.75);
+                for (var i = 0u; i < 3u; i++) { out[i] = textureSampleCompareLevel(tex0, smp0, vec2<f32>(0.5, 0.5), refs[i]); }
+            }";
+        assert_eq!(run(&mut s, x.clone(), tic, tsc, Vec::new(), wgsl, 3), vec![1.0, 1.0, 0.0]);
+        // ZC_GREATER: only the reference above the depth passes (a second cached sampler).
+        put(&mut tsc, &[(12, 10, 4)]);
+        assert_eq!(run(&mut s, x, tic, tsc, Vec::new(), wgsl, 3), vec![0.0, 0.0, 1.0]);
     }
 }
