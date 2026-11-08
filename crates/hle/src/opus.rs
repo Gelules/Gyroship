@@ -86,12 +86,57 @@ mod tests {
         assert_eq!(s.decode(&[], &mut pcm), Ok(5760), "concealment of a missing packet fills the request");
     }
 
+    /// A synthetic second of 440 Hz, encoded here, decodes to a sounding
+    /// signal; a decoder that takes a copy of the state midway decodes the
+    /// rest identically (what a save state relies on).
+    #[test]
+    fn a_copied_state_decodes_the_rest_identically() {
+        use unsafe_libopus::{OPUS_APPLICATION_AUDIO, opus_encode, opus_encoder_create, opus_encoder_destroy};
+        let mut error = 0;
+        // SAFETY: valid arguments; the encoder is destroyed below.
+        let encoder = unsafe { opus_encoder_create(48_000, 2, OPUS_APPLICATION_AUDIO, &mut error) };
+        assert_eq!(error, 0);
+        let packets: Vec<Vec<u8>> = (0..50)
+            .map(|f| {
+                let pcm: Vec<i16> = (0..960).flat_map(|i| {
+                    let v = (8000.0 * ((f * 960 + i) as f32 * 440.0 * std::f32::consts::TAU / 48_000.0).sin()) as i16;
+                    [v, v]
+                }).collect();
+                let mut out = vec![0u8; 1500];
+                // SAFETY: 960 stereo samples in, room for 1500 bytes out.
+                let n = unsafe { opus_encode(encoder, pcm.as_ptr(), 960, out.as_mut_ptr(), out.len() as i32) };
+                assert!(n > 0, "encode: {n}");
+                out.truncate(n as usize);
+                out
+            })
+            .collect();
+        // SAFETY: the encoder created above.
+        unsafe { opus_encoder_destroy(encoder) };
+        let (mut d, mut copy) = (Decoder::new(2), None::<Decoder>);
+        let mut energy = 0f64;
+        for (i, p) in packets.iter().enumerate() {
+            let mut pcm = vec![0i16; 2 * 960];
+            assert_eq!(d.decode(p, &mut pcm), Ok(960));
+            energy += pcm.iter().map(|&s| f64::from(s).powi(2)).sum::<f64>();
+            if i == 25 {
+                let mut c = Decoder::new(2);
+                c.restore(&d.bytes());
+                copy = Some(c);
+            } else if let Some(c) = copy.as_mut() {
+                let mut q = vec![0i16; 2 * 960];
+                assert_eq!(c.decode(p, &mut q), Ok(960));
+                assert_eq!(q, pcm, "packet {i}");
+            }
+        }
+        assert!(energy / (50.0 * 1920.0) > 1e6, "a sounding signal (RMS above 1000)");
+    }
+
     /// The RFC 8251 test vectors (Xiph's, not game data) when they are under
     /// $GYROSHIP_DATA/opus/opus_newvectors: every packet's final range must
     /// equal the encoder's, and the PCM must match the reference closely. A
     /// state copied midway decodes the rest identically.
     #[test]
-    fn rfc8251_vectors_decode_bit_exactly() {
+    fn rfc8251_vectors_meet_the_conformance_criteria() {
         let Some(dir) = std::env::var_os("GYROSHIP_DATA").map(|d| std::path::PathBuf::from(d).join("opus/opus_newvectors")).filter(|d| d.is_dir()) else {
             eprintln!("no RFC 8251 vectors: test skipped");
             return;
