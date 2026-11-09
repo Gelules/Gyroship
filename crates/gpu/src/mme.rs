@@ -111,6 +111,12 @@ impl Group {
     }
 }
 
+/// A group decoded, with whether it takes a parameter into LOAD0 and LOAD1.
+fn decoded(words: [u32; 3]) -> (Group, bool, bool) {
+    let g = Group::decode(words);
+    (g, g.reads(LOAD0, OUT_LOAD0), g.reads(LOAD1, OUT_LOAD1))
+}
+
 /// The macro unit of one 3D class: its RAMs and the pointers that load them.
 #[derive(Debug, Clone)]
 pub struct Mme {
@@ -119,6 +125,10 @@ pub struct Mme {
     pub data: Vec<u32>,
     code_ptr: usize,
     start_ptr: usize,
+    /// `code` decoded group by group, with whether each group takes a parameter
+    /// into LOAD0 and LOAD1: derived, kept in step by `load_code`, so that a
+    /// call decodes nothing (rebuild it if `code` is ever set another way).
+    groups: Vec<(Group, bool, bool)>,
     /// What the calls did, for `--perf` (host statistics, not GPU state).
     pub stats: Stats,
     /// Each macro's last call: a hash of the parameters it took.
@@ -147,7 +157,7 @@ impl std::ops::AddAssign for Stats {
 
 impl Default for Mme {
     fn default() -> Mme {
-        Mme { code: vec![0; CODE_WORDS], starts: vec![u32::MAX; MACROS], data: vec![0; DATA_WORDS], code_ptr: 0, start_ptr: 0, stats: Stats::default(), last: Default::default() }
+        Mme { code: vec![0; CODE_WORDS], starts: vec![u32::MAX; MACROS], data: vec![0; DATA_WORDS], code_ptr: 0, start_ptr: 0, groups: vec![decoded([0; 3]); CODE_WORDS / 3], stats: Stats::default(), last: Default::default() }
     }
 }
 
@@ -183,6 +193,10 @@ impl Mme {
     pub fn load_code(&mut self, word: u32) {
         if let Some(w) = self.code.get_mut(self.code_ptr) {
             *w = word;
+            let g = self.code_ptr / 3;
+            if let Some(&[a, b, c]) = self.code.get(g * 3..g * 3 + 3) {
+                self.groups[g] = decoded([a, b, c]);
+            }
         }
         self.code_ptr += 1;
     }
@@ -226,14 +240,12 @@ impl Mme {
         let (mut ip, mut end_next) = (start, false);
         let mut lp = None::<(usize, usize, u32)>; // (start, end, remaining)
         for _ in 0..STEP_LIMIT {
-            let at = ip * 3;
-            let words = self.code.get(at..at + 3).ok_or(Fault::OutOfCode(ip))?;
-            let g = Group::decode([words[0], words[1], words[2]]);
+            let &(g, load0, load1) = self.groups.get(ip).ok_or(Fault::OutOfCode(ip))?;
             let mut next = ip + 1;
-            if g.reads(LOAD0, OUT_LOAD0) {
+            if load0 {
                 run.load[0] = run.param();
             }
-            if g.reads(LOAD1, OUT_LOAD1) {
+            if load1 {
                 run.load[1] = run.param();
             }
             let mask = match g.pred_mode {
