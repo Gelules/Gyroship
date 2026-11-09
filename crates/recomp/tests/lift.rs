@@ -36,7 +36,7 @@ fn lifts_the_common_integer_forms() {
     );
     assert_eq!(
         lift(0x38401409, pc),
-        Op::Load { dst: Reg::X(9), w: W::W32, size: 0, signed: false, addr: Addr { base: Reg::X(0), offset: 1, index: None, writeback: Writeback::Post } }
+        Op::Load { dst: Reg::X(9), w: W::W32, size: 0, signed: false, ordered: false, addr: Addr { base: Reg::X(0), offset: 1, index: None, writeback: Writeback::Post } }
     );
     assert_eq!(
         lift(0x386869ea, pc),
@@ -45,9 +45,17 @@ fn lifts_the_common_integer_forms() {
             w: W::W32,
             size: 0,
             signed: false,
+            ordered: false,
             addr: Addr { base: Reg::X(15), offset: 0, index: Some((Reg::X(8), false, 64, 0)), writeback: Writeback::None }
         }
     );
+    let at = |base| Addr { base: Reg::X(base), offset: 0, index: None, writeback: Writeback::None };
+    assert_eq!(lift(0x88dffc20, pc), Op::Load { dst: Reg::X(0), w: W::W32, size: 2, signed: false, ordered: true, addr: at(1) }, "ldar w0, [x1]");
+    assert_eq!(lift(0xc89ffc20, pc), Op::Store { src: Reg::X(0), size: 3, ordered: true, addr: at(1) }, "stlr x0, [x1]");
+    assert_eq!(lift(0xd5033bbf, pc), Op::Fence, "dmb ish");
+    assert_eq!(lift(0xd50339bf, pc), Op::Nop, "dmb ishld");
+    assert_eq!(lift(0xd5033abf, pc), Op::Nop, "dmb ishst");
+    assert_eq!(lift(0xd5033f9f, pc), Op::Fence, "dsb sy");
     assert_eq!(lift(0xb005f8af, pc), Op::Const { dst: Reg::X(15), value: 0x71_0bf1_6000 }, "adrp");
     assert_eq!(lift(0x54001108, pc), Op::Branch(Cond::Flags(8), pc + 0x220), "b.hi");
     assert_eq!(lift(0x37180a89, pc), Op::Branch(Cond::Bit { reg: Reg::X(9), bit: 3, set: true }, pc + 0x150), "tbnz");

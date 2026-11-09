@@ -557,6 +557,19 @@ impl<M: Module> Emit<'_, '_, M> {
         }
     }
 
+    /// An acquire load (LDAR and the like): one atomic load of 1 << size bytes,
+    /// which Cranelift neither splits nor merges with another load; extended
+    /// to `w` as [`Emit::load`] does.
+    fn load_ordered(&mut self, host: Value, w: W, size: u8, signed: bool) -> Value {
+        let narrow = [I8, I16, I32, I64][usize::from(size.min(3))];
+        let v = self.b.ins().atomic_load(narrow, self.heap_flags, host);
+        match (narrow == ty(w), signed) {
+            (true, _) => v,
+            (false, true) => self.b.ins().sextend(ty(w), v),
+            (false, false) => self.b.ins().uextend(ty(w), v),
+        }
+    }
+
     fn store(&mut self, v: Value, host: Value, off: i32, size: u8) {
         let f = self.heap_flags;
         let i = self.b.ins();
@@ -752,15 +765,24 @@ impl<M: Module> Emit<'_, '_, M> {
                 let v = self.b.ins().iconst(I64, value as i64);
                 self.set(dst, W::W64, v);
             }
-            Op::Load { dst, w, size, signed, addr } => {
+            Op::Load { dst, w, size, signed, ordered, addr } => {
                 let (_, host) = self.address(&addr);
-                let v = self.load(host, 0, w, size, signed);
+                let v = if ordered { self.load_ordered(host, w, size, signed) } else { self.load(host, 0, w, size, signed) };
                 self.set(dst, w, v);
             }
-            Op::Store { src, size, addr } => {
+            Op::Store { src, size, ordered, addr } => {
                 let v = self.get(src, W::W64);
                 let (_, host) = self.address(&addr);
-                self.store(v, host, 0, size);
+                if ordered {
+                    // A store, then MFENCE: Cranelift's atomic_store on x64.
+                    let v = if size < 3 { self.b.ins().ireduce([I8, I16, I32][size as usize], v) } else { v };
+                    self.b.ins().atomic_store(self.heap_flags, v, host);
+                } else {
+                    self.store(v, host, 0, size);
+                }
+            }
+            Op::Fence => {
+                self.b.ins().fence();
             }
             Op::LoadPair { a, b, w, size, signed, addr } => {
                 let (_, host) = self.address(&addr);

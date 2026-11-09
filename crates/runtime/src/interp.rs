@@ -160,23 +160,48 @@ fn imm(o: &O) -> Result<u64> {
     }
 }
 
+// Up to 8 bytes, one host access of the access's width: another thread never
+// sees half a write (Arm's single-copy atomicity for aligned accesses). Wider
+// accesses are copied, as Arm promises nothing more for them.
+// ponytail: plain unaligned accesses, outside Rust's model of shared memory but
+// single instructions on x86; atomics (aligned only) if that ever matters.
+
 fn read(c: &Cpu, addr: u64, n: usize) -> u128 {
     if c.mem.is_null() {
         return 0;
     }
-    let mut b = [0u8; 16];
     // SAFETY: the guest address space covers every guest address.
-    unsafe { std::ptr::copy_nonoverlapping(c.mem.add(crate::host(addr)), b.as_mut_ptr(), n) };
-    u128::from_le_bytes(b)
+    unsafe {
+        let p = c.mem.add(crate::host(addr));
+        match n {
+            1 => u128::from(p.read()),
+            2 => u128::from(u16::from_le(p.cast::<u16>().read_unaligned())),
+            4 => u128::from(u32::from_le(p.cast::<u32>().read_unaligned())),
+            8 => u128::from(u64::from_le(p.cast::<u64>().read_unaligned())),
+            _ => {
+                let mut b = [0u8; 16];
+                std::ptr::copy_nonoverlapping(p, b.as_mut_ptr(), n);
+                u128::from_le_bytes(b)
+            }
+        }
+    }
 }
 
 fn write(c: &Cpu, addr: u64, n: usize, v: u128) {
     if c.mem.is_null() {
         return;
     }
-    let b = v.to_le_bytes();
     // SAFETY: as for `read`.
-    unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), c.mem.add(crate::host(addr)), n) };
+    unsafe {
+        let p = c.mem.add(crate::host(addr));
+        match n {
+            1 => p.write(v as u8),
+            2 => p.cast::<u16>().write_unaligned((v as u16).to_le()),
+            4 => p.cast::<u32>().write_unaligned((v as u32).to_le()),
+            8 => p.cast::<u64>().write_unaligned((v as u64).to_le()),
+            _ => std::ptr::copy_nonoverlapping(v.to_le_bytes().as_ptr(), p, n),
+        }
+    }
 }
 
 /// The effective address of a memory operand; applies any writeback.
@@ -660,19 +685,29 @@ fn exec(c: &mut Cpu, _pc: u64, i: &Instruction) -> Result {
             let old = atomic(c, a, bytes, |v| (v == expected).then_some(new));
             set_gpr(c, &o[0], old)
         }
+        // Load-exclusive: an atomic load that reserves its address, size and value.
         C::LDAXR | C::LDXR => {
             let bytes = gpr_bits(&o[0])? / 8;
             let a = address(c, &o[1])?;
-            let v = read(c, a, bytes as usize) as u64;
+            let v = atomic(c, a, bytes, |_| None);
+            (c.excl_addr, c.excl_value, c.excl_bytes) = (a, v, u64::from(bytes));
             set_gpr(c, &o[0], v)
         }
-        // ponytail: one guest thread runs at a time, so a store-exclusive always succeeds.
+        // Store-exclusive (status 0 when it stores): only on this thread's reservation,
+        // and only if the word still holds the value read, by a compare-exchange as
+        // dynarmic does. A write of that same value in between (ABA) goes unseen.
         C::STLXR | C::STXR => {
             let bytes = gpr_bits(&o[1])? / 8;
-            let v = gpr(c, &o[1])?;
+            let v = gpr(c, &o[1])? & mask(8 * bytes);
             let a = address(c, &o[2])?;
-            write(c, a, bytes as usize, u128::from(v));
-            set_gpr(c, &o[0], 0)
+            let (reserved, expected) = (c.excl_bytes == u64::from(bytes) && c.excl_addr == a, c.excl_value);
+            c.excl_bytes = 0;
+            let stored = reserved && atomic(c, a, bytes, |old| (old == expected).then_some(v)) == expected;
+            set_gpr(c, &o[0], u64::from(!stored))
+        }
+        C::CLREX => {
+            c.excl_bytes = 0;
+            Ok(())
         }
 
         // ---- moves between lanes ----

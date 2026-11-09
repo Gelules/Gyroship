@@ -109,6 +109,35 @@ fn atomics_and_crc_on_real_memory() {
 }
 
 #[test]
+fn a_store_exclusive_needs_its_reservation_and_the_value_it_read() {
+    const LDXR: u32 = 0x885f7c01; // ldxr w1, [x0]
+    const STXR: u32 = 0x88027c01; // stxr w2, w1, [x0]
+    let mut mem = vec![0u8; 16];
+    let mut c = Cpu::new(mem.as_mut_ptr().wrapping_sub(GUEST as usize));
+    let word = |m: &Vec<u8>| u32::from_le_bytes(m[..4].try_into().unwrap());
+    mem[..4].copy_from_slice(&5u32.to_le_bytes());
+    c.x[0] = GUEST;
+    run(&mut c, LDXR);
+    assert_eq!(c.x[1], 5);
+    c.x[1] = 6;
+    run(&mut c, STXR);
+    assert_eq!((c.x[2], word(&mem)), (0, 6), "stored");
+    run(&mut c, STXR);
+    assert_eq!((c.x[2], word(&mem)), (1, 6), "the reservation is used up");
+
+    run(&mut c, LDXR);
+    mem[..4].copy_from_slice(&7u32.to_le_bytes()); // another thread's write
+    c.x[1] = 8;
+    run(&mut c, STXR);
+    assert_eq!((c.x[2], word(&mem)), (1, 7), "the word changed since the load");
+
+    run(&mut c, LDXR);
+    run(&mut c, 0xd5033f5f); // clrex
+    run(&mut c, STXR);
+    assert_eq!((c.x[2], word(&mem)), (1, 7), "cleared");
+}
+
+#[test]
 fn carry_chain_and_coverage() {
     let mut c = Cpu::new(std::ptr::null_mut());
     (c.x[12], c.x[13], c.c) = (u64::MAX, 0, true);

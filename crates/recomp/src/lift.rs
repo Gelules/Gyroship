@@ -132,12 +132,17 @@ fn lift_decoded(i: &Instruction, pc: u64) -> Option<Op> {
     let load = |size: Option<u8>, signed: bool| -> Option<Op> {
         let (dst, w) = reg(&o[0])?;
         let size = size.unwrap_or(if w == W::W64 { 3 } else { 2 });
-        Some(Op::Load { dst, w, size, signed, addr: addr(&o[1])? })
+        let ordered = matches!(
+            i.opcode,
+            C::LDAR | C::LDARB | C::LDARH | C::LDAPR | C::LDAPRB | C::LDAPRH | C::LDAPUR | C::LDAPURB | C::LDAPURH | C::LDAPURSB | C::LDAPURSH | C::LDAPURSW
+        );
+        Some(Op::Load { dst, w, size, signed, ordered, addr: addr(&o[1])? })
     };
     let store = |size: Option<u8>| -> Option<Op> {
         let (src, w) = reg(&o[0])?;
         let size = size.unwrap_or(if w == W::W64 { 3 } else { 2 });
-        Some(Op::Store { src, size, addr: addr(&o[1])? })
+        let ordered = matches!(i.opcode, C::STLR | C::STLRB | C::STLRH | C::STLUR | C::STLURB | C::STLURH);
+        Some(Op::Store { src, size, ordered, addr: addr(&o[1])? })
     };
     if let Some(op) = lift_simd(i) {
         return Some(op);
@@ -269,9 +274,13 @@ fn lift_decoded(i: &Instruction, pc: u64) -> Option<Op> {
             O::SystemReg(CNTPCT_EL0 | CNTVCT_EL0) => Op::Counter(r(&o[0])?),
             _ => return None,
         },
-        // Hints, barriers and pointer authentication: the host needs none of them
-        // (B-key signing is never checked, so stripping a pointer is a no-op too).
-        C::HINT | C::PACIBSP | C::AUTIBSP | C::XPACI | C::XPACLRI | C::DMB(_) | C::DSB(_) | C::ISB | C::PRFM | C::PRFUM | C::CLREX => Op::Nop,
+        // A DMB or DSB with the LD or ST option (CRm & 3 == 1 or 2) orders what x86
+        // keeps in order anyway; any other option is a full barrier.
+        C::DMB(option) | C::DSB(option) if !matches!(option & 3, 1 | 2) => Op::Fence,
+        // Hints, the other barriers and pointer authentication: the host needs none of
+        // them (B-key signing is never checked, so stripping a pointer is a no-op too).
+        // CLREX goes to the interpreter, which owns the exclusive monitor.
+        C::HINT | C::PACIBSP | C::AUTIBSP | C::XPACI | C::XPACLRI | C::DMB(_) | C::DSB(_) | C::ISB | C::PRFM | C::PRFUM => Op::Nop,
         C::B => Op::Jump(pc_offset(&o[0], pc)?),
         C::BL => Op::Call(pc_offset(&o[0], pc)?),
         C::Bcc(c) => Op::Branch(Cond::Flags(c), pc_offset(&o[0], pc)?),

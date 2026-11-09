@@ -12,6 +12,9 @@ pub fn name(addr: u64) -> String {
     format!("f_{addr:x}")
 }
 
+/// A full barrier: after a release store, and for a full DMB or DSB.
+const FENCE: &str = "std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst); ";
+
 fn rd(r: Reg, w: W) -> String {
     let v = match r {
         Reg::X(n) => format!("c.x[{n}]"),
@@ -248,14 +251,16 @@ fn data(op: &Op, pc: u64, word: u32) -> String {
             wr(dst, w, &e)
         }
         Op::Const { dst, value } => wr(dst, W::W64, &format!("{value:#x}u64")),
-        Op::Load { dst, w, size, signed, addr: a } => {
+        // An ordered load is a plain one here: x86 loads are acquire loads already.
+        Op::Load { dst, w, size, signed, ordered: _, addr: a } => {
             let (at, wb) = addr(&a);
             let v = loaded(&format!("rt::ld{}(c, a)", 8 << size), w, size, signed);
             format!("{{ let a = {at}; let v = {v}; {wb} {} }}", wr(dst, w, "v"))
         }
-        Op::Store { src, size, addr: a } => {
+        Op::Store { src, size, ordered, addr: a } => {
             let (at, wb) = addr(&a);
-            format!("{{ let a = {at}; rt::st{}(c, a, {}); {wb} }}", 8 << size, rd(src, W::W64))
+            let fence = if ordered { FENCE } else { "" };
+            format!("{{ let a = {at}; rt::st{}(c, a, {}); {fence}{wb} }}", 8 << size, rd(src, W::W64))
         }
         Op::LoadPair { a: r1, b: r2, w, size, signed, addr: a } => {
             let (at, wb) = addr(&a);
@@ -398,6 +403,7 @@ fn data(op: &Op, pc: u64, word: u32) -> String {
             };
             wr(dst, w, &format!("({} as {t}) as u64", fread(src, f64)))
         }
+        Op::Fence => FENCE.to_string(),
         Op::Nop => String::new(),
         _ => unreachable!("control flow is emitted by the block"),
     }

@@ -117,14 +117,21 @@ pub enum Op {
     /// ADR/ADRP, resolved.
     Const { dst: Reg, value: u64 },
     /// Loads 1 << size bytes, extended to `w` (sign-extended if `signed`).
-    Load { dst: Reg, w: W, size: u8, signed: bool, addr: Addr },
-    Store { src: Reg, size: u8, addr: Addr },
+    /// `ordered`: an acquire load (LDAR, LDAPR, LDAPUR), an atomic access
+    /// the compiler keeps as it is.
+    Load { dst: Reg, w: W, size: u8, signed: bool, ordered: bool, addr: Addr },
+    /// `ordered`: a release store (STLR, STLUR), followed by a full barrier so
+    /// that a later acquire load cannot pass it (Arm's ordering on x86).
+    Store { src: Reg, size: u8, ordered: bool, addr: Addr },
     LoadPair { a: Reg, b: Reg, w: W, size: u8, signed: bool, addr: Addr },
     StorePair { a: Reg, b: Reg, size: u8, addr: Addr },
     /// MRS of TPIDR_EL0 / TPIDRRO_EL0.
     ReadThread { dst: Reg, ro: bool },
     /// CRC32 or CRC32C (`castagnoli`) of the low 1 << size bytes of data, into acc.
     Crc { dst: Reg, acc: Reg, data: Reg, size: u8, castagnoli: bool },
+    /// A full DMB or DSB: earlier stores before later loads, the one order the
+    /// host does not keep by itself.
+    Fence,
     Nop,
     // FP and SIMD registers. `size` is log2 of the bytes accessed (0 = B .. 4 = Q);
     // writing fewer than 16 bytes zeroes the rest of the register.

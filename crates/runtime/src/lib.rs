@@ -48,6 +48,11 @@ pub struct Cpu {
     /// Guest instructions run since the HLE last took the count: each block of
     /// generated code adds its length when it starts.
     pub work: u64,
+    /// The exclusive monitor of LDXR/STXR (interpreted): the address, the value
+    /// read and its size in bytes, 0 when nothing is reserved.
+    pub excl_addr: u64,
+    pub excl_value: u64,
+    pub excl_bytes: u64,
 }
 
 pub const OFFSET_X: i32 = 0;
@@ -80,7 +85,7 @@ const _: () = {
 
 impl Cpu {
     pub fn new(mem: *mut u8) -> Cpu {
-        Cpu { x: [0; 32], n: false, z: false, c: false, v: false, tpidr: 0, tpidrro: 0, mem, vr: [0; 32], fpcr: 0, fpsr: 0, pc: 0, stack_limit: 0, work: 0 }
+        Cpu { x: [0; 32], n: false, z: false, c: false, v: false, tpidr: 0, tpidrro: 0, mem, vr: [0; 32], fpcr: 0, fpsr: 0, pc: 0, stack_limit: 0, work: 0, excl_addr: 0, excl_value: 0, excl_bytes: 0 }
     }
 }
 
