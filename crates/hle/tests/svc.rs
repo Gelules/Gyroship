@@ -13,7 +13,7 @@ const PC: u64 = CODE + 0x100;
 const STACK: u64 = layout::STACK.0;
 
 fn kernel(config: Config) -> (Kernel, Cpu) {
-    let mut mem = Memory::new().unwrap();
+    let mem = Memory::new().unwrap();
     mem.map(CODE, 0x4000, Block::new(state::CODE, perm::RX)).unwrap();
     mem.map(STACK, 0x1000, Block::new(state::STACK, perm::RW)).unwrap();
     let cpu = Cpu::new(mem.base());

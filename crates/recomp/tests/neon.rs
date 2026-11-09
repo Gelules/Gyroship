@@ -350,7 +350,7 @@ fn clone(c: &Cpu) -> Cpu {
 }
 
 fn data_page(r: &mut Rng) -> Memory {
-    let mut m = Memory::new().unwrap();
+    let m = Memory::new().unwrap();
     m.map(DATA, 0x1000, Block::new(state::NORMAL, perm::RW)).unwrap();
     let bytes: Vec<u8> = (0..0x100).flat_map(|_| r.vector(true).to_le_bytes()).collect();
     m.write(DATA, &bytes).unwrap();
@@ -519,7 +519,7 @@ fn known() -> Vec<(Vec<u32>, Regs, Regs)> {
 
 #[test]
 fn known_answers_of_the_arm_arm() {
-    let mut m = Memory::new().unwrap();
+    let m = Memory::new().unwrap();
     m.map(DATA, 0x1000, Block::new(state::NORMAL, perm::RW)).unwrap();
     m.write(DATA, &std::array::from_fn::<u8, 256, _>(|k| k as u8)).unwrap();
     for (words, before, after) in known() {

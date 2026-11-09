@@ -66,7 +66,7 @@ fn round_up(v: u64) -> u64 {
 
 /// Maps one module raw at `base`: text R-X and ro R in state Code, data and
 /// bss RW in state CodeData. Returns its end.
-pub fn map_module(m: &mut Memory, base: u64, module: &Module) -> Result<u64, String> {
+pub fn map_module(m: &Memory, base: u64, module: &Module) -> Result<u64, String> {
     let data_end = round_up(module.mem_end());
     let segments = [
         (module.text.addr, round_up(module.text.end()), state::CODE, perm::RX),
@@ -89,11 +89,11 @@ pub fn map_module(m: &mut Memory, base: u64, module: &Module) -> Result<u64, Str
 /// A kernel with the modules mapped and the main thread ready at rtld's entry.
 pub fn boot(exefs: &Path, journal: Journal, config: Config) -> Result<Kernel, String> {
     let modules = read_modules(exefs)?;
-    let mut m = Memory::new().map_err(|e| format!("reserving guest memory: {e:?}"))?;
+    let m = Memory::new().map_err(|e| format!("reserving guest memory: {e:?}"))?;
     let mut k_lines = Vec::new();
     for (name, module) in &modules {
         let base = link::base_of(name).ok_or_else(|| format!("no base for {name}"))?;
-        let end = map_module(&mut m, base, module)?;
+        let end = map_module(&m, base, module)?;
         k_lines.push(format!("module {name} at {base:#x}..{end:#x}"));
     }
     m.map(MAIN_STACK.0, MAIN_STACK.1, Block::new(state::STACK, perm::RW)).map_err(|e| format!("main stack: {e:?}"))?;

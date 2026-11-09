@@ -22,9 +22,38 @@ fn walk(m: &Memory) -> Vec<Info> {
     }
 }
 
+/// Several host threads check and copy while another one splits and merges
+/// the next page's block: every check sees whole blocks (the table lock), and
+/// `Memory` is Sync (the scoped threads share it).
+#[test]
+fn host_threads_share_one_memory() {
+    let m = Memory::new().unwrap();
+    m.map(HEAP, 0x2000, Block::new(state::NORMAL, perm::RW)).unwrap();
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            for _ in 0..20_000 {
+                m.protect(HEAP + 0x1000, 0x1000, perm::R).unwrap();
+                m.protect(HEAP + 0x1000, 0x1000, perm::RW).unwrap();
+            }
+        });
+        for t in 0..4u64 {
+            let m = &m;
+            s.spawn(move || {
+                let mut b = [0; 8];
+                for i in 0..20_000u64 {
+                    m.write(HEAP + 8 * t, &i.to_le_bytes()).unwrap();
+                    m.read(HEAP + 8 * t, &mut b).unwrap();
+                    assert_eq!(u64::from_le_bytes(b), i);
+                }
+            });
+        }
+    });
+    assert_eq!(m.blocks().count(), 1, "merged back");
+}
+
 #[test]
 fn walk_sees_free_gaps_and_the_inaccessible_tail() {
-    let mut m = Memory::new().unwrap();
+    let m = Memory::new().unwrap();
     m.map(TEXT, 0x4000, Block::new(state::CODE, perm::RX)).unwrap();
     m.map(TEXT + 0x4000, 0x1000, Block::new(state::CODE, perm::R)).unwrap();
     m.map(TEXT + 0x5000, 0x1000, Block::new(state::CODE_DATA, perm::RW)).unwrap();
@@ -58,7 +87,7 @@ fn memory_info_layout() {
 
 #[test]
 fn bad_ranges_are_refused() {
-    let mut m = Memory::new().unwrap();
+    let m = Memory::new().unwrap();
     let rw = Block::new(state::NORMAL, perm::RW);
     assert_eq!(m.map(HEAP + 1, 0x1000, rw), Err(Error::InvalidRange));
     assert_eq!(m.map(HEAP, 0, rw), Err(Error::InvalidRange));
@@ -73,7 +102,7 @@ fn bad_ranges_are_refused() {
 /// stores are plain stores too), only in the range asked, until it is reset.
 #[test]
 fn written_pages_are_seen_until_reset() {
-    let mut m = Memory::new().unwrap();
+    let m = Memory::new().unwrap();
     m.map(HEAP, 0x3000, Block::new(state::NORMAL, perm::RW)).unwrap();
     m.reset_written(HEAP, 0x3000);
     assert!(!m.written(HEAP, 0x3000));
@@ -93,7 +122,7 @@ fn written_pages_are_seen_until_reset() {
 
 #[test]
 fn protect_splits_then_merges() {
-    let mut m = Memory::new().unwrap();
+    let m = Memory::new().unwrap();
     m.map(HEAP, 0x3000, Block::new(state::NORMAL, perm::RW)).unwrap();
     m.protect(HEAP + 0x1000, 0x1000, perm::R).unwrap();
     let perms: Vec<_> = m.blocks().map(|i| (i.base, i.size, i.block.perm)).collect();
@@ -108,7 +137,7 @@ fn protect_splits_then_merges() {
 
 #[test]
 fn map_move_locks_the_source_and_unmap_copies_back() {
-    let mut m = Memory::new().unwrap();
+    let m = Memory::new().unwrap();
     m.map(HEAP, 0x2000, Block::new(state::NORMAL, perm::RW)).unwrap();
     m.write(HEAP + 0x10, b"stack bytes").unwrap();
     m.map_move(STACK, HEAP, 0x2000, state::STACK).unwrap();
@@ -144,13 +173,14 @@ fn run_child(mode: &str) -> (Option<i32>, String) {
 #[test]
 fn fault_child() {
     let Ok(mode) = std::env::var("GYROSHIP_FAULT_CHILD") else { return };
-    let mut m = Memory::new().unwrap();
+    let m = Memory::new().unwrap();
     m.map(HEAP, 0x1000, Block::new(state::CODE, perm::R)).unwrap();
     mem::install_fault_handler();
     let cpu = Cpu::new(m.base());
     match mode.as_str() {
-        "hole" => drop(ld64(&cpu, 0x1234)),
-        "wild" => drop(ld64(&cpu, mem::SPACE + 0x5678)),
+        // black_box: a release build would drop a load whose value is unused.
+        "hole" => drop(std::hint::black_box(ld64(&cpu, 0x1234))),
+        "wild" => drop(std::hint::black_box(ld64(&cpu, mem::SPACE + 0x5678))),
         "readonly" => st64(&cpu, HEAP + 8, 1),
         _ => unreachable!(),
     }

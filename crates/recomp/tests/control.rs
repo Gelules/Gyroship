@@ -216,7 +216,7 @@ fn setup() {
 /// starts at `pc` with SP = `TOP` and x30 = `EXIT`.
 fn machine(pc: u64) -> (Memory, Cpu) {
     setup();
-    let mut m = Memory::new().unwrap();
+    let m = Memory::new().unwrap();
     m.map(DATA, 0x1000, Block::new(state::NORMAL, perm::RW)).unwrap();
     m.map(STACKS, FIBER_TOP - STACKS, Block::new(state::STACK, perm::RW)).unwrap();
     let mut cpu = Cpu::new(m.base());
@@ -251,7 +251,7 @@ fn unwinder_lands_on_a_landing_pad() {
 
 #[test]
 fn two_contexts_switch_a_thousand_times() {
-    let (mut m, mut cpu) = machine(M);
+    let (m, mut cpu) = machine(M);
     // The second context starts at F on its own stack.
     let slot: Vec<u8> = [FIBER_TOP, F, 0].iter().flat_map(|v| v.to_le_bytes()).collect();
     m.write(SLOT_F, &slot).unwrap();
@@ -274,7 +274,7 @@ fn resume_three_levels_down() {
 
     // The same state as just after S returned: frames of R, Q and P on the
     // stack, each with the return address of its caller.
-    let (mut m, mut cpu) = machine(R + 8);
+    let (m, mut cpu) = machine(R + 8);
     let frames: Vec<u8> = [0, Q + 8, 0, P + 8, 0, EXIT].iter().flat_map(|v| v.to_le_bytes()).collect();
     m.write(TOP - 48, &frames).unwrap();
     (cpu.x[0], cpu.x[31]) = (0, TOP - 48);

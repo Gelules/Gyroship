@@ -128,7 +128,7 @@ fn setup() {
 /// A guest memory with one data page.
 fn machine() -> Memory {
     setup();
-    let mut m = Memory::new().unwrap();
+    let m = Memory::new().unwrap();
     m.map(DATA, 0x1000, Block::new(state::NORMAL, perm::RW)).unwrap();
     m
 }

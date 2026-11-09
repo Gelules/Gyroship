@@ -7,9 +7,14 @@
 //! protection follows the guest permission (see [`Block::host_protection`]).
 //! A host access violation inside the reservation becomes a logged guest
 //! fault (see [`install_fault_handler`]).
+//!
+//! One `Memory` serves every host thread: the block table sits behind a lock,
+//! and the HLE reaches guest bytes through checked accesses that run once the
+//! check has released it.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use windows_sys::Win32::Foundation::EXCEPTION_ACCESS_VIOLATION;
 use windows_sys::Win32::System::Diagnostics::Debug::{AddVectoredExceptionHandler, EXCEPTION_CONTINUE_SEARCH, EXCEPTION_POINTERS};
@@ -117,12 +122,27 @@ pub enum Error {
     Host(u32),
 }
 
-/// The guest address space.
+/// The guest address space, shared by every host thread that runs guest code
+/// or the HLE. The block table sits behind a lock: map, unmap, protect and
+/// attribute changes take it to write, checks take it to read, and the access
+/// a check allows runs once it is released. Changes made of several calls
+/// (query, then map) rely on the kernel lock, under which every table change
+/// runs.
 pub struct Memory {
     base: *mut u8,
-    /// Mapped blocks only: start -> (end, block). Gaps are Free.
-    blocks: BTreeMap<u64, (u64, Block)>,
+    blocks: RwLock<Table>,
 }
+
+// SAFETY: `base` never changes and the reservation is ours until drop; the
+// table is behind its lock. Guest bytes are shared with guest code on other
+// host threads by design: Memory hands out no Rust reference to them that
+// outlives one access, only raw copies, as the generated code's own accesses.
+unsafe impl Send for Memory {}
+unsafe impl Sync for Memory {}
+
+/// Mapped blocks only: start -> (end, block). Gaps are Free.
+#[derive(Default)]
+struct Table(BTreeMap<u64, (u64, Block)>);
 
 /// Base of the reservation the fault handler reports on (0 when none).
 static RESERVATION: AtomicUsize = AtomicUsize::new(0);
@@ -141,7 +161,16 @@ impl Memory {
             return Err(Error::Host(last_error()));
         }
         RESERVATION.store(base as usize, Ordering::Release);
-        Ok(Memory { base, blocks: BTreeMap::new() })
+        Ok(Memory { base, blocks: RwLock::default() })
+    }
+
+    // The table's lock, recovered from poison like the crate's other locks.
+    fn table(&self) -> RwLockReadGuard<'_, Table> {
+        self.blocks.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn table_mut(&self) -> RwLockWriteGuard<'_, Table> {
+        self.blocks.write().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Whether a page of `[addr, addr + len)` was written since its watch was
@@ -170,86 +199,54 @@ impl Memory {
     /// The block that contains `addr`, as `svcQueryMemory` reports it: Free
     /// between mappings, and Inaccessible from the end of the space to 2^64.
     pub fn query(&self, addr: u64) -> Info {
-        if addr >= SPACE {
-            return Info { base: SPACE, size: SPACE.wrapping_neg(), block: Block::new(state::INACCESSIBLE, 0) };
-        }
-        let before = self.blocks.range(..=addr).next_back();
-        if let Some((&start, &(end, block))) = before
-            && addr < end
-        {
-            return Info { base: start, size: end - start, block };
-        }
-        let start = before.map_or(0, |(_, &(end, _))| end);
-        let end = self.blocks.range(addr..).next().map_or(SPACE, |(&s, _)| s);
-        Info { base: start, size: end - start, block: Block::new(state::FREE, 0) }
+        self.table().query(addr)
     }
 
     /// Maps fresh zeroed pages over a Free range.
-    pub fn map(&mut self, addr: u64, size: u64, block: Block) -> Result<(), Error> {
-        let end = check(addr, size)?;
-        if block.state == state::FREE {
-            return Err(Error::InvalidState);
-        }
-        if self.blocks.range(..end).next_back().is_some_and(|(_, &(e, _))| e > addr) {
-            return Err(Error::NotFree);
-        }
-        // SAFETY: the range is inside our reservation and unmapped.
-        if unsafe { VirtualAlloc(self.base.add(addr as usize).cast(), size as usize, MEM_COMMIT, block.host_protection()) }.is_null() {
-            return Err(Error::Host(last_error()));
-        }
-        self.blocks.insert(addr, (end, block));
-        self.merge(addr, end);
-        Ok(())
+    pub fn map(&self, addr: u64, size: u64, block: Block) -> Result<(), Error> {
+        self.map_in(&mut self.table_mut(), addr, size, block)
     }
 
     /// Unmaps a fully mapped range; its pages are decommitted.
-    pub fn unmap(&mut self, addr: u64, size: u64) -> Result<(), Error> {
-        let end = self.mapped(addr, size)?;
-        self.split(addr);
-        self.split(end);
-        let starts: Vec<u64> = self.blocks.range(addr..end).map(|(&s, _)| s).collect();
-        for s in starts {
-            self.blocks.remove(&s);
-        }
-        // SAFETY: committed pages of our reservation.
-        if unsafe { VirtualFree(self.base.add(addr as usize).cast(), size as usize, MEM_DECOMMIT) } == 0 {
-            return Err(Error::Host(last_error()));
-        }
-        Ok(())
+    pub fn unmap(&self, addr: u64, size: u64) -> Result<(), Error> {
+        self.unmap_in(&mut self.table_mut(), addr, size)
     }
 
     /// Changes the permission of a fully mapped range.
-    pub fn protect(&mut self, addr: u64, size: u64, perm: u32) -> Result<(), Error> {
-        self.update(addr, size, |b| b.perm = perm)
+    pub fn protect(&self, addr: u64, size: u64, perm: u32) -> Result<(), Error> {
+        self.update_in(&mut self.table_mut(), addr, size, |b| b.perm = perm)
     }
 
     /// Sets the attribute bits in `mask` to `value` over a fully mapped range.
-    pub fn set_attr(&mut self, addr: u64, size: u64, mask: u32, value: u32) -> Result<(), Error> {
-        self.update(addr, size, |b| b.attr = (b.attr & !mask) | (value & mask))
+    pub fn set_attr(&self, addr: u64, size: u64, mask: u32, value: u32) -> Result<(), Error> {
+        self.update_in(&mut self.table_mut(), addr, size, |b| b.attr = (b.attr & !mask) | (value & mask))
     }
 
     /// `svcMapMemory`: moves `size` bytes from `src` (mapped RW, no
     /// attribute) to the Free range at `dst`, which takes `dst_state`. The
     /// source stays in place, without permission and locked.
-    pub fn map_move(&mut self, dst: u64, src: u64, size: u64, dst_state: u32) -> Result<(), Error> {
-        self.expect(src, size, |b| b.perm == perm::RW && b.attr == 0)?;
-        self.map(dst, size, Block::new(dst_state, perm::RW))?;
+    pub fn map_move(&self, dst: u64, src: u64, size: u64, dst_state: u32) -> Result<(), Error> {
+        let mut t = self.table_mut();
+        t.expect(src, size, |b| b.perm == perm::RW && b.attr == 0)?;
+        self.map_in(&mut t, dst, size, Block::new(dst_state, perm::RW))?;
         // SAFETY: both ranges are committed, readable and writable, and distinct (dst was Free).
+        // Under the write lock: no check sees the move half done.
         unsafe { std::ptr::copy_nonoverlapping(self.base.add(src as usize), self.base.add(dst as usize), size as usize) };
-        self.update(src, size, |b| (b.perm, b.attr) = (0, attr::LOCKED))
+        self.update_in(&mut t, src, size, |b| (b.perm, b.attr) = (0, attr::LOCKED))
     }
 
     /// `svcUnmapMemory`: the inverse of [`Memory::map_move`]. Nothing
     /// changes unless `dst` is in `dst_state` without attribute and `src`
     /// is locked: then the two ranges cannot overlap.
-    pub fn unmap_move(&mut self, dst: u64, src: u64, size: u64, dst_state: u32) -> Result<(), Error> {
-        self.expect(src, size, |b| b.perm == 0 && b.attr == attr::LOCKED)?;
-        self.expect(dst, size, |b| b.state == dst_state && b.perm == perm::RW && b.attr == 0)?;
+    pub fn unmap_move(&self, dst: u64, src: u64, size: u64, dst_state: u32) -> Result<(), Error> {
+        let mut t = self.table_mut();
+        t.expect(src, size, |b| b.perm == 0 && b.attr == attr::LOCKED)?;
+        t.expect(dst, size, |b| b.state == dst_state && b.perm == perm::RW && b.attr == 0)?;
         // SAFETY: both ranges are committed and host-writable (locked pages stay
         // RW on the host), and distinct: one is locked, the other is not.
         unsafe { std::ptr::copy_nonoverlapping(self.base.add(dst as usize), self.base.add(src as usize), size as usize) };
-        self.unmap(dst, size)?;
-        self.update(src, size, |b| (b.perm, b.attr) = (perm::RW, 0))
+        self.unmap_in(&mut t, dst, size)?;
+        self.update_in(&mut t, src, size, |b| (b.perm, b.attr) = (perm::RW, 0))
     }
 
     /// Reads a guest-supplied buffer for the HLE. Every byte must be mapped
@@ -262,9 +259,8 @@ impl Memory {
     }
 
     /// Writes a guest-supplied buffer for the HLE; every byte needs guest
-    /// permission W. Objects the HLE owns (shared memory mapped R by the guest)
-    /// will need their own accessor.
-    pub fn write(&mut self, addr: u64, data: &[u8]) -> Result<(), Error> {
+    /// permission W.
+    pub fn write(&self, addr: u64, data: &[u8]) -> Result<(), Error> {
         self.accessible(addr, data.len() as u64, perm::W)?;
         // SAFETY: checked just above.
         unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), self.base.add(addr as usize), data.len()) };
@@ -273,8 +269,8 @@ impl Memory {
 
     /// Writes memory the HLE owns (shared memory, locked pages): the guest
     /// may only have R there, but the host pages are writable.
-    pub fn write_object(&mut self, addr: u64, data: &[u8]) -> Result<(), Error> {
-        self.host_accessible(addr, data.len() as u64, PAGE_READWRITE)?;
+    pub fn write_object(&self, addr: u64, data: &[u8]) -> Result<(), Error> {
+        self.table().host_accessible(addr, data.len() as u64, PAGE_READWRITE)?;
         // SAFETY: checked just above.
         unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), self.base.add(addr as usize), data.len()) };
         Ok(())
@@ -282,9 +278,103 @@ impl Memory {
 
     /// Reads memory the HLE owns, whatever the guest's permission.
     pub fn read_object(&self, addr: u64, out: &mut [u8]) -> Result<(), Error> {
-        self.host_accessible(addr, out.len() as u64, PAGE_READWRITE)?;
+        self.table().host_accessible(addr, out.len() as u64, PAGE_READWRITE)?;
         // SAFETY: checked just above.
         unsafe { std::ptr::copy_nonoverlapping(self.base.add(addr as usize), out.as_mut_ptr(), out.len()) };
+        Ok(())
+    }
+
+    /// Whether every byte of `[addr, addr + len)` is mapped with the guest
+    /// permission `need`: the check `read` (R) and `write` (W) make.
+    pub fn accessible(&self, addr: u64, len: u64, need: u32) -> Result<(), Error> {
+        self.table().accessible(addr, len, need)
+    }
+
+    /// The mapped blocks, in address order: a snapshot taken under the read lock.
+    pub fn blocks(&self) -> impl Iterator<Item = Info> {
+        let blocks: Vec<Info> = self.table().0.iter().map(|(&base, &(end, block))| Info { base, size: end - base, block }).collect();
+        blocks.into_iter()
+    }
+
+    // The bodies of the table changes, on the write guard their caller holds
+    // (the lock is not re-entrant).
+
+    fn map_in(&self, t: &mut Table, addr: u64, size: u64, block: Block) -> Result<(), Error> {
+        let end = check(addr, size)?;
+        if block.state == state::FREE {
+            return Err(Error::InvalidState);
+        }
+        if t.0.range(..end).next_back().is_some_and(|(_, &(e, _))| e > addr) {
+            return Err(Error::NotFree);
+        }
+        // SAFETY: the range is inside our reservation and unmapped.
+        if unsafe { VirtualAlloc(self.base.add(addr as usize).cast(), size as usize, MEM_COMMIT, block.host_protection()) }.is_null() {
+            return Err(Error::Host(last_error()));
+        }
+        t.0.insert(addr, (end, block));
+        t.merge(addr, end);
+        Ok(())
+    }
+
+    fn unmap_in(&self, t: &mut Table, addr: u64, size: u64) -> Result<(), Error> {
+        let end = t.mapped(addr, size)?;
+        t.split(addr);
+        t.split(end);
+        let starts: Vec<u64> = t.0.range(addr..end).map(|(&s, _)| s).collect();
+        for s in starts {
+            t.0.remove(&s);
+        }
+        // SAFETY: committed pages of our reservation.
+        if unsafe { VirtualFree(self.base.add(addr as usize).cast(), size as usize, MEM_DECOMMIT) } == 0 {
+            return Err(Error::Host(last_error()));
+        }
+        Ok(())
+    }
+
+    /// Applies `f` to every block of a fully mapped range, then reprotects it.
+    fn update_in(&self, t: &mut Table, addr: u64, size: u64, f: impl Fn(&mut Block)) -> Result<(), Error> {
+        let end = t.mapped(addr, size)?;
+        t.split(addr);
+        t.split(end);
+        for (&start, (e, block)) in t.0.range_mut(addr..end) {
+            f(block);
+            let mut old = 0;
+            // SAFETY: committed pages of our reservation.
+            if unsafe { VirtualProtect(self.base.add(start as usize).cast(), (*e - start) as usize, block.host_protection(), &mut old) } == 0 {
+                return Err(Error::Host(last_error()));
+            }
+        }
+        t.merge(addr, end);
+        Ok(())
+    }
+}
+
+impl Table {
+    fn query(&self, addr: u64) -> Info {
+        if addr >= SPACE {
+            return Info { base: SPACE, size: SPACE.wrapping_neg(), block: Block::new(state::INACCESSIBLE, 0) };
+        }
+        let before = self.0.range(..=addr).next_back();
+        if let Some((&start, &(end, block))) = before
+            && addr < end
+        {
+            return Info { base: start, size: end - start, block };
+        }
+        let start = before.map_or(0, |(_, &(end, _))| end);
+        let end = self.0.range(addr..).next().map_or(SPACE, |(&s, _)| s);
+        Info { base: start, size: end - start, block: Block::new(state::FREE, 0) }
+    }
+
+    fn accessible(&self, addr: u64, len: u64, need: u32) -> Result<(), Error> {
+        let end = addr.checked_add(len).filter(|&e| e <= SPACE).ok_or(Error::InvalidRange)?;
+        let mut at = addr;
+        while at < end {
+            let info = self.query(at);
+            if info.block.state == state::FREE || info.block.perm & need != need {
+                return Err(Error::InvalidState);
+            }
+            at = info.base + info.size;
+        }
         Ok(())
     }
 
@@ -294,24 +384,6 @@ impl Memory {
         while at < end {
             let info = self.query(at);
             if info.block.state == state::FREE || info.block.host_protection() != protection {
-                return Err(Error::InvalidState);
-            }
-            at = info.base + info.size;
-        }
-        Ok(())
-    }
-
-    /// The mapped blocks, in address order.
-    pub fn blocks(&self) -> impl Iterator<Item = Info> + '_ {
-        self.blocks.iter().map(|(&base, &(end, block))| Info { base, size: end - base, block })
-    }
-
-    fn accessible(&self, addr: u64, len: u64, need: u32) -> Result<(), Error> {
-        let end = addr.checked_add(len).filter(|&e| e <= SPACE).ok_or(Error::InvalidRange)?;
-        let mut at = addr;
-        while at < end {
-            let info = self.query(at);
-            if info.block.state == state::FREE || info.block.perm & need != need {
                 return Err(Error::InvalidState);
             }
             at = info.base + info.size;
@@ -338,44 +410,27 @@ impl Memory {
         Ok(end)
     }
 
-    /// Applies `f` to every block of a fully mapped range, then reprotects it.
-    fn update(&mut self, addr: u64, size: u64, f: impl Fn(&mut Block)) -> Result<(), Error> {
-        let end = self.mapped(addr, size)?;
-        self.split(addr);
-        self.split(end);
-        for (&start, (e, block)) in self.blocks.range_mut(addr..end) {
-            f(block);
-            let mut old = 0;
-            // SAFETY: committed pages of our reservation.
-            if unsafe { VirtualProtect(self.base.add(start as usize).cast(), (*e - start) as usize, block.host_protection(), &mut old) } == 0 {
-                return Err(Error::Host(last_error()));
-            }
-        }
-        self.merge(addr, end);
-        Ok(())
-    }
-
     /// Cuts the block that strictly contains `at` in two.
     fn split(&mut self, at: u64) {
-        if let Some((&start, &(end, block))) = self.blocks.range(..at).next_back()
+        if let Some((&start, &(end, block))) = self.0.range(..at).next_back()
             && at < end
         {
-            self.blocks.insert(start, (at, block));
-            self.blocks.insert(at, (end, block));
+            self.0.insert(start, (at, block));
+            self.0.insert(at, (end, block));
         }
     }
 
     /// Joins equal blocks that touch, around `[addr, end)`, as the kernel does.
     fn merge(&mut self, addr: u64, end: u64) {
-        let first = self.blocks.range(..addr).next_back().map_or(addr, |(&s, _)| s);
-        let starts: Vec<u64> = self.blocks.range(first..=end).map(|(&s, _)| s).collect();
+        let first = self.0.range(..addr).next_back().map_or(addr, |(&s, _)| s);
+        let starts: Vec<u64> = self.0.range(first..=end).map(|(&s, _)| s).collect();
         let mut keep = starts[0];
         for &s in &starts[1..] {
-            let (kend, kblock) = self.blocks[&keep];
-            let (send, sblock) = self.blocks[&s];
+            let (kend, kblock) = self.0[&keep];
+            let (send, sblock) = self.0[&s];
             if kend == s && kblock == sblock {
-                self.blocks.remove(&s);
-                self.blocks.insert(keep, (send, kblock));
+                self.0.remove(&s);
+                self.0.insert(keep, (send, kblock));
             } else {
                 keep = s;
             }

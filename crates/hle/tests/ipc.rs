@@ -12,7 +12,7 @@ const DATA: u64 = layout::ALIAS.0;
 const PC: u64 = 0x70_0000_0100;
 
 fn kernel() -> (Kernel, Cpu) {
-    let mut mem = Memory::new().unwrap();
+    let mem = Memory::new().unwrap();
     mem.map(TLS, 0x1000, Block::new(state::THREAD_LOCAL, perm::RW)).unwrap();
     mem.map(DATA, 0x1000, Block::new(state::NORMAL, perm::RW)).unwrap();
     let mut cpu = Cpu::new(mem.base());
