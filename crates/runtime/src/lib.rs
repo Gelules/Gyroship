@@ -235,10 +235,10 @@ pub extern "C" fn gyroship_trap(_cpu: *mut Cpu, pc: u64, imm: u32) {
 pub struct Hooks {
     /// `svc #imm` at `pc`: arguments in x0..x7, Result in w0, outputs in x1 and x2.
     pub svc: unsafe fn(*mut Cpu, u64, u32),
-    /// `mrs x<rt>, CNTPCT_EL0`: writes the virtual counter to x<rt> (31: nowhere).
-    pub counter: unsafe fn(*mut Cpu, u32),
-    /// `yield` (1), `wfe` (2) or `wfi` (3).
-    pub wait: unsafe fn(*mut Cpu, u32),
+    /// `mrs x<rt>, CNTPCT_EL0` at `pc`: writes the virtual counter to x<rt> (31: nowhere).
+    pub counter: unsafe fn(*mut Cpu, u64, u32),
+    /// `yield` (1), `wfe` (2) or `wfi` (3) at `pc`.
+    pub wait: unsafe fn(*mut Cpu, u64, u32),
     /// The first pass at a probe (`pc`, its name).
     pub probe: unsafe fn(*mut Cpu, u64, &str),
     /// A guest fault (its message), just before the process exits: a last
@@ -264,10 +264,10 @@ pub const COUNTER_STEP: u64 = 32;
 /// # Safety
 /// `cpu` must point to a valid context.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn gyroship_counter(cpu: *mut Cpu, _pc: u64, rt: u32) {
+pub unsafe extern "C" fn gyroship_counter(cpu: *mut Cpu, pc: u64, rt: u32) {
     if let Some(h) = HOOKS.get() {
         // SAFETY: guaranteed by the caller.
-        return unsafe { (h.counter)(cpu, rt) };
+        return unsafe { (h.counter)(cpu, pc, rt) };
     }
     let v = COUNTER.fetch_add(COUNTER_STEP, Ordering::Relaxed) + COUNTER_STEP;
     if rt < 31 {
@@ -281,10 +281,10 @@ pub unsafe extern "C" fn gyroship_counter(cpu: *mut Cpu, _pc: u64, rt: u32) {
 /// # Safety
 /// `cpu` must point to a valid context.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn gyroship_yield(cpu: *mut Cpu, _pc: u64, kind: u32) {
+pub unsafe extern "C" fn gyroship_yield(cpu: *mut Cpu, pc: u64, kind: u32) {
     if let Some(h) = HOOKS.get() {
         // SAFETY: guaranteed by the caller.
-        unsafe { (h.wait)(cpu, kind) }
+        unsafe { (h.wait)(cpu, pc, kind) }
     }
 }
 

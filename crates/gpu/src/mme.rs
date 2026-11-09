@@ -119,11 +119,35 @@ pub struct Mme {
     pub data: Vec<u32>,
     code_ptr: usize,
     start_ptr: usize,
+    /// What the calls did, for `--perf` (host statistics, not GPU state).
+    pub stats: Stats,
+    /// Each macro's last call: a hash of the parameters it took.
+    last: std::collections::HashMap<usize, u64>,
+}
+
+/// What macro calls did, for the speed work: the calls; those a memo could
+/// replay (same macro and parameters as its last call, no register or memory
+/// read); LOOPs with a zero count (run once here; Lichii skips them); taken
+/// branches with immediate bit 14 (Lichii cancels a pending END with them), in
+/// all and with an END pending.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Stats {
+    pub calls: u64,
+    pub repeats: u64,
+    pub zero_loops: u64,
+    pub bit14: u64,
+    pub bit14_end: u64,
+}
+
+impl std::ops::AddAssign for Stats {
+    fn add_assign(&mut self, o: Stats) {
+        (self.calls, self.repeats, self.zero_loops, self.bit14, self.bit14_end) = (self.calls + o.calls, self.repeats + o.repeats, self.zero_loops + o.zero_loops, self.bit14 + o.bit14, self.bit14_end + o.bit14_end);
+    }
 }
 
 impl Default for Mme {
     fn default() -> Mme {
-        Mme { code: vec![0; CODE_WORDS], starts: vec![u32::MAX; MACROS], data: vec![0; DATA_WORDS], code_ptr: 0, start_ptr: 0 }
+        Mme { code: vec![0; CODE_WORDS], starts: vec![u32::MAX; MACROS], data: vec![0; DATA_WORDS], code_ptr: 0, start_ptr: 0, stats: Stats::default(), last: Default::default() }
     }
 }
 
@@ -141,6 +165,11 @@ struct Run<'a, H: Host> {
     fifo: std::collections::VecDeque<u32>,
     /// Each ALU's (x, y), read before either ALU of the group writes.
     sources: [(u32, u32); 2],
+    /// For [`Stats`]: a hash of the parameters taken, whether the call read
+    /// registers or memory, and whether a taken branch had immediate bit 14.
+    params: u64,
+    reads: bool,
+    bit14: bool,
 }
 
 impl Mme {
@@ -193,7 +222,7 @@ impl Mme {
         if start == u32::MAX as usize {
             return Err(Fault::NoMacro(index));
         }
-        let mut run = Run { host, regs: [0; 24], load: [0; 2], alu_res: [0; 2], carry: 0, method: 0, inc: 0, stop: false, fifo: Default::default(), sources: [(0, 0); 2] };
+        let mut run = Run { host, regs: [0; 24], load: [0; 2], alu_res: [0; 2], carry: 0, method: 0, inc: 0, stop: false, fifo: Default::default(), sources: [(0, 0); 2], params: 0, reads: false, bit14: false };
         let (mut ip, mut end_next) = (start, false);
         let mut lp = None::<(usize, usize, u32)>; // (start, end, remaining)
         for _ in 0..STEP_LIMIT {
@@ -225,12 +254,19 @@ impl Mme {
             for (i, _) in mask[..2].iter().enumerate().filter(|m| *m.1) {
                 run.alu(self, &g, i, ip, &mut next, &mut lp)?;
             }
+            if std::mem::take(&mut run.bit14) {
+                self.stats.bit14 += 1;
+                self.stats.bit14_end += u64::from(end_next);
+            }
             for i in 0..2 {
                 if mask[2 + i] {
                     run.out(self, &g, i);
                 }
             }
             if end_next || run.stop {
+                self.stats.calls += 1;
+                let last = self.last.insert(index, run.params);
+                self.stats.repeats += u64::from(!run.reads && last == Some(run.params));
                 return Ok(());
             }
             end_next = g.end_next;
@@ -314,9 +350,13 @@ impl<H: Host> Run<'_, H> {
                     0
                 }
             }
-            22 => self.host.state(u32::from(x.wrapping_add(y) as u16) * 4),
+            22 => {
+                self.reads = true;
+                self.host.state(u32::from(x.wrapping_add(y) as u16) * 4)
+            }
             // LOOP: the next `imm - 1` groups run max(x, 1) times.
             23 => {
+                mme.stats.zero_loops += u64::from(x == 0);
                 *lp = Some((ip, ip + usize::from(a.imm) - 1, x.max(1) - 1));
                 0
             }
@@ -326,6 +366,7 @@ impl<H: Host> Run<'_, H> {
             }
             25..=29 => {
                 if branch(compare(a.op, x, y)) {
+                    self.bit14 |= a.imm & 0x4000 != 0;
                     // A 13-bit signed offset; its most negative value means "stop".
                     let offset = i32::from(((a.imm as i16) << 3) >> 3);
                     if offset == -0x1000 {
@@ -355,12 +396,19 @@ impl<H: Host> Run<'_, H> {
 
     /// The call's parameters, then what DMA reads queued; 0 once both run out.
     fn param(&mut self) -> u32 {
-        self.host.param().or_else(|| self.fifo.pop_front()).unwrap_or(0)
+        match self.host.param() {
+            Some(v) => {
+                self.params = (self.params.rotate_left(5) ^ u64::from(v)).wrapping_mul(0x517c_c1b7_2722_0a95);
+                v
+            }
+            None => self.fifo.pop_front().unwrap_or(0),
+        }
     }
 
     /// MME_DMA_READ(_FIFOED): `count` words at SET_MME_MEM_ADDRESS_A/B go to
     /// data RAM from SET_MME_DATA_RAM_ADDRESS, or after the parameters.
     fn dma(&mut self, mme: &mut Mme, method: u32, count: u32) {
+        self.reads = true;
         let addr = u64::from(self.host.reg(SET_MME_MEM_ADDRESS_A) & 0x1_ffff) << 32 | u64::from(self.host.reg(SET_MME_MEM_ADDRESS_B));
         let mut words = vec![0; count.min(DMA_LIMIT) as usize];
         self.host.read(addr, &mut words);

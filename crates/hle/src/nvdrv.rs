@@ -425,6 +425,10 @@ fn forget_written_textures(k: &mut Kernel, space: u32) {
         for (start, end) in written {
             s.invalidate(start, end - start);
             k.counts.entry("textures rewritten").and_modify(|c| *c += 1).or_insert(1);
+            // Each rewrite, to compare replays (the 12c divergence; host statistics).
+            if k.config.perf.is_some() {
+                k.census.rewrites.push((k.gs.presents, start, end - start));
+            }
         }
     }
 }
@@ -516,6 +520,17 @@ fn note_wait(k: &mut Kernel, fd: u32, space: u32, before: Option<gyroship_gpu::p
 }
 
 impl Gpu {
+    /// The macro units' statistics, every channel together (`--perf`).
+    pub fn mme_stats(&self) -> gyroship_gpu::mme::Stats {
+        let mut all = gyroship_gpu::mme::Stats::default();
+        for (channel, _) in self.channels.values() {
+            if let Some(m) = &channel.mme {
+                all += m.stats;
+            }
+        }
+        all
+    }
+
     /// The key of the graphics program at a GPU address (read from guest
     /// memory once, until its closing self-branch), None when no end is found
     /// in readable memory; new programs are journaled and go to

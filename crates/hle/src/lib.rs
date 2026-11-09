@@ -161,6 +161,8 @@ pub struct Kernel {
     pub input: hid::Input,
     /// Spin detector: each thread's counter reads and waits since its last SVC.
     pub spin: Vec<u32>,
+    /// Switch points by thread and kind, for `--perf` (host statistics).
+    pub census: Census,
     /// Open saves, by key (user id and save type).
     pub saves: std::collections::BTreeMap<String, save::SaveFs>,
     /// Virtual timers (the audio sink).
@@ -214,7 +216,7 @@ impl Kernel {
         journal.line(0, 0, &format!("gyroship hle: mode {mode}, seed {:#x}, non-system memory {:#x}", config.seed, config.non_system_memory));
         let recorded = config.record.as_ref().map(|_| Vec::new());
         let audio_samples = config.audio_dump.as_ref().map(|_| Vec::new());
-        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None, sessions: Vec::new(), objects: Vec::new(), domains: Vec::new(), allowed_services: Vec::new(), shared: Vec::new(), transfers: Vec::new(), time_shared: None, frame: (0, 0, 0), symbols: Vec::new(), romfs: None, gs: gs::State::default(), hid_shared: None, input: Default::default(), spin: Vec::new(), saves: Default::default(), timers: Vec::new(), surfaces: None, gpu: Default::default(), counts: Default::default(), anomalies: Default::default(), frame_hashes: Vec::new(), window: None, live_input: None, recorded, audio_out: None, audio_samples, opus: Default::default(), audio_gain: 1.0, audio_format: (2, 48_000) }
+        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None, sessions: Vec::new(), objects: Vec::new(), domains: Vec::new(), allowed_services: Vec::new(), shared: Vec::new(), transfers: Vec::new(), time_shared: None, frame: (0, 0, 0), symbols: Vec::new(), romfs: None, gs: gs::State::default(), hid_shared: None, input: Default::default(), spin: Vec::new(), census: Census::default(), saves: Default::default(), timers: Vec::new(), surfaces: None, gpu: Default::default(), counts: Default::default(), anomalies: Default::default(), frame_hashes: Vec::new(), window: None, live_input: None, recorded, audio_out: None, audio_samples, opus: Default::default(), audio_gain: 1.0, audio_format: (2, 48_000) }
     }
 
     /// Counts one more `name` (normal activity); returns the new count.
@@ -304,6 +306,27 @@ impl Kernel {
             by.sort_by(|a, b| b.1.total_cmp(&a.1));
             let rows: Vec<String> = by.iter().filter(|r| r.1 > 0.0005).map(|(i, s)| format!("thread {i} {:.1} s ({:.1}%)", s, 100.0 * s / total.max(1e-9))).collect();
             eprintln!("gyroship: host time by guest thread over {} presents: {}", self.gs.presents, rows.join(", "));
+            let census = path.with_extension("census.txt");
+            if let Err(e) = std::fs::write(&census, self.census_report()) {
+                eprintln!("gyroship: --perf {}: {e}", census.display());
+            }
+            for (name, header, rows) in [("rewrites.csv", "present,gpu,size\n", &self.census.rewrites), ("romfs.csv", "present,offset,size\n", &self.census.romfs)] {
+                let file = path.with_extension(name);
+                let csv: String = std::iter::once(header.to_string()).chain(rows.iter().map(|(n, at, size)| format!("{n},{at:#x},{size:#x}\n"))).collect();
+                if let Err(e) = std::fs::write(&file, csv) {
+                    eprintln!("gyroship: --perf {}: {e}", file.display());
+                }
+            }
+            let m = self.gpu.mme_stats();
+            eprintln!(
+                "gyroship: macros over {} presents: {} calls, {:.1}% repeating their macro's last parameters without reading registers or memory; {} zero-count LOOPs; {} taken branches with bit 14 ({} with an END pending)",
+                self.gs.presents,
+                m.calls,
+                100.0 * m.repeats as f64 / m.calls.max(1) as f64,
+                m.zero_loops,
+                m.bit14,
+                m.bit14_end
+            );
         }
         if let (Some(path), Some(samples)) = (&self.config.audio_dump, &self.audio_samples)
             && let Err(e) = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::write(path, audio::wav(samples, self.audio_format.0, self.audio_format.1)))
@@ -426,6 +449,7 @@ pub fn with<R>(f: impl FnOnce(&mut Kernel) -> R) -> R {
 unsafe fn on_svc(cpu: *mut Cpu, pc: u64, imm: u32) {
     let next = with(|k| {
         k.tick();
+        k.census(cpu, imm, None);
         if let Some(n) = k.sched.current.and_then(|t| k.spin.get_mut(t)) {
             *n = 0;
         }
@@ -439,7 +463,81 @@ unsafe fn on_svc(cpu: *mut Cpu, pc: u64, imm: u32) {
 /// Counter reads without an SVC in between that mean a thread spins.
 const SPIN_READS: u32 = 10_000;
 
+/// Switch points by guest thread and kind, counter reads and waits by site,
+/// and each thread's frame chain at its first switch point: `--perf` host
+/// statistics, never journaled and not guest state.
+#[derive(Default)]
+pub struct Census {
+    /// (thread id, kind) -> count; a kind is an SVC number, [`COUNTER`], or [`WAIT`] plus the hint.
+    by_kind: std::collections::HashMap<(u64, u32), u64>,
+    /// (thread id, pc) -> count, for counter reads and waits.
+    sites: std::collections::HashMap<(u64, u64), u64>,
+    /// Thread id -> its frame chain at its first switch point (its body is at the end).
+    first: std::collections::BTreeMap<u64, Vec<String>>,
+    /// Textures found rewritten by the CPU: (present, GPU address, size).
+    rewrites: Vec<(u64, u64, u64)>,
+    /// RomFS reads: (present, offset, size).
+    romfs: Vec<(u64, u64, u64)>,
+}
+
+const COUNTER: u32 = 0x100;
+const WAIT: u32 = 0x200;
+
 impl Kernel {
+    /// Counts a switch point of the running thread for `--perf`; `pc` is
+    /// given for counter reads and waits.
+    fn census(&mut self, cpu: *mut Cpu, kind: u32, pc: Option<u64>) {
+        let (Some(_), Some(t)) = (&self.config.perf, self.sched.current) else { return };
+        let id = self.sched.threads[t].id;
+        *self.census.by_kind.entry((id, kind)).or_insert(0) += 1;
+        if let Some(pc) = pc {
+            *self.census.sites.entry((id, pc)).or_insert(0) += 1;
+        }
+        if !self.census.first.contains_key(&id) {
+            // SAFETY: the running thread's context, stopped in the hook.
+            let (lr, fp) = unsafe { ((*cpu).x[30], (*cpu).x[29]) };
+            let chain = self.backtrace_from((lr, lr, fp)).into_iter().skip(1).collect();
+            self.census.first.insert(id, chain);
+        }
+    }
+
+    /// The census as text: switch points per present by thread and kind, the
+    /// busiest counter-read and wait sites, and each thread's first frame chain.
+    fn census_report(&self) -> String {
+        use std::fmt::Write as _;
+        let presents = self.gs.presents.max(1) as f64;
+        let name = |k: u32| match k {
+            COUNTER => "counter".to_string(),
+            k if k > WAIT => ["yield", "wfe", "wfi"].get((k - WAIT - 1) as usize).map_or(format!("hint {k:#x}"), |s| s.to_string()),
+            k => format!("svc {k:#x}"),
+        };
+        let mut by_thread: std::collections::BTreeMap<u64, Vec<(u32, u64)>> = Default::default();
+        for (&(id, kind), &n) in &self.census.by_kind {
+            by_thread.entry(id).or_default().push((kind, n));
+        }
+        let mut out = format!("# switch points per present ({} presents), by guest thread and kind\n", self.gs.presents);
+        for (id, mut kinds) in by_thread {
+            kinds.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            let total: u64 = kinds.iter().map(|k| k.1).sum();
+            let top: Vec<String> = kinds.iter().take(8).map(|&(k, n)| format!("{} {:.1}", name(k), n as f64 / presents)).collect();
+            let _ = writeln!(out, "thread {id}: {:.1} per present: {}", total as f64 / presents, top.join(", "));
+        }
+        let mut sites: Vec<(&(u64, u64), &u64)> = self.census.sites.iter().collect();
+        sites.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        out += "# counter reads and waits per present, by site\n";
+        for (&(id, pc), &n) in sites.into_iter().take(30) {
+            let _ = writeln!(out, "{:8.1}  thread {id}  {pc:#x} {}", n as f64 / presents, self.symbolize(pc));
+        }
+        out += "# each thread's frame chain at its first switch point (its body is last)\n";
+        for (id, chain) in &self.census.first {
+            let _ = writeln!(out, "thread {id}:");
+            for line in chain {
+                let _ = writeln!(out, "{line}");
+            }
+        }
+        out
+    }
+
     /// A thread that reads the counter or waits (yield, wfe, wfi) SPIN_READS
     /// times without an SVC spins on something: its frame chain goes to the
     /// journal, once per thread.
@@ -463,9 +561,10 @@ impl Kernel {
     }
 }
 
-unsafe fn on_counter(cpu: *mut Cpu, rt: u32) {
+unsafe fn on_counter(cpu: *mut Cpu, pc: u64, rt: u32) {
     let next = with(|k| {
         k.tick();
+        k.census(cpu, COUNTER, Some(pc));
         k.count_spin(cpu, "counter reads or waits");
         if rt < 31 {
             // SAFETY: as above.
@@ -476,9 +575,10 @@ unsafe fn on_counter(cpu: *mut Cpu, rt: u32) {
     thread::switch_to(next);
 }
 
-unsafe fn on_wait(cpu: *mut Cpu, _kind: u32) {
+unsafe fn on_wait(cpu: *mut Cpu, pc: u64, kind: u32) {
     let next = with(|k| {
         k.tick();
+        k.census(cpu, WAIT + kind, Some(pc));
         k.count_spin(cpu, "counter reads or waits");
         k.reschedule()
     });

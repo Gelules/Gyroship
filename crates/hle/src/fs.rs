@@ -246,6 +246,10 @@ impl Fs {
                     return Some(Reply::error(crate::result::INVALID_POINTER));
                 }
                 k.count("romfs reads");
+                // Each read, to see what loads read and whether any is read again (host statistics).
+                if k.config.perf.is_some() {
+                    k.census.romfs.push((k.gs.presents, offset, size));
+                }
                 Reply::ok()
             }
             (Fs::RomStorage, 4) => Reply::with(&k.romfs.as_ref()?.size().to_le_bytes()),
