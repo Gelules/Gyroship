@@ -145,6 +145,8 @@ pub struct Thread {
     pub host: std::time::Duration,
     /// Guest instructions it ran (from the generated code's count; `--perf`).
     pub instructions: u64,
+    /// With `--work-time`, the instructions not yet turned into a whole tick.
+    pub work_rem: u64,
     pub fiber: Option<Fiber>,
     pub wait: Wait,
     /// Arrival order among waiters of equal priority.
@@ -280,6 +282,7 @@ impl Kernel {
             cpu_time: 0,
             host: std::time::Duration::ZERO,
             instructions: 0,
+            work_rem: 0,
             fiber: None,
             wait: Wait::None,
             wait_seq: 0,

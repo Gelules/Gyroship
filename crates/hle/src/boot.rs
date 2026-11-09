@@ -248,6 +248,7 @@ pub fn run(table: Vec<rt::Entry>, window: Option<HostWindow>) {
         frames,
         save_dir,
         vsync: !flag("--no-vsync"),
+        work_time: flag("--work-time"),
         gpfifo_dump: value("--dump-gpfifo").map(std::path::PathBuf::from),
         frames_dump: value("--dump-frames").map(std::path::PathBuf::from),
         dump_draws: value("--dump-draws").and_then(|s| s.parse().ok()),

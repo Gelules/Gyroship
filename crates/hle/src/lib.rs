@@ -95,6 +95,9 @@ pub struct Config {
     pub save_dir: Option<std::path::PathBuf>,
     /// vi2 presents wait for the display's next vsync (60 Hz); `--no-vsync` turns it off.
     pub vsync: bool,
+    /// `--work-time`: guest instructions cost virtual time (D40), so that loads
+    /// spread over frames; off, only switch points do (D19).
+    pub work_time: bool,
     /// `--dump-gpfifo DIR`: the first submits' pushbuffer segments go to DIR, raw.
     pub gpfifo_dump: Option<std::path::PathBuf>,
     /// `--dump-frames DIR`: at each present, the render targets the frame
@@ -124,7 +127,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Config {
-        Config { seed: 0x5EED, explore: false, non_system_memory: 0x2_6410_0000, time_limit: None, frames: None, save_dir: None, vsync: true, gpfifo_dump: None, frames_dump: None, dump_every: 1, dump_draws: None, shaders_dump: None, replay: None, profile: None, perf: None, hashes: None, record: None, audio_dump: None }
+        Config { seed: 0x5EED, explore: false, non_system_memory: 0x2_6410_0000, time_limit: None, frames: None, save_dir: None, vsync: true, work_time: false, gpfifo_dump: None, frames_dump: None, dump_every: 1, dump_draws: None, shaders_dump: None, replay: None, profile: None, perf: None, hashes: None, record: None, audio_dump: None }
     }
 }
 
@@ -471,6 +474,11 @@ unsafe fn on_svc(cpu: *mut Cpu, pc: u64, imm: u32) {
 /// Counter reads without an SVC in between that mean a thread spins.
 const SPIN_READS: u32 = 10_000;
 
+/// Guest instructions a virtual tick (31.25 MHz) costs with `--work-time`:
+/// 48 is 1.5 billion a second per core, an estimate for the console's
+/// Cortex-A78C cores near 1 GHz on game code (not measured on hardware).
+const WORK_PER_TICK: u64 = 48;
+
 /// Switch points by guest thread and kind, counter reads and waits by site,
 /// and each thread's frame chain at its first switch point: `--perf` host
 /// statistics, never journaled and not guest state.
@@ -493,12 +501,21 @@ const WAIT: u32 = 0x200;
 
 impl Kernel {
     /// Takes the guest instructions the running thread ran since its last
-    /// switch point (the generated code counts them in its context).
+    /// switch point (the generated code counts them in its context). With
+    /// `--work-time` they cost its core virtual time, at WORK_PER_TICK a tick:
+    /// a long computation (a load) then spreads over frames as on the
+    /// console, instead of running between two of them.
     fn take_work(&mut self, cpu: *mut Cpu) {
         // SAFETY: the running thread's context, stopped in the hook.
         let work = unsafe { std::mem::take(&mut (*cpu).work) };
-        if let Some(t) = self.sched.current {
-            self.sched.threads[t].instructions += work;
+        let Some(t) = self.sched.current else { return };
+        let th = &mut self.sched.threads[t];
+        th.instructions += work;
+        if self.config.work_time {
+            th.work_rem += work;
+            let ticks = th.work_rem / WORK_PER_TICK;
+            th.work_rem %= WORK_PER_TICK;
+            self.sched.clocks[th.core] += ticks;
         }
     }
 
