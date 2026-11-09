@@ -2,6 +2,7 @@
 
 use gyroship_runtime::mem::{self, Block, Error, Info, Memory, attr, perm, state};
 use gyroship_runtime::{Cpu, ld64, st64};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 const TEXT: u64 = 0x70_0000_0000;
 const STACK: u64 = 0x20_0000_0000;
@@ -98,26 +99,69 @@ fn bad_ranges_are_refused() {
     assert_eq!(m.protect(HEAP - 0x1000, 0x2000, perm::R), Err(Error::InvalidState));
 }
 
-/// The write watch sees a write to a page (by the host here; the guest's
-/// stores are plain stores too), only in the range asked, until it is reset.
+/// The write watch reports the pages written (by the host here; the guest's
+/// stores are plain stores too) in the range asked, once: the take resets them.
 #[test]
-fn written_pages_are_seen_until_reset() {
+fn written_pages_are_taken_once() {
     let m = Memory::new().unwrap();
     m.map(HEAP, 0x3000, Block::new(state::NORMAL, perm::RW)).unwrap();
-    m.reset_written(HEAP, 0x3000);
-    assert!(!m.written(HEAP, 0x3000));
+    m.take_written(HEAP, 0x3000);
+    assert!(m.take_written(HEAP, 0x3000).is_empty());
     m.write(HEAP + 0x1010, &[1, 2, 3]).unwrap();
-    assert!(m.written(HEAP, 0x3000));
-    assert!(m.written(HEAP + 0x1000, 0x10), "the page written");
-    assert!(!m.written(HEAP, 0x1000) && !m.written(HEAP + 0x2000, 0x1000), "its neighbours");
-    m.reset_written(HEAP, 0x3000);
-    assert!(!m.written(HEAP, 0x3000));
-    // Several written pages in the range: still written.
-    m.write(HEAP + 0x10, &[1]).unwrap();
-    m.write(HEAP + 0x2010, &[2]).unwrap();
-    assert!(m.written(HEAP, 0x3000), "two pages written");
-    m.reset_written(HEAP, 0x3000);
-    assert!(!m.written(HEAP, 0x3000));
+    m.write(HEAP + 0x2010, &[4]).unwrap();
+    assert_eq!(m.take_written(HEAP + 0x1008, 0x10), [HEAP + 0x1000], "the page of the range asked, from an unaligned base");
+    assert_eq!(m.take_written(HEAP, 0x3000), [HEAP + 0x2000], "the other page, still written");
+    assert!(m.take_written(HEAP, 0x3000).is_empty(), "both taken");
+    assert!(m.take_written(HEAP, 0).is_empty() && m.take_written(mem::SPACE - 0x1000, 0x2000).is_empty());
+}
+
+/// A write that races a take shows at that take or the next one. Each round
+/// one thread writes the round's number once, while the other keeps taking
+/// the page and copying the word after each take that reports it (as a
+/// texture re-uploads); once the write is done, one more take must leave the
+/// copy up to date.
+#[test]
+fn a_write_racing_the_take_shows_at_the_next_take() {
+    const ROUNDS: u32 = 1_000;
+    let m = Memory::new().unwrap();
+    m.map(HEAP, 0x1000, Block::new(state::NORMAL, perm::RW)).unwrap();
+    // SAFETY: an aligned word of a page mapped for the whole test.
+    let word = unsafe { AtomicU32::from_ptr(m.base().add(HEAP as usize + 0x10).cast()) };
+    let (round, wrote) = (AtomicU32::new(0), AtomicU32::new(0));
+    let lost = std::thread::scope(|s| {
+        s.spawn(|| {
+            for r in 1..=ROUNDS {
+                while round.load(Ordering::Acquire) != r {
+                    std::thread::yield_now();
+                }
+                // A varying delay: the write lands anywhere in the other thread's take.
+                for _ in 0..r % 97 {
+                    std::hint::spin_loop();
+                }
+                word.store(r, Ordering::Release);
+                wrote.store(r, Ordering::Release);
+            }
+        });
+        let (mut copy, mut lost) = (0, Vec::new());
+        for r in 1..=ROUNDS {
+            round.store(r, Ordering::Release);
+            loop {
+                let done = wrote.load(Ordering::Acquire) == r;
+                if !m.take_written(HEAP, 0x1000).is_empty() {
+                    copy = word.load(Ordering::Acquire);
+                }
+                if done {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            if copy != r {
+                lost.push(r);
+            }
+        }
+        lost
+    });
+    assert!(lost.is_empty(), "writes lost in rounds {lost:?}");
 }
 
 #[test]

@@ -18,10 +18,12 @@ use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use windows_sys::Win32::Foundation::EXCEPTION_ACCESS_VIOLATION;
 use windows_sys::Win32::System::Diagnostics::Debug::{AddVectoredExceptionHandler, EXCEPTION_CONTINUE_SEARCH, EXCEPTION_POINTERS};
-/// MEM_WRITE_WATCH (winnt.h), which windows-sys does not list.
+/// MEM_WRITE_WATCH (winnt.h) and WRITE_WATCH_FLAG_RESET (memoryapi.h):
+/// windows-sys lists them under SystemServices, a feature this crate does not enable.
 const MEM_WRITE_WATCH: windows_sys::Win32::System::Memory::VIRTUAL_ALLOCATION_TYPE = 0x0020_0000;
+const WRITE_WATCH_FLAG_RESET: u32 = 0x01;
 use windows_sys::Win32::System::Memory::{
-    GetWriteWatch, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_PROTECTION_FLAGS, PAGE_READONLY, PAGE_READWRITE, ResetWriteWatch, VirtualAlloc, VirtualFree, VirtualProtect,
+    GetWriteWatch, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_PROTECTION_FLAGS, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualProtect,
 };
 
 /// Size of the guest address space (39 bits, from the NPDM).
@@ -173,22 +175,27 @@ impl Memory {
         self.blocks.write().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Whether a page of `[addr, addr + len)` was written since its watch was
-    /// last reset (by the guest or the host alike).
-    pub fn written(&self, addr: u64, len: u64) -> bool {
-        let Some(end) = addr.checked_add(len).filter(|&e| e <= SPACE && len > 0) else { return false };
-        let (mut page, mut count, mut granularity) = (std::ptr::null_mut::<core::ffi::c_void>(), 1usize, 0u32);
-        // SAFETY: a range of our reservation; room for one address.
-        let r = unsafe { GetWriteWatch(0, self.base.add(addr as usize).cast(), (end - addr) as usize, &mut page, &mut count, &mut granularity) };
-        r == 0 && count > 0
-    }
-
-    /// Starts watching `[addr, addr + len)` afresh.
-    pub fn reset_written(&self, addr: u64, len: u64) {
-        if addr.checked_add(len).is_some_and(|e| e <= SPACE) && len > 0 {
-            // SAFETY: a range of our reservation.
-            unsafe { ResetWriteWatch(self.base.add(addr as usize).cast(), len as usize) };
+    /// The pages of `[addr, addr + len)` written since they were last taken
+    /// (by the guest or the host alike), as sorted guest page addresses.
+    /// Taking them resets their watch in the same call, so a write that races
+    /// the call is reported by it or by the next take. Empty for an empty range
+    /// or one that leaves the space.
+    pub fn take_written(&self, addr: u64, len: u64) -> Vec<u64> {
+        let Some(end) = addr.checked_add(len).filter(|&e| e <= SPACE && len > 0) else { return Vec::new() };
+        // Room for every page of the range, so one call reports and resets all of it
+        // (how far a reset reaches when the buffer fills is not documented).
+        // ponytail: 8 bytes a page, on every span of every submit; cut a huge span
+        // into fixed chunks, one call each, if this ever shows in --profile.
+        let mut pages = vec![std::ptr::null_mut(); ((end.next_multiple_of(PAGE) - addr / PAGE * PAGE) / PAGE) as usize];
+        let (mut count, mut granularity) = (pages.len(), 0u32);
+        // SAFETY: a range of our reservation; `pages` has room for `count` addresses.
+        let r = unsafe { GetWriteWatch(WRITE_WATCH_FLAG_RESET, self.base.add(addr as usize).cast(), len as usize, pages.as_mut_ptr(), &mut count, &mut granularity) };
+        if r != 0 {
+            return Vec::new();
         }
+        let mut out: Vec<u64> = pages[..count].iter().map(|&p| p as u64 - self.base as u64).collect();
+        out.sort_unstable();
+        out
     }
 
     /// Host address of guest address 0 (`Cpu.mem`).

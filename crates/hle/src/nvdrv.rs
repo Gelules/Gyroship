@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 
 use gyroship_gpu::pushbuf::{Channel, Effect};
+use gyroship_runtime::mem::{Memory, PAGE};
 
 use crate::Kernel;
 use crate::ipc::{Reply, Request};
@@ -402,28 +403,13 @@ fn run_gpfifo(k: &mut Kernel, fd: u32, space: u32, entries: &[u8]) {
 
 /// The host's copies of textures whose guest memory was written since they
 /// were made (the CPU drawing glyphs into a font atlas, say) are dropped
-/// before the GPU work that may use them: they upload afresh. Every range is
-/// checked before any watch is reset, so textures sharing a page all see it.
+/// before the GPU work that may use them: they upload afresh.
 fn forget_written_textures(k: &mut Kernel, space: u32) {
     let Some(ranges) = k.surfaces.as_ref().map(|s| s.texture_ranges()) else { return };
-    // (GPU start, GPU end, CPU address) by CPU address, in spans whose pages touch:
-    // one write-watch query per span, its textures tested one by one only when the
-    // span was written, and only written spans watched afresh (a clean page stays
-    // clean), as a query and a reset per texture would do.
+    // (GPU start, GPU end, CPU address), by CPU address.
     let mut cpu: Vec<(u64, u64, u64)> = ranges.iter().map(|&(start, end)| (start, end, k.gpu_to_cpu(space, start))).collect();
     cpu.sort_unstable_by_key(|c| c.2);
-    let mut written = Vec::new();
-    let mut dirty = Vec::new();
-    for span in page_spans(&cpu) {
-        let (first, last) = (span[0].2, span.iter().map(|&(start, end, at)| at + (end - start)).max().unwrap_or(0));
-        if k.mem.written(first, last - first) {
-            written.extend(span.iter().filter(|&&(start, end, at)| span.len() == 1 || k.mem.written(at, end - start)).map(|&(start, end, _)| (start, end)));
-            dirty.push((first, last));
-        }
-    }
-    for (first, last) in dirty {
-        k.mem.reset_written(first, last - first);
-    }
+    let written = written_textures(&k.mem, &cpu);
     if let Some(s) = k.surfaces.as_mut() {
         for (start, end) in written {
             s.invalidate(start, end - start);
@@ -436,10 +422,32 @@ fn forget_written_textures(k: &mut Kernel, space: u32) {
     }
 }
 
+/// The textures of `cpu` (GPU start, GPU end, CPU address; sorted by CPU
+/// address) whose pages were written since the last call, as (GPU start, GPU
+/// end). One write-watch take per span of textures whose pages touch: the
+/// span's written pages are reported and reset in one call, so a write that
+/// races it shows at the next submit, and every texture of the span is tested
+/// against them, so textures sharing a page all see its write. Spans share no
+/// page: taking one hides nothing from another.
+fn written_textures(mem: &Memory, cpu: &[(u64, u64, u64)]) -> Vec<(u64, u64)> {
+    let mut written = Vec::new();
+    for span in page_spans(cpu) {
+        let (first, last) = (span[0].2, span.iter().map(|&(start, end, at)| at + (end - start)).max().unwrap_or(0));
+        let pages = mem.take_written(first, last - first);
+        written.extend(span.iter().filter(|&&(start, end, at)| touches(&pages, at, end - start)).map(|&(start, end, _)| (start, end)));
+    }
+    written
+}
+
+/// Whether `[at, at + len)` holds a byte of one of `pages` (sorted page addresses).
+fn touches(pages: &[u64], at: u64, len: u64) -> bool {
+    let i = pages.partition_point(|&p| p + PAGE <= at);
+    len > 0 && pages.get(i).is_some_and(|&p| p < at + len)
+}
+
 /// `ranges` (GPU start, GPU end, CPU address), sorted by CPU address, cut into
 /// runs whose 4 KiB pages touch or overlap: a run's pages are its members' pages.
 fn page_spans(ranges: &[(u64, u64, u64)]) -> Vec<&[(u64, u64, u64)]> {
-    const PAGE: u64 = 0x1000;
     let mut spans = Vec::new();
     let mut from = 0;
     let mut reach = 0u64;
@@ -781,7 +789,23 @@ mod tests {
 
 #[cfg(test)]
 mod page_span_tests {
-    use super::page_spans;
+    use super::{page_spans, written_textures};
+    use gyroship_runtime::mem::{Block, Memory, perm, state};
+
+    /// Textures that share a written page all see the write, once: the span's
+    /// pages are taken in one call and every texture is tested against them.
+    #[test]
+    fn textures_sharing_a_written_page_all_see_it() {
+        const AT: u64 = 0x10_0000_0000;
+        let m = Memory::new().unwrap();
+        m.map(AT, 0x3000, Block::new(state::NORMAL, perm::RW)).unwrap();
+        // (GPU start, GPU end, CPU address): two textures on page 1, one on page 2.
+        let cpu = [(0x100, 0x900, AT + 0x1000), (0x900, 0xa00, AT + 0x1800), (0xa00, 0xb00, AT + 0x2000)];
+        written_textures(&m, &cpu);
+        m.write(AT + 0x1ff0, &[1]).unwrap();
+        assert_eq!(written_textures(&m, &cpu), [(0x100, 0x900), (0x900, 0xa00)]);
+        assert!(written_textures(&m, &cpu).is_empty(), "taken once");
+    }
 
     #[test]
     fn spans_join_ranges_whose_pages_touch() {
