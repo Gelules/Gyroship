@@ -155,6 +155,13 @@ pub struct Thread {
     pub cancel: bool,
 }
 
+// SAFETY: `cpu` is a heap context owned by the thread table (freed by
+// `Sched::drop`) and tied to no host thread. The host thread running this
+// guest thread uses it (generated code, its own hooks); kernel code under the
+// kernel lock uses it only while the guest thread is not running (created, or
+// parked at a switch point: `wake`, `pick`'s deadlines). `fiber` is Send.
+unsafe impl Send for Thread {}
+
 /// How a run of the threads ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {

@@ -1,8 +1,9 @@
 //! High-level emulation of OS services: SVCs, IPC services, fs (romfs), hid, audio, time; network always offline.
 //!
-//! The kernel state lives in a thread-local: everything guest runs on one
-//! host thread (D19), and each test thread gets a kernel of its own. A borrow
-//! of it must never stay open across a guest fiber switch.
+//! A run's kernel sits behind one lock. Each host thread reaches it through a
+//! thread-local handle: the thread that installs it, and the threads that
+//! attach to it; each test thread installs a kernel of its own. The lock is
+//! never held across a guest fiber switch.
 
 pub mod account;
 pub mod am;
@@ -27,8 +28,8 @@ pub mod time;
 use gyroship_runtime::{Cpu, Hooks};
 use gyroship_runtime::mem::Memory;
 use journal::Journal;
-use std::cell::RefCell;
-use std::sync::Arc;
+use std::cell::Cell;
+use std::sync::{Arc, Mutex, PoisonError, TryLockError};
 
 /// Horizon result codes of the kernel module (1); the description is the
 /// public one from switchbrew.
@@ -408,55 +409,73 @@ impl Kernel {
     }
 }
 
+/// A run's kernel, shared by the run's host threads. The box is leaked (it
+/// lives as long as the process); `uninstall` takes the kernel itself back.
+pub type KernelRef = &'static Mutex<Option<Kernel>>;
+
 thread_local! {
-    static KERNEL: RefCell<Option<Kernel>> = const { RefCell::new(None) };
+    static KERNEL: Cell<Option<KernelRef>> = const { Cell::new(None) };
 }
 
-/// Makes `kernel` the one this thread's guest code talks to.
-pub fn install(kernel: Kernel) {
-    KERNEL.with(|k| *k.borrow_mut() = Some(kernel));
+/// Makes `kernel` the one this host thread's guest code talks to; returns its
+/// handle, for the run's other host threads to [`attach`].
+pub fn install(kernel: Kernel) -> KernelRef {
+    // ponytail: one Mutex box leaked per install (the kernel leaves with `uninstall`); a run installs once, a test binary a few hundred times.
+    let kernel: KernelRef = Box::leak(Box::new(Mutex::new(Some(kernel))));
+    KERNEL.set(Some(kernel));
     gyroship_runtime::set_hooks(Hooks { svc: on_svc, counter: on_counter, wait: on_wait, probe: boot::on_probe, fault: on_fault });
+    kernel
+}
+
+/// Makes the calling host thread talk to a kernel another thread installed.
+pub fn attach(kernel: KernelRef) {
+    KERNEL.set(Some(kernel));
 }
 
 /// A guest fault: the message and the stack at the last SVC go to the
-/// journal, which is flushed (the runtime exits next). Guest code faults
-/// outside any kernel borrow; if one is held, nothing is written.
+/// journal, which is flushed (the runtime exits next). The kernel is tried,
+/// never waited for: if a thread holds it (this one, faulting in HLE code,
+/// or another one), nothing is written.
 fn on_fault(what: &str) {
-    KERNEL.with(|k| {
-        if let Ok(mut k) = k.try_borrow_mut()
-            && let Some(k) = k.as_mut()
-        {
-            k.log(what);
-            // The faulting thread's lr and frame chain (registers live in its context).
-            if let Some(t) = k.sched.current {
-                // SAFETY: the running thread's context; its code is stopped in the fault.
-                let (lr, fp) = unsafe { ((*k.sched.threads[t].cpu).x[30], (*k.sched.threads[t].cpu).x[29]) };
-                k.log("stack at the fault (lr, then the frame chain):");
-                for line in k.backtrace_from((lr, lr, fp)).into_iter().skip(1) {
-                    k.log(&line);
-                }
-            }
-            k.log("stack at the last SVC:");
-            for line in k.backtrace() {
-                k.log(&line);
-            }
-            k.journal.flush();
+    let Some(kernel) = KERNEL.get() else { return };
+    let mut guard = match kernel.try_lock() {
+        Ok(guard) => guard,
+        Err(TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(TryLockError::WouldBlock) => return,
+    };
+    let Some(k) = guard.as_mut() else { return };
+    k.log(what);
+    // The faulting thread's lr and frame chain (registers live in its context).
+    if let Some(t) = k.sched.current {
+        // SAFETY: the running thread's context; its code is stopped in the fault.
+        let (lr, fp) = unsafe { ((*k.sched.threads[t].cpu).x[30], (*k.sched.threads[t].cpu).x[29]) };
+        k.log("stack at the fault (lr, then the frame chain):");
+        for line in k.backtrace_from((lr, lr, fp)).into_iter().skip(1) {
+            k.log(&line);
         }
-    });
+    }
+    k.log("stack at the last SVC:");
+    for line in k.backtrace() {
+        k.log(&line);
+    }
+    k.journal.flush();
 }
 
-/// Takes this thread's kernel back.
+/// Takes this thread's kernel back; threads attached to it find none.
 pub fn uninstall() -> Option<Kernel> {
-    KERNEL.with(|k| k.borrow_mut().take())
+    KERNEL.take()?.lock().unwrap_or_else(PoisonError::into_inner).take()
 }
 
-/// Runs `f` on this thread's kernel.
+/// Runs `f` on this thread's kernel, under the run's lock, which is released
+/// when `f` returns. Never switch fibers or park inside `f`.
 pub fn with<R>(f: impl FnOnce(&mut Kernel) -> R) -> R {
-    KERNEL.with(|k| f(k.borrow_mut().as_mut().expect("no kernel installed on this thread")))
+    let kernel = KERNEL.get().expect("no kernel installed on this thread");
+    let mut guard = kernel.lock().unwrap_or_else(PoisonError::into_inner);
+    f(guard.as_mut().expect("no kernel installed on this thread"))
 }
 
-// Each hook releases the kernel before it switches fibers: the next thread
-// borrows it too.
+// Each hook leaves `with` (releasing the kernel lock) before it switches
+// fibers: the next thread takes the lock too.
 
 unsafe fn on_svc(cpu: *mut Cpu, pc: u64, imm: u32) {
     let next = with(|k| {

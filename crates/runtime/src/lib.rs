@@ -19,7 +19,7 @@ pub mod profile;
 pub mod fiber;
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// The context of one guest thread. The layout is fixed: generated code
 /// addresses its fields by offset (see the `OFFSET_*` constants).
@@ -175,6 +175,25 @@ pub static INTERPRETED: AtomicU64 = AtomicU64::new(0);
 /// Untranslated instructions the interpreter does not cover either (each logged once).
 pub static UNHANDLED: AtomicU64 = AtomicU64::new(0);
 
+/// Set by the first fatal guest fault: only that one reports.
+static FAULTED: AtomicBool = AtomicBool::new(false);
+
+/// A fatal guest fault: the first goes to stderr and to the HLE's fault hook,
+/// then ends the process. A later one, from another host thread or from inside
+/// that report, waits for that exit instead of reporting too.
+pub(crate) fn fatal(what: &str) -> ! {
+    if FAULTED.swap(true, Ordering::Relaxed) {
+        // ponytail: bounded, so a fault inside the report still ends the process.
+        std::thread::sleep(std::time::Duration::from_secs(5));
+    } else {
+        eprintln!("gyroship: {what}");
+        if let Some(h) = HOOKS.get() {
+            (h.fault)(what);
+        }
+    }
+    std::process::exit(mem::FAULT_EXIT)
+}
+
 /// An indirect call or jump to `target`: calls the function that starts
 /// there. An address inside a function is a non-local jump: it becomes
 /// `cpu.pc`, and the generated callers hand it down to [`run`].
@@ -210,11 +229,8 @@ pub unsafe extern "C" fn gyroship_unhandled(cpu: *mut Cpu, pc: u64, word: u32) {
             UNHANDLED.fetch_add(1, Ordering::Relaxed);
             // Under an HLE (a real run), a skipped instruction would leave wrong state
             // behind: it stops the run like a guest fault. Bare harnesses count and go on.
-            if let Some(h) = HOOKS.get() {
-                let what = format!("instruction {word:08x} at {pc:#x} cannot be executed: {why}");
-                eprintln!("gyroship: {what}");
-                (h.fault)(&what);
-                std::process::exit(mem::FAULT_EXIT);
+            if HOOKS.get().is_some() {
+                fatal(&format!("instruction {word:08x} at {pc:#x} cannot be executed: {why}"));
             }
             let mut logged = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
             if !logged.contains(&word) {

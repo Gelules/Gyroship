@@ -153,6 +153,63 @@ fn guest_code_reaches_the_kernel_through_the_runtime() {
     // SAFETY: a valid context.
     unsafe { rt::gyroship_svc(&mut cpu, PC, 0x29) };
     assert_eq!((cpu.x[0], cpu.x[1]), (0, 0x1000));
+    gyroship_hle::uninstall();
+}
+
+/// One kernel, several host threads: `with` lets one in at a time (no count
+/// is lost), and a thread that did not attach has no kernel.
+#[test]
+fn host_threads_share_one_kernel() {
+    let (k, _) = kernel(Config::default());
+    let shared = gyroship_hle::install(k);
+    let workers: Vec<_> = (0..4)
+        .map(|_| {
+            std::thread::spawn(move || {
+                gyroship_hle::attach(shared);
+                for _ in 0..10_000 {
+                    gyroship_hle::with(|k| k.count("lock test"));
+                }
+            })
+        })
+        .collect();
+    for w in workers {
+        w.join().unwrap();
+    }
+    assert!(std::thread::spawn(|| gyroship_hle::with(|_| ())).join().is_err(), "a thread that did not attach has no kernel");
+    assert_eq!(gyroship_hle::uninstall().unwrap().counts["lock test"], 40_000);
+}
+
+/// Only does something when started by `a_fault_inside_the_kernel_exits`.
+#[test]
+fn kernel_fault_child() {
+    if std::env::var("GYROSHIP_KERNEL_FAULT_CHILD").is_err() {
+        return;
+    }
+    // A fault that waited for the kernel lock would hang: this ends the child instead.
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(20));
+        std::process::exit(99);
+    });
+    let (k, cpu) = kernel(Config::default());
+    gyroship_runtime::mem::install_fault_handler();
+    gyroship_hle::install(k);
+    // HLE code faults: this thread holds the kernel lock (black_box: a release
+    // build would drop a load whose value is unused).
+    gyroship_hle::with(|_| {
+        let _ = std::hint::black_box(rt::ld64(&cpu, 0x1234));
+    });
+}
+
+#[test]
+fn a_fault_inside_the_kernel_exits() {
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "kernel_fault_child", "--nocapture", "--test-threads=1"])
+        .env("GYROSHIP_KERNEL_FAULT_CHILD", "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(gyroship_runtime::mem::FAULT_EXIT), "{stderr}");
+    assert!(stderr.contains("guest fault: read at guest address 0x1234 "), "{stderr}");
 }
 
 /// Only does something when started by `stops_are_logged`.

@@ -223,12 +223,41 @@ fn fault_child() {
     let cpu = Cpu::new(m.base());
     match mode.as_str() {
         // black_box: a release build would drop a load whose value is unused.
-        "hole" => drop(std::hint::black_box(ld64(&cpu, 0x1234))),
-        "wild" => drop(std::hint::black_box(ld64(&cpu, mem::SPACE + 0x5678))),
+        "hole" => {
+            let _ = std::hint::black_box(ld64(&cpu, 0x1234));
+        }
+        "wild" => {
+            let _ = std::hint::black_box(ld64(&cpu, mem::SPACE + 0x5678));
+        }
         "readonly" => st64(&cpu, HEAP + 8, 1),
+        "two" => {
+            // Two host threads fault at once: one report.
+            let base = m.base() as usize;
+            let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let threads: Vec<_> = (0..2)
+                .map(|_| {
+                    let start = start.clone();
+                    std::thread::spawn(move || {
+                        let cpu = Cpu::new(base as *mut u8);
+                        start.wait();
+                        let _ = std::hint::black_box(ld64(&cpu, 0x1234));
+                    })
+                })
+                .collect();
+            for t in threads {
+                let _ = t.join();
+            }
+        }
         _ => unreachable!(),
     }
     eprintln!("no fault");
+}
+
+#[test]
+fn only_the_first_fault_reports() {
+    let (code, stderr) = run_child("two");
+    assert_eq!(code, Some(mem::FAULT_EXIT), "{stderr}");
+    assert_eq!(stderr.matches("guest fault:").count(), 1, "{stderr}");
 }
 
 #[test]

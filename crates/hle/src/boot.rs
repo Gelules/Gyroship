@@ -324,4 +324,6 @@ pub fn run(table: Vec<rt::Entry>, window: Option<HostWindow>) {
         }
         thread::Outcome::Deadlock(who) => k.stop(STOP_EXIT, &format!("deadlock: {who}")),
     });
+    // The kernel ends with the run, as the thread-local one did with its thread.
+    drop(crate::uninstall());
 }

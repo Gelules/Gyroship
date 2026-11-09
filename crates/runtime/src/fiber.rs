@@ -11,6 +11,10 @@ const FIBER_FLAG_FLOAT_SWITCH: u32 = 1;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Fiber(pub *mut c_void);
 
+// SAFETY: a handle to a process-wide fiber object; moving it to another
+// thread runs nothing. `switch` and `delete` keep their own contracts.
+unsafe impl Send for Fiber {}
+
 /// Host stack of a guest thread: reserved, committed on use. Generated code
 /// hands tail calls back to the driver past `STACK_BUDGET`, and guest
 /// recursion is bounded by the guest stack.
