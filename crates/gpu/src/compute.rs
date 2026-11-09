@@ -190,7 +190,7 @@ impl Surfaces {
                 }
                 data = vec![0u8; bytes.next_multiple_of(4) as usize];
                 if mem(address, &mut data) {
-                    self.note_read(crate::surfaces::Read::Global, address, data.len());
+                    self.note_read(crate::surfaces::Read::Global, data.len(), false);
                     break;
                 }
                 data.clear();

@@ -149,13 +149,11 @@ pub struct Surfaces {
     arena: (wgpu::Buffer, Vec<u8>),
     /// Offsets of the arena's staged blocks by content hash: draws share identical
     /// constant banks (64 KiB each) instead of staging each copy.
-    staged: HashMap<u64, Vec<(usize, usize)>>,
+    staged: FxMap<u64, Vec<(usize, usize)>>,
     /// The color target written last (the presented image at a present).
     last_color: Option<(u64, u32)>,
     /// The window the presented images go to, if any.
     window: Option<Window>,
-    /// The guest ranges read for the GPU in this submit, by kind and address: their lengths.
-    seen: HashMap<(u8, u64), Vec<usize>>,
     /// This submit's guest reads and staged blocks, for the reads that repeat.
     pub(crate) memo: Memo,
 }
@@ -255,8 +253,7 @@ impl Window {
 /// identical block already in the frame's arena served), their bytes by kind
 /// (constant banks, other data), the zeros completing bank windows, and the
 /// bytes and count of the arena uploads. Then the guest reads for the GPU by
-/// kind ([`Read`]): reads and bytes, those of an (address, length) the same
-/// submit already read, and reads of an address already read with another length.
+/// kind ([`Read`]): reads and bytes, and those the submit's [`Memo`] served.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Staging {
     pub calls: u64,
@@ -268,9 +265,8 @@ pub struct Staging {
     pub flushes: u64,
     pub reads: [u64; 5],
     pub read_bytes: [u64; 5],
-    pub repeats: [u64; 5],
-    pub repeat_bytes: [u64; 5],
-    pub other_lengths: [u64; 5],
+    pub memo_hits: [u64; 5],
+    pub memo_bytes: [u64; 5],
 }
 
 /// What a guest read for the GPU was for, an index into [`Staging`]'s arrays.
@@ -292,6 +288,48 @@ pub(crate) type Indices = (Slice, wgpu::IndexFormat, u32);
 /// A memo value and the write epoch it was made at.
 type Dated<T> = (T, u64);
 
+/// A fast hasher for host maps keyed by addresses and small tuples, where
+/// SipHash (the default) costs more than the lookup; fixed, so iteration
+/// orders are the same in every run.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct Fx(u64);
+
+impl Fx {
+    fn add(&mut self, w: u64) {
+        self.0 = (self.0.rotate_left(5) ^ w).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+}
+
+impl std::hash::Hasher for Fx {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        let (words, tail) = bytes.as_chunks::<8>();
+        for w in words {
+            self.add(u64::from_le_bytes(*w));
+        }
+        for &b in tail {
+            self.add(u64::from(b));
+        }
+    }
+    fn write_u8(&mut self, n: u8) {
+        self.add(n.into());
+    }
+    fn write_u32(&mut self, n: u32) {
+        self.add(n.into());
+    }
+    fn write_u64(&mut self, n: u64) {
+        self.add(n);
+    }
+    fn write_usize(&mut self, n: usize) {
+        self.add(n as u64);
+    }
+}
+
+/// A map hashed with [`Fx`].
+pub(crate) type FxMap<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<Fx>>;
+
 /// Bytes read from guest memory, shared by the draws that read them.
 type Bytes = Arc<Vec<u8>>;
 
@@ -304,13 +342,14 @@ type Bytes = Arc<Vec<u8>>;
 #[derive(Default)]
 pub(crate) struct Memo {
     /// (kind, address, length) -> the bytes.
-    reads: HashMap<(u8, u64, usize), Dated<Bytes>>,
+    reads: FxMap<(u8, u64, usize), Dated<Bytes>>,
     /// (kind, address, length, filled to, bound as) -> the staged block.
-    staged: HashMap<(u8, u64, usize, usize, usize), Dated<Slice>>,
+    staged: FxMap<(u8, u64, usize, usize, usize), Dated<Slice>>,
     /// (address, index size, count, restart index) -> the staged indices.
-    indices: HashMap<(u64, usize, u32, Option<u32>), Dated<Indices>>,
-    /// The epoch of each page written by the GPU in this submit.
-    pages: HashMap<u64, u64>,
+    indices: FxMap<(u64, usize, u32, Option<u32>), Dated<Indices>>,
+    /// The epoch of each page written by the GPU in this submit, in page order:
+    /// an entry's check visits only the written pages inside it.
+    pages: BTreeMap<u64, u64>,
     epoch: u64,
 }
 
@@ -336,11 +375,7 @@ impl Memo {
     /// No GPU write on `[addr, addr + len)`'s pages since `epoch`.
     fn fresh(&self, addr: u64, len: usize, epoch: u64) -> bool {
         let (first, last) = (addr >> 12, addr.saturating_add(len.max(1) as u64 - 1) >> 12);
-        if self.pages.len() as u64 <= last - first {
-            self.pages.iter().all(|(page, e)| *e <= epoch || !(first..=last).contains(page))
-        } else {
-            (first..=last).all(|page| self.pages.get(&page).is_none_or(|e| *e <= epoch))
-        }
+        self.pages.range(first..=last).all(|(_, e)| *e <= epoch)
     }
 }
 
@@ -461,7 +496,7 @@ impl Surfaces {
         let arena = (arena_buffer(&device, 16 << 20), Vec::new());
         let window = window.map(|(surface, size)| Window::new(&adapter, &device, surface, size));
         let timing = crate::timing::Timing::new(&device, &queue);
-        Ok(Surfaces { adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pending: None, timing, clock: None, present: 0, readbacks: Default::default(), hasher: None, arena, staging: Staging::default(), staged: HashMap::new(), last_color: None, window, seen: HashMap::new(), memo: Memo::default() })
+        Ok(Surfaces { adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pending: None, timing, clock: None, present: 0, readbacks: Default::default(), hasher: None, arena, staging: Staging::default(), staged: FxMap::default(), last_color: None, window, memo: Memo::default() })
     }
 
     /// Shows the presented image (the color target written last, its top-left
@@ -544,26 +579,19 @@ impl Surfaces {
     /// Submits the work recorded so far (at each present, and before any
     /// readback). Uploads (`write_texture`) only ever go to new textures,
     /// which nothing recorded before can use, so they need no flush.
-    /// Counts a guest read for the GPU (host statistics, see [`Staging`]).
-    pub(crate) fn note_read(&mut self, kind: Read, addr: u64, len: usize) {
-        let k = kind as usize;
-        let s = &mut self.staging;
+    /// Counts a guest read for the GPU, `memo` if the memo served it (host
+    /// statistics, see [`Staging`]).
+    pub(crate) fn note_read(&mut self, kind: Read, len: usize, memo: bool) {
+        let (k, s) = (kind as usize, &mut self.staging);
         s.reads[k] += 1;
         s.read_bytes[k] += len as u64;
-        let lengths = self.seen.entry((k as u8, addr)).or_default();
-        if lengths.contains(&len) {
-            s.repeats[k] += 1;
-            s.repeat_bytes[k] += len as u64;
-        } else {
-            s.other_lengths[k] += u64::from(!lengths.is_empty());
-            lengths.push(len);
-        }
+        s.memo_hits[k] += u64::from(memo);
+        s.memo_bytes[k] += if memo { len as u64 } else { 0 };
     }
 
     /// Guest code may have run since the last GPU work (a new submit, or a
     /// wait that ended): what was read from guest memory may have changed.
     pub fn new_submit(&mut self) {
-        self.seen.clear();
         self.memo.clear();
     }
 
@@ -571,13 +599,15 @@ impl Surfaces {
     /// submit read them already and the GPU has not written them since; None
     /// if they are not readable.
     pub(crate) fn read_guest(&mut self, kind: Read, addr: u64, len: usize, mem: crate::draw::Mem) -> Option<Arc<Vec<u8>>> {
-        self.note_read(kind, addr, len);
         let key = (kind as u8, addr, len);
         if let Some((bytes, epoch)) = self.memo.reads.get(&key)
             && self.memo.fresh(addr, len, *epoch)
         {
-            return Some(bytes.clone());
+            let bytes = bytes.clone();
+            self.note_read(kind, len, true);
+            return Some(bytes);
         }
+        self.note_read(kind, len, false);
         let mut bytes = vec![0u8; len];
         if !mem(addr, &mut bytes) {
             return None;
@@ -605,18 +635,19 @@ impl Surfaces {
     /// submit made it and the GPU has not written its bytes since (the read is
     /// counted in [`Staging`]).
     pub(crate) fn staged_guest(&mut self, kind: Read, addr: u64, len: usize, zeros: usize, window: usize) -> Option<Slice> {
-        self.note_read(kind, addr, len);
-        let (slice, epoch) = self.memo.staged.get(&(kind as u8, addr, len, zeros, window))?;
-        self.memo.fresh(addr, len, *epoch).then(|| slice.clone())
+        let found = self.memo.staged.get(&(kind as u8, addr, len, zeros, window)).filter(|(_, epoch)| self.memo.fresh(addr, len, *epoch)).map(|(slice, _)| slice.clone());
+        self.note_read(kind, len, found.is_some());
+        found
     }
 
     /// The staged indices of `count` indices of `size` bytes at `addr` (with a
     /// restart index), their format and the highest index, if this submit made
     /// them and the GPU has not written them since.
     pub(crate) fn staged_indices(&mut self, addr: u64, size: usize, count: u32, restart: Option<u32>) -> Option<Indices> {
-        self.note_read(Read::Index, addr, size * count as usize);
-        let (found, epoch) = self.memo.indices.get(&(addr, size, count, restart))?;
-        self.memo.fresh(addr, size * count as usize, *epoch).then(|| found.clone())
+        let len = size * count as usize;
+        let found = self.memo.indices.get(&(addr, size, count, restart)).filter(|(_, epoch)| self.memo.fresh(addr, len, *epoch)).map(|(indices, _)| indices.clone());
+        self.note_read(Read::Index, len, found.is_some());
+        found
     }
 
     /// Records indices staged by the caller (see [`Surfaces::staged_indices`]).
@@ -625,7 +656,6 @@ impl Surfaces {
     }
 
     pub fn flush(&mut self) {
-        self.seen.clear();
         self.memo.clear();
         // The arena's writes land before this submit's commands, and after the
         // previous frame's, which read the same bytes: queue order.
