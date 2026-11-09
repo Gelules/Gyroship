@@ -308,17 +308,39 @@ fn fp1(a: u128, e: u32, q: bool, f: impl Fn(f64) -> f64, g: impl Fn(f32) -> f32)
     fp2(a, 0, e, q, |x, _| f(x), |x, _| g(x))
 }
 
+/// FMAXNM and FMINNM (Arm's FPMaxNum, FPMinNum): a quiet NaN against anything
+/// but a quiet NaN counts as `fill` (-inf for the max, +inf for the min), so a
+/// number wins; the rest goes as for FMAX: a signalling NaN first, quieted,
+/// else the first quiet NaN.
+fn nm64(a: f64, b: f64, f: fn(f64, f64) -> f64, fill: f64) -> f64 {
+    let quiet = |x: f64| x.is_nan() && x.to_bits() & (1 << 51) != 0;
+    let (a, b) = match (quiet(a), quiet(b)) {
+        (true, false) => (fill, b),
+        (false, true) => (a, fill),
+        _ => (a, b),
+    };
+    f64b(arm_nan(&[a.to_bits(), b.to_bits()], f(a, b).to_bits(), 64))
+}
+fn nm32(a: f32, b: f32, f: fn(f32, f32) -> f32, fill: f32) -> f32 {
+    let quiet = |x: f32| x.is_nan() && x.to_bits() & (1 << 22) != 0;
+    let (a, b) = match (quiet(a), quiet(b)) {
+        (true, false) => (fill, b),
+        (false, true) => (a, fill),
+        _ => (a, b),
+    };
+    f32b(arm_nan(&[a.to_bits().into(), b.to_bits().into()], f(a, b).to_bits().into(), 32))
+}
 fn fmaxnm64(a: f64, b: f64) -> f64 {
-    if a.is_nan() { b } else if b.is_nan() { a } else { crate::fmax64(a, b) }
+    nm64(a, b, crate::fmax64, f64::NEG_INFINITY)
 }
 fn fminnm64(a: f64, b: f64) -> f64 {
-    if a.is_nan() { b } else if b.is_nan() { a } else { crate::fmin64(a, b) }
+    nm64(a, b, crate::fmin64, f64::INFINITY)
 }
 fn fmaxnm32(a: f32, b: f32) -> f32 {
-    if a.is_nan() { b } else if b.is_nan() { a } else { crate::fmax32(a, b) }
+    nm32(a, b, crate::fmax32, f32::NEG_INFINITY)
 }
 fn fminnm32(a: f32, b: f32) -> f32 {
-    if a.is_nan() { b } else if b.is_nan() { a } else { crate::fmin32(a, b) }
+    nm32(a, b, crate::fmin32, f32::INFINITY)
 }
 
 fn all_ones(c: bool, e: u32) -> u64 {
@@ -551,6 +573,9 @@ fn exec(c: &mut Cpu, _pc: u64, i: &Instruction) -> Result {
             let v = gpr(c, &o[1])?;
             match r {
                 NZCV => crate::set_nzcv(c, (v >> 28) as u8),
+                // D36: the game never sets a control bit (rounding, flush to zero,
+                // default NaN, traps); one that does would change results we do not model.
+                FPCR if v != 0 => return Err("msr FPCR with control bits, which are not applied (D36)"),
                 FPCR => c.fpcr = v,
                 FPSR => c.fpsr = v,
                 TPIDR_EL0 => c.tpidr = v,

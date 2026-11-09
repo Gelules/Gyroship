@@ -67,6 +67,21 @@ fn reciprocal_estimates_match_the_hardware() {
 }
 
 #[test]
+fn fmaxnm_takes_the_number_against_a_quiet_nan_only() {
+    // Arm's FPMaxNum and FPMinNum: a quiet NaN loses to a number; a signalling
+    // NaN wins, quieted; of two quiet NaNs, the first.
+    let (one, qnan, snan, other) = (0x3F80_0000, 0x7FC0_0001, 0x7F80_0002, 0x7FC0_0003);
+    let mut c = Cpu::new(std::ptr::null_mut());
+    c.vr[1] = lanes32([qnan, snan, qnan, one]);
+    c.vr[2] = lanes32([one, one, other, qnan]);
+    let expected = lanes32([one, 0x7FC0_0002, qnan, one]);
+    run(&mut c, 0x4e22c420); // fmaxnm v0.4s, v1.4s, v2.4s
+    assert_eq!(c.vr[0], expected);
+    run(&mut c, 0x4ea2c420); // fminnm v0.4s, v1.4s, v2.4s
+    assert_eq!(c.vr[0], expected);
+}
+
+#[test]
 fn atomics_and_crc_on_real_memory() {
     let mut mem = vec![0u8; 64];
     let mut c = Cpu::new(mem.as_mut_ptr().wrapping_sub(GUEST as usize));
