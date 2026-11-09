@@ -99,6 +99,38 @@ fn bad_ranges_are_refused() {
     assert_eq!(m.protect(HEAP - 0x1000, 0x2000, perm::R), Err(Error::InvalidState));
 }
 
+/// The atomic accessors read and write the bytes the copies do, check the
+/// guest's permission as `read` and `write` do, refuse unaligned words, and
+/// write nothing when they only load or when `update_u32` refuses.
+#[test]
+fn atomic_words_check_like_read_and_write() {
+    let m = Memory::new().unwrap();
+    m.map(HEAP, 0x1000, Block::new(state::NORMAL, perm::RW)).unwrap();
+    m.map(HEAP + 0x1000, 0x1000, Block::new(state::NORMAL, perm::R)).unwrap();
+    let (rw, r) = (HEAP + 0x10, HEAP + 0x1010);
+    m.store_u32(rw, 0x1122_3344).unwrap();
+    let mut b = [0; 4];
+    m.read(rw, &mut b).unwrap();
+    assert_eq!(b, [0x44, 0x33, 0x22, 0x11]);
+    m.write(rw + 8, &0x0102_0304_0506_0708u64.to_le_bytes()).unwrap();
+    assert_eq!(m.load_u64(rw + 8), Ok(0x0102_0304_0506_0708));
+    m.take_written(HEAP, 0x2000);
+    assert_eq!(m.update_u32(rw, |v| (v < 5).then_some(v.wrapping_sub(1))), Ok(Err(0x1122_3344)));
+    assert_eq!(m.load_u32(rw), Ok(0x1122_3344));
+    assert!(m.take_written(HEAP, 0x2000).is_empty(), "loads and refused updates write nothing");
+    assert_eq!(m.update_u32(rw, |v| Some(v | 0x4000_0000)), Ok(Ok(0x1122_3344)));
+    assert_eq!(m.load_u32(rw), Ok(0x5122_3344));
+    // The guest's permission: R loads only.
+    assert!(m.load_u32(r).is_ok());
+    assert_eq!(m.store_u32(r, 1), Err(Error::InvalidState));
+    assert_eq!(m.update_u32(r, Some), Err(Error::InvalidState));
+    // Unmapped, unaligned, past the space.
+    assert_eq!(m.load_u32(HEAP + 0x2000), Err(Error::InvalidState));
+    assert_eq!(m.load_u32(rw + 2), Err(Error::InvalidRange));
+    assert_eq!(m.load_u64(rw + 4), Err(Error::InvalidRange));
+    assert_eq!(m.load_u32(mem::SPACE), Err(Error::InvalidRange));
+}
+
 /// The write watch reports the pages written (by the host here; the guest's
 /// stores are plain stores too) in the range asked, once: the take resets them.
 #[test]

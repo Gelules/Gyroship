@@ -6,8 +6,11 @@ use common::*;
 use gyroship_hle::result::*;
 use gyroship_hle::svc::CURRENT_THREAD;
 use gyroship_hle::sync::HAS_LISTENERS;
-use gyroship_hle::thread::Outcome;
+use gyroship_hle::thread::{Outcome, State, Wait};
+use gyroship_hle::{Config, Kernel};
 use gyroship_runtime::Cpu;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::SeqCst};
+use std::time::{Duration, Instant};
 
 const TURN: u64 = DATA;
 const MUTEX: u64 = DATA + 0x10;
@@ -301,4 +304,163 @@ fn events_wake_their_waiters() {
     let mut events = events;
     events.sort();
     assert_eq!(events, [("index", 0), ("reset", 0), ("reset again", u64::from(INVALID_STATE)), ("signal", 0), ("woken", 0)], "{journal}");
+}
+
+// Guest words that other host threads update while the kernel runs: the tests call
+// the handlers from one host thread, with no fiber; the other host threads stand
+// for guest code (LSE and STXR are host atomics since Stage 1).
+
+/// A kernel with the data page mapped.
+fn kernel() -> Kernel {
+    use gyroship_hle::journal::Journal;
+    use gyroship_runtime::mem::{Block, Memory, perm, state};
+    let k = Kernel::new(Memory::new().unwrap(), Journal::memory(), Config::default());
+    k.mem.map(DATA, 0x1000, Block::new(state::NORMAL, perm::RW)).unwrap();
+    k
+}
+
+/// Guest word `addr`, as guest code on another host thread updates it.
+fn word(k: &Kernel, addr: u64) -> &'static AtomicU32 {
+    // SAFETY: an aligned word of a mapped page; the kernel outlives the test's uses.
+    unsafe { AtomicU32::from_ptr(k.mem.base().add(addr as usize).cast()) }
+}
+
+/// A thread waiting on condition `key` after releasing `mutex`, as
+/// WaitProcessWideKeyAtomic leaves it; returns its index.
+fn cond_waiter(k: &mut Kernel, mutex: u64, key: u64, tag: u32) -> usize {
+    k.create_thread(PC, 0, 0, 44, 0).unwrap();
+    let t = k.sched.threads.len() - 1;
+    k.sched.current = Some(t);
+    assert_eq!(k.wait_key(mutex, key, tag, -1), SUCCESS);
+    k.sched.current = None;
+    t
+}
+
+/// WaitForAddress type 1 and SignalToAddress type 1 update a word that other host
+/// threads add to with atomics, as the guest's LSE code does: no update is lost.
+#[test]
+fn address_updates_lose_nothing_to_other_host_threads() {
+    const HOSTS: i32 = 3;
+    const ADDS: i32 = 100_000;
+    const ROUNDS: i32 = 100_000;
+    let mut k = kernel();
+    let w = word(&k, DATA);
+    let mut incremented = 0;
+    std::thread::scope(|s| {
+        for _ in 0..HOSTS {
+            s.spawn(move || {
+                for _ in 0..ADDS {
+                    w.fetch_add(1, SeqCst);
+                }
+            });
+        }
+        for _ in 0..ROUNDS {
+            // Decrement if less than (always: the word stays far below i32::MAX), no wait.
+            assert_eq!(k.wait_address(DATA, 1, i32::MAX as u64, 0), TIMED_OUT);
+            // Increment if equal: InvalidState when a host thread added in between.
+            match k.signal_address(DATA, 1, w.load(SeqCst) as i32, -1) {
+                SUCCESS => incremented += 1,
+                r => assert_eq!(r, INVALID_STATE),
+            }
+        }
+    });
+    assert_eq!(w.load(SeqCst) as i32, HOSTS * ADDS - ROUNDS + incremented);
+}
+
+/// SignalProcessWideKey takes the mutex word over in one atomic step while a guest
+/// thread on another host thread locks and unlocks it by compare-exchange (the SDK's
+/// fast paths): the waiter gets the mutex free, or queues behind its holder, whose
+/// unlock then sees the has-listeners bit. Nothing else may come out.
+#[test]
+fn a_signal_takes_the_mutex_over_in_one_step() {
+    const HOLDER: u32 = 0x100;
+    const WAITER: u32 = 0x200;
+    let mut k = kernel();
+    for i in 0..200 {
+        let (mutex, key) = (DATA + 8 * i, DATA + 8 * i + 4);
+        let t = cond_waiter(&mut k, mutex, key, WAITER);
+        let m = word(&k, mutex);
+        let (running, stop) = (AtomicBool::new(false), AtomicBool::new(false));
+        let holds = std::thread::scope(|s| {
+            let guest = s.spawn(|| {
+                let mut holds = false;
+                while !holds && !stop.load(SeqCst) {
+                    running.store(true, SeqCst);
+                    // An unlock fails only if the kernel set the bit meanwhile: the
+                    // holder keeps the mutex (the SDK would call ArbitrateUnlock).
+                    holds = m.compare_exchange(0, HOLDER, SeqCst, SeqCst).is_ok() && m.compare_exchange(HOLDER, 0, SeqCst, SeqCst).is_err();
+                }
+                holds
+            });
+            while !running.load(SeqCst) {
+                std::hint::spin_loop();
+            }
+            k.signal_key(key, 1);
+            stop.store(true, SeqCst);
+            guest.join().unwrap()
+        });
+        let th = &k.sched.threads[t];
+        if th.state == State::Ready {
+            assert_eq!((m.load(SeqCst), holds), (WAITER, false), "round {i}");
+        } else {
+            assert_eq!((m.load(SeqCst), &th.wait, holds), (HOLDER | HAS_LISTENERS, &Wait::Lock { addr: mutex, tag: WAITER }, true), "round {i}");
+        }
+        assert_eq!(word(&k, key).load(SeqCst), 0, "no waiter is left on the key");
+    }
+}
+
+/// WaitProcessWideKeyAtomic sets the key before it frees the mutex, as Horizon does:
+/// a guest thread that takes the mutex on another host thread, then reads the key,
+/// finds it set (an SDK that signals only when it is set loses no wake-up).
+#[test]
+fn the_key_is_set_before_the_mutex_is_free() {
+    const WAITER: u32 = 0x100;
+    const TAKER: u32 = 0x200;
+    let mut k = kernel();
+    for i in 0..200 {
+        let (mutex, key) = (DATA + 8 * i, DATA + 8 * i + 4);
+        let (m, flag) = (word(&k, mutex), word(&k, key));
+        m.store(WAITER, SeqCst);
+        k.create_thread(PC, 0, 0, 44, 0).unwrap();
+        k.sched.current = Some(k.sched.threads.len() - 1);
+        let running = AtomicBool::new(false);
+        let seen = std::thread::scope(|s| {
+            let guest = s.spawn(|| {
+                running.store(true, SeqCst);
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while m.compare_exchange(0, TAKER, SeqCst, SeqCst).is_err() {
+                    assert!(Instant::now() < deadline, "round {i}: the mutex was never freed");
+                    std::hint::spin_loop();
+                }
+                flag.load(SeqCst)
+            });
+            while !running.load(SeqCst) {
+                std::hint::spin_loop();
+            }
+            assert_eq!(k.wait_key(mutex, key, WAITER, -1), SUCCESS);
+            guest.join().unwrap()
+        });
+        k.sched.current = None;
+        assert_eq!(seen, 1, "round {i}");
+    }
+}
+
+/// A failed WaitProcessWideKeyAtomic has the effects it had before the key moved
+/// first: a mutex word it cannot write changes nothing, the key included; a bad
+/// key still frees the mutex.
+#[test]
+fn a_failed_condition_wait_keeps_its_effects() {
+    use gyroship_runtime::mem::{Block, perm, state};
+    const OWNER: u32 = 0x100;
+    let mut k = kernel();
+    let read_only = DATA + 0x1000;
+    k.mem.map(read_only, 0x1000, Block::new(state::NORMAL, perm::R)).unwrap();
+    let (m, key) = (word(&k, MUTEX), word(&k, KEY));
+    assert_eq!(k.wait_key(read_only, KEY, OWNER, -1), INVALID_CURRENT_MEMORY);
+    assert_eq!(key.load(SeqCst), 0, "the key is untouched");
+    for (bad, result) in [(KEY + 2, INVALID_ADDRESS), (read_only, INVALID_CURRENT_MEMORY)] {
+        m.store(OWNER, SeqCst);
+        assert_eq!(k.wait_key(MUTEX, bad, OWNER, -1), result);
+        assert_eq!(m.load(SeqCst), 0, "the mutex is free");
+    }
 }

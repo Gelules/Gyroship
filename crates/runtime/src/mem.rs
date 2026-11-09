@@ -13,7 +13,7 @@
 //! check has released it.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use windows_sys::Win32::Foundation::EXCEPTION_ACCESS_VIOLATION;
@@ -114,7 +114,8 @@ impl Info {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
-    /// Address or size not page-aligned, empty, or outside the address space.
+    /// Address or size not aligned (a page for mappings, the word for atomic
+    /// accesses), empty, or outside the address space.
     InvalidRange,
     /// Part of the range is already mapped.
     NotFree,
@@ -138,7 +139,8 @@ pub struct Memory {
 // SAFETY: `base` never changes and the reservation is ours until drop; the
 // table is behind its lock. Guest bytes are shared with guest code on other
 // host threads by design: Memory hands out no Rust reference to them that
-// outlives one access, only raw copies, as the generated code's own accesses.
+// outlives one access, only raw copies and host atomics, as the generated
+// code's own accesses.
 unsafe impl Send for Memory {}
 unsafe impl Sync for Memory {}
 
@@ -295,6 +297,43 @@ impl Memory {
     /// permission `need`: the check `read` (R) and `write` (W) make.
     pub fn accessible(&self, addr: u64, len: u64, need: u32) -> Result<(), Error> {
         self.table().accessible(addr, len, need)
+    }
+
+    /// The naturally aligned guest word at `addr` as host atomic `A`, once the
+    /// guest permission `need` is checked as `read` (R) and `write` (W) check
+    /// it. The table lock is released before the caller's access, as for copies.
+    fn word<A>(&self, addr: u64, need: u32) -> Result<&A, Error> {
+        if !addr.is_multiple_of(size_of::<A>() as u64) {
+            return Err(Error::InvalidRange);
+        }
+        self.accessible(addr, size_of::<A>() as u64, need)?;
+        // SAFETY: mapped with `need` (checked just above) and aligned; the
+        // reservation lives as long as `self`.
+        Ok(unsafe { &*self.base.add(addr as usize).cast::<A>() })
+    }
+
+    /// Loads a naturally aligned guest word with Acquire ordering, checked as
+    /// `read` (Err(InvalidRange) when unaligned). A plain load: it never writes.
+    pub fn load_u32(&self, addr: u64) -> Result<u32, Error> {
+        Ok(self.word::<AtomicU32>(addr, perm::R)?.load(Ordering::Acquire))
+    }
+
+    pub fn load_u64(&self, addr: u64) -> Result<u64, Error> {
+        Ok(self.word::<AtomicU64>(addr, perm::R)?.load(Ordering::Acquire))
+    }
+
+    /// Stores a naturally aligned guest word with Release ordering, checked as `write`.
+    pub fn store_u32(&self, addr: u64, v: u32) -> Result<(), Error> {
+        self.word::<AtomicU32>(addr, perm::W)?.store(v, Ordering::Release);
+        Ok(())
+    }
+
+    /// Replaces the guest word v by f(v) in one compare-exchange loop (`f` may
+    /// run more than once) unless `f` returns None, which stores nothing;
+    /// checked for R and W first. The inner result is the value replaced (Ok)
+    /// or refused (Err).
+    pub fn update_u32(&self, addr: u64, f: impl FnMut(u32) -> Option<u32>) -> Result<Result<u32, u32>, Error> {
+        Ok(self.word::<AtomicU32>(addr, perm::RW)?.try_update(Ordering::AcqRel, Ordering::Acquire, f))
     }
 
     /// The mapped blocks, in address order: a snapshot taken under the read lock.

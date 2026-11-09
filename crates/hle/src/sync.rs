@@ -3,14 +3,18 @@
 //! (ArbitrateLock/Unlock), process-wide condition variables, and waits and
 //! signals on addresses. Waiters wake by priority, then in arrival order.
 //!
-//! Guest words are read and written between two switch points, so they are
-//! atomic with respect to every other guest thread.
+//! Guest code on other host threads may change a guest word at any time, so the
+//! kernel reads and writes words with host atomics and makes each
+//! read-compare-write one compare-exchange, as Horizon's kernel does with
+//! exclusives. Each SVC runs with the kernel to itself, so a check and the wait
+//! it decides stay atomic with respect to the SVCs that signal.
 
 use crate::Kernel;
 use crate::result::*;
 use crate::svc::{CURRENT_THREAD, ns_to_ticks};
 use crate::thread::{Object, State, Wait};
 use gyroship_runtime::Cpu;
+use gyroship_runtime::mem::perm;
 
 /// Set in a mutex word while threads wait for the mutex.
 pub const HAS_LISTENERS: u32 = 0x4000_0000;
@@ -68,13 +72,14 @@ impl Kernel {
     }
 
     fn read32(&self, addr: u64) -> Option<u32> {
-        let mut b = [0; 4];
-        self.mem.read(addr, &mut b).ok()?;
-        Some(u32::from_le_bytes(b))
+        self.mem.load_u32(addr).ok()
     }
 
+    /// Stores a guest word atomically (guest code on other host threads reads it).
+    /// SignalProcessWideKey's key is the one address nobody checks for alignment:
+    /// a misaligned one keeps its plain write, as before.
     fn write32(&mut self, addr: u64, v: u32) -> Option<()> {
-        self.mem.write(addr, &v.to_le_bytes()).ok()
+        if addr.is_multiple_of(4) { self.mem.store_u32(addr, v).ok() } else { self.mem.write(addr, &v.to_le_bytes()).ok() }
     }
 
     fn deadline(&self, timeout: i64) -> Option<u64> {
@@ -209,10 +214,16 @@ impl Kernel {
         SUCCESS
     }
 
-    /// WaitProcessWideKeyAtomic: releases the mutex at `addr`, marks the
-    /// condition `key` as waited on, and waits for a signal; once signaled,
-    /// the thread takes the mutex back before it returns.
+    /// WaitProcessWideKeyAtomic: marks the condition `key` as waited on, releases
+    /// the mutex at `addr`, and waits for a signal; once signaled, the thread
+    /// takes the mutex back before it returns.
     pub fn wait_key(&mut self, addr: u64, key: u64, tag: u32, timeout: i64) -> u32 {
+        // The key is set before the mutex is free, as Horizon does it: a thread that
+        // takes the mutex on another host thread, then reads the key, finds it set.
+        // Early only when the release below cannot fail and the two words differ, so
+        // the Results and the final bytes stay those of releasing first.
+        let releasable = addr.is_multiple_of(4) && self.mem.accessible(addr, 4, perm::W).is_ok();
+        let early = releasable && key != addr && key.is_multiple_of(4) && self.write32(key, 1).is_some();
         let r = self.arbitrate_unlock(addr);
         if r != SUCCESS {
             return r;
@@ -220,7 +231,7 @@ impl Kernel {
         if !key.is_multiple_of(4) {
             return INVALID_ADDRESS;
         }
-        if self.write32(key, 1).is_none() {
+        if !early && self.write32(key, 1).is_none() {
             return INVALID_CURRENT_MEMORY;
         }
         if timeout == 0 {
@@ -238,15 +249,20 @@ impl Kernel {
         let n = if count <= 0 { w.len() } else { w.len().min(count as usize) };
         for &t in &w[..n] {
             let Wait::CondVar { addr, tag, .. } = self.sched.threads[t].wait else { unreachable!() };
-            match self.read32(addr) {
+            // One atomic step, as Horizon's kernel does it, since guest code on other
+            // host threads may lock or unlock meanwhile: a free mutex goes to the
+            // waiter, a held one gets the has-listeners bit. It always stores, as the
+            // plain write did (the write watch sees the same pages). A word the guest
+            // cannot write keeps its value and is acted on as read, as before.
+            let seen = match self.mem.update_u32(addr, |v| Some(if v == 0 { tag } else { v | HAS_LISTENERS })) {
+                Ok(Ok(v) | Err(v)) => Some(v),
+                Err(_) => self.read32(addr),
+            };
+            match seen {
                 None => self.wake(t, INVALID_CURRENT_MEMORY, None),
-                Some(0) => {
-                    let _ = self.write32(addr, tag);
-                    self.wake(t, SUCCESS, None);
-                }
-                Some(v) => {
-                    // Owned: wait for it like ArbitrateLock, with no deadline any more.
-                    let _ = self.write32(addr, v | HAS_LISTENERS);
+                Some(0) => self.wake(t, SUCCESS, None),
+                Some(_) => {
+                    // Held: wait for it like ArbitrateLock, with no deadline any more.
                     let th = &mut self.sched.threads[t];
                     (th.wait, th.deadline) = (Wait::Lock { addr, tag }, None);
                 }
@@ -271,19 +287,22 @@ impl Kernel {
                 if !(if kind == 2 { v == value } else { v < value }) {
                     return INVALID_STATE;
                 }
-                if kind == 1 && self.write32(addr, v.wrapping_sub(1) as u32).is_none() {
-                    return INVALID_CURRENT_MEMORY;
+                // Decrement if still less than, in one atomic step: guest code on other
+                // host threads may have changed the word since the check.
+                if kind == 1 {
+                    match self.mem.update_u32(addr, |x| ((x as i32) < value).then_some(x.wrapping_sub(1))) {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(_)) => return INVALID_STATE,
+                        Err(_) => return INVALID_CURRENT_MEMORY,
+                    }
                 }
             }
             3 => {
                 if self.journal.first("WaitForAddress type 3") {
                     self.log("svc 0x34 WaitForAddress type 3: assumed to wait if the 64-bit value is equal");
                 }
-                let mut b = [0; 8];
-                if self.mem.read(addr, &mut b).is_err() {
-                    return INVALID_CURRENT_MEMORY;
-                }
-                if u64::from_le_bytes(b) != value {
+                let Ok(v) = self.mem.load_u64(addr) else { return INVALID_CURRENT_MEMORY };
+                if v != value {
                     return INVALID_STATE;
                 }
             }
@@ -322,8 +341,14 @@ impl Kernel {
             if v as i32 != value {
                 return INVALID_STATE;
             }
-            if new != value && self.write32(addr, new as u32).is_none() {
-                return INVALID_CURRENT_MEMORY;
+            // Store if still equal, in one atomic step: guest code on other host threads
+            // may have changed the word since the check. No store when nothing changes.
+            if new != value {
+                match self.mem.update_u32(addr, |x| (x == value as u32).then_some(new as u32)) {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(_)) => return INVALID_STATE,
+                    Err(_) => return INVALID_CURRENT_MEMORY,
+                }
             }
         }
         let n = if count <= 0 { w.len() } else { w.len().min(count as usize) };
