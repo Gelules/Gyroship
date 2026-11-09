@@ -428,6 +428,8 @@ impl Kernel {
             self.mem.write(tlr + 0x108, &offset.to_le_bytes()).expect("the TLR is mapped");
         }
         self.sched.current = Some(t);
+        // For --profile's samples (host state only).
+        gyroship_runtime::profile::set_guest(self.sched.threads[t].id, self.sched.threads[t].cpu);
     }
 
     /// The next thread to run, after waking the threads whose deadline

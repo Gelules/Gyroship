@@ -12,17 +12,32 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::thread::JoinHandle;
+
+/// Samples by (guest thread, host instruction pointer, guest x30).
+type Samples = HashMap<(u64, u64, u64), u64>;
 
 struct Profiler {
     path: PathBuf,
     stop: &'static AtomicBool,
-    sampler: JoinHandle<HashMap<u64, u64>>,
+    sampler: JoinHandle<Samples>,
 }
 
 static PROFILER: Mutex<Option<Profiler>> = Mutex::new(None);
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// The guest thread the guest's host thread runs, and its CPU context: the
+/// sampler tags each sample with the thread and its x30 (the caller, in a
+/// leaf function). Contexts live until the end of the run.
+static GUEST_THREAD: AtomicU64 = AtomicU64::new(0);
+static GUEST_CPU: AtomicPtr<crate::Cpu> = AtomicPtr::new(std::ptr::null_mut());
+
+/// Guest thread `id`, whose context is `cpu`, runs from now on.
+pub fn set_guest(id: u64, cpu: *mut crate::Cpu) {
+    GUEST_THREAD.store(id, Ordering::Relaxed);
+    GUEST_CPU.store(cpu, Ordering::Relaxed);
+}
 
 thread_local! {
     /// Interpreted instruction words and how often each ran (guest thread only).
@@ -112,7 +127,10 @@ pub fn start(path: PathBuf) {
                 ok
             };
             if read {
-                *samples.entry(context.Rip).or_insert(0u64) += 1;
+                let cpu = GUEST_CPU.load(Ordering::Relaxed);
+                // SAFETY: the context outlives the run; its thread is suspended or parked.
+                let lr = if cpu.is_null() { 0 } else { unsafe { std::ptr::read_volatile(&raw const (*cpu).x[30]) } };
+                *samples.entry((GUEST_THREAD.load(Ordering::Relaxed), context.Rip, lr)).or_insert(0u64) += 1;
             } else if samples.is_empty() {
                 eprintln!("gyroship: --profile: GetThreadContext: {}", std::io::Error::last_os_error());
                 break;
@@ -137,26 +155,69 @@ pub fn finish(guest: &dyn Fn(u64) -> String) {
     ACTIVE.store(false, Ordering::Relaxed);
     let Ok(samples) = p.sampler.join() else { return };
     let total: u64 = samples.values().sum();
+    let pct = |n: u64| 100.0 * n as f64 / total.max(1) as f64;
+    // A recompiled function's guest name, after its symbol.
+    let guest_of = |name: &str| {
+        let bare = name.split_once("] ").map_or(name, |(_, s)| s);
+        bare.strip_prefix("f_").and_then(|a| u64::from_str_radix(a, 16).ok()).map_or(String::new(), |a| format!("  {}", guest(a)))
+    };
+    let mut names: HashMap<u64, (String, String)> = HashMap::new();
     let mut by_symbol: HashMap<String, u64> = HashMap::new();
     let mut by_module: HashMap<String, u64> = HashMap::new();
-    for (rip, n) in samples {
-        let module = module(rip);
-        *by_module.entry(module.clone()).or_insert(0) += n;
-        *by_symbol.entry(format!("[{module}] {}", symbol(rip))).or_insert(0) += n;
+    let mut by_thread: HashMap<u64, HashMap<String, u64>> = HashMap::new();
+    let mut callers: HashMap<String, HashMap<u64, u64>> = HashMap::new();
+    for ((thread, rip, lr), n) in samples {
+        let (module, name) = names
+            .entry(rip)
+            .or_insert_with(|| {
+                let m = module(rip);
+                let s = format!("[{m}] {}", symbol(rip));
+                (m, s)
+            })
+            .clone();
+        *by_module.entry(module).or_insert(0) += n;
+        *by_symbol.entry(name.clone()).or_insert(0) += n;
+        *by_thread.entry(thread).or_default().entry(name.clone()).or_insert(0) += n;
+        *callers.entry(name).or_default().entry(lr).or_insert(0) += n;
     }
     let mut out = format!("# gyroship profile: {total} samples of 1 ms of the guest's host thread\n# samples  percent  module\n");
     let mut modules: Vec<(String, u64)> = by_module.into_iter().collect();
     modules.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     for (name, n) in modules {
-        out += &format!("{n:9} {:7.2}%  {name}\n", 100.0 * n as f64 / total.max(1) as f64);
+        out += &format!("{n:9} {:7.2}%  {name}\n", pct(n));
     }
     out += "# samples  percent  [module] symbol\n";
     let mut rows: Vec<(String, u64)> = by_symbol.into_iter().collect();
     rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    for (name, n) in rows {
-        let bare = name.split_once("] ").map_or(name.as_str(), |(_, s)| s);
-        let guest = bare.strip_prefix("f_").and_then(|a| u64::from_str_radix(a, 16).ok()).map_or(String::new(), |a| format!("  {}", guest(a)));
-        out += &format!("{n:9} {:7.2}%  {name}{guest}\n", 100.0 * n as f64 / total.max(1) as f64);
+    for (name, n) in &rows {
+        out += &format!("{n:9} {:7.2}%  {name}{}\n", pct(*n), guest_of(name));
+    }
+    // By guest thread (0: the boot fiber, before any thread), then the
+    // hottest symbols of each thread with 1% of the samples or more.
+    let mut threads: Vec<(u64, u64, HashMap<String, u64>)> = by_thread.into_iter().map(|(t, m)| (t, m.values().sum(), m)).collect();
+    threads.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    out += "# samples  percent  guest thread\n";
+    for (t, n, _) in &threads {
+        out += &format!("{n:9} {:7.2}%  thread {t}\n", pct(*n));
+    }
+    for (t, n, m) in threads.iter().filter(|r| pct(r.1) >= 1.0) {
+        out += &format!("# thread {t}: {n} samples, its hottest symbols\n");
+        let mut hot: Vec<(&String, &u64)> = m.iter().collect();
+        hot.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+        for (name, k) in hot.into_iter().take(15) {
+            out += &format!("{k:9} {:7.2}%  {name}{}\n", pct(*k), guest_of(name));
+        }
+    }
+    // Where the hottest symbols were called from: the guest's x30 at the
+    // sample, the return address of the last call; exact in a leaf function only.
+    out += "# callers of the 25 hottest symbols (x30 when sampled; exact in leaf functions only)\n";
+    for (name, n) in rows.iter().take(25) {
+        out += &format!("# {name}: {n} samples\n");
+        let mut sites: Vec<(u64, u64)> = callers.get(name).map_or(Vec::new(), |c| c.iter().map(|(&a, &k)| (a, k)).collect());
+        sites.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        for (lr, k) in sites.into_iter().take(6) {
+            out += &format!("{k:9} {:7.2}%  x30 {lr:#x}  {}\n", pct(k), guest(lr));
+        }
     }
     // The interpreter's instructions, by opcode, then the most frequent words.
     let words: Vec<(u32, u64)> = WORDS.with(|w| w.borrow().iter().map(|(&w, &n)| (w, n)).collect());
