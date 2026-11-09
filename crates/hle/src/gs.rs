@@ -43,17 +43,60 @@ pub struct State {
     pub gpu_mems: Vec<u64>,
     /// GPU mappings (gpu 211): address space, GPU range (bounds included), CPU address.
     pub gpu_maps: Vec<(u32, u64, u64, u64)>,
+    /// `gpu_maps` flattened for lookups (derived: rebuilt from it after a load).
+    pub gpu_table: Table,
+}
+
+/// Disjoint GPU ranges by address space, sorted: (space, first) -> (last, CPU
+/// address of first). A later mapping wins where it overlaps an earlier one.
+pub type Table = std::collections::BTreeMap<(u32, u64), (u64, u64)>;
+
+/// Paints mapping `space`, `first..=last` -> `cpu` over `table`: the ranges it
+/// overlaps keep only their parts outside it.
+fn paint(table: &mut Table, space: u32, first: u64, last: u64, cpu: u64) {
+    let mut hit = Vec::new();
+    if let Some((&(s, f), &(l, c))) = table.range(..(space, first)).next_back()
+        && s == space
+        && l >= first
+    {
+        hit.push((f, l, c));
+    }
+    hit.extend(table.range((space, first)..=(space, last)).map(|(&(_, f), &(l, c))| (f, l, c)));
+    for (f, l, c) in hit {
+        table.remove(&(space, f));
+        if f < first {
+            table.insert((space, f), (first - 1, c));
+        }
+        if l > last {
+            table.insert((space, last + 1), (l, c + (last + 1 - f)));
+        }
+    }
+    table.insert((space, first), (last, cpu));
+}
+
+/// The table of `maps`, painted in order.
+fn flatten(maps: &[(u32, u64, u64, u64)]) -> Table {
+    let mut table = Table::new();
+    for &(space, first, last, cpu) in maps {
+        paint(&mut table, space, first, last, cpu);
+    }
+    table
+}
+
+/// The CPU address of `gpu` in `space` through `table`; itself when no range has it.
+fn lookup(table: &Table, space: u32, gpu: u64) -> u64 {
+    match table.range(..=(space, gpu)).next_back() {
+        Some((&(s, first), &(last, cpu))) if s == space && gpu <= last => cpu + (gpu - first),
+        _ => gpu,
+    }
 }
 
 impl crate::Kernel {
-    /// The CPU address of a GPU address in address space `space`; addresses
-    /// no mapping covers are taken as CPU addresses (NVN maps the CPU's ASLR
-    /// region one to one).
+    /// The CPU address of a GPU address in address space `space`, through the
+    /// mapping made last that covers it; addresses no mapping covers are taken
+    /// as CPU addresses (NVN maps the CPU's ASLR region one to one).
     pub fn gpu_to_cpu(&mut self, space: u32, gpu: u64) -> u64 {
-        match self.gs.gpu_maps.iter().rev().find(|m| m.0 == space && (m.1..=m.2).contains(&gpu)) {
-            Some(m) => m.3 + (gpu - m.1),
-            None => gpu,
-        }
+        lookup(&self.gs.gpu_table, space, gpu)
     }
 
     /// Reads guest memory at a GPU address for the GPU; false if a byte is
@@ -172,6 +215,7 @@ impl Gs {
             (Gs::GpuMemory, 213) => {
                 let (space, first, last) = (req.u32_at(0)?, req.u64_at(4)?, req.u64_at(0xc)?);
                 k.gs.gpu_maps.retain(|m| m.0 != space || m.2 < first || m.1 > last);
+                k.gs.gpu_table = flatten(&k.gs.gpu_maps);
                 k.signal_gpu(req.u32_at(0x18)? as usize);
                 Reply::ok()
             }
@@ -198,6 +242,7 @@ impl Gs {
                         let (space, first, last, mem, offset) = (req.u32_at(0)?, req.u64_at(4)?, req.u64_at(0xc)?, req.u32_at(0x14)?, req.u64_at(0x18)?);
                         if let Some(&base) = k.gs.gpu_mems.get(mem.wrapping_sub(1) as usize) {
                             k.gs.gpu_maps.push((space, first, last, base + offset));
+                            paint(&mut k.gs.gpu_table, space, first, last, base + offset);
                         }
                         k.signal_gpu(req.u32_at(0x3c)? as usize);
                         Reply::with(&[*req.data.get(0x2c)?])
@@ -541,5 +586,42 @@ impl Kernel {
         self.gs.syncpt_events = self.event_of(_req_r).zip(self.event_of(ack_r));
         self.log(&format!("gsv 204: syncpoint memory rw {:#x}+{:#x} r {:#x}+{:#x}, header version 1 n 0, events (request, acknowledge) {:?}", a.0, a.1, b.0, b.1, self.gs.syncpt_events));
         Reply { move_handles: vec![req_w, ack_r], ..Reply::ok() }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The flattened table answers what a scan of the mappings from the last one
+    /// does, over random overlapping, nested, adjacent and removed mappings in
+    /// two address spaces, at random addresses and at each mapping's bounds.
+    #[test]
+    fn the_mapping_table_matches_the_reverse_scan() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let (mut maps, mut table): (Vec<(u32, u64, u64, u64)>, Table) = Default::default();
+        for round in 0..400 {
+            let (space, first) = (next(2) as u32, next(64) * 0x1000);
+            let last = first + next(16) * 0x1000 + 0xfff;
+            if round % 7 == 6 {
+                maps.retain(|m| m.0 != space || m.2 < first || m.1 > last);
+                table = flatten(&maps);
+            } else {
+                let cpu = 0x1_0000_0000 + next(1 << 20) * 0x1000;
+                maps.push((space, first, last, cpu));
+                paint(&mut table, space, first, last, cpu);
+            }
+            let probes = (0..64).map(|_| (next(2) as u32, next(80 * 0x1000))).chain([first.wrapping_sub(1), first, last, last + 1].map(|gpu| (space, gpu)));
+            for (space, gpu) in probes.collect::<Vec<_>>() {
+                let scan = maps.iter().rev().find(|m| m.0 == space && (m.1..=m.2).contains(&gpu)).map_or(gpu, |m| m.3 + (gpu - m.1));
+                assert_eq!(lookup(&table, space, gpu), scan, "round {round}: space {space}, gpu {gpu:#x}");
+            }
+        }
     }
 }
