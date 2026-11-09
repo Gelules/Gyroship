@@ -17,8 +17,8 @@ use crate::shader::{self, Handle, Options, Translation};
 use crate::state::resources::{Pool, SamplerBinding, TexHandle};
 use crate::state::textures::{self, Layout, TextureType};
 use crate::state::vertex::{AttrKind, wgpu_vertex_format};
-use crate::surfaces::{Surfaces, color_format, depth_format, uniform};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use crate::surfaces::{FxMap, Surfaces, color_format, depth_format, uniform};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Reads guest memory at a GPU address; false if a byte is not readable.
 pub type Mem<'a> = &'a mut dyn FnMut(u64, &mut [u8]) -> bool;
@@ -60,34 +60,36 @@ fn read_until(mem: Mem, gpu: u64, key: fn(&[u8]) -> Option<(u64, usize)>) -> Opt
 /// of the WGSL (some programs are 300 KB of text, drawn a dozen times a frame).
 type Module = Result<std::sync::Arc<(Translation, wgpu::ShaderModule)>, String>;
 
+/// The caches below are hashed with `Fx`: SipHash cost more than the lookups,
+/// every draw hashing a pipeline key, texture and sampler headers.
 #[derive(Default)]
 pub struct Cache {
     /// Program key by GPU address, and code by key.
-    programs: HashMap<u64, Option<u64>>,
-    pub(crate) code: HashMap<u64, Vec<u8>>,
+    programs: FxMap<u64, Option<u64>>,
+    pub(crate) code: FxMap<u64, Vec<u8>>,
     /// Compute program keys by GPU address, compiled compute programs, and the
     /// images compute programs wrote, by GPU address (see `compute.rs`).
-    pub(crate) compute_programs: HashMap<u64, Option<u64>>,
-    pub(crate) compute: HashMap<String, crate::compute::Compiled>,
-    pub(crate) compute_pipelines: HashMap<String, (wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
-    pub(crate) images: HashMap<u64, wgpu::Texture>,
+    pub(crate) compute_programs: FxMap<u64, Option<u64>>,
+    pub(crate) compute: FxMap<String, crate::compute::Compiled>,
+    pub(crate) compute_pipelines: FxMap<String, (wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
+    pub(crate) images: FxMap<u64, wgpu::Texture>,
     /// Translations by (program key, key of the pixel program it pairs with,
     /// mask of the attributes fetched as integers, hash of the jump targets or 0).
-    modules: HashMap<(u64, Option<u64>, u64, u64), Module>,
-    pipelines: HashMap<PipelineKey, (wgpu::RenderPipeline, Vec<wgpu::BindGroupLayout>)>,
+    modules: FxMap<(u64, Option<u64>, u64, u64), Module>,
+    pipelines: FxMap<PipelineKey, (wgpu::RenderPipeline, Vec<wgpu::BindGroupLayout>)>,
     /// Uploaded textures by address and header, with the end of the memory they came from.
-    textures: HashMap<(u64, [u8; 32]), (wgpu::Texture, u64)>,
+    textures: FxMap<(u64, [u8; 32]), (wgpu::Texture, u64)>,
     /// Samplers by header, filtering and compare.
-    samplers: HashMap<([u8; 32], bool, bool), wgpu::Sampler>,
+    samplers: FxMap<([u8; 32], bool, bool), wgpu::Sampler>,
     /// Stand-ins for textures only queried, by width, height, depth and levels.
-    queried: HashMap<(u32, u32, u32, u32), wgpu::Texture>,
+    queried: FxMap<(u32, u32, u32, u32), wgpu::Texture>,
     /// The pass that writes R32Float texels as depth (ZF32 uploads).
     depth_copy: Option<wgpu::RenderPipeline>,
     /// Float twins of integer compute images, by address, until the next dispatch.
-    pub(crate) twins: HashMap<u64, wgpu::Texture>,
+    pub(crate) twins: FxMap<u64, wgpu::Texture>,
     /// Color textures from memory read with a depth compare: their R channel as
     /// depth, by address and header; forgotten with any invalidation.
-    compare_depths: HashMap<(u64, [u8; 32]), wgpu::Texture>,
+    compare_depths: FxMap<(u64, [u8; 32]), wgpu::Texture>,
     /// Per program (key, paired pixel key, integer mask): the jump tables' bank
     /// bytes last seen and the module variant (id.3) they gave; the same bytes
     /// give the same variant without scanning them again.
@@ -97,7 +99,7 @@ pub struct Cache {
     pending: Vec<(u64, u64)>,
     /// Color targets read through a smaller texture header, cropped to it, by
     /// (address, format, width, height), with the target's write stamp when copied.
-    crops: HashMap<(u64, u32, u32, u32), (u64, wgpu::Texture)>,
+    crops: FxMap<(u64, u32, u32, u32), (u64, wgpu::Texture)>,
 }
 
 /// The bytes of each jump table's bank, as bound, in table order; None if a
@@ -191,7 +193,7 @@ fn float_format(f: wgpu::TextureFormat) -> Option<wgpu::TextureFormat> {
 
 /// Per program (key, paired pixel key, integer mask): jump-table bank bytes and the
 /// module variant they gave.
-type JumpMemo = HashMap<(u64, Option<u64>, u64), (Vec<Vec<u8>>, u64)>;
+type JumpMemo = FxMap<(u64, Option<u64>, u64), (Vec<Vec<u8>>, u64)>;
 
 /// What a render pipeline is made from, as a hashable key: the vertex program
 /// (key, WGSL length), the pixel program's, the vertex buffer layouts (stream,
