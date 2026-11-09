@@ -402,6 +402,10 @@ impl Kernel {
         if self.config.perf.is_some() {
             gyroship_runtime::profile::mark_frame();
         }
+        // The GPU work submitted from here to the end of this present is this frame's.
+        if let Some(s) = self.surfaces.as_mut() {
+            s.present = n;
+        }
         if n <= 3 || n.is_multiple_of(60) {
             let (layer, image) = (req.u64_at(0).unwrap_or(0), req.u32_at(0xc).unwrap_or(0));
             let (fence_id, fence) = (req.u32_at(0x50).unwrap_or(0), req.u64_at(0x58).unwrap_or(0));
@@ -442,15 +446,14 @@ impl Kernel {
         }
         // The presented image's hash, over the drawn area but its last row: the game's
         // upscaler races on that row (two threads write it; M3 report, §6.1).
+        // Hashed images are read back without waiting and land at the end of the run.
         if self.config.hashes.is_some()
             && let Some(s) = self.surfaces.as_mut()
         {
             let (w, h) = ((self.gs.drawn_area & 0xffff) + 1, (self.gs.drawn_area >> 16) + 1);
-            let line = match s.presented_hash(w, h.saturating_sub(1)) {
-                Some((target, hash)) => format!("{n},{target:#x},{hash:016x}"),
-                None => format!("{n},,"),
-            };
-            self.frame_hashes.push(line);
+            if !s.hash_presented(n, w, h.saturating_sub(1)) {
+                self.frame_hashes.push((n, None));
+            }
         }
         // The host window: show the frame, then wait for its time on the wall clock.
         let now = self.now();
@@ -474,6 +477,9 @@ impl Kernel {
             self.log(&line);
         } else if let Some(s) = self.surfaces.as_mut() {
             s.untouch();
+        }
+        if let Some(s) = self.surfaces.as_mut() {
+            s.present = n + 1;
         }
         if self.config.frames.is_some_and(|f| n >= f) {
             self.stop(0, &format!("{n} frames presented"));

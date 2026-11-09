@@ -296,8 +296,11 @@ pub fn run(table: Vec<rt::Entry>, window: Option<HostWindow>) {
             None => gyroship_gpu::surfaces::Surfaces::headless(backend),
         };
         match surfaces {
-            Ok(s) => {
+            Ok(mut s) => {
                 k.log(&format!("gpu: host renderer {}", s.describe()));
+                if k.config.perf.is_some() && !s.measure_frames() {
+                    eprintln!("gyroship: --perf: this GPU has no timestamps inside command encoders: no GPU frame times");
+                }
                 k.surfaces = Some(s);
             }
             Err(e) => {

@@ -173,8 +173,8 @@ pub struct Kernel {
     pub counts: std::collections::BTreeMap<&'static str, u64>,
     /// Named anomalies seen (D32), for the summary line.
     pub anomalies: std::collections::BTreeMap<&'static str, u64>,
-    /// `--hashes`: one CSV line per present.
-    pub frame_hashes: Vec<String>,
+    /// `--hashes`: the presents with no image to hash (the others come back from the GPU).
+    pub frame_hashes: Vec<(u64, Option<(u64, u64)>)>,
     /// The host window's pace hook and its last size (`boot::HostWindow`).
     pub window: Option<(Pace, (u32, u32))>,
     /// The host's live controller state, read at each hid sample.
@@ -287,10 +287,14 @@ impl Kernel {
     }
 
     /// Writes the host-side reports a run asked for (`--profile`, `--perf`).
-    pub fn host_reports(&self) {
+    pub fn host_reports(&mut self) {
         gyroship_runtime::profile::finish(&|a| self.symbolize(a));
         if let Some(path) = &self.config.perf {
-            gyroship_runtime::profile::write_perf(path, self.config.profile.as_ref().map_or(600, |p| p.1 as usize));
+            let (gpu, stalls) = self.surfaces.as_mut().map_or((Vec::new(), 0), |s| s.frame_times());
+            gyroship_runtime::profile::write_perf(path, self.config.profile.as_ref().map_or(600, |p| p.1 as usize), &gpu);
+            if stalls > 0 {
+                eprintln!("gyroship: GPU frame times: {stalls} flushes waited for the GPU to free a timing slot");
+            }
             if let Some(s) = &self.surfaces {
                 eprintln!("gyroship: staging over {} presents: {:?}", self.gs.presents, s.staging);
             }
@@ -316,7 +320,16 @@ impl Kernel {
             }
         }
         if let Some(path) = &self.config.hashes {
-            let csv = std::iter::once("present,target,hash".to_string()).chain(self.frame_hashes.iter().cloned()).collect::<Vec<_>>().join("\n") + "\n";
+            let mut rows = std::mem::take(&mut self.frame_hashes);
+            if let Some(s) = self.surfaces.as_mut() {
+                rows.extend(s.presented_hashes().into_iter().map(|(n, target, hash)| (n, Some((target, hash)))));
+            }
+            rows.sort_unstable();
+            let lines = rows.iter().map(|(n, h)| match h {
+                Some((target, hash)) => format!("{n},{target:#x},{hash:016x}"),
+                None => format!("{n},,"),
+            });
+            let csv = std::iter::once("present,target,hash".to_string()).chain(lines).collect::<Vec<_>>().join("\n") + "\n";
             if let Err(e) = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::write(path, csv)) {
                 eprintln!("gyroship: --hashes {}: {e}", path.display());
             }

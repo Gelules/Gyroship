@@ -137,6 +137,14 @@ pub struct Surfaces {
     pending: Option<wgpu::CommandEncoder>,
     /// GPU time per program, when asked for (`timing.rs`).
     pub(crate) timing: Option<crate::timing::Timing>,
+    /// GPU time per frame, for `--perf` ([`Surfaces::measure_frames`]).
+    clock: Option<crate::timing::FrameClock>,
+    /// The present the work recorded now belongs to (set by the caller at each present).
+    pub present: u64,
+    /// `--hashes` images on their way back from the GPU, oldest first.
+    readbacks: std::collections::VecDeque<Readback>,
+    /// The thread hashing them, and the channel to it.
+    hasher: Option<Hasher>,
     /// This frame's vertex, index and constant data: one buffer, written at flush.
     arena: (wgpu::Buffer, Vec<u8>),
     /// Offsets of the arena's staged blocks by content hash: draws share identical
@@ -146,6 +154,28 @@ pub struct Surfaces {
     last_color: Option<(u64, u32)>,
     /// The window the presented images go to, if any.
     window: Option<Window>,
+}
+
+/// A presented image copied for hashing: mapped when the GPU gets to it.
+struct Readback {
+    present: u64,
+    target: u64,
+    buffer: wgpu::Buffer,
+    /// Bytes of a row, its padded stride in the buffer, and the rows.
+    row: u32,
+    padded: u32,
+    height: u32,
+    /// 1 mapping, 2 mapped, 3 failed.
+    state: Arc<std::sync::atomic::AtomicU8>,
+}
+
+/// The channel to the thread hashing read-back images (present, target, rows),
+/// and that thread, which returns (present, target, hash) for each.
+type Hasher = (std::sync::mpsc::Sender<(u64, u64, Vec<u8>)>, std::thread::JoinHandle<Vec<(u64, u64, u64)>>);
+
+/// 64-bit FNV-1a, the hash of `--hashes`.
+fn fnv(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
 }
 
 /// A window's surface and the pipeline that copies an image into it.
@@ -349,7 +379,7 @@ impl Surfaces {
         let arena = (arena_buffer(&device, 16 << 20), Vec::new());
         let window = window.map(|(surface, size)| Window::new(&adapter, &device, surface, size));
         let timing = crate::timing::Timing::new(&device, &queue);
-        Ok(Surfaces { adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pending: None, timing, arena, staging: Staging::default(), staged: HashMap::new(), last_color: None, window })
+        Ok(Surfaces { adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pending: None, timing, clock: None, present: 0, readbacks: Default::default(), hasher: None, arena, staging: Staging::default(), staged: HashMap::new(), last_color: None, window })
     }
 
     /// Shows the presented image (the color target written last, its top-left
@@ -402,7 +432,27 @@ impl Surfaces {
     /// The encoder that collects a frame's passes: one submit per frame
     /// instead of one per operation. Give it back with [`Surfaces::record`].
     pub(crate) fn encoder(&mut self) -> wgpu::CommandEncoder {
-        self.pending.take().unwrap_or_else(|| self.device.create_command_encoder(&Default::default()))
+        self.pending.take().unwrap_or_else(|| {
+            let mut encoder = self.device.create_command_encoder(&Default::default());
+            if let Some(c) = &self.clock {
+                c.open(&mut encoder);
+            }
+            encoder
+        })
+    }
+
+    /// Times each frame's GPU work from now on (`--perf`); false if the GPU
+    /// has no timestamps inside command encoders.
+    pub fn measure_frames(&mut self) -> bool {
+        self.clock = crate::timing::FrameClock::new(&self.device, &self.queue);
+        self.clock.is_some()
+    }
+
+    /// Waits for the GPU; each present's GPU milliseconds (index: present) and
+    /// how many flushes had to wait for the GPU to free a timing slot.
+    pub fn frame_times(&mut self) -> (Vec<f64>, u64) {
+        self.flush();
+        self.clock.as_mut().map_or((Vec::new(), 0), |c| (c.finish(&self.device), c.stalls))
     }
 
     pub(crate) fn record(&mut self, encoder: wgpu::CommandEncoder) {
@@ -426,9 +476,15 @@ impl Surfaces {
             if let Some(t) = &self.timing {
                 t.resolve(&mut e);
             }
+            if let Some(c) = &mut self.clock {
+                c.close(&self.device, &mut e);
+            }
             self.queue.submit([e.finish()]);
             if let Some(t) = &mut self.timing {
                 t.collect(&self.device);
+            }
+            if let Some(c) = &mut self.clock {
+                c.submitted(&self.device, self.present);
             }
         }
     }
@@ -508,16 +564,18 @@ impl Surfaces {
         map.range((addr, 0)..=(addr, u32::MAX)).map(|(_, e)| e).max_by_key(|e| e.written)
     }
 
-    /// A 64-bit FNV-1a hash of the image a present shows: the color target
-    /// written last, its top-left `width` × `height` texels, raw bytes. None
-    /// if nothing was written or the target is smaller.
-    pub fn presented_hash(&mut self, width: u32, height: u32) -> Option<(u64, u64)> {
+    /// Starts hashing the image present `present` shows: the color target written
+    /// last, its top-left `width` × `height` texels, raw bytes (64-bit FNV-1a).
+    /// The copy is read back when the GPU gets to it, and hashed on a helper
+    /// thread: the frame never waits ([`Surfaces::presented_hashes`]). False if
+    /// nothing was written or the target is smaller.
+    pub fn hash_presented(&mut self, present: u64, width: u32, height: u32) -> bool {
         self.flush();
-        let e = self.map.get(&self.last_color?)?;
+        let Some(e) = self.last_color.and_then(|k| self.map.get(&k)) else { return false };
+        let Some(bpp) = e.texture.format().block_copy_size(None) else { return false };
         if width == 0 || height == 0 || width > e.surface.width || height > e.surface.height {
-            return None;
+            return false;
         }
-        let bpp = e.texture.format().block_copy_size(None)?;
         let row = width * bpp;
         let padded = row.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("hash"), size: u64::from(padded * height), usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
@@ -527,19 +585,53 @@ impl Surfaces {
             wgpu::TexelCopyBufferInfo { buffer: &buffer, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(padded), rows_per_image: Some(height) } },
             wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
         );
+        let target = e.surface.addr;
         self.queue.submit([encoder.finish()]);
-        let slice = buffer.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |_| ());
-        self.device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
-        let mapped = slice.get_mapped_range().ok()?;
-        let mut h = 0xcbf2_9ce4_8422_2325u64;
-        for y in 0..height {
-            let start = (y * padded) as usize;
-            for &b in &mapped[start..start + row as usize] {
-                h = (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
+        let state = Arc::new(std::sync::atomic::AtomicU8::new(1));
+        let done = state.clone();
+        buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| done.store(if r.is_ok() { 2 } else { 3 }, std::sync::atomic::Ordering::Release));
+        self.readbacks.push_back(Readback { present, target, buffer, row, padded, height, state });
+        // ponytail: a few images in flight bound the memory; the GPU rarely lags more.
+        self.collect_hashes(self.readbacks.len() > 8);
+        true
+    }
+
+    /// Hands the images back from the GPU to the hasher, oldest first; with
+    /// `wait`, waits for the GPU first.
+    fn collect_hashes(&mut self, wait: bool) {
+        let _ = self.device.poll(if wait { wgpu::PollType::wait_indefinitely() } else { wgpu::PollType::Poll });
+        while let Some(r) = self.readbacks.front() {
+            match r.state.load(std::sync::atomic::Ordering::Acquire) {
+                2 => {
+                    let mut bytes = Vec::with_capacity((r.row * r.height) as usize);
+                    if let Ok(mapped) = r.buffer.slice(..).get_mapped_range() {
+                        for line in mapped.chunks(r.padded as usize) {
+                            bytes.extend_from_slice(&line[..r.row as usize]);
+                        }
+                    }
+                    r.buffer.unmap();
+                    let (tx, _) = self.hasher.get_or_insert_with(|| {
+                        let (tx, rx) = std::sync::mpsc::channel::<(u64, u64, Vec<u8>)>();
+                        (tx, std::thread::spawn(move || rx.into_iter().map(|(present, target, bytes)| (present, target, fnv(&bytes))).collect()))
+                    });
+                    let _ = tx.send((r.present, r.target, bytes));
+                }
+                3 => eprintln!("gyroship: --hashes: present {}: the image could not be read back", r.present),
+                _ => break,
             }
+            self.readbacks.pop_front();
         }
-        Some((e.surface.addr, h))
+    }
+
+    /// Waits for every image in flight; (present, target, hash) of each image
+    /// hashed, by present.
+    pub fn presented_hashes(&mut self) -> Vec<(u64, u64, u64)> {
+        self.collect_hashes(true);
+        let Some((tx, hasher)) = self.hasher.take() else { return Vec::new() };
+        drop(tx);
+        let mut all = hasher.join().unwrap_or_default();
+        all.sort_unstable();
+        all
     }
 
     /// The GPU and backend in use, for the journal.
@@ -873,5 +965,24 @@ mod tests {
             let left = i % 4 < 2;
             assert_eq!(p, if left { [255, 0, 255, 255] } else { [0, 0, 255, 255] }, "pixel {i}: {rgba:?}");
         }
+    }
+
+    /// Presented images are hashed off the frame: each present's hash comes
+    /// back in present order, FNV-1a over the image's raw bytes; an area larger
+    /// than the target gives none. Needs a GPU adapter.
+    #[test]
+    fn presented_images_hash_in_present_order() {
+        let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
+            eprintln!("no GPU adapter: test skipped");
+            return;
+        };
+        let one = 1f32.to_bits();
+        let target = Surface { addr: 0x81_0000_6000, width: 4, height: 2, format: 0xd5, layers: 1 };
+        s.clear(&Clear { layer: 0, color: Some((target, [0, 0, one, one], 0xf)), depth: None, scissor: None });
+        assert!(s.hash_presented(1, 4, 2));
+        assert!(s.hash_presented(2, 4, 1));
+        assert!(!s.hash_presented(3, 5, 1));
+        let blue = |texels: usize| fnv(&[0u8, 0, 255, 255].repeat(texels));
+        assert_eq!(s.presented_hashes(), vec![(1, target.addr, blue(8)), (2, target.addr, blue(4))]);
     }
 }

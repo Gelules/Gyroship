@@ -37,14 +37,15 @@ pub fn mark_frame() {
     FRAMES.lock().unwrap_or_else(|e| e.into_inner()).push(std::time::Instant::now());
 }
 
-/// Writes each frame's wall time to `path` (CSV: present, ms) and prints
-/// the median and 95th percentile from present `from` on.
-pub fn write_perf(path: &std::path::Path, from: usize) {
+/// Writes each frame's wall time and the GPU time of its work (`gpu`, by
+/// present; empty if not measured) to `path` (CSV: present, ms, gpu_ms) and
+/// prints their median, 95th percentile and mean from present `from` on.
+pub fn write_perf(path: &std::path::Path, from: usize, gpu: &[f64]) {
     let marks = std::mem::take(&mut *FRAMES.lock().unwrap_or_else(|e| e.into_inner()));
     let ms: Vec<f64> = marks.windows(2).map(|w| (w[1] - w[0]).as_secs_f64() * 1e3).collect();
-    let mut csv = String::from("present,ms\n");
+    let mut csv = String::from("present,ms,gpu_ms\n");
     for (i, t) in ms.iter().enumerate() {
-        csv += &format!("{},{t:.3}\n", i + 2);
+        csv += &format!("{},{t:.3},{:.3}\n", i + 2, gpu.get(i + 2).copied().unwrap_or(0.0));
     }
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -52,14 +53,21 @@ pub fn write_perf(path: &std::path::Path, from: usize) {
     if let Err(e) = std::fs::write(path, csv) {
         eprintln!("gyroship: --perf {}: {e}", path.display());
     }
-    let mut steady: Vec<f64> = ms.iter().copied().skip(from.saturating_sub(1)).collect();
-    if steady.is_empty() {
-        return;
+    let stats = |label: &str, values: &[f64]| {
+        let mut steady: Vec<f64> = values.iter().copied().skip(from.saturating_sub(1)).collect();
+        if steady.is_empty() {
+            return;
+        }
+        steady.sort_by(f64::total_cmp);
+        let at = |q: f64| steady[((steady.len() - 1) as f64 * q) as usize];
+        let mean = steady.iter().sum::<f64>() / steady.len() as f64;
+        eprintln!("gyroship: {label} from present {from}: {} frames, median {:.2} ms, p95 {:.2} ms, mean {mean:.2} ms", steady.len(), at(0.5), at(0.95));
+    };
+    stats("perf", &ms);
+    // The GPU's own time, aligned with the wall times (index 0: present 2).
+    if gpu.len() > 2 {
+        stats("GPU time", &gpu[2..]);
     }
-    steady.sort_by(f64::total_cmp);
-    let at = |q: f64| steady[((steady.len() - 1) as f64 * q) as usize];
-    let mean = steady.iter().sum::<f64>() / steady.len() as f64;
-    eprintln!("gyroship: perf from present {from}: {} frames, median {:.2} ms, p95 {:.2} ms, mean {mean:.2} ms", steady.len(), at(0.5), at(0.95));
 }
 
 /// Counts an instruction the interpreter runs, while a profile runs.
