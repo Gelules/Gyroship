@@ -386,6 +386,20 @@ impl mme::Host for MacroHost<'_> {
     }
 }
 
+/// Adds a guest write to `effects`, merged into the previous effect when that
+/// is a write ending where this one starts: a macro's run of constant-buffer
+/// words becomes one write (one translation, one invalidation, one copy). The
+/// HLE splits a write where the GPU mappings do.
+fn push_write(effects: &mut Vec<Effect>, address: u64, bytes: &[u8]) {
+    if let Some(Effect::Write(last)) = effects.last_mut()
+        && last.address + last.data.len() as u64 == address
+    {
+        last.data.extend_from_slice(bytes);
+    } else {
+        effects.push(Effect::Write(MemWrite { address, data: bytes.to_vec() }));
+    }
+}
+
 impl Channel {
     /// Runs one pushbuffer segment, every acquire taken as met (for replays
     /// without memory).
@@ -555,13 +569,13 @@ impl Channel {
         }
         if three_d {
             let regs = &self.engine[subchannel * 0x1000..(subchannel + 1) * 0x1000];
-            effects.extend(self.resources.method(method, value, &|m| regs.get((m / 4) as usize).copied().unwrap_or(0)).into_iter().map(Effect::Write));
+            self.resources.method(method, value, &|m| regs.get((m / 4) as usize).copied().unwrap_or(0), &mut |a, b| push_write(effects, a, b));
             effects.extend(self.resources.unsupported.drain(..).map(Effect::Unsupported));
             effects.extend(self.resources.semaphores.drain(..).map(Effect::Semaphore));
         } else if self.classes[subchannel] & 0xff == 0xc0 && (LOAD_INLINE_QMD_DATA..LOAD_INLINE_QMD_DATA + 0x100).contains(&method) {
             // LOAD_INLINE_QMD_DATA(i): word i of the QMD at SET_INLINE_QMD_ADDRESS_A/B << 8.
             let at = (u64::from(self.reg(subchannel, SET_INLINE_QMD_ADDRESS)) << 32 | u64::from(self.reg(subchannel, SET_INLINE_QMD_ADDRESS + 4))) << 8;
-            effects.push(Effect::Write(MemWrite { address: at + u64::from(method - LOAD_INLINE_QMD_DATA), data: value.to_le_bytes().to_vec() }));
+            push_write(effects, at + u64::from(method - LOAD_INLINE_QMD_DATA), &value.to_le_bytes());
             // Once the last word is in, it schedules itself unless it waits for a PCAS.
             if method == LOAD_INLINE_QMD_DATA + 0xfc {
                 let regs = &self.engine[subchannel * 0x1000..(subchannel + 1) * 0x1000];
@@ -576,7 +590,7 @@ impl Channel {
             // Compute and inline-to-memory classes share the 3D class's upload methods.
             let regs = &self.engine[subchannel * 0x1000..(subchannel + 1) * 0x1000];
             let r = self.uploads.entry(subchannel).or_default();
-            effects.extend(r.method(method, value, &|m| regs.get((m / 4) as usize).copied().unwrap_or(0)).into_iter().map(Effect::Write));
+            r.method(method, value, &|m| regs.get((m / 4) as usize).copied().unwrap_or(0), &mut |a, b| push_write(effects, a, b));
             effects.extend(r.unsupported.drain(..).map(Effect::Unsupported));
             effects.extend(r.semaphores.drain(..).map(Effect::Semaphore));
         }
@@ -1001,7 +1015,8 @@ mod tests {
         ];
         let effects = c.run(&words);
         let writes: Vec<(u64, Vec<u8>)> = effects.iter().filter_map(|e| if let Effect::Write(w) = e { Some((w.address, w.data.clone())) } else { None }).collect();
-        assert_eq!(writes, vec![(0x12_3456_7870, vec![0x11; 4]), (0x12_3456_7874, vec![0x22; 4])]);
+        // The two words are contiguous: one write, in stream order.
+        assert_eq!(writes, vec![(0x12_3456_7870, [[0x11; 4], [0x22; 4]].concat())]);
         let Some(Effect::Draw(d)) = effects.last() else { panic!("{effects:?}") };
         assert_eq!(d.cbufs[4][2], Some((0x12_3456_7800, 0x100)));
         assert!(d.index.is_none());

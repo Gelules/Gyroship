@@ -85,9 +85,18 @@ fn flatten(maps: &[(u32, u64, u64, u64)]) -> Table {
 
 /// The CPU address of `gpu` in `space` through `table`; itself when no range has it.
 fn lookup(table: &Table, space: u32, gpu: u64) -> u64 {
+    span(table, space, gpu).0
+}
+
+/// The CPU address of `gpu` in `space` and how many bytes from it stay in one
+/// range of `table`: to its end, or, outside every range, to the next one's start.
+fn span(table: &Table, space: u32, gpu: u64) -> (u64, u64) {
     match table.range(..=(space, gpu)).next_back() {
-        Some((&(s, first), &(last, cpu))) if s == space && gpu <= last => cpu + (gpu - first),
-        _ => gpu,
+        Some((&(s, first), &(last, cpu))) if s == space && gpu <= last => (cpu + (gpu - first), (last - gpu).saturating_add(1)),
+        _ => {
+            let next = table.range((space, gpu)..).next().filter(|((s, _), _)| *s == space).map_or(u64::MAX, |((_, f), _)| *f);
+            (gpu, next - gpu)
+        }
     }
 }
 
@@ -97,6 +106,19 @@ impl crate::Kernel {
     /// as CPU addresses (NVN maps the CPU's ASLR region one to one).
     pub fn gpu_to_cpu(&mut self, space: u32, gpu: u64) -> u64 {
         lookup(&self.gs.gpu_table, space, gpu)
+    }
+
+    /// Writes `bytes` at GPU address `gpu` of `space`, each part through the
+    /// mapping that covers it (the GPU writes whatever the CPU's permissions);
+    /// Err with the CPU address of a part that is not writable.
+    pub fn write_gpu(&mut self, space: u32, mut gpu: u64, mut bytes: &[u8]) -> Result<(), u64> {
+        while !bytes.is_empty() {
+            let (at, room) = span(&self.gs.gpu_table, space, gpu);
+            let n = bytes.len().min(usize::try_from(room).unwrap_or(usize::MAX));
+            self.mem.write_object(at, &bytes[..n]).map_err(|_| at)?;
+            (gpu, bytes) = (gpu + n as u64, &bytes[n..]);
+        }
+        Ok(())
     }
 
     /// Reads guest memory at a GPU address for the GPU; false if a byte is
@@ -618,9 +640,14 @@ mod tests {
                 paint(&mut table, space, first, last, cpu);
             }
             let probes = (0..64).map(|_| (next(2) as u32, next(80 * 0x1000))).chain([first.wrapping_sub(1), first, last, last + 1].map(|gpu| (space, gpu)));
+            let scan = |maps: &[(u32, u64, u64, u64)], space: u32, gpu: u64| maps.iter().rev().find(|m| m.0 == space && (m.1..=m.2).contains(&gpu)).map_or(gpu, |m| m.3 + (gpu - m.1));
             for (space, gpu) in probes.collect::<Vec<_>>() {
-                let scan = maps.iter().rev().find(|m| m.0 == space && (m.1..=m.2).contains(&gpu)).map_or(gpu, |m| m.3 + (gpu - m.1));
-                assert_eq!(lookup(&table, space, gpu), scan, "round {round}: space {space}, gpu {gpu:#x}");
+                let (cpu, room) = span(&table, space, gpu);
+                assert_eq!(cpu, scan(&maps, space, gpu), "round {round}: space {space}, gpu {gpu:#x}");
+                // The span's last byte is still contiguous with its first.
+                if room < 1 << 32 {
+                    assert_eq!(scan(&maps, space, gpu + room - 1), cpu + room - 1, "round {round}: space {space}, gpu {gpu:#x}, span {room:#x}");
+                }
             }
         }
     }

@@ -732,8 +732,8 @@ impl Gpu {
                     if let Some(s) = &mut k.surfaces {
                         s.invalidate(w.address, w.data.len() as u64);
                     }
-                    let at = k.gpu_to_cpu(space, w.address);
-                    if k.mem.write_object(at, &w.data).is_err() {
+                    // Contiguous writes come merged: split where the mappings are.
+                    if let Err(at) = k.write_gpu(space, w.address, &w.data) {
                         k.anomaly("gpu write not done", &format!("{} bytes at {:#x} (cpu {at:#x}) not writable", w.data.len(), w.address));
                     }
                 }

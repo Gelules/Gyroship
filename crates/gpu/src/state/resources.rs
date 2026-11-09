@@ -195,11 +195,12 @@ pub struct Resources {
 pub type Bindings = [[Option<(u64, u32)>; BANKS]; STAGES];
 
 impl Resources {
-    /// Feeds one 3D method; `r` reads the register file after this write.
-    pub fn method(&mut self, method: u32, value: u32, r: Reg) -> Vec<MemWrite> {
+    /// Feeds one 3D method; `r` reads the register file after this write, and
+    /// `write` receives each guest write it makes (address, bytes), in order.
+    pub fn method(&mut self, method: u32, value: u32, r: Reg, write: &mut dyn FnMut(u64, &[u8])) {
         match method {
             LOAD_CONSTANT_BUFFER_OFFSET => self.cbuf_offset = value & 0xffff,
-            m if LOAD_CONSTANT_BUFFER.contains(&m) => return self.load_cbuf(value, r),
+            m if LOAD_CONSTANT_BUFFER.contains(&m) => self.load_cbuf(value, r, write),
             m if (BIND_GROUP_CONSTANT_BUFFER..0x25f8).contains(&m) && (m - BIND_GROUP_CONSTANT_BUFFER).is_multiple_of(32) => {
                 let stage = ((m - BIND_GROUP_CONSTANT_BUFFER) / 32) as usize;
                 if stage >= STAGES {
@@ -212,11 +213,10 @@ impl Resources {
                 }
             }
             LAUNCH_DMA => self.launch(value, r),
-            LOAD_INLINE_DATA => return self.inline_data(method, value),
+            LOAD_INLINE_DATA => self.inline_data(method, value, write),
             SET_ROOT_TABLE_SELECTOR | LOAD_ROOT_TABLE | UNBIND_ALL => self.unsupported.push(Unsupported::Method { method, value }),
             _ => {}
         }
-        Vec::new()
     }
 
     pub fn bindings(&self) -> Bindings {
@@ -228,15 +228,15 @@ impl Resources {
         *self.banks.get(stage)?.get(bank)?
     }
 
-    fn load_cbuf(&mut self, value: u32, r: Reg) -> Vec<MemWrite> {
+    fn load_cbuf(&mut self, value: u32, r: Reg, write: &mut dyn FnMut(u64, &[u8])) {
         let (address, size) = selector(r);
         let offset = self.cbuf_offset;
         self.cbuf_offset += 4;
         if offset + 4 > size {
             self.unsupported.push(Unsupported::CbufLoadPastSize { address, offset, size });
-            return Vec::new();
+            return;
         }
-        vec![MemWrite { address: address + offset as u64, data: value.to_le_bytes().to_vec() }]
+        write(address + offset as u64, &value.to_le_bytes());
     }
 
     fn launch(&mut self, value: u32, r: Reg) {
@@ -279,22 +279,17 @@ impl Resources {
         });
     }
 
-    fn inline_data(&mut self, method: u32, value: u32) -> Vec<MemWrite> {
+    fn inline_data(&mut self, method: u32, value: u32, write: &mut dyn FnMut(u64, &[u8])) {
         let Some(u) = &mut self.upload else {
             self.unsupported.push(Unsupported::Method { method, value });
-            return Vec::new();
+            return;
         };
         let n = (u.total - u.done).min(4);
-        let mut out: Vec<MemWrite> = Vec::new();
         if u.write {
             for (k, byte) in value.to_le_bytes().into_iter().take(n as usize).enumerate() {
                 // Line i / LINE_LENGTH_IN lands at OFFSET_OUT + line * PITCH_OUT.
                 let i = u.done + k as u64;
-                let a = u.address + i / u.line_length * u.pitch + i % u.line_length;
-                match out.last_mut() {
-                    Some(w) if w.address + w.data.len() as u64 == a => w.data.push(byte),
-                    _ => out.push(MemWrite { address: a, data: vec![byte] }),
-                }
+                write(u.address + i / u.line_length * u.pitch + i % u.line_length, &[byte]);
             }
         }
         u.done += n;
@@ -302,7 +297,6 @@ impl Resources {
             self.semaphores.extend(u.semaphore);
             self.upload = None;
         }
-        out
     }
 }
 
@@ -320,11 +314,17 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    /// Writes `m = v` into the register file, then feeds it.
+    /// Writes `m = v` into the register file, then feeds it; the guest writes
+    /// it made, contiguous ones merged (as the channel does).
     fn feed(res: &mut Resources, regs: &mut HashMap<u32, u32>, m: u32, v: u32) -> Vec<MemWrite> {
         regs.insert(m, v);
         let r = |x: u32| regs.get(&x).copied().unwrap_or(0);
-        res.method(m, v, &r)
+        let mut out: Vec<MemWrite> = Vec::new();
+        res.method(m, v, &r, &mut |address, bytes| match out.last_mut() {
+            Some(w) if w.address + w.data.len() as u64 == address => w.data.extend_from_slice(bytes),
+            _ => out.push(MemWrite { address, data: bytes.to_vec() }),
+        });
+        out
     }
 
     fn select(res: &mut Resources, regs: &mut HashMap<u32, u32>, size: u32, addr: u64) {
