@@ -154,6 +154,10 @@ pub struct Surfaces {
     last_color: Option<(u64, u32)>,
     /// The window the presented images go to, if any.
     window: Option<Window>,
+    /// The guest ranges read for the GPU in this submit, by kind and address: their lengths.
+    seen: HashMap<(u8, u64), Vec<usize>>,
+    /// This submit's guest reads and staged blocks, for the reads that repeat.
+    pub(crate) memo: Memo,
 }
 
 /// A presented image copied for hashing: mapped when the GPU gets to it.
@@ -250,7 +254,9 @@ impl Window {
 /// What the upload arena carried since the start: staged blocks (and those an
 /// identical block already in the frame's arena served), their bytes by kind
 /// (constant banks, other data), the zeros completing bank windows, and the
-/// bytes and count of the arena uploads.
+/// bytes and count of the arena uploads. Then the guest reads for the GPU by
+/// kind ([`Read`]): reads and bytes, those of an (address, length) the same
+/// submit already read, and reads of an address already read with another length.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Staging {
     pub calls: u64,
@@ -260,6 +266,82 @@ pub struct Staging {
     pub zero_bytes: u64,
     pub flushed: u64,
     pub flushes: u64,
+    pub reads: [u64; 5],
+    pub read_bytes: [u64; 5],
+    pub repeats: [u64; 5],
+    pub repeat_bytes: [u64; 5],
+    pub other_lengths: [u64; 5],
+}
+
+/// What a guest read for the GPU was for, an index into [`Staging`]'s arrays.
+#[derive(Clone, Copy)]
+pub(crate) enum Read {
+    Vertex,
+    Index,
+    Bank,
+    ComputeBank,
+    Global,
+}
+
+/// A range of the upload arena: its buffer, offset and size.
+pub(crate) type Slice = (wgpu::Buffer, u64, u64);
+
+/// Staged indices: the range, their format and the highest index.
+pub(crate) type Indices = (Slice, wgpu::IndexFormat, u32);
+
+/// A memo value and the write epoch it was made at.
+type Dated<T> = (T, u64);
+
+/// Bytes read from guest memory, shared by the draws that read them.
+type Bytes = Arc<Vec<u8>>;
+
+/// What this submit already read from guest memory for the GPU, and staged:
+/// most reads repeat (the same constant banks and meshes for many draws), and a
+/// repeat skips the read, the hash and the copy. A GPU write stamps the 4 KiB
+/// pages it touches with a new epoch; an entry is stale once one of its pages
+/// was stamped after it was made. Host state only, emptied at each submit and
+/// flush (guest code may have written in between).
+#[derive(Default)]
+pub(crate) struct Memo {
+    /// (kind, address, length) -> the bytes.
+    reads: HashMap<(u8, u64, usize), Dated<Bytes>>,
+    /// (kind, address, length, filled to, bound as) -> the staged block.
+    staged: HashMap<(u8, u64, usize, usize, usize), Dated<Slice>>,
+    /// (address, index size, count, restart index) -> the staged indices.
+    indices: HashMap<(u64, usize, u32, Option<u32>), Dated<Indices>>,
+    /// The epoch of each page written by the GPU in this submit.
+    pages: HashMap<u64, u64>,
+    epoch: u64,
+}
+
+impl Memo {
+    fn clear(&mut self) {
+        self.reads.clear();
+        self.staged.clear();
+        self.indices.clear();
+        self.pages.clear();
+    }
+
+    /// The GPU wrote `[start, start + len)`.
+    pub(crate) fn wrote(&mut self, start: u64, len: u64) {
+        if len == 0 {
+            return;
+        }
+        self.epoch += 1;
+        for page in start >> 12..=start.saturating_add(len - 1) >> 12 {
+            self.pages.insert(page, self.epoch);
+        }
+    }
+
+    /// No GPU write on `[addr, addr + len)`'s pages since `epoch`.
+    fn fresh(&self, addr: u64, len: usize, epoch: u64) -> bool {
+        let (first, last) = (addr >> 12, addr.saturating_add(len.max(1) as u64 - 1) >> 12);
+        if self.pages.len() as u64 <= last - first {
+            self.pages.iter().all(|(page, e)| *e <= epoch || !(first..=last).contains(page))
+        } else {
+            (first..=last).all(|page| self.pages.get(&page).is_none_or(|e| *e <= epoch))
+        }
+    }
 }
 
 /// Offsets in the upload arena: the uniform binding alignment wgpu allows at most.
@@ -379,7 +461,7 @@ impl Surfaces {
         let arena = (arena_buffer(&device, 16 << 20), Vec::new());
         let window = window.map(|(surface, size)| Window::new(&adapter, &device, surface, size));
         let timing = crate::timing::Timing::new(&device, &queue);
-        Ok(Surfaces { adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pending: None, timing, clock: None, present: 0, readbacks: Default::default(), hasher: None, arena, staging: Staging::default(), staged: HashMap::new(), last_color: None, window })
+        Ok(Surfaces { adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pending: None, timing, clock: None, present: 0, readbacks: Default::default(), hasher: None, arena, staging: Staging::default(), staged: HashMap::new(), last_color: None, window, seen: HashMap::new(), memo: Memo::default() })
     }
 
     /// Shows the presented image (the color target written last, its top-left
@@ -462,7 +544,89 @@ impl Surfaces {
     /// Submits the work recorded so far (at each present, and before any
     /// readback). Uploads (`write_texture`) only ever go to new textures,
     /// which nothing recorded before can use, so they need no flush.
+    /// Counts a guest read for the GPU (host statistics, see [`Staging`]).
+    pub(crate) fn note_read(&mut self, kind: Read, addr: u64, len: usize) {
+        let k = kind as usize;
+        let s = &mut self.staging;
+        s.reads[k] += 1;
+        s.read_bytes[k] += len as u64;
+        let lengths = self.seen.entry((k as u8, addr)).or_default();
+        if lengths.contains(&len) {
+            s.repeats[k] += 1;
+            s.repeat_bytes[k] += len as u64;
+        } else {
+            s.other_lengths[k] += u64::from(!lengths.is_empty());
+            lengths.push(len);
+        }
+    }
+
+    /// Guest code may have run since the last GPU work (a new submit, or a
+    /// wait that ended): what was read from guest memory may have changed.
+    pub fn new_submit(&mut self) {
+        self.seen.clear();
+        self.memo.clear();
+    }
+
+    /// `len` bytes of guest memory at `addr`, read through `mem` unless this
+    /// submit read them already and the GPU has not written them since; None
+    /// if they are not readable.
+    pub(crate) fn read_guest(&mut self, kind: Read, addr: u64, len: usize, mem: crate::draw::Mem) -> Option<Arc<Vec<u8>>> {
+        self.note_read(kind, addr, len);
+        let key = (kind as u8, addr, len);
+        if let Some((bytes, epoch)) = self.memo.reads.get(&key)
+            && self.memo.fresh(addr, len, *epoch)
+        {
+            return Some(bytes.clone());
+        }
+        let mut bytes = vec![0u8; len];
+        if !mem(addr, &mut bytes) {
+            return None;
+        }
+        let bytes = Arc::new(bytes);
+        self.memo.reads.insert(key, (bytes.clone(), self.memo.epoch));
+        Some(bytes)
+    }
+
+    /// As [`Surfaces::stage_window`], for `bytes` read from guest memory at
+    /// `addr`: staged once a submit while the GPU does not write them.
+    pub(crate) fn stage_guest(&mut self, kind: Read, addr: u64, bytes: &[u8], zeros: usize, window: usize) -> Slice {
+        let key = (kind as u8, addr, bytes.len(), zeros, window);
+        if let Some((slice, epoch)) = self.memo.staged.get(&key)
+            && self.memo.fresh(addr, bytes.len(), *epoch)
+        {
+            return slice.clone();
+        }
+        let slice = self.stage_window(bytes, zeros, window);
+        self.memo.staged.insert(key, (slice.clone(), self.memo.epoch));
+        slice
+    }
+
+    /// The block [`Surfaces::stage_guest`] staged for these arguments, if this
+    /// submit made it and the GPU has not written its bytes since (the read is
+    /// counted in [`Staging`]).
+    pub(crate) fn staged_guest(&mut self, kind: Read, addr: u64, len: usize, zeros: usize, window: usize) -> Option<Slice> {
+        self.note_read(kind, addr, len);
+        let (slice, epoch) = self.memo.staged.get(&(kind as u8, addr, len, zeros, window))?;
+        self.memo.fresh(addr, len, *epoch).then(|| slice.clone())
+    }
+
+    /// The staged indices of `count` indices of `size` bytes at `addr` (with a
+    /// restart index), their format and the highest index, if this submit made
+    /// them and the GPU has not written them since.
+    pub(crate) fn staged_indices(&mut self, addr: u64, size: usize, count: u32, restart: Option<u32>) -> Option<Indices> {
+        self.note_read(Read::Index, addr, size * count as usize);
+        let (found, epoch) = self.memo.indices.get(&(addr, size, count, restart))?;
+        self.memo.fresh(addr, size * count as usize, *epoch).then(|| found.clone())
+    }
+
+    /// Records indices staged by the caller (see [`Surfaces::staged_indices`]).
+    pub(crate) fn remember_indices(&mut self, addr: u64, size: usize, count: u32, restart: Option<u32>, staged: Indices) {
+        self.memo.indices.insert((addr, size, count, restart), (staged, self.memo.epoch));
+    }
+
     pub fn flush(&mut self) {
+        self.seen.clear();
+        self.memo.clear();
         // The arena's writes land before this submit's commands, and after the
         // previous frame's, which read the same bytes: queue order.
         if !self.arena.1.is_empty() {
@@ -495,13 +659,6 @@ impl Surfaces {
         self.stage_window(bytes, 0, 0)
     }
 
-    /// A constant bank: `bytes` then zeros up to `zeros` bytes (what the program
-    /// may read), bound as 64 KiB, its declared size; past `zeros` the range holds
-    /// whatever the arena does, never read.
-    pub(crate) fn stage_bank(&mut self, bytes: &[u8], zeros: usize) -> (wgpu::Buffer, u64, u64) {
-        self.stage_window(bytes, zeros, 0x10000)
-    }
-
     /// As [`Surfaces::stage`], the range given being at least `window` bytes: a
     /// constant bank is bound as 64 KiB but only its bound size is hashed and
     /// compared; the rest of its window is zeros, as the console reads past a bank's
@@ -529,6 +686,9 @@ impl Surfaces {
             let capacity = (capacity * 2).max((range as u64).next_power_of_two());
             self.arena = (arena_buffer(&self.device, capacity), Vec::new());
             self.staged.clear();
+            // ponytail: staged blocks stay valid in the old buffer; dropped for simplicity (rare).
+            self.memo.staged.clear();
+            self.memo.indices.clear();
             return self.stage_window(bytes, zeros, window);
         }
         match window {
@@ -965,6 +1125,35 @@ mod tests {
             let left = i % 4 < 2;
             assert_eq!(p, if left { [255, 0, 255, 255] } else { [0, 0, 255, 255] }, "pixel {i}: {rgba:?}");
         }
+    }
+
+    /// A guest range read again in a submit comes from the memo; a GPU write on
+    /// one of its pages, or a new submit, sends the next read to memory; a write
+    /// elsewhere does not. Needs a GPU adapter.
+    #[test]
+    fn repeated_guest_reads_skip_memory_until_written() {
+        let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
+            eprintln!("no GPU adapter: test skipped");
+            return;
+        };
+        let reads = std::cell::Cell::new(0);
+        let mut mem = |_: u64, buf: &mut [u8]| {
+            reads.set(reads.get() + 1);
+            buf.fill(7);
+            true
+        };
+        let mut read = |s: &mut Surfaces| s.read_guest(Read::Bank, 0x1000, 16, &mut mem).map(|b| b.to_vec());
+        assert_eq!(read(&mut s), Some(vec![7; 16]));
+        assert_eq!(read(&mut s), Some(vec![7; 16]));
+        s.invalidate(0x3000, 4);
+        read(&mut s);
+        assert_eq!(reads.get(), 1);
+        s.invalidate(0x1ff0, 0x20);
+        read(&mut s);
+        assert_eq!(reads.get(), 2);
+        s.new_submit();
+        read(&mut s);
+        assert_eq!(reads.get(), 3);
     }
 
     /// Presented images are hashed off the frame: each present's hash comes

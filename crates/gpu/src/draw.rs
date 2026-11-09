@@ -23,6 +23,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 /// Reads guest memory at a GPU address; false if a byte is not readable.
 pub type Mem<'a> = &'a mut dyn FnMut(u64, &mut [u8]) -> bool;
 
+/// A constant bank as read: its guest address and bytes (shared by the draws of a submit).
+pub(crate) type Bank = (u64, std::sync::Arc<Vec<u8>>);
+
 /// The bytes of a constant bank as the translated programs declare it.
 const CBUF_BYTES: usize = 0x10000;
 
@@ -208,7 +211,7 @@ type PipelineKey = (
 /// A stage's bindings.
 pub(crate) struct Bindings {
     /// Constant buffers by bank.
-    pub(crate) cbufs: BTreeMap<u8, Vec<u8>>,
+    pub(crate) cbufs: BTreeMap<u8, Bank>,
     pub(crate) textures: Vec<Slot>,
     /// Each slot's header swizzle, when the program reads them.
     pub(crate) swizzles: Option<Vec<u32>>,
@@ -390,18 +393,29 @@ impl Surfaces {
                 if size == 0 {
                     return Err("index size".into());
                 }
-                let mut raw = vec![0u8; size * d.count as usize];
-                if !mem(ib.address + u64::from(ib.first) * size as u64, &mut raw) {
-                    return Err("index buffer not readable".into());
-                }
-                let max = index_max(&raw, size, ib.restart_enable.then_some(ib.restart_index));
-                let (bytes, format) = match size {
-                    4 => (raw, wgpu::IndexFormat::Uint32),
-                    2 => (raw, wgpu::IndexFormat::Uint16),
-                    1 => (raw.iter().flat_map(|&b| u16::from(b).to_le_bytes()).collect(), wgpu::IndexFormat::Uint16),
-                    _ => (raw.chunks_exact(size).flat_map(|c| (index_value(c) as u16).to_le_bytes()).collect(), wgpu::IndexFormat::Uint16),
+                let addr = ib.address + u64::from(ib.first) * size as u64;
+                let restart = ib.restart_enable.then_some(ib.restart_index);
+                // Staged once a submit: the same indices serve many draws.
+                let (slice, format, max) = match self.staged_indices(addr, size, d.count, restart) {
+                    Some(found) => found,
+                    None => {
+                        let mut raw = vec![0u8; size * d.count as usize];
+                        if !mem(addr, &mut raw) {
+                            return Err("index buffer not readable".into());
+                        }
+                        let max = index_max(&raw, size, restart);
+                        let (bytes, format) = match size {
+                            4 => (raw, wgpu::IndexFormat::Uint32),
+                            2 => (raw, wgpu::IndexFormat::Uint16),
+                            1 => (raw.iter().flat_map(|&b| u16::from(b).to_le_bytes()).collect(), wgpu::IndexFormat::Uint16),
+                            _ => (raw.chunks_exact(size).flat_map(|c| (index_value(c) as u16).to_le_bytes()).collect(), wgpu::IndexFormat::Uint16),
+                        };
+                        let found = (self.stage(&bytes), format, max);
+                        self.remember_indices(addr, size, d.count, restart, found.clone());
+                        found
+                    }
                 };
-                (Some((bytes, format)), (i64::from(d.base_vertex) + i64::from(max)).max(0) as u64)
+                (Some((slice, format)), (i64::from(d.base_vertex) + i64::from(max)).max(0) as u64)
             }
             None => (None, u64::from(d.first) + u64::from(d.count) - 1),
         };
@@ -414,11 +428,18 @@ impl Surfaces {
             if s.end.wrapping_sub(s.address) < bytes - 1 || bytes > 64 << 20 {
                 return Err("vertex stream shorter than the draw".into());
             }
-            let mut data = vec![0u8; bytes.next_multiple_of(4) as usize];
-            if !mem(s.address, &mut data[..bytes as usize]) {
-                return Err("vertex stream not readable".into());
-            }
-            vertex_buffers.push(self.stage(&data));
+            let padded = bytes.next_multiple_of(4) as usize;
+            let slice = match self.staged_guest(crate::surfaces::Read::Vertex, s.address, padded, 0, 0) {
+                Some(slice) => slice,
+                None => {
+                    let mut data = vec![0u8; padded];
+                    if !mem(s.address, &mut data[..bytes as usize]) {
+                        return Err("vertex stream not readable".into());
+                    }
+                    self.stage_guest(crate::surfaces::Read::Vertex, s.address, &data, 0, 0)
+                }
+            };
+            vertex_buffers.push(slice);
         }
 
         // Constant buffers and textures, per stage (bind group 0 vertex, 1 pixel).
@@ -501,9 +522,9 @@ impl Surfaces {
             let Bindings { cbufs, textures, swizzles, .. } = &stages[g];
             let mut buffers: Vec<(u32, (wgpu::Buffer, u64, u64))> = cbufs
                 .iter()
-                .map(|(b, data)| {
+                .map(|(b, (addr, data))| {
                     let (len, zeros) = stages[g].staged(*b, data);
-                    (u32::from(*b), self.stage_bank(&data[..len], zeros))
+                    (u32::from(*b), self.stage_guest(crate::surfaces::Read::Bank, *addr, &data[..len], zeros, 0x10000))
                 })
                 .collect();
             if let Some(codes) = swizzles {
@@ -519,7 +540,7 @@ impl Surfaces {
             }
             bind_groups.push(self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout, entries: &entries }));
         }
-        let index_buffer = indices.as_ref().map(|(bytes, format)| (self.stage(bytes), *format));
+        let index_buffer = indices;
 
         // The pass.
         let color_views: Vec<Option<wgpu::TextureView>> = colors.iter().map(|c| c.map(|(s, f)| self.texture(&s, f))).collect();
@@ -653,11 +674,8 @@ impl Surfaces {
         for b in t.interface.cbufs.iter().copied().chain(handle_banks) {
             let (addr, size) = d.cbufs[stage].get(usize::from(b)).copied().flatten().ok_or_else(|| format!("constant bank {b} not bound"))?;
             // Its bound size only: binding it as 64 KiB is `stage_window`'s.
-            let mut data = vec![0u8; (size as usize).min(CBUF_BYTES)];
-            if !mem(addr, &mut data) {
-                return Err("constant buffer not readable".into());
-            }
-            banks.insert(b, data);
+            let data = self.read_guest(crate::surfaces::Read::Bank, addr, (size as usize).min(CBUF_BYTES), mem).ok_or("constant buffer not readable")?;
+            banks.insert(b, (addr, data));
         }
         let (textures, swizzles) = self.texture_slots(t, &banks, d.headers, d.samplers, d.sampler_binding, attached, mem)?;
         let cbufs = banks.into_iter().filter(|(b, _)| t.interface.cbufs.contains(b)).collect();
@@ -682,13 +700,13 @@ impl Surfaces {
     /// A program's texture slots (view, sampler) and swizzle codes, from its
     /// handles in `banks` and the header and sampler pools.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn texture_slots(&mut self, t: &Translation, banks: &BTreeMap<u8, Vec<u8>>, headers: Pool, samplers: Pool, binding: SamplerBinding, attached: &[u64], mem: Mem) -> Result<(Vec<Slot>, Vec<u32>), String> {
+    pub(crate) fn texture_slots(&mut self, t: &Translation, banks: &BTreeMap<u8, Bank>, headers: Pool, samplers: Pool, binding: SamplerBinding, attached: &[u64], mem: Mem) -> Result<(Vec<Slot>, Vec<u32>), String> {
         let mut textures = Vec::new();
         let mut swizzles = vec![0u32; t.interface.textures.len().next_multiple_of(4)];
         for (slot, x) in t.interface.textures.iter().enumerate() {
             let word = |bank: u8, offset: u16| -> Option<u32> {
                 let at = usize::from(offset);
-                let w = banks.get(&bank)?.get(at..at + 4)?;
+                let w = banks.get(&bank)?.1.get(at..at + 4)?;
                 Some(u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
             };
             let handle = TexHandle::new(
@@ -1028,6 +1046,7 @@ impl Surfaces {
     /// writes a few bytes at a time, thousands of times a frame); contiguous writes
     /// merge.
     pub fn invalidate(&mut self, start: u64, len: u64) {
+        self.memo.wrote(start, len);
         let end = start.saturating_add(len);
         match self.cache.pending.last_mut() {
             Some(last) if start <= last.1 && end >= last.0 => *last = (last.0.min(start), last.1.max(end)),
@@ -1130,7 +1149,7 @@ mod tests {
             0x1560 => SAMPLERS as u32,
             _ => 0,
         };
-        let banks = BTreeMap::from([(0u8, vec![0u8; 16])]);
+        let banks = BTreeMap::from([(0u8, (0, std::sync::Arc::new(vec![0u8; 16])))]);
         let (slots, _) = s.texture_slots(&t, &banks, resources::header_pool(&reg), resources::sampler_pool(&reg), resources::sampler_binding(&reg), &[], &mut mem).unwrap_or_else(|e| panic!("{e}"));
         let bindings = Bindings { cbufs: BTreeMap::new(), textures: slots, swizzles: None, windows: BTreeMap::new() };
         let mut entries = bindings.layout(wgpu::ShaderStages::COMPUTE);

@@ -7,7 +7,7 @@
 //! normalized storage formats only; image contents stay on the host (never
 //! written back to guest memory).
 
-use crate::draw::{Bindings, Mem};
+use crate::draw::{Bank, Bindings, Mem};
 use crate::pushbuf::Pools;
 use crate::shader::{self, Handle, IMAGE_BINDING, Options, Translation};
 use crate::sass::memory::ImageDim;
@@ -87,16 +87,13 @@ impl Surfaces {
         }
         let mut banks = BTreeMap::new();
         for &(bank, addr, size) in &l.cbufs {
-            let mut data = vec![0u8; (size as usize).min(CBUF_BYTES)];
-            if !mem(addr, &mut data) {
-                return Err("compute constant buffer not readable".into());
-            }
-            banks.insert(bank, data);
+            let data = self.read_guest(crate::surfaces::Read::ComputeBank, addr, (size as usize).min(CBUF_BYTES), mem).ok_or("compute constant buffer not readable")?;
+            banks.insert(bank, (addr, data));
         }
-        let word = |banks: &BTreeMap<u8, Vec<u8>>, h: &Handle| -> Option<u32> {
+        let word = |banks: &BTreeMap<u8, Bank>, h: &Handle| -> Option<u32> {
             let Handle::CBuf { bank, offset } = h else { return None };
             let at = usize::from(*offset);
-            let w = banks.get(bank)?.get(at..at + 4)?;
+            let w = banks.get(bank)?.1.get(at..at + 4)?;
             Some(u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
         };
         let mut tic_of = |h: &Handle| -> Result<textures::Tic, String> {
@@ -175,7 +172,7 @@ impl Surfaces {
         // ponytail: read again at every dispatch; cache by address if it shows in profiles.
         let mut globals = Vec::new();
         for &(bank, at) in &t.interface.buffers {
-            let word = |o: usize| banks.get(&bank).and_then(|b| b.get(o..o + 4)).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]));
+            let word = |o: usize| banks.get(&bank).and_then(|b| b.1.get(o..o + 4)).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]));
             let at = usize::from(at);
             let (Some(lo), Some(hi), Some(size)) = (word(at), word(at + 4), word(at + 8)) else { return Err("global memory descriptor out of its bank".into()) };
             // The word after the pointer is not proved to be a size: at least 1 MiB is read
@@ -193,6 +190,7 @@ impl Surfaces {
                 }
                 data = vec![0u8; bytes.next_multiple_of(4) as usize];
                 if mem(address, &mut data) {
+                    self.note_read(crate::surfaces::Read::Global, address, data.len());
                     break;
                 }
                 data.clear();
@@ -208,7 +206,7 @@ impl Surfaces {
 
         // Bindings: constant banks, textures and swizzles as for draws, then the images.
         let (textures, swizzles) = self.texture_slots(t, &banks, pools.headers, pools.samplers, pools.sampler_binding, &[], mem)?;
-        let cbufs: BTreeMap<u8, Vec<u8>> = banks.into_iter().filter(|(b, _)| t.interface.cbufs.contains(b)).collect();
+        let cbufs: BTreeMap<u8, Bank> = banks.into_iter().filter(|(b, _)| t.interface.cbufs.contains(b)).collect();
         let bindings = Bindings { cbufs, textures, swizzles: t.interface.swizzles.then_some(swizzles), windows: crate::draw::windows(t) };
         let mut layout_entries = bindings.layout(wgpu::ShaderStages::COMPUTE);
         for (i, (img, (_, format, _, _))) in t.interface.images.iter().zip(&images).enumerate() {
@@ -254,9 +252,9 @@ impl Surfaces {
         let mut buffers: Vec<(u32, (wgpu::Buffer, u64, u64))> = bindings
             .cbufs
             .iter()
-            .map(|(b, data)| {
+            .map(|(b, (addr, data))| {
                 let (len, zeros) = bindings.staged(*b, data);
-                (u32::from(*b), self.stage_bank(&data[..len], zeros))
+                (u32::from(*b), self.stage_guest(crate::surfaces::Read::ComputeBank, *addr, &data[..len], zeros, 0x10000))
             })
             .collect();
         if let Some(codes) = &bindings.swizzles {

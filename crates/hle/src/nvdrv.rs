@@ -369,6 +369,9 @@ impl Nvdrv {
 /// its semaphore acquires allow, and performs what they did.
 fn run_gpfifo(k: &mut Kernel, fd: u32, space: u32, entries: &[u8]) {
     forget_written_textures(k, space);
+    if let Some(s) = k.surfaces.as_mut() {
+        s.new_submit();
+    }
     let mut gpu = std::mem::take(&mut k.gpu);
     for (rank, e) in entries.as_chunks::<8>().0.iter().map(|e| u64::from_le_bytes(*e)).enumerate() {
         let (at, len) = (e & 0xffff_fffc | (e >> 32 & 0xff) << 32, (e >> 42 & 0x1f_ffff) as usize);
@@ -456,6 +459,9 @@ fn page_spans(ranges: &[(u64, u64, u64)]) -> Vec<&[(u64, u64, u64)]> {
 /// Lets the channels that wait on a semaphore go on, once the CPU has
 /// released it (called at each present; a submit resumes its own channel).
 pub fn poll(k: &mut Kernel) {
+    if let Some(s) = k.surfaces.as_mut() {
+        s.new_submit();
+    }
     let mut gpu = std::mem::take(&mut k.gpu);
     let waiting: Vec<u32> = gpu.channels.iter().filter(|(_, (c, _))| c.waiting().is_some()).map(|(fd, _)| *fd).collect();
     for fd in waiting {
@@ -495,6 +501,8 @@ fn semaphore(k: &mut Kernel, space: u32, r: &gyroship_gpu::state::qmd::Release) 
     let cpu = k.gpu_to_cpu(space, r.addr);
     if k.mem.write_object(cpu, &bytes).is_err() {
         k.anomaly("gpu semaphore not writable", &format!("semaphore at {:#x}", r.addr));
+    } else if let Some(s) = k.surfaces.as_mut() {
+        s.invalidate(r.addr, bytes.len() as u64);
     }
     if k.journal.few("gpu semaphore release", 8) {
         k.log(&format!("gpu: semaphore {r:x?}"));
@@ -572,8 +580,14 @@ impl Gpu {
                         k.count("syncpoint increments");
                     } else if k.mem.write_object(at, &bytes).is_err() {
                         k.anomaly(if r.addr == 0 { "gpu release at 0" } else { "gpu release not writable" }, &what);
-                    } else if k.journal.few("gpu release", 8) {
-                        k.log(&format!("gpu: {what}"));
+                    } else {
+                        // Read again by later GPU work, as any GPU write.
+                        if let Some(s) = k.surfaces.as_mut() {
+                            s.invalidate(r.addr, bytes.len() as u64);
+                        }
+                        if k.journal.few("gpu release", 8) {
+                            k.log(&format!("gpu: {what}"));
+                        }
                     }
                 }
                 Effect::Ignored { class, method, value } => k.anomaly("gpu method ignored", &format!("class {class:#x} method {method:#x} = {value:#x} not executed")),
