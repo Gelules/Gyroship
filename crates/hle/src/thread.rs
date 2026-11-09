@@ -143,6 +143,8 @@ pub struct Thread {
     /// Host time spent while it was the current thread, HLE work done on its
     /// behalf included (`--perf` reports it; host state, never the guest's).
     pub host: std::time::Duration,
+    /// Guest instructions it ran (from the generated code's count; `--perf`).
+    pub instructions: u64,
     pub fiber: Option<Fiber>,
     pub wait: Wait,
     /// Arrival order among waiters of equal priority.
@@ -277,6 +279,7 @@ impl Kernel {
             on_timeout: 0,
             cpu_time: 0,
             host: std::time::Duration::ZERO,
+            instructions: 0,
             fiber: None,
             wait: Wait::None,
             wait_seq: 0,

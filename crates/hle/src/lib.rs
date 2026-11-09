@@ -306,6 +306,13 @@ impl Kernel {
             by.sort_by(|a, b| b.1.total_cmp(&a.1));
             let rows: Vec<String> = by.iter().filter(|r| r.1 > 0.0005).map(|(i, s)| format!("thread {i} {:.1} s ({:.1}%)", s, 100.0 * s / total.max(1e-9))).collect();
             eprintln!("gyroship: host time by guest thread over {} presents: {}", self.gs.presents, rows.join(", "));
+            // Guest instructions by thread: per present, and per second of the thread's host time.
+            let presents = self.gs.presents.max(1) as f64;
+            let mut work: Vec<(u64, u64, f64)> = self.sched.threads.iter().map(|t| (t.id, t.instructions, t.host.as_secs_f64())).filter(|w| w.1 > 0).collect();
+            work.sort_by_key(|w| std::cmp::Reverse(w.1));
+            let all: u64 = work.iter().map(|w| w.1).sum();
+            let rows: Vec<String> = work.iter().take(12).map(|&(id, n, s)| format!("thread {id} {:.0} M ({:.2} M/present, {:.0} M/s)", n as f64 / 1e6, n as f64 / presents / 1e6, n as f64 / s.max(1e-9) / 1e6)).collect();
+            eprintln!("gyroship: guest instructions over {} presents: {:.0} M in all; {}", self.gs.presents, all as f64 / 1e6, rows.join(", "));
             let census = path.with_extension("census.txt");
             if let Err(e) = std::fs::write(&census, self.census_report()) {
                 eprintln!("gyroship: --perf {}: {e}", census.display());
@@ -449,6 +456,7 @@ pub fn with<R>(f: impl FnOnce(&mut Kernel) -> R) -> R {
 unsafe fn on_svc(cpu: *mut Cpu, pc: u64, imm: u32) {
     let next = with(|k| {
         k.tick();
+        k.take_work(cpu);
         k.census(cpu, imm, None);
         if let Some(n) = k.sched.current.and_then(|t| k.spin.get_mut(t)) {
             *n = 0;
@@ -484,6 +492,16 @@ const COUNTER: u32 = 0x100;
 const WAIT: u32 = 0x200;
 
 impl Kernel {
+    /// Takes the guest instructions the running thread ran since its last
+    /// switch point (the generated code counts them in its context).
+    fn take_work(&mut self, cpu: *mut Cpu) {
+        // SAFETY: the running thread's context, stopped in the hook.
+        let work = unsafe { std::mem::take(&mut (*cpu).work) };
+        if let Some(t) = self.sched.current {
+            self.sched.threads[t].instructions += work;
+        }
+    }
+
     /// Counts a switch point of the running thread for `--perf`; `pc` is
     /// given for counter reads and waits.
     fn census(&mut self, cpu: *mut Cpu, kind: u32, pc: Option<u64>) {
@@ -564,6 +582,7 @@ impl Kernel {
 unsafe fn on_counter(cpu: *mut Cpu, pc: u64, rt: u32) {
     let next = with(|k| {
         k.tick();
+        k.take_work(cpu);
         k.census(cpu, COUNTER, Some(pc));
         k.count_spin(cpu, "counter reads or waits");
         if rt < 31 {
@@ -578,6 +597,7 @@ unsafe fn on_counter(cpu: *mut Cpu, pc: u64, rt: u32) {
 unsafe fn on_wait(cpu: *mut Cpu, pc: u64, kind: u32) {
     let next = with(|k| {
         k.tick();
+        k.take_work(cpu);
         k.census(cpu, WAIT + kind, Some(pc));
         k.count_spin(cpu, "counter reads or waits");
         k.reschedule()

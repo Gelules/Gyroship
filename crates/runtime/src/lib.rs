@@ -45,6 +45,9 @@ pub struct Cpu {
     /// Host stack address below which generated code stops nesting tail
     /// calls and hands them to [`run`] instead (set by `run`).
     pub stack_limit: u64,
+    /// Guest instructions run since the HLE last took the count: each block of
+    /// generated code adds its length when it starts.
+    pub work: u64,
 }
 
 pub const OFFSET_X: i32 = 0;
@@ -58,6 +61,7 @@ pub const OFFSET_MEM: i32 = 280;
 pub const OFFSET_VR: i32 = 288;
 pub const OFFSET_PC: i32 = 816;
 pub const OFFSET_STACK_LIMIT: i32 = 824;
+pub const OFFSET_WORK: i32 = 832;
 
 const _: () = {
     assert!(std::mem::offset_of!(Cpu, x) == OFFSET_X as usize);
@@ -71,11 +75,12 @@ const _: () = {
     assert!(std::mem::offset_of!(Cpu, vr) == OFFSET_VR as usize);
     assert!(std::mem::offset_of!(Cpu, pc) == OFFSET_PC as usize);
     assert!(std::mem::offset_of!(Cpu, stack_limit) == OFFSET_STACK_LIMIT as usize);
+    assert!(std::mem::offset_of!(Cpu, work) == OFFSET_WORK as usize);
 };
 
 impl Cpu {
     pub fn new(mem: *mut u8) -> Cpu {
-        Cpu { x: [0; 32], n: false, z: false, c: false, v: false, tpidr: 0, tpidrro: 0, mem, vr: [0; 32], fpcr: 0, fpsr: 0, pc: 0, stack_limit: 0 }
+        Cpu { x: [0; 32], n: false, z: false, c: false, v: false, tpidr: 0, tpidrro: 0, mem, vr: [0; 32], fpcr: 0, fpsr: 0, pc: 0, stack_limit: 0, work: 0 }
     }
 }
 

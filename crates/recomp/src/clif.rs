@@ -36,7 +36,7 @@ pub type Result<T> = std::result::Result<T, String>;
 mod layout {
     pub use gyroship_runtime::{
         OFFSET_C as C, OFFSET_MEM as MEM, OFFSET_N as N, OFFSET_PC as PC, OFFSET_STACK_LIMIT as STACK_LIMIT, OFFSET_TPIDR as TPIDR,
-        OFFSET_TPIDRRO as TPIDRRO, OFFSET_V as V, OFFSET_VR as VR, OFFSET_X as X, OFFSET_Z as Z,
+        OFFSET_TPIDRRO as TPIDRRO, OFFSET_V as V, OFFSET_VR as VR, OFFSET_WORK as WORK, OFFSET_X as X, OFFSET_Z as Z,
     };
 }
 
@@ -190,6 +190,10 @@ impl<M: Module> Object<M> {
         let mut e = Emit { b, cpu, mem, cpu_flags, heap_flags, module, rt, ids, sig, refs: &mut refs, callee: input.callee, pending: Vec::new() };
         for (bi, block) in input.cfg.blocks.iter().enumerate() {
             e.b.switch_to_block(blocks[bi]);
+            // The guest work done: the block's instructions, counted as it starts.
+            let work = e.b.ins().load(I64, e.cpu_flags, cpu, layout::WORK);
+            let work = e.b.ins().iadd_imm_s(work, (block.len / 4) as i64);
+            e.b.ins().store(e.cpu_flags, work, cpu, layout::WORK);
             let end = block.start + block.len;
             let mut ended = false;
             for pc in (block.start..end).step_by(4) {
