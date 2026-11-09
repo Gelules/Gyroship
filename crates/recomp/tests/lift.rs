@@ -2,7 +2,7 @@
 
 use gyroship_analysis::cfg::{Block, Cfg};
 use gyroship_analysis::discover::Function;
-use gyroship_recomp::ir::{Addr, Alu, Cond, Op, Operand, Reg, Shift, VCmp, VFp, VInt, W, Writeback, ZERO};
+use gyroship_recomp::ir::{Addr, Alu, Cond, Op, Operand, Reg, Rmw, Shift, VCmp, VFp, VInt, W, Writeback, ZERO};
 use gyroship_recomp::{Callee, Input, clif, lift::lift, rust};
 
 #[test]
@@ -56,6 +56,11 @@ fn lifts_the_common_integer_forms() {
     assert_eq!(lift(0xd50339bf, pc), Op::Nop, "dmb ishld");
     assert_eq!(lift(0xd5033abf, pc), Op::Nop, "dmb ishst");
     assert_eq!(lift(0xd5033f9f, pc), Op::Fence, "dsb sy");
+    assert_eq!(lift(0xf8e90108, pc), Op::AtomicRmw { op: Rmw::Add, size: 3, src: Reg::X(9), dst: Reg::X(8), addr: at(8) }, "ldaddal x9, x8, [x8]");
+    assert_eq!(lift(0x3821105f, pc), Op::AtomicRmw { op: Rmw::Clr, size: 0, src: Reg::X(1), dst: Reg::Zr, addr: at(2) }, "stclrb w1, [x2]");
+    assert_eq!(lift(0x88e9fe8a, pc), Op::AtomicCas { size: 2, cmp: Reg::X(9), new: Reg::X(10), addr: at(20) }, "casal w9, w10, [x20]");
+    assert_eq!(lift(0xd50b7e2a, pc), Op::Nop, "dc civac, x10");
+    assert_eq!(lift(0xd50b7420, pc), Op::Unhandled, "dc zva, x0: the interpreter writes the zeros");
     assert_eq!(lift(0xb005f8af, pc), Op::Const { dst: Reg::X(15), value: 0x71_0bf1_6000 }, "adrp");
     assert_eq!(lift(0x54001108, pc), Op::Branch(Cond::Flags(8), pc + 0x220), "b.hi");
     assert_eq!(lift(0x37180a89, pc), Op::Branch(Cond::Bit { reg: Reg::X(9), bit: 3, set: true }, pc + 0x150), "tbnz");

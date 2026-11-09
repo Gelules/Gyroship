@@ -14,13 +14,13 @@
 //! load or store; caching them in SSA values between calls is the upgrade if
 //! this backend wins.
 
-use crate::ir::{Addr, Alu, Cond, FBin, FUn, Op, Operand, Reg, Select, Shift, Unary, VCmp, VFp, VInt, Writeback, W, ZERO};
+use crate::ir::{Addr, Alu, Cond, FBin, FUn, Op, Operand, Reg, Rmw, Select, Shift, Unary, VCmp, VFp, VInt, Writeback, W, ZERO};
 use crate::{Callee, Input};
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types::{F32, F32X4, F64, F64X2, I8, I8X16, I16, I16X8, I32, I32X4, I64, I64X2, Type};
 use cranelift_codegen::ir::{
-    AbiParam, AliasRegionData, Block, ConstantData, Endianness, FuncRef, Function, InstBuilder, MemFlagsData, Signature, UserFuncName,
-    Value,
+    AbiParam, AliasRegionData, AtomicRmwOp, Block, ConstantData, Endianness, FuncRef, Function, InstBuilder, MemFlagsData, Signature,
+    UserFuncName, Value,
 };
 use cranelift_codegen::isa::OwnedTargetIsa;
 use cranelift_codegen::settings::{self, Configurable};
@@ -570,6 +570,24 @@ impl<M: Module> Emit<'_, '_, M> {
         }
     }
 
+    /// The low 1 << size bytes of a 64-bit value, as the integer type of that width.
+    fn narrow(&mut self, v: Value, size: u8) -> Value {
+        if size < 3 { self.b.ins().ireduce([I8, I16, I32][usize::from(size)], v) } else { v }
+    }
+
+    /// Writes a value of 1 << size bytes to `dst`, zero-extended: X for 8 bytes,
+    /// W (upper half cleared) otherwise.
+    fn set_widened(&mut self, dst: Reg, v: Value, size: u8) {
+        match size {
+            3 => self.set(dst, W::W64, v),
+            2 => self.set(dst, W::W32, v),
+            _ => {
+                let v = self.b.ins().uextend(I32, v);
+                self.set(dst, W::W32, v);
+            }
+        }
+    }
+
     fn store(&mut self, v: Value, host: Value, off: i32, size: u8) {
         let f = self.heap_flags;
         let i = self.b.ins();
@@ -775,7 +793,7 @@ impl<M: Module> Emit<'_, '_, M> {
                 let (_, host) = self.address(&addr);
                 if ordered {
                     // A store, then MFENCE: Cranelift's atomic_store on x64.
-                    let v = if size < 3 { self.b.ins().ireduce([I8, I16, I32][size as usize], v) } else { v };
+                    let v = self.narrow(v, size);
                     self.b.ins().atomic_store(self.heap_flags, v, host);
                 } else {
                     self.store(v, host, 0, size);
@@ -783,6 +801,34 @@ impl<M: Module> Emit<'_, '_, M> {
             }
             Op::Fence => {
                 self.b.ins().fence();
+            }
+            // Host atomics are sequentially consistent: at least the order any Arm
+            // variant (none, A, L, AL) asks for.
+            Op::AtomicRmw { op, size, src, dst, addr } => {
+                let s = self.get(src, W::W64);
+                let s = self.narrow(s, size);
+                let (_, host) = self.address(&addr);
+                let (rmw, s) = match op {
+                    Rmw::Add => (AtomicRmwOp::Add, s),
+                    Rmw::Clr => (AtomicRmwOp::And, self.b.ins().bnot(s)),
+                    Rmw::Eor => (AtomicRmwOp::Xor, s),
+                    Rmw::Set => (AtomicRmwOp::Or, s),
+                    Rmw::Smax => (AtomicRmwOp::Smax, s),
+                    Rmw::Smin => (AtomicRmwOp::Smin, s),
+                    Rmw::Umax => (AtomicRmwOp::Umax, s),
+                    Rmw::Umin => (AtomicRmwOp::Umin, s),
+                    Rmw::Swp => (AtomicRmwOp::Xchg, s),
+                };
+                let t = [I8, I16, I32, I64][usize::from(size.min(3))];
+                let old = self.b.ins().atomic_rmw(t, self.heap_flags, rmw, host, s);
+                self.set_widened(dst, old, size);
+            }
+            Op::AtomicCas { size, cmp, new, addr } => {
+                let (c, n) = (self.get(cmp, W::W64), self.get(new, W::W64));
+                let (c, n) = (self.narrow(c, size), self.narrow(n, size));
+                let (_, host) = self.address(&addr);
+                let old = self.b.ins().atomic_cas(self.heap_flags, host, c, n);
+                self.set_widened(cmp, old, size);
             }
             Op::LoadPair { a, b, w, size, signed, addr } => {
                 let (_, host) = self.address(&addr);

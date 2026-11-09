@@ -138,6 +138,18 @@ fn a_store_exclusive_needs_its_reservation_and_the_value_it_read() {
 }
 
 #[test]
+fn dc_zva_zeroes_the_64_bytes_around_the_address_and_dc_civac_nothing() {
+    let mut mem = vec![0xffu8; 192];
+    let mut c = Cpu::new(mem.as_mut_ptr().wrapping_sub(GUEST as usize));
+    c.x[0] = GUEST + 64 + 13;
+    run(&mut c, 0xd50b7420); // dc zva, x0
+    assert!(mem[..64].iter().chain(&mem[128..]).all(|&b| b == 0xff) && mem[64..128].iter().all(|&b| b == 0));
+    c.x[10] = GUEST;
+    run(&mut c, 0xd50b7e2a); // dc civac, x10
+    assert!(mem[..64].iter().all(|&b| b == 0xff));
+}
+
+#[test]
 fn carry_chain_and_coverage() {
     let mut c = Cpu::new(std::ptr::null_mut());
     (c.x[12], c.x[13], c.c) = (u64::MAX, 0, true);

@@ -609,7 +609,13 @@ fn exec(c: &mut Cpu, _pc: u64, i: &Instruction) -> Result {
             }
             Ok(())
         }
-        // Cache maintenance (DC CIVAC and the like) and memory tagging do nothing on the host.
+        // DC ZVA: zeroes the 64-byte block holding the address (DCZID_EL0 above).
+        C::SYS(ops) if ops.op1() == 3 && ops.op2() == 1 && matches!((&o[1], &o[2]), (O::ControlReg(7), O::ControlReg(4))) => {
+            let block = gpr(c, &o[0])? & !63;
+            (0..4).for_each(|k| write(c, block + 16 * k, 16, 0));
+            Ok(())
+        }
+        // Other cache maintenance (DC CIVAC and the like) and memory tagging do nothing on the host.
         C::SYS(_) | C::STG => Ok(()),
         C::FRECPE | C::FRSQRTE => {
             let (d, q, e, src, one) = match o[0] {

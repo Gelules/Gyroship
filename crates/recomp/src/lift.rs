@@ -1,6 +1,6 @@
 //! From a decoded instruction to one IR operation.
 
-use crate::ir::{Addr, Alu, Cond, FBin, FUn, Op, Operand, Reg, Select, Shift, Unary, VCmp, VFp, VInt, Writeback, W, ZERO};
+use crate::ir::{Addr, Alu, Cond, FBin, FUn, Op, Operand, Reg, Rmw, Select, Shift, Unary, VCmp, VFp, VInt, Writeback, W, ZERO};
 use gyroship_analysis::decode::{decode, Instruction, Opcode, Operand as O, SIMDSizeCode, ShiftStyle, SizeCode};
 
 /// MRS/MSR encodings of TPIDR_EL0 and TPIDRRO_EL0 as yaxpeax numbers them.
@@ -119,6 +119,42 @@ fn cond(o: &O) -> Option<u8> {
         O::ConditionCode(c) => Some(c),
         _ => None,
     }
+}
+
+/// An LSE atomic's operation, and its size when the opcode fixes it (B, H);
+/// the ordering bits do not matter, every host atomic being sequentially consistent.
+fn lse(op: Opcode) -> Option<(Rmw, Option<u8>)> {
+    use Opcode as C;
+    Some(match op {
+        C::LDADD(_) => (Rmw::Add, None),
+        C::LDADDB(_) => (Rmw::Add, Some(0)),
+        C::LDADDH(_) => (Rmw::Add, Some(1)),
+        C::LDCLR(_) => (Rmw::Clr, None),
+        C::LDCLRB(_) => (Rmw::Clr, Some(0)),
+        C::LDCLRH(_) => (Rmw::Clr, Some(1)),
+        C::LDEOR(_) => (Rmw::Eor, None),
+        C::LDEORB(_) => (Rmw::Eor, Some(0)),
+        C::LDEORH(_) => (Rmw::Eor, Some(1)),
+        C::LDSET(_) => (Rmw::Set, None),
+        C::LDSETB(_) => (Rmw::Set, Some(0)),
+        C::LDSETH(_) => (Rmw::Set, Some(1)),
+        C::LDSMAX(_) => (Rmw::Smax, None),
+        C::LDSMAXB(_) => (Rmw::Smax, Some(0)),
+        C::LDSMAXH(_) => (Rmw::Smax, Some(1)),
+        C::LDSMIN(_) => (Rmw::Smin, None),
+        C::LDSMINB(_) => (Rmw::Smin, Some(0)),
+        C::LDSMINH(_) => (Rmw::Smin, Some(1)),
+        C::LDUMAX(_) => (Rmw::Umax, None),
+        C::LDUMAXB(_) => (Rmw::Umax, Some(0)),
+        C::LDUMAXH(_) => (Rmw::Umax, Some(1)),
+        C::LDUMIN(_) => (Rmw::Umin, None),
+        C::LDUMINB(_) => (Rmw::Umin, Some(0)),
+        C::LDUMINH(_) => (Rmw::Umin, Some(1)),
+        C::SWP(_) => (Rmw::Swp, None),
+        C::SWPB(_) => (Rmw::Swp, Some(0)),
+        C::SWPH(_) => (Rmw::Swp, Some(1)),
+        _ => return None,
+    })
 }
 
 fn lift_decoded(i: &Instruction, pc: u64) -> Option<Op> {
@@ -298,6 +334,25 @@ fn lift_decoded(i: &Instruction, pc: u64) -> Option<Op> {
         C::RETAB | C::RETAA => Op::Return,
         C::UDF | C::BRK | C::HLT => Op::Trap(imm(&o[0])? as u16),
         C::SVC => Op::Svc(imm(&o[0])? as u16),
+        // LSE atomics, [Rs, Rt, [Xn|SP]]: host atomics of the same width.
+        op if lse(op).is_some() => {
+            let (rmw, size) = lse(op)?;
+            let (src, w) = reg(&o[0])?;
+            Op::AtomicRmw { op: rmw, size: size.unwrap_or(if w == W::W64 { 3 } else { 2 }), src, dst: r(&o[1])?, addr: addr(&o[2])? }
+        }
+        C::CAS(_) | C::CASB(_) | C::CASH(_) => {
+            let (cmp, w) = reg(&o[0])?;
+            let size = match i.opcode {
+                C::CASB(_) => 0,
+                C::CASH(_) => 1,
+                _ if w == W::W64 => 3,
+                _ => 2,
+            };
+            Op::AtomicCas { size, cmp, new: r(&o[1])?, addr: addr(&o[2])? }
+        }
+        // Cache maintenance by address (DC CIVAC and the like, IC IVAU): nothing to do
+        // on the host. DC ZVA (CRm 4) writes memory: the interpreter does it.
+        C::SYS(ops) if ops.op1() == 3 && matches!(o[1], O::ControlReg(7)) && !matches!(o[2], O::ControlReg(4)) => Op::Nop,
         _ => return None,
     })
 }

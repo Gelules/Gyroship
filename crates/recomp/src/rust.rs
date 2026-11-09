@@ -496,8 +496,11 @@ pub fn function(out: &mut String, input: &Input) {
                     format!("unsafe {{ rt::gyroship_counter(c, {pc:#x}, {n}) }};")
                 }
                 Op::Yield(kind) => format!("rt::gyroship_yield(c, {pc:#x}, {kind});"),
-                // ponytail: this experimental backend leaves the vector-lane forms and CRC to the interpreter.
+                // ponytail: this experimental backend leaves the vector-lane forms, CRC and
+                // LSE atomics to the interpreter.
                 Op::Unhandled
+                | Op::AtomicRmw { .. }
+                | Op::AtomicCas { .. }
                 | Op::Crc { .. }
                 | Op::LoadLane { .. }
                 | Op::ToLane { .. }

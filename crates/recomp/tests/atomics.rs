@@ -5,9 +5,11 @@
 use cranelift_jit::{JITBuilder, JITModule};
 use gyroship_analysis::cfg;
 use gyroship_analysis::discover::Function;
+use gyroship_recomp::ir::Op;
+use gyroship_recomp::lift::lift;
 use gyroship_recomp::{Callee, Input, clif};
 use gyroship_runtime::mem::{Block, Memory, perm, state};
-use gyroship_runtime::{self as rt, Cpu, EXIT};
+use gyroship_runtime::{self as rt, Cpu, EXIT, interp};
 use std::collections::BTreeMap;
 use std::hint::spin_loop;
 use std::sync::Once;
@@ -30,18 +32,43 @@ const SB_PLAIN: u64 = 0x1100;
 const EXCLUSIVE: u64 = 0x1200;
 /// x3 times: ldadd w4, w5, [x0].
 const LSE: u64 = 0x1300;
+/// x3 times: ldr w1, [x0]; add w2, w1, #1; mov w5, w1; cas w1, w2, [x0];
+/// cmp w1, w5; b.ne retry.
+const CAS: u64 = 0x1400;
+/// One function per word of `atomic_forms()`: the word, then RET.
+const FORMS: u64 = 0x2000;
 
 const DATA: u64 = 0x8000;
 const FLAGS: [u64; 2] = [DATA, DATA + 0x40];
 const COUNTER: u64 = DATA + 0x80;
+const SLOT: u64 = DATA + 0x100;
+
+/// Every LSE atomic (9 operations) and CAS, in each size and ordering, on
+/// Rs = x1, Rt = x2, Rn = x0.
+fn atomic_forms() -> Vec<u32> {
+    let mut words = Vec::new();
+    for size in 0..4 {
+        for order in 0..4 {
+            for (o3, opc) in (0..8).map(|opc| (0, opc)).chain([(1, 0)]) {
+                words.push(0x3820_0000 | size << 30 | order << 22 | 1 << 16 | o3 << 15 | opc << 12 | 2);
+            }
+            // CAS: L is bit 22, o0 bit 15.
+            words.push(0x08a0_7c00 | size << 30 | (order >> 1) << 22 | 1 << 16 | (order & 1) << 15 | 2);
+        }
+    }
+    words
+}
 
 fn functions() -> Vec<(u64, Vec<u32>)> {
-    vec![
+    let mut f = vec![
         (SB_ORDERED, vec![0x889f_fc01, 0x88df_fc62, RET]),
         (SB_PLAIN, vec![0xb900_0001, 0xb940_0062, RET]),
         (EXCLUSIVE, vec![0x885f_7c01, 0x1100_0421, 0x8802_7c01, 0x35ff_ffa2, COUNT_DOWN, bne(EXCLUSIVE + 0x14, EXCLUSIVE), RET]),
         (LSE, vec![0xb824_0005, COUNT_DOWN, bne(LSE + 8, LSE), RET]),
-    ]
+        (CAS, vec![0xb940_0001, 0x1100_0422, 0x2a01_03e5, 0x88a1_7c02, 0x6b05_003f, bne(CAS + 0x14, CAS), COUNT_DOWN, bne(CAS + 0x1c, CAS), RET]),
+    ];
+    f.extend(atomic_forms().into_iter().enumerate().map(|(i, w)| (FORMS + 8 * i as u64, vec![w, RET])));
+    f
 }
 
 /// Compiles the functions once into JIT code and installs their dispatch table.
@@ -176,12 +203,56 @@ fn plain_stores_and_loads_do_get_reordered() {
     eprintln!("plain STR then LDR: both loads saw 0 in {n} of 100000 rounds");
 }
 
+/// Each atomic form, compiled and interpreted from the same registers and
+/// memory: the memory doubleword and x1, x2 must agree. The doubleword's
+/// bytes past the access show a write that is too wide.
+#[test]
+fn compiled_atomics_match_the_interpreter() {
+    let m = machine();
+    let base = m.base() as usize;
+    let slot = || {
+        // SAFETY: a mapped, aligned guest doubleword.
+        unsafe { AtomicU64::from_ptr((base as *mut u8).add(SLOT as usize).cast()) }
+    };
+    let mut seed = 0x5eed_u64;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    for (i, word) in atomic_forms().into_iter().enumerate() {
+        assert!(matches!(lift(word, 0), Op::AtomicRmw { .. } | Op::AtomicCas { .. }), "{word:08x} ({}) is not compiled", interp::disassemble(word));
+        let f = FORMS + 8 * i as u64;
+        for trial in 0..200 {
+            let (old, a, b) = (next(), next(), next());
+            // Half the CAS trials compare equal.
+            let a = if trial % 2 == 0 { old } else { a };
+            let run = |native: bool| {
+                slot().store(old, Ordering::Relaxed);
+                let mut cpu = Cpu::new(base as *mut u8);
+                (cpu.x[0], cpu.x[1], cpu.x[2]) = (SLOT, a, b);
+                if native {
+                    (cpu.pc, cpu.x[30]) = (f, EXIT);
+                    // SAFETY: the context's memory maps the data page.
+                    unsafe { rt::run(&mut cpu) };
+                } else {
+                    interp::execute(&mut cpu, f, word).unwrap();
+                }
+                (slot().load(Ordering::Relaxed), cpu.x[1], cpu.x[2])
+            };
+            let (jit, int) = (run(true), run(false));
+            assert_eq!(jit, int, "{word:08x} ({}) from [x0] {old:#x}, x1 {a:#x}, x2 {b:#x}", interp::disassemble(word));
+        }
+    }
+}
+
 #[test]
 fn increments_from_four_threads_add_up() {
     const PER_THREAD: u64 = 50_000;
     let m = machine();
     let base = m.base() as usize;
-    for f in [EXCLUSIVE, LSE] {
+    for f in [EXCLUSIVE, LSE, CAS] {
         word(base, COUNTER).store(0, Ordering::Relaxed);
         std::thread::scope(|s| {
             for _ in 0..4 {

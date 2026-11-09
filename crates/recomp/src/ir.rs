@@ -89,6 +89,21 @@ pub enum Cond {
     Bit { reg: Reg, bit: u8, set: bool },
 }
 
+/// The operation of an LSE atomic: LDADD, LDCLR (and not), LDEOR, LDSET,
+/// the signed and unsigned LDxMAX and LDxMIN, SWP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rmw {
+    Add,
+    Clr,
+    Eor,
+    Set,
+    Smax,
+    Smin,
+    Umax,
+    Umin,
+    Swp,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
     Alu { op: Alu, w: W, dst: Reg, a: Reg, b: Operand, flags: bool },
@@ -132,6 +147,12 @@ pub enum Op {
     /// A full DMB or DSB: earlier stores before later loads, the one order the
     /// host does not keep by itself.
     Fence,
+    /// An LSE atomic (LDADD and the like, SWP) on 1 << size bytes: the value
+    /// at `addr` becomes op(old, src); `dst` gets the old value, zero-extended.
+    AtomicRmw { op: Rmw, size: u8, src: Reg, dst: Reg, addr: Addr },
+    /// CAS on 1 << size bytes: `new` is stored if the value at `addr` equals
+    /// `cmp`; `cmp` gets the old value either way, zero-extended.
+    AtomicCas { size: u8, cmp: Reg, new: Reg, addr: Addr },
     Nop,
     // FP and SIMD registers. `size` is log2 of the bytes accessed (0 = B .. 4 = Q);
     // writing fewer than 16 bytes zeroes the rest of the register.
