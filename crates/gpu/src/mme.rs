@@ -354,10 +354,15 @@ impl<H: Host> Run<'_, H> {
                 self.reads = true;
                 self.host.state(u32::from(x.wrapping_add(y) as u16) * 4)
             }
-            // LOOP: the next `imm - 1` groups run max(x, 1) times.
+            // LOOP: the next `imm - 1` groups run x times; none when x is 0. Mesa's
+            // simulator runs them once, but NVK skips padding words with a LOOP of
+            // parameter loads whose count is 0 for packed draws (D37).
             23 => {
                 mme.stats.zero_loops += u64::from(x == 0);
-                *lp = Some((ip, ip + usize::from(a.imm) - 1, x.max(1) - 1));
+                match x {
+                    0 => *next = ip + usize::from(a.imm),
+                    _ => *lp = Some((ip, ip + usize::from(a.imm) - 1, x - 1)),
+                }
                 0
             }
             24 => {
@@ -582,6 +587,19 @@ mod tests {
         let end = last(group(NOP, NOP, [(OUT_NONE, OUT_NONE); 2]));
         let host = run(&[set, lp, body, end, group(NOP, NOP, [(OUT_NONE, OUT_NONE); 2])], &[3]);
         assert_eq!(host.emitted, vec![(0x800, 2), (0x800, 4), (0x800, 6)]);
+    }
+
+    #[test]
+    fn a_zero_count_loop_skips_its_body() {
+        // LOOP param (0) times over a group that takes and emits a parameter, then a
+        // group that takes and emits the next one: it is the second parameter, the
+        // body took none (as NVK's padding loops need on hardware).
+        let mut set = group(NOP, NOP, [(5, OUT_NONE), (OUT_NONE, OUT_NONE)]);
+        set.alu[0].imm = 0x200;
+        let lp = group(alu(23, ZERO, LOAD0, ZERO, 2), NOP, [(OUT_NONE, OUT_NONE); 2]);
+        let take = group(alu(0, 1, LOAD0, ZERO, 0), NOP, [(OUT_NONE, 1), (OUT_NONE, OUT_NONE)]);
+        let host = run(&[set, lp, take, last(take), group(NOP, NOP, [(OUT_NONE, OUT_NONE); 2])], &[0, 7]);
+        assert_eq!(host.emitted, vec![(0x800, 7)]);
     }
 
     #[test]
