@@ -133,6 +133,11 @@ pub struct Surfaces {
     pub staging: Staging,
     /// wgpu validation errors (the first ones), which the HLE takes as anomalies.
     pub errors: Arc<Mutex<Vec<String>>>,
+    /// The render pass the last draw recorded into, left open for the next draws
+    /// to the same targets (a pass per draw cost a begin and an end each, ~585 a
+    /// frame); anything else recorded ends it first ([`Surfaces::encoder`]).
+    /// Declared before `pending`, so that it ends before its encoder is dropped.
+    pub(crate) pass: Option<(crate::draw::PassKey, wgpu::RenderPass<'static>)>,
     /// The work recorded since the last [`Surfaces::flush`], in order.
     pending: Option<wgpu::CommandEncoder>,
     /// GPU time per program, when asked for (`timing.rs`).
@@ -496,7 +501,7 @@ impl Surfaces {
         let arena = (arena_buffer(&device, 16 << 20), Vec::new());
         let window = window.map(|(surface, size)| Window::new(&adapter, &device, surface, size));
         let timing = crate::timing::Timing::new(&device, &queue);
-        Ok(Surfaces { adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pending: None, timing, clock: None, present: 0, readbacks: Default::default(), hasher: None, arena, staging: Staging::default(), staged: FxMap::default(), last_color: None, window, memo: Memo::default() })
+        Ok(Surfaces { adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pass: None, pending: None, timing, clock: None, present: 0, readbacks: Default::default(), hasher: None, arena, staging: Staging::default(), staged: FxMap::default(), last_color: None, window, memo: Memo::default() })
     }
 
     /// Shows the presented image (the color target written last, its top-left
@@ -549,6 +554,8 @@ impl Surfaces {
     /// The encoder that collects a frame's passes: one submit per frame
     /// instead of one per operation. Give it back with [`Surfaces::record`].
     pub(crate) fn encoder(&mut self) -> wgpu::CommandEncoder {
+        // A pass left open for the next draw ends before anything else is recorded.
+        self.pass = None;
         self.pending.take().unwrap_or_else(|| {
             let mut encoder = self.device.create_command_encoder(&Default::default());
             if let Some(c) = &self.clock {
@@ -656,6 +663,7 @@ impl Surfaces {
     }
 
     pub fn flush(&mut self) {
+        self.pass = None;
         self.memo.clear();
         // The arena's writes land before this submit's commands, and after the
         // previous frame's, which read the same bytes: queue order.

@@ -26,6 +26,11 @@ pub type Mem<'a> = &'a mut dyn FnMut(u64, &mut [u8]) -> bool;
 /// A constant bank as read: its guest address and bytes (shared by the draws of a submit).
 pub(crate) type Bank = (u64, std::sync::Arc<Vec<u8>>);
 
+/// What a draw's render pass is opened on: the color targets with their formats,
+/// the depth target with its format, and whether colors are attached (not
+/// without a pixel program). Draws with the same key share the open pass.
+pub(crate) type PassKey = (Vec<Option<(Surface, wgpu::TextureFormat)>>, Option<(Surface, wgpu::TextureFormat)>, bool);
+
 /// The bytes of a constant bank as the translated programs declare it.
 const CBUF_BYTES: usize = 0x10000;
 
@@ -544,18 +549,23 @@ impl Surfaces {
         }
         let index_buffer = indices;
 
-        // The pass.
-        let color_views: Vec<Option<wgpu::TextureView>> = colors.iter().map(|c| c.map(|(s, f)| self.texture(&s, f))).collect();
-        let depth_view = depth.map(|(s, f)| (self.texture(&s, f), f));
-        let timed = self.timing.as_mut().and_then(|t| t.next(format!("draw vs {:016x} ps {}", vs.0.key, ps.as_ref().map_or("none".into(), |p| format!("{:016x}", p.0.key)))));
-        let mut encoder = self.encoder();
-        {
+        // The pass: the open one when this draw writes the same targets (every
+        // attachment loads and stores, so consecutive draws can share it; one
+        // sampling its own attachment is refused by wgpu either way); else a new
+        // one. Anything else recorded ends it (`Surfaces::encoder`). Timed draws
+        // each keep a pass of their own.
+        let key: PassKey = (colors.clone(), depth, ps.is_some());
+        if self.timing.is_some() || self.pass.as_ref().is_none_or(|(open, _)| *open != key) {
+            let color_views: Vec<Option<wgpu::TextureView>> = colors.iter().map(|c| c.map(|(s, f)| self.texture(&s, f))).collect();
+            let depth_view = depth.map(|(s, f)| (self.texture(&s, f), f));
+            let timed = self.timing.as_mut().and_then(|t| t.next(format!("draw vs {:016x} ps {}", vs.0.key, ps.as_ref().map_or("none".into(), |p| format!("{:016x}", p.0.key)))));
+            let mut encoder = self.encoder();
             let load = wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store };
             let attachments: Vec<Option<wgpu::RenderPassColorAttachment>> = color_views.iter().map(|v| v.as_ref().map(|view| wgpu::RenderPassColorAttachment { view, depth_slice: None, resolve_target: None, ops: load })).collect();
             // Without a pixel program the pipeline has no color targets: neither may the pass.
             let attachments = if ps.is_none() { Vec::new() } else { attachments };
             let timestamp_writes = timed.zip(self.timing.as_ref()).map(|(i, t)| wgpu::RenderPassTimestampWrites { query_set: &t.set, beginning_of_pass_write_index: Some(i), end_of_pass_write_index: Some(i + 1) });
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("draw"),
                 timestamp_writes,
                 color_attachments: &attachments,
@@ -566,6 +576,12 @@ impl Surfaces {
                 }),
                 ..Default::default()
             });
+            let pass = pass.forget_lifetime();
+            self.record(encoder);
+            self.pass = Some((key, pass));
+        }
+        {
+            let Some((_, pass)) = self.pass.as_mut() else { return Err("no open render pass".into()) };
             pass.set_pipeline(&pipeline);
             pass.set_viewport(v.x, v.y, v.width, v.height, v.min_depth, v.max_depth);
             pass.set_scissor_rect(x, y, x1 - x, y1 - y);
@@ -586,7 +602,6 @@ impl Surfaces {
                 None => pass.draw(d.first..d.first + d.count, 0..1),
             }
         }
-        self.record(encoder);
         for (s, _) in colors.iter().flatten() {
             self.wrote((s.addr, s.format));
         }
