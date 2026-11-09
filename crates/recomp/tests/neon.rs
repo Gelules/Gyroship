@@ -271,12 +271,14 @@ fn compiled() -> &'static HashMap<u32, rt::Guest> {
     CODE_MAP.get_or_init(|| {
         let words: Vec<u32> = cases().iter().map(|c| c.word).chain(known().into_iter().flat_map(|k| k.0)).collect();
         let mut jb = JITBuilder::with_isa(clif::isa(true).unwrap(), cranelift_module::default_libcall_names());
-        // What the functions call (every rescue block refers to gyroship_call and gyroship_miss).
-        let runtime: [(&str, *const u8); 4] = [
+        // What the functions call (every rescue block refers to gyroship_call and
+        // gyroship_miss, every entry to gyroship_yield, the preemption point).
+        let runtime: [(&str, *const u8); 5] = [
             ("gyroship_call", rt::gyroship_call as *const () as *const u8),
             ("gyroship_crc32", rt::gyroship_crc32 as *const () as *const u8),
             ("gyroship_miss", rt::gyroship_miss as *const () as *const u8),
             ("gyroship_unhandled", unhandled as *const () as *const u8),
+            ("gyroship_yield", rt::gyroship_yield as *const () as *const u8),
         ];
         for (name, f) in runtime {
             jb.symbol(name, f);

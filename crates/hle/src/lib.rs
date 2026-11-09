@@ -612,6 +612,17 @@ unsafe fn on_counter(cpu: *mut Cpu, pc: u64, rt: u32) {
 }
 
 unsafe fn on_wait(cpu: *mut Cpu, pc: u64, kind: u32) {
+    // A preemption point of a long computation: with --work-time, its work
+    // costs time and the scheduler may run another core first (D40); without,
+    // only the instruction count is taken: no step, the same order (D19).
+    if kind == gyroship_runtime::YIELD_PREEMPT {
+        let next = with(|k| {
+            k.take_work(cpu);
+            if k.config.work_time { k.reschedule() } else { None }
+        });
+        thread::switch_to(next);
+        return;
+    }
     let next = with(|k| {
         k.tick();
         k.take_work(cpu);

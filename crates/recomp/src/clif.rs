@@ -28,7 +28,7 @@ use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch};
 use cranelift_module::{DataDescription, FuncId, Linkage, Module, default_libcall_names};
 use cranelift_object::{ObjectBuilder, ObjectModule};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 pub type Result<T> = std::result::Result<T, String>;
 
@@ -188,12 +188,38 @@ impl<M: Module> Object<M> {
         // Resume points: guest address -> block. Entries, then continuations.
         let mut points: BTreeMap<u64, Block> = f.entries.iter().filter_map(|&a| Some((a, blocks[index(a)?]))).collect();
         let mut e = Emit { b, cpu, mem, cpu_flags, heap_flags, module, rt, ids, sig, refs: &mut refs, callee: input.callee, pending: Vec::new() };
+        // Loop heads: blocks a branch at the end of a block reaches backward.
+        let heads: BTreeSet<u64> = input
+            .cfg
+            .blocks
+            .iter()
+            .filter(|b| b.len >= 4)
+            .filter_map(|b| {
+                let last = b.start + b.len - 4;
+                match crate::lift::lift((input.word)(last), last) {
+                    Op::Jump(t) | Op::Branch(_, t) if t <= last => Some(t),
+                    _ => None,
+                }
+            })
+            .collect();
         for (bi, block) in input.cfg.blocks.iter().enumerate() {
             e.b.switch_to_block(blocks[bi]);
             // The guest work done: the block's instructions, counted as it starts.
             let work = e.b.ins().load(I64, e.cpu_flags, cpu, layout::WORK);
             let work = e.b.ins().iadd_imm_s(work, (block.len / 4) as i64);
             e.b.ins().store(e.cpu_flags, work, cpu, layout::WORK);
+            // A loop head or the entry: past PREEMPT_WORK instructions, a
+            // preemption point for computations that make no SVC.
+            if heads.contains(&block.start) || block.start == f.start {
+                let over = e.b.ins().icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, work, gyroship_runtime::PREEMPT_WORK as i64);
+                let (slow, go) = (e.b.create_block(), e.b.create_block());
+                e.b.set_cold_block(slow);
+                e.b.ins().brif(over, slow, &[], go, &[]);
+                e.b.switch_to_block(slow);
+                e.runtime(e.rt.yield_, block.start, gyroship_runtime::YIELD_PREEMPT);
+                e.b.ins().jump(go, &[]);
+                e.b.switch_to_block(go);
+            }
             let end = block.start + block.len;
             let mut ended = false;
             for pc in (block.start..end).step_by(4) {

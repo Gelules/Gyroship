@@ -281,7 +281,16 @@ pub unsafe extern "C" fn gyroship_counter(cpu: *mut Cpu, pc: u64, rt: u32) {
     }
 }
 
-/// `yield` (1), `wfe` (2) or `wfi` (3): nothing to do without a scheduler.
+/// The kind of [`gyroship_yield`] that generated code calls at a loop head or a
+/// function's entry once its thread has run [`PREEMPT_WORK`] instructions since
+/// the HLE last took the count: a preemption point for long computations
+/// without switch points (the HLE decides whether it is one, D40).
+pub const YIELD_PREEMPT: u32 = 4;
+
+/// Instructions between two preemption points of a long computation.
+pub const PREEMPT_WORK: u64 = 1 << 20;
+
+/// `yield` (1), `wfe` (2) or `wfi` (3), or [`YIELD_PREEMPT`]: nothing to do without a scheduler.
 ///
 /// # Safety
 /// `cpu` must point to a valid context.
