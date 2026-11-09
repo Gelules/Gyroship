@@ -494,6 +494,9 @@ pub struct Census {
     rewrites: Vec<(u64, u64, u64)>,
     /// RomFS reads: (present, offset, size).
     romfs: Vec<(u64, u64, u64)>,
+    /// (command, thread id) -> count, for the IPC commands the multi-core plan
+    /// needs counted (syncpt 22, 103 and 201).
+    ipc: std::collections::BTreeMap<(&'static str, u64), u64>,
 }
 
 const COUNTER: u32 = 0x100;
@@ -536,8 +539,16 @@ impl Kernel {
         }
     }
 
+    /// Counts an IPC command of the running thread for `--perf`.
+    pub(crate) fn census_ipc(&mut self, command: &'static str) {
+        let (Some(_), Some(t)) = (&self.config.perf, self.sched.current) else { return };
+        let id = self.sched.threads[t].id;
+        *self.census.ipc.entry((command, id)).or_insert(0) += 1;
+    }
+
     /// The census as text: switch points per present by thread and kind, the
-    /// busiest counter-read and wait sites, and each thread's first frame chain.
+    /// busiest counter-read and wait sites, the counted IPC commands by thread,
+    /// each thread's priority and cores, and each thread's first frame chain.
     fn census_report(&self) -> String {
         use std::fmt::Write as _;
         let presents = self.gs.presents.max(1) as f64;
@@ -562,6 +573,14 @@ impl Kernel {
         out += "# counter reads and waits per present, by site\n";
         for (&(id, pc), &n) in sites.into_iter().take(30) {
             let _ = writeln!(out, "{:8.1}  thread {id}  {pc:#x} {}", n as f64 / presents, self.symbolize(pc));
+        }
+        out += "# counted IPC commands, by command and guest thread\n";
+        for (&(command, id), &n) in &self.census.ipc {
+            let _ = writeln!(out, "{command}  thread {id}: {n} ({:.2} per present)", n as f64 / presents);
+        }
+        out += "# threads at the end: priority, ideal core (-1: none), core, affinity mask\n";
+        for t in &self.sched.threads {
+            let _ = writeln!(out, "thread {}: priority {} ideal {} core {} mask {:#x}", t.id, t.priority, t.ideal, t.core, t.affinity);
         }
         out += "# each thread's frame chain at its first switch point (its body is last)\n";
         for (id, chain) in &self.census.first {

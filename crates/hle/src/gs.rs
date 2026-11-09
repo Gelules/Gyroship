@@ -277,11 +277,13 @@ impl Gs {
             }
             // syncpt: the value of a syncpoint (on the wire, its id inverted), mode 0.
             (Gs::Syncpt, 103) => {
+                k.census_ipc("syncpt 103");
                 let v = k.gs.syncpts.get(!req.u32_at(0)? as usize).copied().unwrap_or(0);
                 Reply::with(&[&u64::from(v).to_le_bytes()[..], &[0]].concat())
             }
             // The event of a wait index.
             (Gs::Syncpt, 22) => {
+                k.census_ipc("syncpt 22");
                 let n = req.u32_at(0)? as usize;
                 let (r, e) = k.numbered_event()?;
                 put(&mut k.gs.syncpt_waits, n, e);
@@ -293,6 +295,7 @@ impl Gs {
             // Arm a wait: the fake GPU has always got there (the syncpoint is raised to the
             // threshold, 32-bit wrapping compare), so the event is signaled at once.
             (Gs::Syncpt, 201) => {
+                k.census_ipc("syncpt 201");
                 let (n, id, threshold) = (req.u32_at(0)? as usize, !req.u32_at(4)? as usize, req.u64_at(8)? as u32);
                 if k.journal.few("syncpt 201", 4) {
                     let armed = k.gs.syncpt_waits.get(n).copied().flatten().is_some();

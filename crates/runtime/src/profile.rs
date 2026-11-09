@@ -200,13 +200,18 @@ pub fn finish(guest: &dyn Fn(u64) -> String) {
     for (t, n, _) in &threads {
         out += &format!("{n:9} {:7.2}%  thread {t}\n", pct(*n));
     }
+    // Down to 0.1% of the thread's own samples, so its time can be split by
+    // category; the rest in one line.
     for (t, n, m) in threads.iter().filter(|r| pct(r.1) >= 1.0) {
-        out += &format!("# thread {t}: {n} samples, its hottest symbols\n");
+        out += &format!("# thread {t}: {n} samples, its symbols down to 0.1% of them\n");
         let mut hot: Vec<(&String, &u64)> = m.iter().collect();
         hot.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
-        for (name, k) in hot.into_iter().take(15) {
+        let (shown, rest): (Vec<_>, Vec<_>) = hot.into_iter().partition(|(_, k)| **k * 1000 >= *n);
+        for (name, k) in shown {
             out += &format!("{k:9} {:7.2}%  {name}{}\n", pct(*k), guest_of(name));
         }
+        let rest: u64 = rest.iter().map(|(_, k)| **k).sum();
+        out += &format!("{rest:9} {:7.2}%  (the rest of thread {t})\n", pct(rest));
     }
     // Where the hottest symbols were called from: the guest's x30 at the
     // sample, the return address of the last call; exact in a leaf function only.
