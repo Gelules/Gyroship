@@ -2,7 +2,8 @@
 
 use gyroship_hle::journal::Journal;
 use gyroship_hle::result::*;
-use gyroship_hle::service::SM_NOT_ALLOWED;
+use gyroship_hle::fs::{Fs, RomFs};
+use gyroship_hle::service::{SM_NOT_ALLOWED, Service};
 use gyroship_hle::{Config, Kernel, boot, layout};
 use gyroship_runtime::Cpu;
 use gyroship_runtime::mem::{Block, Memory, perm, state};
@@ -236,4 +237,38 @@ fn a_cloned_session_reaches_the_same_object() {
     let (_, w) = send(&mut k, &mut cpu, clone, &cmif(&[4], 0, &[0, 0], None));
     assert_ne!(moved(&w), 0, "OpenLogger through the clone");
     assert_eq!(k.objects.iter().filter(|o| matches!(o, gyroship_hle::service::Service::Lm)).count(), 1, "one lm object");
+}
+
+/// IStorage Read: the destination is checked and the read counted at once, the
+/// bytes come with the deferred work, and a read over the message is an anomaly.
+#[test]
+fn a_romfs_read_is_checked_at_once_and_lands_after_the_svc() {
+    let (mut k, mut cpu) = kernel();
+    k.config.explore = true;
+    let root = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("ipc-romfs");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("c"), b"xyz").unwrap();
+    k.romfs = Some(std::sync::Arc::new(RomFs::build(&root).unwrap()));
+    let h = k.open_session(Service::Fs(Fs::RomStorage)).unwrap();
+    // Read(0x200, 3), the file's bytes, into `to` (one B buffer); returns the CMIF result.
+    let read = |k: &mut Kernel, cpu: &mut Cpu, to: u64| {
+        let (r, w) = send(k, cpu, h, &cmif(&[4 | 1 << 24, 3, to as u32, ((to >> 36 & 7) << 2) as u32], 0, &[0x200, 0, 3, 0], None));
+        assert_eq!(r, SUCCESS);
+        cmif_result(&w, 2)
+    };
+    assert_eq!(read(&mut k, &mut cpu, DATA + 0x800), SUCCESS);
+    let mut dest = [0; 3];
+    k.mem.read(DATA + 0x800, &mut dest).unwrap();
+    assert_eq!(dest, [0; 3], "the bytes come with the deferred work");
+    assert_eq!(k.counts["romfs reads"], 1);
+    k.deferred.take().expect("a deferred read").run().unwrap();
+    k.mem.read(DATA + 0x800, &mut dest).unwrap();
+    assert_eq!(&dest, b"xyz");
+    // Unmapped: refused at once, nothing deferred.
+    assert_eq!(read(&mut k, &mut cpu, DATA + 0x1000), INVALID_POINTER);
+    assert!(k.deferred.is_none());
+    // Over the message (the TLS): the reply would no longer win there.
+    assert_eq!(read(&mut k, &mut cpu, TLS + 0x80), SUCCESS);
+    assert_eq!(k.anomalies["romfs read buffer"], 2);
 }

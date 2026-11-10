@@ -108,7 +108,7 @@ pub fn boot(exefs: &Path, journal: Journal, config: Config) -> Result<Kernel, St
     let romfs = exefs.parent().map(|p| p.join("romfs")).filter(|p| p.is_dir()).ok_or("no romfs folder next to the exefs")?;
     let image = crate::fs::RomFs::build(&romfs).map_err(|e| format!("{}: {e}", romfs.display()))?;
     k.log(&format!("romfs: an image of {} bytes", image.size()));
-    k.romfs = Some(image);
+    k.romfs = Some(std::sync::Arc::new(image));
     let rtld = link::base_of("rtld").expect("rtld's base");
     k.create_main(rtld, MAIN_STACK.0 + MAIN_STACK.1);
     let program = Program::link(modules).map_err(|e| format!("link: {}", e.0))?;

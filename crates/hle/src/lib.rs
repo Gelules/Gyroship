@@ -157,8 +157,11 @@ pub struct Kernel {
     pub frame: (u64, u64, u64),
     /// Exported function symbols of every module, sorted: (address, name).
     pub symbols: Vec<(u64, String)>,
-    /// The game's RomFS, served by fsp-srv.
-    pub romfs: Option<fs::RomFs>,
+    /// The game's RomFS, served by fsp-srv (shared with deferred reads).
+    pub romfs: Option<Arc<fs::RomFs>>,
+    /// Work the running SVC left for after the kernel lock: `on_svc` takes it
+    /// in the scope that ran the SVC, so it is None whenever the kernel is free.
+    pub deferred: Option<Deferred>,
     /// State the graphics sessions share.
     pub gs: gs::State,
     /// hid's shared memory, once a client asked for it.
@@ -222,7 +225,7 @@ impl Kernel {
         journal.line(0, 0, &format!("gyroship hle: mode {mode}, seed {:#x}, non-system memory {:#x}", config.seed, config.non_system_memory));
         let recorded = config.record.as_ref().map(|_| Vec::new());
         let audio_samples = config.audio_dump.as_ref().map(|_| Vec::new());
-        Kernel { mem: Arc::new(mem), journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None, sessions: Vec::new(), objects: Vec::new(), domains: Vec::new(), allowed_services: Vec::new(), shared: Vec::new(), transfers: Vec::new(), time_shared: None, frame: (0, 0, 0), symbols: Vec::new(), romfs: None, gs: gs::State::default(), hid_shared: None, input: Default::default(), spin: Vec::new(), census: Census::default(), saves: Default::default(), timers: Vec::new(), surfaces: None, gpu: Default::default(), counts: Default::default(), anomalies: Default::default(), frame_hashes: Vec::new(), window: None, live_input: None, recorded, audio_out: None, audio_samples, opus: Default::default(), audio_gain: 1.0, audio_format: (2, 48_000) }
+        Kernel { mem: Arc::new(mem), journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None, sessions: Vec::new(), objects: Vec::new(), domains: Vec::new(), allowed_services: Vec::new(), shared: Vec::new(), transfers: Vec::new(), time_shared: None, frame: (0, 0, 0), symbols: Vec::new(), romfs: None, deferred: None, gs: gs::State::default(), hid_shared: None, input: Default::default(), spin: Vec::new(), census: Census::default(), saves: Default::default(), timers: Vec::new(), surfaces: None, gpu: Default::default(), counts: Default::default(), anomalies: Default::default(), frame_hashes: Vec::new(), window: None, live_input: None, recorded, audio_out: None, audio_samples, opus: Default::default(), audio_gain: 1.0, audio_format: (2, 48_000) }
     }
 
     /// Counts one more `name` (normal activity); returns the new count.
@@ -474,11 +477,37 @@ pub fn with<R>(f: impl FnOnce(&mut Kernel) -> R) -> R {
     f(guard.as_mut().expect("no kernel installed on this thread"))
 }
 
+/// Work an SVC leaves for after the kernel lock. `on_svc` runs it after
+/// `svc()` and before `reschedule()`, on the caller's host thread, before any
+/// guest code; meanwhile other host threads may use the kernel. A job holds
+/// all it needs from the moment it is queued and never touches the kernel.
+pub enum Deferred {
+    /// IStorage Read: `len` bytes of the image at `offset` into guest `addr`
+    /// (found writable when queued).
+    RomFsRead { romfs: Arc<fs::RomFs>, mem: Arc<Memory>, offset: u64, addr: u64, len: u64 },
+}
+
+impl Deferred {
+    /// Does the work; `Err` is the line the run stops with.
+    pub fn run(self) -> Result<(), String> {
+        match self {
+            Deferred::RomFsRead { romfs, mem, offset, addr, len } => {
+                let mut bytes = vec![0; len as usize];
+                romfs.read(offset, &mut bytes).map_err(|e| format!("RomFS read at {offset:#x}+{len:#x}: {e}"))?;
+                // Checked again: only another host thread (play mode) can have
+                // unmapped it since, which Horizon forbids during the request.
+                mem.write(addr, &bytes).map_err(|e| format!("RomFS read at {offset:#x}+{len:#x}: {addr:#x} no longer writable ({e:?})"))
+            }
+        }
+    }
+}
+
 // Each hook leaves `with` (releasing the kernel lock) before it switches
-// fibers: the next thread takes the lock too.
+// fibers: the next thread takes the lock too. `on_svc` also releases it
+// around the SVC's deferred work.
 
 unsafe fn on_svc(cpu: *mut Cpu, pc: u64, imm: u32) {
-    let next = with(|k| {
+    let job = with(|k| {
         k.tick();
         k.take_work(cpu);
         k.census(cpu, imm, None);
@@ -487,6 +516,18 @@ unsafe fn on_svc(cpu: *mut Cpu, pc: u64, imm: u32) {
         }
         // SAFETY: the running thread's context, for the time of the call.
         k.svc(unsafe { &mut *cpu }, pc, imm);
+        k.deferred.take()
+    });
+    // The SVC's deferred work, without the kernel. Nothing ran since svc() and
+    // no guest code runs before switch_to(): the guest sees the work done, at the
+    // SVC's virtual time and on its thread.
+    // ponytail: two kernel scopes per SVC even without a job; re-lock only when
+    // there is one if the uncontended lock ever shows in --perf.
+    let failed = job.and_then(|job| job.run().err());
+    let next = with(|k| {
+        if let Some(why) = failed {
+            k.stop(STOP_EXIT, &why);
+        }
         k.reschedule()
     });
     thread::switch_to(next);

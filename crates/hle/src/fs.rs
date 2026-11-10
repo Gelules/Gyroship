@@ -11,8 +11,9 @@
 use crate::Kernel;
 use crate::ipc::{Reply, Request};
 use crate::service::Service;
-use std::cell::OnceCell;
+use gyroship_runtime::mem::perm;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 const HEADER: u64 = 0x50;
 const DATA: u64 = 0x200;
@@ -35,8 +36,12 @@ pub struct RomFs {
     files: Vec<File>,
     size: u64,
     /// Each file's host handle, opened at its first read and kept (host state,
-    /// rebuilt on demand: never part of the guest's).
-    open: Vec<OnceCell<std::fs::File>>,
+    /// rebuilt on demand: never part of the guest's). Host threads share them:
+    /// reads are positional.
+    // ponytail: one handle per file, so concurrent reads of one file (data.zip)
+    // serialize on it (a synchronous file object); a handle per host thread if
+    // play-mode loads measure it.
+    open: Vec<OnceLock<std::fs::File>>,
 }
 
 /// RomFS hash of an entry name under its parent's offset.
@@ -157,7 +162,7 @@ impl RomFs {
         }
         header.extend(DATA.to_le_bytes());
         let size = tables_at + tables.len() as u64;
-        let open = files.iter().map(|_| OnceCell::new()).collect();
+        let open = files.iter().map(|_| OnceLock::new()).collect();
         Ok(RomFs { header, tables, tables_at, files, size, open })
     }
 
@@ -232,16 +237,15 @@ impl Fs {
             (Fs::Proxy, 200) => Reply::object(Service::Fs(Fs::RomStorage)),
             // OpenSaveDataFileSystem(space id, attribute).
             (Fs::Proxy, 51) => return k.open_save(req),
-            // Read(offset, size) into the B buffer; GetSize.
+            // Read(offset, size) into the B buffer: checked and counted here; the
+            // bytes are read and land after the kernel lock, before the caller
+            // resumes (`crate::Deferred`). GetSize.
             (Fs::RomStorage, 0) => {
                 let (offset, size) = (req.u64_at(0)?, req.u64_at(8)?);
                 let b = req.out_buffer(0)?;
-                let mut bytes = vec![0; size.min(b.size) as usize];
-                let romfs = k.romfs.as_ref()?;
-                if let Err(e) = romfs.read(offset, &mut bytes) {
-                    k.stop(crate::STOP_EXIT, &format!("RomFS read at {offset:#x}+{size:#x}: {e}"));
-                }
-                if k.mem.write(b.addr, &bytes).is_err() {
+                let len = size.min(b.size);
+                let romfs = k.romfs.clone()?;
+                if k.mem.accessible(b.addr, len, perm::W).is_err() {
                     k.anomaly("romfs read buffer", &format!("{size:#x} bytes at {offset:#x} into {:#x}+{:#x}: not writable", b.addr, b.size));
                     return Some(Reply::error(crate::result::INVALID_POINTER));
                 }
@@ -250,6 +254,7 @@ impl Fs {
                 if k.config.perf.is_some() {
                     k.census.romfs.push((k.gs.presents, offset, size));
                 }
+                k.deferred = Some(crate::Deferred::RomFsRead { romfs, mem: k.mem.clone(), offset, addr: b.addr, len });
                 Reply::ok()
             }
             (Fs::RomStorage, 4) => Reply::with(&k.romfs.as_ref()?.size().to_le_bytes()),

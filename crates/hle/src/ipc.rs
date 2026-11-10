@@ -302,6 +302,16 @@ impl Kernel {
             self.stop(crate::STOP_EXIT, &what);
         };
         let (reply, objects) = self.dispatch(s, &req);
+        // A deferred read lands after this reply (`on_svc`): over the message it
+        // would win where the reply used to.
+        // ponytail: an anomaly, not the console's order (reply over data); emulate
+        // that order if a game ever does it.
+        if let Some(&crate::Deferred::RomFsRead { addr, len, .. }) = self.deferred.as_ref()
+            && addr < buf + size as u64
+            && buf < addr + len
+        {
+            self.anomaly("romfs read buffer", &format!("{len:#x} bytes into {addr:#x}: over the IPC message at {buf:#x}"));
+        }
         if req.kind == Kind::Close {
             self.sessions[s] = None;
         }
