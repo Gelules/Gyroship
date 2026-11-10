@@ -2,7 +2,7 @@
 
 use gyroship_runtime::mem::{self, Block, Error, Info, Memory, attr, perm, state};
 use gyroship_runtime::{Cpu, ld64, st64};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 const TEXT: u64 = 0x70_0000_0000;
 const STACK: u64 = 0x20_0000_0000;
@@ -129,6 +129,105 @@ fn atomic_words_check_like_read_and_write() {
     assert_eq!(m.load_u32(rw + 2), Err(Error::InvalidRange));
     assert_eq!(m.load_u64(rw + 4), Err(Error::InvalidRange));
     assert_eq!(m.load_u32(mem::SPACE), Err(Error::InvalidRange));
+}
+
+/// `publish_object` leaves what `write_object` of the new word and the rest leaves:
+/// the same bytes, written pages and refusals (then nothing is written), at every
+/// alignment, across pages and blocks, and where the guest may only read.
+#[test]
+fn publish_object_leaves_what_write_object_leaves() {
+    const COPY: u64 = 0x10_0000;
+    let m = Memory::new().unwrap();
+    for at in [HEAP, HEAP + COPY] {
+        m.map(at, 0x2000, Block::new(state::NORMAL, perm::RW)).unwrap();
+        // Guest R, host RW (the GPU still writes it), then host read-only (refused).
+        m.map(at + 0x2000, 0x1000, Block::new(state::SHARED, perm::R)).unwrap();
+        m.map(at + 0x3000, 0x1000, Block::new(state::CODE, perm::R)).unwrap();
+        m.write_object(at, &(0..0x3000).map(|i| i as u8).collect::<Vec<_>>()).unwrap();
+    }
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = |n: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % n
+    };
+    m.take_written(HEAP, 0x4000);
+    m.take_written(HEAP + COPY, 0x4000);
+    for trial in 0..4000 {
+        let (at, width) = (HEAP + next(0x4000 - 20), [4usize, 8][next(2) as usize]);
+        let rest: Vec<u8> = (0..[0, 4, 8, 12][next(4) as usize]).map(|_| next(256) as u8).collect();
+        let key = next(u64::MAX);
+        let f = move |old: u64| old.wrapping_mul(3) ^ key;
+        let mut old = [0u8; 8];
+        m.read(at, &mut old[..width]).unwrap();
+        let word = f(u64::from_le_bytes(old)).to_le_bytes();
+        let plain = m.write_object(at, &[&word[..width], &rest[..]].concat());
+        let published = m.publish_object(at + COPY, width, &rest, f);
+        assert_eq!(plain.is_ok(), published.is_ok(), "trial {trial} at {at:#x}");
+        if let Ok(o) = published {
+            assert_eq!(o.to_le_bytes()[..width], old[..width], "trial {trial}: old word");
+        }
+        let (mut a, mut b) = (vec![0u8; 0x4000], vec![0u8; 0x4000]);
+        m.read(HEAP, &mut a).unwrap();
+        m.read(HEAP + COPY, &mut b).unwrap();
+        assert_eq!(a, b, "trial {trial} at {at:#x}, width {width}, rest {}", rest.len());
+        let copied: Vec<u64> = m.take_written(HEAP + COPY, 0x4000).iter().map(|p| p - COPY).collect();
+        assert_eq!(m.take_written(HEAP, 0x4000), copied, "trial {trial}: written pages");
+    }
+}
+
+/// A poller on another host thread that acquire-loads a report's payload never sees
+/// it with an older report's timestamp: the timestamp goes first, the payload last
+/// with Release (how a guest thread waits for the GPU).
+#[test]
+fn a_poller_that_sees_a_payload_sees_its_timestamp() {
+    const REPORTS: u64 = 200_000;
+    let m = Memory::new().unwrap();
+    m.map(HEAP, 0x1000, Block::new(state::NORMAL, perm::RW)).unwrap();
+    let base = m.base() as usize;
+    let done = AtomicBool::new(false);
+    std::thread::scope(|s| {
+        let done = &done;
+        s.spawn(move || {
+            // SAFETY: a mapped page that outlives the scope; aligned words.
+            let (payload, stamp) = unsafe { (AtomicU32::from_ptr((base as *mut u8).add(HEAP as usize).cast()), AtomicU64::from_ptr((base as *mut u8).add(HEAP as usize + 8).cast())) };
+            while !done.load(Ordering::Acquire) {
+                let p = u64::from(payload.load(Ordering::Acquire));
+                let t = stamp.load(Ordering::Relaxed);
+                assert!(t >= p, "payload {p} seen with the timestamp {t} of an older report");
+            }
+        });
+        for i in 1..=REPORTS {
+            m.publish_object(HEAP, 4, &[&[0u8; 4][..], &i.to_le_bytes()[..]].concat(), |_| i).unwrap();
+        }
+        done.store(true, Ordering::Release);
+    });
+}
+
+/// GPU reductions and guest atomics on one word lose no update: the reduction is one
+/// compare-exchange loop on the host word, as a guest LDADD is one LOCK XADD on it.
+#[test]
+fn reductions_and_guest_atomics_on_one_word_lose_nothing() {
+    const N: u32 = 100_000;
+    let m = Memory::new().unwrap();
+    m.map(HEAP, 0x1000, Block::new(state::NORMAL, perm::RW)).unwrap();
+    let base = m.base() as usize;
+    std::thread::scope(|s| {
+        for _ in 0..3 {
+            s.spawn(move || {
+                // SAFETY: as above.
+                let word = unsafe { AtomicU32::from_ptr((base as *mut u8).add(HEAP as usize).cast()) };
+                for _ in 0..N {
+                    word.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+        }
+        for _ in 0..N {
+            m.publish_object(HEAP, 4, &[], |old| old + 1).unwrap();
+        }
+    });
+    assert_eq!(m.load_u32(HEAP), Ok(4 * N));
 }
 
 /// The write watch reports the pages written (by the host here; the guest's

@@ -496,18 +496,21 @@ pub fn poll(k: &mut Kernel) {
 }
 
 /// Performs a semaphore release or reduction in guest memory (the GPU
-/// writes whatever the CPU's permissions).
+/// writes whatever the CPU's permissions). The payload goes last, in one host
+/// atomic: a guest thread that polls it sees the whole report, and its own
+/// atomics on the word are not lost.
 fn semaphore(k: &mut Kernel, space: u32, r: &gyroship_gpu::state::qmd::Release) {
     let n = if r.wide { 8 } else { 4 };
-    let mut old = [0u8; 8];
-    let _ = k.read_gpu(space, r.addr, &mut old[..n]);
-    let mut bytes = r.apply(u64::from_le_bytes(old)).to_le_bytes()[..n].to_vec();
+    // ponytail: where the CPU cannot read the word, the reduction starts from 0, as
+    // when it was a copy (identical replays); start from the word if a game needs it.
+    let readable = k.read_gpu(space, r.addr, &mut [0u8; 8][..n]);
+    let mut bytes = vec![0u8; n];
     if r.timestamp {
         bytes.resize(8, 0);
         bytes.extend((k.now() * 32).to_le_bytes());
     }
     let cpu = k.gpu_to_cpu(space, r.addr);
-    if k.mem.write_object(cpu, &bytes).is_err() {
+    if k.mem.publish_object(cpu, n, &bytes[n..], |old| r.apply(if readable { old } else { 0 })).is_err() {
         k.anomaly("gpu semaphore not writable", &format!("semaphore at {:#x}", r.addr));
     } else if let Some(s) = k.surfaces.as_mut() {
         s.invalidate(r.addr, bytes.len() as u64);
@@ -573,7 +576,9 @@ impl Gpu {
             match effect {
                 Effect::Release(r) => {
                     let at = k.gpu_to_cpu(space, r.addr);
-                    let mut bytes = r.value.to_le_bytes()[..r.width as usize].to_vec();
+                    let width = usize::from(r.width);
+                    // The payload is written last (publish_object): a guest thread polling it sees the whole report.
+                    let mut bytes = r.value.to_le_bytes()[..width].to_vec();
                     if r.timestamp {
                         bytes.resize(8, 0);
                         bytes.extend((k.now() * 32).to_le_bytes());
@@ -586,7 +591,7 @@ impl Gpu {
                         let s = &mut k.gs.syncpts[CHANNEL_SYNCPT as usize];
                         *s = s.wrapping_add(1);
                         k.count("syncpoint increments");
-                    } else if k.mem.write_object(at, &bytes).is_err() {
+                    } else if k.mem.publish_object(at, width, &bytes[width..], |_| r.value).is_err() {
                         k.anomaly(if r.addr == 0 { "gpu release at 0" } else { "gpu release not writable" }, &what);
                     } else {
                         // Read again by later GPU work, as any GPU write.
@@ -784,6 +789,40 @@ mod tests {
         assert_ne!(flags & 1 << 8, 0, "TSG");
         assert_ne!(flags & 1 << 34, 0, "mapping modify");
         assert_eq!(flags & (1 << 22 | 1 << 30), 0);
+    }
+
+    /// What the GPU path leaves for a release with a timestamp and two reductions,
+    /// one where the CPU cannot read the word (the reduction then starts from 0).
+    #[test]
+    fn releases_and_reductions_leave_the_bytes_they_left_before() {
+        use gyroship_gpu::pushbuf::Release;
+        use gyroship_gpu::state::qmd::{self, Reduction};
+        use gyroship_runtime::mem::{Block, Memory, attr, perm, state};
+        let page = crate::layout::ALIAS.0;
+        let mut k = Kernel::new(Memory::new().unwrap(), crate::journal::Journal::memory(), crate::Config::default());
+        k.mem.map(page, 0x2000, Block::new(state::NORMAL, perm::RW)).unwrap();
+        k.mem.write(page, &[0xff; 0x20]).unwrap();
+        k.mem.write(page + 0x20, &5u32.to_le_bytes()).unwrap();
+        k.mem.write(page + 0x1000, &5u32.to_le_bytes()).unwrap();
+        // The second page lent with no permission (a transfer memory): the GPU writes it, the CPU cannot read it.
+        k.mem.set_attr(page + 0x1000, 0x1000, attr::LOCKED, attr::LOCKED).unwrap();
+        k.mem.protect(page + 0x1000, 0x1000, 0).unwrap();
+        let add = |addr| qmd::Release { addr, payload: 3, reduction: Some(Reduction::Add), signed: false, wide: false, timestamp: false };
+        let effects = vec![
+            Effect::Release(Release { method: 0x1b0c, addr: page, value: 7, width: 4, timestamp: true }),
+            Effect::Semaphore(add(page + 0x20)),
+            Effect::Semaphore(add(page + 0x1000)),
+        ];
+        Gpu::default().effects(&mut k, 0, effects);
+        let mut b = [0u8; 0x24];
+        k.mem.read(page, &mut b).unwrap();
+        // Payload 7, zero padding, timestamp 0 (no thread runs: virtual time 0); nothing past it.
+        assert_eq!(b[..0x10], [7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(b[0x10..0x20], [0xff; 0x10]);
+        assert_eq!(b[0x20..], 8u32.to_le_bytes());
+        let mut c = [0u8; 4];
+        k.mem.read_object(page + 0x1000, &mut c).unwrap();
+        assert_eq!(c, 3u32.to_le_bytes());
     }
 }
 

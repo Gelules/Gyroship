@@ -336,6 +336,41 @@ impl Memory {
         Ok(self.word::<AtomicU32>(addr, perm::RW)?.try_update(Ordering::AcqRel, Ordering::Acquire, f))
     }
 
+    /// Writes memory the HLE owns, as `write_object` does, with one word last:
+    /// `rest` goes to `addr + width`, then the `width`-byte word at `addr` (at
+    /// most 8) becomes `f(old)`; returns `old`. A naturally aligned 4- or 8-byte
+    /// word changes in one host atomic with Release ordering: a thread whose
+    /// Acquire load sees the new value also sees `rest` and every earlier write
+    /// of this thread (a GPU report: timestamp, then payload). Any other word is
+    /// copied, as no Arm atomic can reach it either. Nothing is written unless
+    /// the whole range is host-writable.
+    pub fn publish_object(&self, addr: u64, width: usize, rest: &[u8], mut f: impl FnMut(u64) -> u64) -> Result<u64, Error> {
+        assert!(width <= 8, "a word of at most 8 bytes");
+        self.table().host_accessible(addr, (width + rest.len()) as u64, PAGE_READWRITE)?;
+        // SAFETY: the whole range is mapped and host-writable (checked just above);
+        // an aligned guest address is an aligned host one (the base is 64 KiB-aligned).
+        unsafe {
+            let p = self.base.add(addr as usize);
+            std::ptr::copy_nonoverlapping(rest.as_ptr(), p.add(width), rest.len());
+            let (set, fetch) = (Ordering::Release, Ordering::Relaxed);
+            Ok(match width {
+                4 if addr.is_multiple_of(4) => match AtomicU32::from_ptr(p.cast()).try_update(set, fetch, |v| Some(f(u64::from(v)) as u32)) {
+                    Ok(v) | Err(v) => u64::from(v),
+                },
+                8 if addr.is_multiple_of(8) => match AtomicU64::from_ptr(p.cast()).try_update(set, fetch, |v| Some(f(v))) {
+                    Ok(v) | Err(v) => v,
+                },
+                _ => {
+                    let mut old = [0u8; 8];
+                    std::ptr::copy_nonoverlapping(p, old.as_mut_ptr(), width);
+                    let old = u64::from_le_bytes(old);
+                    std::ptr::copy_nonoverlapping(f(old).to_le_bytes().as_ptr(), p, width);
+                    old
+                }
+            })
+        }
+    }
+
     /// The mapped blocks, in address order: a snapshot taken under the read lock.
     pub fn blocks(&self) -> impl Iterator<Item = Info> {
         let blocks: Vec<Info> = self.table().0.iter().map(|(&base, &(end, block))| Info { base, size: end - base, block }).collect();

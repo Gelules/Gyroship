@@ -122,12 +122,18 @@ impl crate::Kernel {
     }
 
     /// Reads guest memory at a GPU address for the GPU; false if a byte is
-    /// not readable.
+    /// not readable. A naturally aligned 4- or 8-byte read (the semaphore an
+    /// acquire polls while guest threads release it) is one Acquire load.
     // ponytail: a read crossing into another GPU mapping follows the first
     // one's CPU range; split the read per mapping if a buffer ever does.
     pub fn read_gpu(&mut self, space: u32, gpu: u64, out: &mut [u8]) -> bool {
         let at = self.gpu_to_cpu(space, gpu);
-        self.mem.read(at, out).is_ok()
+        let word = match out.len() {
+            4 if at.is_multiple_of(4) => self.mem.load_u32(at).map(u64::from),
+            8 if at.is_multiple_of(8) => self.mem.load_u64(at),
+            _ => return self.mem.read(at, out).is_ok(),
+        };
+        word.map(|v| out.copy_from_slice(&v.to_le_bytes()[..out.len()])).is_ok()
     }
 }
 
