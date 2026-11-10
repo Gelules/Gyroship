@@ -8,6 +8,9 @@
 //! the same. Within a core the highest priority runs (lowest number), in
 //! arrival order at equal priority; a core with nothing to run takes a ready
 //! thread that waits behind another, if its affinity allows.
+//!
+//! In the play engine (D41, `crate::play`) time is real and none of this
+//! scheduler runs.
 
 use crate::Kernel;
 use crate::layout;
@@ -216,6 +219,9 @@ pub struct Sched {
     /// Fibers of ended threads, deleted by the next fiber that runs.
     dead: Vec<Fiber>,
     pub outcome: Option<Outcome>,
+    /// Play engine: the real time at which the current kernel scope began
+    /// (`crate::with` sets it), which `now()` returns there.
+    pub real_now: u64,
 }
 
 impl Drop for Sched {
@@ -228,8 +234,13 @@ impl Drop for Sched {
 }
 
 impl Kernel {
-    /// The running core's clock: the guest's present.
+    /// The running core's clock: the guest's present. In the play engine, the
+    /// real time at which this kernel scope began, so that one SVC sees one
+    /// time, as in virtual time (a submit's GPU timestamps, a deadline).
     pub fn now(&self) -> u64 {
+        if self.config.play {
+            return self.sched.real_now;
+        }
         self.sched.current.map_or(0, |t| self.sched.clocks[self.sched.threads[t].core])
     }
 

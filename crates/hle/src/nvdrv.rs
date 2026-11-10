@@ -255,7 +255,7 @@ impl Nvdrv {
                 }
                 put32(&mut out, 0, (engines.len() * 0x10) as u32);
             }
-            // GPU time: nanoseconds of virtual time (ticks are 32 ns).
+            // GPU time: nanoseconds of the kernel's time (ticks are 32 ns).
             (Device::CtrlGpu, 0xc010471c) => put64(&mut out, 0, k.now() * 32),
             (Device::CtrlGpu, 0x402c4703) => {}
             // as-gpu: allocate, the read-only syncpoint map, the VA regions, bind a channel.

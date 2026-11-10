@@ -1,6 +1,7 @@
 //! The journal of a run (D21): one line per event, stamped with the virtual
 //! time and the guest thread, never with wall-clock time or a host address,
-//! so that two runs compare byte for byte.
+//! so that two runs compare byte for byte. The play engine stamps real time
+//! instead: its journal is a log, never a reference (D38).
 
 use std::collections::BTreeSet;
 use std::io::Write;

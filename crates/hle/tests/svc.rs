@@ -179,6 +179,47 @@ fn host_threads_share_one_kernel() {
     assert_eq!(gyroship_hle::uninstall().unwrap().counts["lock test"], 40_000);
 }
 
+/// The play engine's kernel time: one value per scope, which never goes back
+/// across host threads and never runs ahead of the real clock.
+#[test]
+fn play_kernel_time_is_one_value_per_scope() {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    let (k, _) = kernel(Config { play: true, ..Config::default() });
+    let shared = gyroship_hle::install(k);
+    let last = AtomicU64::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..4 {
+            s.spawn(|| {
+                gyroship_hle::attach(shared);
+                for i in 0..2_000 {
+                    gyroship_hle::with(|k| {
+                        let now = k.now();
+                        // The kernel lock orders the scopes, so Relaxed is enough here.
+                        assert!(now >= last.swap(now, Relaxed), "kernel time went back");
+                        assert!(now <= gyroship_hle::play::real_ticks());
+                        if i % 100 == 0 {
+                            std::thread::sleep(std::time::Duration::from_micros(300));
+                            assert_eq!(k.now(), now, "one time per scope");
+                        }
+                    });
+                }
+            });
+        }
+    });
+    gyroship_hle::uninstall();
+}
+
+/// A play scope that holds the kernel over 40 ms counts in the summary.
+#[test]
+fn a_long_play_scope_is_counted() {
+    let (k, _) = kernel(Config { play: true, ..Config::default() });
+    gyroship_hle::install(k);
+    gyroship_hle::with(|_| std::thread::sleep(std::time::Duration::from_millis(45)));
+    gyroship_hle::with(|_| std::thread::sleep(std::time::Duration::from_millis(1)));
+    let k = gyroship_hle::uninstall().unwrap();
+    assert_eq!(k.counts.get("play: kernel lock held over 40 ms"), Some(&1));
+}
+
 /// Only does something when started by `a_fault_inside_the_kernel_exits`.
 #[test]
 fn kernel_fault_child() {

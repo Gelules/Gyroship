@@ -1,6 +1,7 @@
-//! `time:u` (IStaticService) and its clocks. Times come from the virtual
-//! clock, never from the host: the run starts at a fixed date. The network
-//! clock is never synchronized (rule 9).
+//! `time:u` (IStaticService) and its clocks. Times come from the kernel's
+//! clock (virtual, or real in the play engine), never from the host's
+//! calendar: the run starts at a fixed date. The network clock is never
+//! synchronized (rule 9).
 
 use crate::Kernel;
 use crate::ipc::{Reply, Request};

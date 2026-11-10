@@ -17,6 +17,7 @@ pub mod ipc;
 pub mod journal;
 pub mod nvdrv;
 pub mod opus;
+pub mod play;
 pub mod save;
 pub mod service;
 pub mod shared;
@@ -88,7 +89,8 @@ pub struct Config {
     /// GetInfo 0x15 TotalNonSystemMemorySize: 9 793 MiB, Lichii's value, the
     /// one known to reach the title screen (an arena of 128 MiB).
     pub non_system_memory: u64,
-    /// Stop the run past this virtual time (ticks).
+    /// Stop the run past this time (ticks): virtual time, or real time since
+    /// the run started in the play engine.
     pub time_limit: Option<u64>,
     /// End the run after this many presented frames.
     pub frames: Option<u64>,
@@ -125,11 +127,14 @@ pub struct Config {
     pub record: Option<std::path::PathBuf>,
     /// `--dump-audio FILE`: every frame the game plays, as a float WAV.
     pub audio_dump: Option<std::path::PathBuf>,
+    /// `--play`: the play engine (D41). Each guest thread runs on a host thread
+    /// of its own, in real time; never a reference run (D38).
+    pub play: bool,
 }
 
 impl Default for Config {
     fn default() -> Config {
-        Config { seed: 0x5EED, explore: false, non_system_memory: 0x2_6410_0000, time_limit: None, frames: None, save_dir: None, vsync: true, work_time: false, gpfifo_dump: None, frames_dump: None, dump_every: 1, dump_draws: None, shaders_dump: None, replay: None, profile: None, perf: None, hashes: None, record: None, audio_dump: None }
+        Config { seed: 0x5EED, explore: false, non_system_memory: 0x2_6410_0000, time_limit: None, frames: None, save_dir: None, vsync: true, work_time: false, gpfifo_dump: None, frames_dump: None, dump_every: 1, dump_draws: None, shaders_dump: None, replay: None, profile: None, perf: None, hashes: None, record: None, audio_dump: None, play: false }
     }
 }
 
@@ -482,11 +487,24 @@ pub fn uninstall() -> Option<Kernel> {
 }
 
 /// Runs `f` on this thread's kernel, under the run's lock, which is released
-/// when `f` returns. Never switch fibers or park inside `f`.
+/// when `f` returns. Never switch fibers, park, sleep or yield inside `f`. In
+/// the play engine `f` runs for the caller's guest thread (`Sched::current`;
+/// none on the boot and timer threads), at one time: the real time the scope
+/// began (`Kernel::now`).
 pub fn with<R>(f: impl FnOnce(&mut Kernel) -> R) -> R {
     let kernel = KERNEL.get().expect("no kernel installed on this thread");
     let mut guard = kernel.lock().unwrap_or_else(PoisonError::into_inner);
-    f(guard.as_mut().expect("no kernel installed on this thread"))
+    let k = guard.as_mut().expect("no kernel installed on this thread");
+    if k.config.play {
+        k.sched.current = play::me();
+        // Read once the lock is taken: scopes take turns, so kernel time never goes back.
+        k.sched.real_now = k.sched.real_now.max(play::real_ticks());
+    }
+    let r = f(&mut *k);
+    if k.config.play && play::real_ticks().saturating_sub(k.sched.real_now) > play::LONG_HOLD {
+        k.count("play: kernel lock held over 40 ms");
+    }
+    r
 }
 
 /// Work an SVC leaves for after the kernel lock. `on_svc` runs it after
