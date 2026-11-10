@@ -270,6 +270,10 @@ impl Kernel {
             Some(t) if self.sched.threads[t].state == State::Created => {
                 let now = self.now();
                 self.ready(t, now);
+                // The play engine: a host thread of its own, which may start at once.
+                if self.config.play {
+                    self.start_host_thread(t);
+                }
                 SUCCESS
             }
             Some(_) => INVALID_STATE,

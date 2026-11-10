@@ -85,6 +85,23 @@ pub fn write_perf(path: &std::path::Path, from: usize, gpu: &[f64]) {
     }
 }
 
+/// CPU time (user and kernel) of the host thread behind `handle`, which the
+/// caller keeps open: `--perf` in the play engine, where threads run at once.
+/// Windows counts it in clock ticks: exact enough for a run, not for a frame.
+#[cfg(windows)]
+pub fn cpu_time(handle: usize) -> Option<std::time::Duration> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::GetThreadTimes;
+    let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+    // SAFETY: a thread handle the caller keeps open, and four FILETIMEs to fill.
+    if unsafe { GetThreadTimes(handle as _, &mut created, &mut exited, &mut kernel, &mut user) } == 0 {
+        return None;
+    }
+    let hundreds = |f: FILETIME| u64::from(f.dwHighDateTime) << 32 | u64::from(f.dwLowDateTime);
+    Some(std::time::Duration::from_nanos((hundreds(kernel) + hundreds(user)) * 100))
+}
+
 /// Counts an instruction the interpreter runs, while a profile runs.
 #[inline]
 pub fn count_interpreted(word: u32) {
@@ -314,4 +331,35 @@ fn module(rip: u64) -> String {
 #[cfg(not(windows))]
 fn module(_rip: u64) -> String {
     "?".into()
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use std::os::windows::io::AsRawHandle;
+    use std::time::{Duration, Instant};
+
+    /// A thread that spins has CPU time; one that sleeps has almost none.
+    #[test]
+    fn cpu_time_counts_running_not_sleeping() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (busy_tx, idle_tx) = (tx.clone(), tx);
+        let busy = std::thread::spawn(move || {
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_millis(300) {
+                std::hint::spin_loop();
+            }
+            busy_tx.send(()).unwrap();
+        });
+        let idle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            idle_tx.send(()).unwrap();
+        });
+        rx.recv().unwrap();
+        rx.recv().unwrap();
+        let busy_time = super::cpu_time(busy.as_raw_handle() as usize).unwrap();
+        let idle_time = super::cpu_time(idle.as_raw_handle() as usize).unwrap();
+        assert!(busy_time > Duration::from_millis(100) && idle_time < Duration::from_millis(50), "busy {busy_time:?}, idle {idle_time:?}");
+        busy.join().unwrap();
+        idle.join().unwrap();
+    }
 }

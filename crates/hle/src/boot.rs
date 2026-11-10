@@ -199,9 +199,10 @@ pub(crate) unsafe fn on_probe(cpu: *mut Cpu, pc: u64, name: &str) {
 
 /// The generated harness's `main`: `boot <exefs> [--log FILE] [--explore]
 /// [--all-svcs] [--seconds N] [--frames N] [--gpu] [--backend auto|vulkan|dx12]
-/// ...` runs the game (until N frames are presented, or for N virtual
-/// seconds: 60 when neither is given); any other mode is the runtime's. A
-/// GPU that lacks what the game needs ends the run with exit code 3.
+/// [--play] ...` runs the game (until N frames are presented, or for N
+/// seconds of virtual time, or of real time with `--play`: 60 when neither is
+/// given); any other mode is the runtime's. A GPU that lacks what the game
+/// needs ends the run with exit code 3.
 pub fn main(table: Vec<rt::Entry>) {
     run(table, None)
 }
@@ -266,8 +267,18 @@ pub fn run(table: Vec<rt::Entry>, window: Option<HostWindow>) {
         hashes: value("--hashes").map(Into::into),
         record: value("--record").map(Into::into),
         audio_dump: value("--dump-audio").map(Into::into),
+        play: flag("--play"),
         ..Config::default()
     };
+    if config.play {
+        eprintln!("gyroship: play mode (experimental): a host thread per guest thread, on the wall clock; runs do not repeat and are never a reference");
+        if config.replay.is_some() {
+            eprintln!("gyroship: --replay in play mode follows the wall clock: the game sees the inputs at other moments than in the recorded run");
+        }
+        if config.record.is_some() {
+            eprintln!("gyroship: --record in play mode: the file will not replay this run exactly");
+        }
+    }
     let installed = table.len();
     rt::install(table);
     mem::install_fault_handler();
@@ -312,8 +323,9 @@ pub fn run(table: Vec<rt::Entry>, window: Option<HostWindow>) {
             }
         }
     }
+    let play = k.config.play;
     crate::install(k);
-    let outcome = thread::run();
+    let outcome = if play { crate::play::run_play() } else { thread::run() };
     crate::with(|k| match &outcome {
         thread::Outcome::Finished => {
             k.log("every guest thread ended");

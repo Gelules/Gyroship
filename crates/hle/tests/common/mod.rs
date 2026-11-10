@@ -79,6 +79,17 @@ pub fn install(functions: &[(u64, rt::Guest)]) {
     ONCE.call_once(|| rt::install(functions.iter().map(|&(addr, function)| rt::Entry { addr, len: 0x100, function }).collect()));
 }
 
+/// Runs the main thread at `entry` in the play engine until the run ends;
+/// returns how it ended and the kernel, whose memory holds what threads wrote.
+pub fn play(entry: u64, config: Config) -> (Outcome, Kernel) {
+    let mut k = Kernel::new(Memory::new().unwrap(), Journal::memory(), Config { play: true, ..config });
+    k.mem.map(DATA, 0x1000, Block::new(state::NORMAL, perm::RW)).unwrap();
+    k.create_main(entry, 0);
+    gyroship_hle::install(k);
+    let outcome = gyroship_hle::play::run_play();
+    (outcome, gyroship_hle::uninstall().unwrap())
+}
+
 /// Runs the main thread at `entry` to the end; returns how it ended, the
 /// events and the journal.
 pub fn run(entry: u64) -> (Outcome, Vec<(&'static str, u64)>, String) {

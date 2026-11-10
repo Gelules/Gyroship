@@ -248,13 +248,15 @@ pub extern "C" fn gyroship_trap(_cpu: *mut Cpu, pc: u64, imm: u32) {
 
 /// What the HLE plugs into generated code (`gyroship-hle` registers it; the
 /// runtime does not depend on the HLE, so harnesses without one still link).
-/// Every hook is a point where the scheduler may switch guest threads, and
-/// writes its results into the context before it does.
+/// Every hook is a point where the deterministic scheduler may switch guest
+/// threads, and writes its results into the context before it does; in the
+/// play engine the counter and wait hooks return at once, without a lock.
 #[derive(Clone, Copy)]
 pub struct Hooks {
     /// `svc #imm` at `pc`: arguments in x0..x7, Result in w0, outputs in x1 and x2.
     pub svc: unsafe fn(*mut Cpu, u64, u32),
-    /// `mrs x<rt>, CNTPCT_EL0` at `pc`: writes the virtual counter to x<rt> (31: nowhere).
+    /// `mrs x<rt>, CNTPCT_EL0` at `pc`: writes the counter (virtual, or real in
+    /// the play engine) to x<rt> (31: nowhere).
     pub counter: unsafe fn(*mut Cpu, u64, u32),
     /// `yield` (1), `wfe` (2) or `wfi` (3) at `pc`.
     pub wait: unsafe fn(*mut Cpu, u64, u32),

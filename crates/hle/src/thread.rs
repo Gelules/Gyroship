@@ -156,13 +156,17 @@ pub struct Thread {
     pub wait_seq: u64,
     /// CancelSynchronization came while the thread was not waiting.
     pub cancel: bool,
+    /// Play engine: the host thread that runs it, from StartThread on; its OS
+    /// handle gives its CPU time. None in the deterministic engine.
+    pub host_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 // SAFETY: `cpu` is a heap context owned by the thread table (freed by
 // `Sched::drop`) and tied to no host thread. The host thread running this
 // guest thread uses it (generated code, its own hooks); kernel code under the
 // kernel lock uses it only while the guest thread is not running (created, or
-// parked at a switch point: `wake`, `pick`'s deadlines). `fiber` is Send.
+// parked at a switch point: `wake`, `pick`'s deadlines). `fiber` and
+// `host_thread` are Send.
 unsafe impl Send for Thread {}
 
 /// How a run of the threads ended.
@@ -222,6 +226,11 @@ pub struct Sched {
     /// Play engine: the real time at which the current kernel scope began
     /// (`crate::with` sets it), which `now()` returns there.
     pub real_now: u64,
+    /// Play engine: the thread that waits for the end of the run.
+    pub boot_thread: Option<std::thread::Thread>,
+    /// Play engine: host threads to unpark once the kernel lock is released
+    /// (`crate::with` does it). Always empty in the deterministic engine.
+    pub unparks: Vec<std::thread::Thread>,
 }
 
 impl Drop for Sched {
@@ -305,6 +314,7 @@ impl Kernel {
             wait: Wait::None,
             wait_seq: 0,
             cancel: false,
+            host_thread: None,
         });
         Ok(handle)
     }
@@ -385,6 +395,13 @@ impl Kernel {
             self.sched.dead.push(f);
         }
         self.sched.current = None;
+        // Play engine: the last started thread to end ends the run (the
+        // deterministic scheduler finds it in pick()), and the boot thread
+        // learns it once the lock is released.
+        if self.config.play && !self.sched.threads.iter().any(|th| matches!(th.state, State::Ready | State::Waiting)) {
+            self.finish();
+            self.sched.unparks.extend(self.sched.boot_thread.clone());
+        }
     }
 
     /// Moves thread `t` to core `c`; the scheduler places it there at its next decision.
@@ -610,7 +627,7 @@ impl Kernel {
     }
 
     /// No thread can run: either all ended, or a deadlock.
-    fn finish(&mut self) {
+    pub(crate) fn finish(&mut self) {
         let waiting: Vec<String> = self.sched.threads.iter().filter(|t| t.state != State::Done).map(|t| format!("thread {} ({:?})", t.id, t.state)).collect();
         self.sched.outcome = Some(if waiting.is_empty() { Outcome::Finished } else { Outcome::Deadlock(waiting.join(", ")) });
         self.sched.current = None;

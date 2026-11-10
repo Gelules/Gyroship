@@ -3,7 +3,8 @@
 //! A run's kernel sits behind one lock. Each host thread reaches it through a
 //! thread-local handle: the thread that installs it, and the threads that
 //! attach to it; each test thread installs a kernel of its own. The lock is
-//! never held across a guest fiber switch.
+//! never held across a guest fiber switch. In the play engine (`play`) each
+//! guest thread has a host thread of its own.
 
 pub mod account;
 pub mod am;
@@ -230,7 +231,9 @@ const TOLERATED: &[&str] = &[];
 impl Kernel {
     pub fn new(mem: Memory, mut journal: Journal, config: Config) -> Kernel {
         let mode = if config.explore { "exploration (not a validation run)" } else { "strict" };
-        journal.line(0, 0, &format!("gyroship hle: mode {mode}, seed {:#x}, non-system memory {:#x}", config.seed, config.non_system_memory));
+        // The deterministic header keeps its bytes.
+        let engine = if config.play { ", play engine (a host thread per guest thread, real time): a log, never a reference" } else { "" };
+        journal.line(0, 0, &format!("gyroship hle: mode {mode}, seed {:#x}, non-system memory {:#x}{engine}", config.seed, config.non_system_memory));
         let recorded = config.record.as_ref().map(|_| Vec::new());
         let audio_samples = config.audio_dump.as_ref().map(|_| Vec::new());
         Kernel { mem: Arc::new(mem), journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None, sessions: Vec::new(), objects: Vec::new(), domains: Vec::new(), allowed_services: Vec::new(), shared: Vec::new(), transfers: Vec::new(), time_shared: None, frame: (0, 0, 0), symbols: Vec::new(), romfs: None, deferred: None, gs: gs::State::default(), hid_shared: None, input: Default::default(), spin: Vec::new(), census: Census::default(), saves: Default::default(), timers: Vec::new(), surfaces: None, gpu: Default::default(), counts: Default::default(), anomalies: Default::default(), frame_hashes: Vec::new(), window: None, live_input: None, recorded, audio_out: None, audio_samples, opus: Default::default(), audio_gain: 1.0, audio_format: (2, 48_000) }
@@ -317,12 +320,24 @@ impl Kernel {
             if let Some(s) = &self.surfaces {
                 eprintln!("gyroship: staging over {} presents: {:?}", self.gs.presents, s.staging);
             }
+            // The play engine charges no host time at switch points: each guest
+            // thread's host thread reports its CPU time instead (parked time is not in it).
+            #[cfg(windows)]
+            if self.config.play {
+                use std::os::windows::io::AsRawHandle;
+                for t in &mut self.sched.threads {
+                    if let Some(h) = &t.host_thread {
+                        t.host = gyroship_runtime::profile::cpu_time(h.as_raw_handle() as usize).unwrap_or_default();
+                    }
+                }
+            }
             // Host time by guest thread, most first (HLE work on a thread's behalf included).
             let total: f64 = self.sched.threads.iter().map(|t| t.host.as_secs_f64()).sum();
             let mut by: Vec<(usize, f64)> = self.sched.threads.iter().enumerate().map(|(i, t)| (i + 1, t.host.as_secs_f64())).collect();
             by.sort_by(|a, b| b.1.total_cmp(&a.1));
             let rows: Vec<String> = by.iter().filter(|r| r.1 > 0.0005).map(|(i, s)| format!("thread {i} {:.1} s ({:.1}%)", s, 100.0 * s / total.max(1e-9))).collect();
-            eprintln!("gyroship: host time by guest thread over {} presents: {}", self.gs.presents, rows.join(", "));
+            let what = if self.config.play { "host CPU time" } else { "host time" };
+            eprintln!("gyroship: {what} by guest thread over {} presents: {}", self.gs.presents, rows.join(", "));
             // Guest instructions by thread: per present, and per second of the thread's host time.
             let presents = self.gs.presents.max(1) as f64;
             let mut work: Vec<(u64, u64, f64)> = self.sched.threads.iter().map(|t| (t.id, t.instructions, t.host.as_secs_f64())).filter(|w| w.1 > 0).collect();
@@ -443,6 +458,11 @@ pub fn attach(kernel: KernelRef) {
     KERNEL.set(Some(kernel));
 }
 
+/// The kernel this host thread talks to, for the host threads it starts (play engine).
+pub(crate) fn kernel_ref() -> KernelRef {
+    KERNEL.get().expect("no kernel installed on this thread")
+}
+
 /// How long a fault report tries for the kernel lock: another host thread may
 /// hold it a while (the play engine's GPU work, until Stage 4). Well under the
 /// 5 s a later fault waits in the runtime's `fatal`.
@@ -464,6 +484,10 @@ fn on_fault(what: &str) {
         }
     };
     let Some(k) = guard.as_mut() else { return };
+    // The faulting thread, not the lock's last holder (play engine).
+    if k.config.play {
+        k.sched.current = play::me();
+    }
     k.log(what);
     // The faulting thread's lr and frame chain (registers live in its context).
     if let Some(t) = k.sched.current {
@@ -474,7 +498,7 @@ fn on_fault(what: &str) {
             k.log(&line);
         }
     }
-    k.log("stack at the last SVC:");
+    k.log(if k.config.play { "stack at the last SVC (of any thread):" } else { "stack at the last SVC:" });
     for line in k.backtrace() {
         k.log(&line);
     }
@@ -490,7 +514,9 @@ pub fn uninstall() -> Option<Kernel> {
 /// when `f` returns. Never switch fibers, park, sleep or yield inside `f`. In
 /// the play engine `f` runs for the caller's guest thread (`Sched::current`;
 /// none on the boot and timer threads), at one time: the real time the scope
-/// began (`Kernel::now`).
+/// began (`Kernel::now`); once the lock is released, the host threads `f`
+/// queued in `Sched::unparks` are unparked, so that none wakes only to wait
+/// for the lock.
 pub fn with<R>(f: impl FnOnce(&mut Kernel) -> R) -> R {
     let kernel = KERNEL.get().expect("no kernel installed on this thread");
     let mut guard = kernel.lock().unwrap_or_else(PoisonError::into_inner);
@@ -503,6 +529,11 @@ pub fn with<R>(f: impl FnOnce(&mut Kernel) -> R) -> R {
     let r = f(&mut *k);
     if k.config.play && play::real_ticks().saturating_sub(k.sched.real_now) > play::LONG_HOLD {
         k.count("play: kernel lock held over 40 ms");
+    }
+    let unparks = std::mem::take(&mut k.sched.unparks);
+    drop(guard);
+    for t in unparks {
+        t.unpark();
     }
     r
 }
@@ -537,6 +568,10 @@ impl Deferred {
 // around the SVC's deferred work.
 
 unsafe fn on_svc(cpu: *mut Cpu, pc: u64, imm: u32) {
+    // The play engine, on a guest thread's own host thread (never in the deterministic engine).
+    if let Some(me) = play::me() {
+        return unsafe { play::svc(cpu, pc, imm, me) };
+    }
     let job = with(|k| {
         k.tick();
         k.take_work(cpu);
@@ -708,6 +743,14 @@ impl Kernel {
 }
 
 unsafe fn on_counter(cpu: *mut Cpu, pc: u64, rt: u32) {
+    // The play engine: the real clock, without the kernel lock or a switch.
+    if play::me().is_some() {
+        if rt < 31 {
+            // SAFETY: the calling thread's own context, during its own hook.
+            unsafe { (*cpu).x[rt as usize] = play::real_ticks() };
+        }
+        return;
+    }
     let next = with(|k| {
         k.tick();
         k.take_work(cpu);
@@ -723,6 +766,9 @@ unsafe fn on_counter(cpu: *mut Cpu, pc: u64, rt: u32) {
 }
 
 unsafe fn on_wait(cpu: *mut Cpu, pc: u64, kind: u32) {
+    if play::me().is_some() {
+        return unsafe { play::hint(cpu, kind) };
+    }
     // A preemption point of a long computation: with --work-time, its work
     // costs time and the scheduler may run another core first (D40); without,
     // only the instruction count is taken: no step, the same order (D19).
