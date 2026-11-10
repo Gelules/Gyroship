@@ -4,7 +4,7 @@
 //! engine (D19): `me()` is None on every one of its host threads.
 
 use crate::Kernel;
-use crate::thread::{Outcome, State, Wait};
+use crate::thread::{Outcome, State, Timer, TimerAction, Wait};
 use gyroship_runtime::{self as rt, Cpu};
 use std::cell::Cell;
 use std::sync::LazyLock;
@@ -42,8 +42,14 @@ pub fn run_play() -> Outcome {
         }
         k.config.time_limit.map(|l| start.saturating_add(l))
     });
+    let timers = spawn_timers(crate::kernel_ref());
     loop {
         if let Some(outcome) = crate::with(|k| k.sched.outcome.clone()) {
+            // They see the outcome too, and leave the kernel before it is uninstalled.
+            for t in timers {
+                t.thread().unpark();
+                let _ = t.join();
+            }
             return outcome;
         }
         match limit {
@@ -168,6 +174,117 @@ fn wait(me: usize) {
     }
 }
 
+/// The longest wait of a timer thread: a timer the game creates meanwhile
+/// starts within it.
+// ponytail: a new timer may start up to 100 ms late (twice a run); unpark the timer threads where timers are pushed if that ever matters.
+const TIMER_IDLE: u64 = 3_125_000;
+
+/// Waits until real tick `at`, TIMER_IDLE at most (to the millisecond, as
+/// timed waits are); the boot thread unparks it at the run's end.
+fn wait_until(at: u64) {
+    std::thread::park_timeout(real_until(at.min(real_ticks() + TIMER_IDLE)));
+}
+
+/// The play engine's timers, each on a host thread of its own: the audio
+/// sinks and hid's sampler. Each returns once the run's outcome is set.
+fn spawn_timers(kernel: crate::KernelRef) -> [std::thread::JoinHandle<()>; 2] {
+    let spawn = |name: &str, run: fn()| {
+        std::thread::Builder::new()
+            .name(name.into())
+            .spawn(move || {
+                crate::attach(kernel);
+                run()
+            })
+            .expect("a timer thread")
+    };
+    [spawn("audio sink", run_sinks), spawn("hid sampler", run_hid)]
+}
+
+/// The audio sinks, on their grid of real time. A tick copies the ring and
+/// hands it to the host outside the kernel lock, so that the sound does not
+/// wait for a holder (thread 17 holds it through its GPU work until Stage 4);
+/// then one scope signals the streams' events, takes new sinks and the gain.
+/// A holder past a whole period still delays the next tick.
+// ponytail: QPC's grid, which the sound device's own clock drifts from (a gap or a dropped tick every few minutes); pace on the device's queue level if that is heard.
+fn run_sinks() {
+    let (mem, mut out) = crate::with(|k| (k.mem.clone(), k.audio_out.take()));
+    // (timer index, the timer as it ticks here); timers are never removed.
+    let mut sinks: Vec<(usize, Timer)> = Vec::new();
+    let (mut seen, mut gain) = (0, 1.0);
+    // For the journal: ticks so far, and the frames played since the last line.
+    let (mut ticks, mut played, mut since) = (0u64, 0usize, Instant::now());
+    loop {
+        let now = real_ticks();
+        let mut ticked = Vec::new();
+        for (i, timer) in sinks.iter_mut().filter(|s| s.1.at() <= now) {
+            let TimerAction::AudioSink { ring, slots, data, channels, event } = timer.action else { unreachable!("only sinks are kept") };
+            let (_, frames) = crate::audio::sink_take(&mem, ring, slots, data, channels, true);
+            if let (Some(out), Some(f)) = (out.as_mut(), &frames) {
+                out(f, gain);
+            }
+            played += frames.as_ref().map_or(0, |f| f.len() / channels.max(1) as usize);
+            // A tick takes all that was written: the ticks a late wake-up missed go with it.
+            while timer.at() <= now {
+                timer.k += 1;
+            }
+            ticked.push((*i, event, frames, timer.k));
+        }
+        let done = crate::with(|k| {
+            for (i, t) in k.timers.iter().enumerate().skip(seen) {
+                if matches!(t.action, TimerAction::AudioSink { .. }) {
+                    sinks.push((i, *t));
+                }
+            }
+            seen = k.timers.len();
+            for (i, event, frames, next) in ticked {
+                if let (Some(all), Some(f)) = (k.audio_samples.as_mut(), frames) {
+                    all.extend(f);
+                }
+                k.signal_event(event);
+                k.timers[i].k = next;
+                ticks += 1;
+                if ticks.is_multiple_of(100) {
+                    let line = format!("audio sink: tick {ticks}: {played} frames in {:.2} s", since.elapsed().as_secs_f64());
+                    k.log(&line);
+                    (played, since) = (0, Instant::now());
+                }
+            }
+            gain = k.audio_gain;
+            k.sched.outcome.is_some()
+        });
+        if done {
+            return;
+        }
+        wait_until(sinks.iter().map(|s| s.1.at()).min().unwrap_or(u64::MAX));
+    }
+}
+
+/// hid's samples on their 60 Hz grid of real time, on a host thread of its
+/// own: a sample needs the kernel lock, which the sink must never wait behind.
+/// Samples the lock made late are taken at once, one after the other, so that
+/// sample k still stands for k / 60 s (`--replay` and `--record` count samples).
+fn run_hid() {
+    loop {
+        let next = crate::with(|k| {
+            if k.sched.outcome.is_some() {
+                return None;
+            }
+            let now = k.now();
+            for i in 0..k.timers.len() {
+                let TimerAction::HidSample { shared } = k.timers[i].action else { continue };
+                while k.timers[i].at() <= now {
+                    let n = k.timers[i].k;
+                    k.hid_sample(shared, n);
+                    k.timers[i].k += 1;
+                }
+            }
+            Some(k.timers.iter().filter(|t| matches!(t.action, TimerAction::HidSample { .. })).map(Timer::at).min().unwrap_or(u64::MAX))
+        });
+        let Some(next) = next else { return };
+        wait_until(next);
+    }
+}
+
 /// The play engine's `yield`, `wfe`, `wfi` and preemption points (from
 /// `on_wait`): no kernel lock and no switch.
 pub(crate) unsafe fn hint(cpu: *mut Cpu, kind: u32) {
@@ -233,5 +350,48 @@ mod tests {
         assert_eq!(real_until(t0), Duration::ZERO);
         assert!(real_until(real_ticks() + 31_250) <= Duration::from_millis(1));
         assert!(real_until(u64::MAX) > Duration::from_secs(1 << 32));
+    }
+
+    /// The sink's copy and its sound go out on time while another thread holds
+    /// the kernel: only the stream's event waits for the lock.
+    #[test]
+    fn the_sink_plays_while_another_thread_holds_the_kernel() {
+        use crate::journal::Journal;
+        use gyroship_runtime::mem::{Block, Memory, perm, state};
+        use std::sync::{Arc, Mutex};
+        const RING: u64 = crate::layout::ALIAS.0;
+        let mut k = Kernel::new(Memory::new().unwrap(), Journal::memory(), crate::Config { play: true, ..crate::Config::default() });
+        k.mem.map(RING, 0x2000, Block::new(state::NORMAL, perm::RW)).unwrap();
+        let (w, r) = k.create_event().unwrap();
+        k.handles.close(w);
+        let event = k.event_of(r).unwrap();
+        // A tick every 50 ms from now, on an empty ring.
+        k.timers.push(Timer { start: real_ticks(), k: 1, num: 50 * 31_250, den: 1, action: TimerAction::AudioSink { ring: RING, slots: 9, data: RING + 0x1040, channels: 1, event } });
+        let ticks = Arc::new(Mutex::new(Vec::new()));
+        let heard = ticks.clone();
+        k.audio_out = Some(Box::new(move |_: &[f32], _: f32| {
+            heard.lock().unwrap().push(Instant::now());
+            0
+        }));
+        let timers = spawn_timers(crate::install(k));
+        // Once the first tick's scope is over (the sink sleeps), the kernel is held through the next tick.
+        while crate::with(|k| k.timers[0].k) < 2 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let held = crate::with(|_| {
+            let from = Instant::now();
+            std::thread::sleep(Duration::from_millis(80));
+            from..Instant::now()
+        });
+        while ticks.lock().unwrap().len() < 3 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        crate::with(|k| k.sched.outcome = Some(Outcome::Finished));
+        for t in timers {
+            t.join().unwrap();
+        }
+        let k = crate::uninstall().unwrap();
+        assert!(ticks.lock().unwrap().iter().any(|t| held.contains(t)), "no sound while the kernel was held");
+        assert!(k.events[event].signaled);
     }
 }
