@@ -170,8 +170,6 @@ pub unsafe fn run(cpu: *mut Cpu) {
     }
 }
 
-/// Untranslated instructions the interpreter executed.
-pub static INTERPRETED: AtomicU64 = AtomicU64::new(0);
 /// Untranslated instructions the interpreter does not cover either (each logged once).
 pub static UNHANDLED: AtomicU64 = AtomicU64::new(0);
 
@@ -221,22 +219,17 @@ pub unsafe extern "C" fn gyroship_unhandled(cpu: *mut Cpu, pc: u64, word: u32) {
     // SAFETY: guaranteed by the caller.
     let c = unsafe { &mut *cpu };
     profile::count_interpreted(word);
-    match interp::execute(c, pc, word) {
-        Ok(()) => {
-            INTERPRETED.fetch_add(1, Ordering::Relaxed);
+    if let Err(why) = interp::execute(c, pc, word) {
+        UNHANDLED.fetch_add(1, Ordering::Relaxed);
+        // Under an HLE (a real run), a skipped instruction would leave wrong state
+        // behind: it stops the run like a guest fault. Bare harnesses count and go on.
+        if HOOKS.get().is_some() {
+            fatal(&format!("instruction {word:08x} at {pc:#x} cannot be executed: {why}"));
         }
-        Err(why) => {
-            UNHANDLED.fetch_add(1, Ordering::Relaxed);
-            // Under an HLE (a real run), a skipped instruction would leave wrong state
-            // behind: it stops the run like a guest fault. Bare harnesses count and go on.
-            if HOOKS.get().is_some() {
-                fatal(&format!("instruction {word:08x} at {pc:#x} cannot be executed: {why}"));
-            }
-            let mut logged = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
-            if !logged.contains(&word) {
-                logged.push(word);
-                eprintln!("gyroship: instruction {word:08x} at {pc:#x} is not executed: {why}");
-            }
+        let mut logged = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
+        if !logged.contains(&word) {
+            logged.push(word);
+            eprintln!("gyroship: instruction {word:08x} at {pc:#x} is not executed: {why}");
         }
     }
 }

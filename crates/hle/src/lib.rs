@@ -435,16 +435,25 @@ pub fn attach(kernel: KernelRef) {
     KERNEL.set(Some(kernel));
 }
 
+/// How long a fault report tries for the kernel lock: another host thread may
+/// hold it a while (the play engine's GPU work, until Stage 4). Well under the
+/// 5 s a later fault waits in the runtime's `fatal`.
+const FAULT_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// A guest fault: the message and the stack at the last SVC go to the
-/// journal, which is flushed (the runtime exits next). The kernel is tried,
-/// never waited for: if a thread holds it (this one, faulting in HLE code,
-/// or another one), nothing is written.
+/// journal, which is flushed (the runtime exits next). The kernel is tried
+/// for up to FAULT_WAIT, never waited for: if it stays held (by this thread,
+/// faulting in HLE code, or by another one), nothing is written.
 fn on_fault(what: &str) {
     let Some(kernel) = KERNEL.get() else { return };
-    let mut guard = match kernel.try_lock() {
-        Ok(guard) => guard,
-        Err(TryLockError::Poisoned(e)) => e.into_inner(),
-        Err(TryLockError::WouldBlock) => return,
+    let since = std::time::Instant::now();
+    let mut guard = loop {
+        match kernel.try_lock() {
+            Ok(guard) => break guard,
+            Err(TryLockError::Poisoned(e)) => break e.into_inner(),
+            Err(TryLockError::WouldBlock) if since.elapsed() < FAULT_WAIT => std::thread::sleep(std::time::Duration::from_millis(1)),
+            Err(TryLockError::WouldBlock) => return,
+        }
     };
     let Some(k) = guard.as_mut() else { return };
     k.log(what);

@@ -212,6 +212,53 @@ fn a_fault_inside_the_kernel_exits() {
     assert!(stderr.contains("guest fault: read at guest address 0x1234 "), "{stderr}");
 }
 
+/// Only does something when started by `a_fault_report_waits_for_another_threads_lock`.
+#[test]
+fn fault_wait_child() {
+    let Ok(log) = std::env::var("GYROSHIP_FAULT_WAIT_CHILD") else { return };
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(20));
+        std::process::exit(99);
+    });
+    let (mut k, cpu) = kernel(Config::default());
+    k.journal = Journal::file(std::path::Path::new(&log)).unwrap();
+    let base = cpu.mem as usize;
+    gyroship_runtime::mem::install_fault_handler();
+    let shared = gyroship_hle::install(k);
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let b = barrier.clone();
+    let faulter = std::thread::spawn(move || {
+        gyroship_hle::attach(shared);
+        let cpu = Cpu::new(base as *mut u8);
+        b.wait();
+        let _ = std::hint::black_box(rt::ld64(&cpu, 0x1234));
+    });
+    // This thread holds the kernel while the other one faults.
+    gyroship_hle::with(|_| {
+        barrier.wait();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    });
+    let _ = faulter.join();
+}
+
+/// A guest fault while another host thread holds the kernel: the report
+/// waits for the lock, then reaches the journal.
+#[test]
+fn a_fault_report_waits_for_another_threads_lock() {
+    let log = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("fault-wait.log");
+    let _ = std::fs::remove_file(&log);
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "fault_wait_child", "--nocapture", "--test-threads=1"])
+        .env("GYROSHIP_FAULT_WAIT_CHILD", &log)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(gyroship_runtime::mem::FAULT_EXIT), "{stderr}");
+    let journal = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(journal.matches("guest fault: read at guest address 0x1234 ").count(), 1, "{journal}");
+    assert!(journal.contains("stack at the last SVC:"), "{journal}");
+}
+
 /// Only does something when started by `stops_are_logged`.
 #[test]
 fn stop_child() {
