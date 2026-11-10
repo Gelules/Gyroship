@@ -507,33 +507,17 @@ impl Kernel {
         let k = self.timers[i].k;
         match self.timers[i].action {
             TimerAction::AudioSink { ring, slots, data, channels, event } => {
-                // The sink plays everything written: frames from the read index to the
-                // write index go to the host (nothing goes back to the guest), then the
-                // read index catches up with the write index. The game may write the ring
-                // meanwhile: the write index is loaded (acquire) before the frames, the
-                // read index stored (release) after them, as the SDK's WriteStream expects.
-                let index = |k: &Self, at: u64| k.mem.load_u32(at).unwrap_or(u32::MAX);
-                let (read, write) = (index(self, ring + 0x44), index(self, ring + 0x1004));
-                if write < slots {
-                    if read < slots && (self.audio_out.is_some() || self.audio_samples.is_some()) {
-                        let mem = &self.mem;
-                        let mut read_f32s = |at: u64, out: &mut [f32]| {
-                            let mut bytes = vec![0u8; out.len() * 4];
-                            let ok = mem.read(at, &mut bytes).is_ok();
-                            for (o, c) in out.iter_mut().zip(bytes.as_chunks::<4>().0) {
-                                *o = f32::from_le_bytes(*c);
-                            }
-                            ok
-                        };
-                        let frames = crate::audio::ring_frames(&mut read_f32s, data, channels, slots, read, write);
-                        if let Some(all) = self.audio_samples.as_mut() {
-                            all.extend_from_slice(&frames);
-                        }
-                        if let Some(out) = self.audio_out.as_mut() {
-                            out(&frames, self.audio_gain);
-                        }
+                // The sink plays everything written (audio::sink_take): the frames go to
+                // the host, nothing goes back to the guest.
+                let want = self.audio_out.is_some() || self.audio_samples.is_some();
+                let (write, frames) = crate::audio::sink_take(&self.mem, ring, slots, data, channels, want);
+                if let Some(frames) = frames {
+                    if let Some(all) = self.audio_samples.as_mut() {
+                        all.extend_from_slice(&frames);
                     }
-                    let _ = self.mem.store_u32(ring + 0x44, write);
+                    if let Some(out) = self.audio_out.as_mut() {
+                        out(&frames, self.audio_gain);
+                    }
                 }
                 self.signal_event(event);
                 if k == 1 || k.is_multiple_of(100) {

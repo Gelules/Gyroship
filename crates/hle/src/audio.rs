@@ -7,6 +7,7 @@ use crate::Kernel;
 use crate::ipc::{Reply, Request};
 use crate::service::Service;
 use crate::thread::Object;
+use gyroship_runtime::mem::Memory;
 
 /// The device name the audio device reports; any NUL-terminated name.
 const DEVICE_NAME: &[u8] = b"AudioTvOutput\0";
@@ -219,6 +220,35 @@ impl Audio {
             _ => return None,
         })
     }
+}
+
+/// A sink tick on a stream's ring: the frames the game wrote since the last
+/// tick (read only when `want`), then the read index (+0x44) takes the write
+/// index (+0x1004). The write index is loaded (acquire) before the frames and
+/// the read index stored (release) after them, as the SDK's WriteStream
+/// expects. No kernel state: the play engine runs it outside the kernel lock.
+/// Returns the write index (u32::MAX if unreadable) and the frames: None when
+/// the write index is outside the ring (nothing is stored then), when the
+/// read index is, or when they are not wanted.
+pub fn sink_take(mem: &Memory, ring: u64, slots: u32, data: u64, channels: u32, want: bool) -> (u32, Option<Vec<f32>>) {
+    let index = |at: u64| mem.load_u32(at).unwrap_or(u32::MAX);
+    let (read, write) = (index(ring + 0x44), index(ring + 0x1004));
+    if write >= slots {
+        return (write, None);
+    }
+    let frames = (want && read < slots).then(|| {
+        let mut read_f32s = |at: u64, out: &mut [f32]| {
+            let mut bytes = vec![0u8; out.len() * 4];
+            let ok = mem.read(at, &mut bytes).is_ok();
+            for (o, c) in out.iter_mut().zip(bytes.as_chunks::<4>().0) {
+                *o = f32::from_le_bytes(*c);
+            }
+            ok
+        };
+        ring_frames(&mut read_f32s, data, channels, slots, read, write)
+    });
+    let _ = mem.store_u32(ring + 0x44, write);
+    (write, frames)
 }
 
 /// The frames a sink plays: slots `read` up to `write` (wrapping at

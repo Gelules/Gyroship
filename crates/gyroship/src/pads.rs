@@ -161,13 +161,15 @@ pub fn audio(sdl: Arc<Sdl>, channels: i32, rate: i32) -> Option<gyroship_hle::Au
     };
     let (mut dropped, mut starved, mut first) = (0u64, 0u64, true);
     let start = std::time::Instant::now();
+    let frame_bytes = channels.max(1) as usize * 4;
     Some(Box::new(move |frames: &[f32], gain: f32| {
         let s = &stream;
         let queued = sdl.queued(s.0);
         // An empty queue: the device ran dry (a gap, but at the start). A tick of
         // silence goes first, so the queue holds one to two ticks (D30: about 85 ms)
         // and the ticks' jitter (they come at frames, ±16 ms) no longer reaches it.
-        if queued == 0 {
+        // A tick without frames is no gap: the next one with frames counts it.
+        if queued == 0 && !frames.is_empty() {
             if !std::mem::take(&mut first) {
                 starved += 1;
                 if starved.is_power_of_two() {
@@ -181,10 +183,12 @@ pub fn audio(sdl: Arc<Sdl>, channels: i32, rate: i32) -> Option<gyroship_hle::Au
             if dropped.is_power_of_two() {
                 eprintln!("gyroship: sound: {dropped} ticks dropped (the host is ahead)");
             }
-            return;
+        } else if !frames.is_empty() {
+            let scaled: Vec<f32> = frames.iter().map(|v| v * gain).collect();
+            sdl.put(s.0, &scaled);
         }
-        let scaled: Vec<f32> = frames.iter().map(|v| v * gain).collect();
-        sdl.put(s.0, &scaled);
+        // The frames the device still holds: the play engine's sink paces on it.
+        sdl.queued(s.0).max(0) as usize / frame_bytes
     }))
 }
 

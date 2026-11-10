@@ -203,8 +203,11 @@ pub struct Kernel {
     pub audio_format: (u16, u32),
 }
 
-/// The host's sound output (`boot::HostWindow::audio`): interleaved f32 frames and the gain.
-pub type AudioOut = Box<dyn FnMut(&[f32], f32) + Send>;
+/// The host's sound output (`boot::HostWindow::audio`): interleaved f32 frames
+/// and the gain. It returns the frames the host still holds once these are
+/// queued, which the play engine's sink paces on; the deterministic engine
+/// ignores it.
+pub type AudioOut = Box<dyn FnMut(&[f32], f32) -> usize + Send>;
 
 /// A host window's pace hook (`boot::HostWindow::pace`).
 pub type Pace = Box<dyn FnMut(u64) -> Option<(u32, u32)> + Send>;
