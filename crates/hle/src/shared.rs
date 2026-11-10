@@ -126,4 +126,15 @@ impl Kernel {
             self.mem.write_object(addr + offset as u64, bytes).expect("mapped shared memory");
         }
     }
+
+    /// Stores the u64 at `offset` (8-aligned) of shared memory `m`, in the
+    /// guest's copy too, last of everything the HLE wrote so far
+    /// (`publish_object`): a guest thread that reads it also sees the earlier
+    /// writes.
+    pub(crate) fn store_shared(&mut self, m: usize, offset: usize, v: u64) {
+        self.shared[m].data[offset..offset + 8].copy_from_slice(&v.to_le_bytes());
+        if let Some(addr) = self.shared[m].mapped {
+            self.mem.publish_object(addr + offset as u64, 8, &[], |_| v).expect("mapped shared memory");
+        }
+    }
 }

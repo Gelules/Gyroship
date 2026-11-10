@@ -283,10 +283,25 @@ impl Kernel {
         }
         input.last = k;
         self.input = input;
+        self.push_sample(m, &input.current);
+    }
+
+    /// Appends `pad` to slot 0's FullKey lifo, in the guest's copy too. Guest
+    /// threads may read the lifo meanwhile, so only the words `push` changes
+    /// are written, each one published last of all so far, in the order the
+    /// SDK's reader needs: the new entry's sequence made odd ("write in
+    /// progress"), its state, its even sequence, then the tail, then the count.
+    /// The guest maps this memory read-only, so its other bytes already equal ours.
+    fn push_sample(&mut self, m: usize, pad: &Pad) {
         let at = NPAD + 0x28;
         let mut lifo = self.shared[m].data[at..at + LIFO_SIZE].to_vec();
-        push(&mut lifo, &input.current);
-        self.write_shared(m, at, &lifo);
+        push(&mut lifo, pad);
+        let word = |o: usize| u64::from_le_bytes(lifo[o..o + 8].try_into().unwrap());
+        let e = LIFO_ENTRIES + word(LIFO_TAIL) as usize * ENTRY;
+        self.store_shared(m, at + e, word(e) | 1);
+        for o in (e + 8..e + ENTRY).step_by(8).chain([e, LIFO_TAIL, LIFO_COUNT]) {
+            self.store_shared(m, at + o, word(o));
+        }
     }
 
     /// The Npad condition: hold type and "initialized".
@@ -360,5 +375,109 @@ mod tests {
         assert!(parse_script("5 A\n5 B").unwrap_err().contains("increase"));
         assert!(parse_script("5 Q").unwrap_err().contains("unknown button Q"));
         assert!(parse_script("5 A R=1").is_err());
+    }
+
+    use crate::Config;
+    use crate::journal::Journal;
+    use crate::result::SUCCESS;
+    use gyroship_runtime::mem::{Memory, perm};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::{Acquire, Relaxed, Release}, fence};
+    use std::time::{Duration, Instant};
+
+    /// A kernel with hid's shared memory mapped read-only, as the SDK maps it:
+    /// the kernel, the shared memory, its guest address.
+    fn mapped() -> (Kernel, usize, u64) {
+        let mut k = Kernel::new(Memory::new().unwrap(), Journal::memory(), Config::default());
+        let m = k.hid_memory();
+        let h = k.handles.add(Object::SharedMemory(m)).unwrap();
+        let addr = crate::layout::ASLR.0;
+        assert_eq!(k.map_shared(h, addr, SHARED_SIZE, perm::R), SUCCESS);
+        (k, m, addr)
+    }
+
+    /// Sample n: buttons and sticks that say n, so that a torn entry shows.
+    fn pad(n: u64) -> Pad {
+        Pad { buttons: n, l: [n as i32, -(n as i32)], r: [0, 0] }
+    }
+
+    /// The ordered writes leave the bytes of the whole copy they replace,
+    /// in the guest and in the kernel's copy.
+    #[test]
+    fn samples_leave_the_bytes_of_a_whole_copy() {
+        let (mut k, m, addr) = mapped();
+        let at = NPAD + 0x28;
+        let mut want = k.shared[m].data.clone();
+        let mut guest = vec![0u8; SHARED_SIZE as usize];
+        for n in 1..=40 {
+            push(&mut want[at..at + LIFO_SIZE], &pad(n));
+            k.push_sample(m, &pad(n));
+            k.mem.read_object(addr, &mut guest).unwrap();
+            assert!(guest == want && k.shared[m].data == want, "sample {n}");
+        }
+    }
+
+    /// GetNpadStates as another core runs it, on the guest's lifo at host
+    /// address `lifo`: the `n` newest entries, oldest first, each under a stable
+    /// even sequence, sampling numbers consecutive, else start over (the SDK
+    /// spins forever; here, a million tries). (sampling number, buttons), newest last.
+    fn read_racing(lifo: usize, n: usize) -> Vec<(u64, u64)> {
+        // SAFETY: aligned words of a lifo that stays mapped while the readers run.
+        let word = |o: usize| unsafe { AtomicU64::from_ptr((lifo + o) as *mut u64) };
+        for _ in 0..1_000_000 {
+            let tail = word(LIFO_TAIL).load(Acquire) as usize;
+            let n = n.min(word(LIFO_COUNT).load(Acquire) as usize);
+            let mut out: Vec<(u64, u64)> = Vec::with_capacity(n);
+            for i in 0..n {
+                let e = LIFO_ENTRIES + (tail + LIFO_LEN + 1 - n + i) % LIFO_LEN * ENTRY;
+                let seq = word(e).load(Acquire);
+                let state = (word(e + 8).load(Relaxed), word(e + 0x10).load(Relaxed));
+                fence(Acquire); // the reader's DMB ISHLD
+                if seq & 1 != 0 || word(e).load(Relaxed) != seq || out.last().is_some_and(|p| state.0 != p.0 + 1) {
+                    break;
+                }
+                out.push(state);
+            }
+            if out.len() == n {
+                return out;
+            }
+        }
+        panic!("the reader spins: the lifo stays inconsistent");
+    }
+
+    /// While the sampler pushes, readers on other threads (one state, as the
+    /// game asks, and all 17) only ever accept whole entries, and never an
+    /// older newest entry: no new tail shows before its entry.
+    #[test]
+    fn readers_on_other_threads_see_whole_samples_in_order() {
+        const SAMPLES: u64 = 100_000;
+        let (mut k, m, addr) = mapped();
+        let lifo = k.mem.base() as usize + addr as usize + NPAD + 0x28;
+        let (done, deadline) = (AtomicBool::new(false), Instant::now() + Duration::from_secs(60));
+        std::thread::scope(|s| {
+            let readers = [1, LIFO_LEN].map(|n| {
+                let done = &done;
+                s.spawn(move || {
+                    let mut newest = 0;
+                    loop {
+                        let stop = done.load(Acquire) || Instant::now() > deadline;
+                        let got = read_racing(lifo, n);
+                        assert!(got.iter().all(|&(sample, buttons)| buttons == sample), "a torn entry: {got:?}");
+                        let latest = got.last().unwrap().0;
+                        assert!(latest >= newest, "sample {latest} after {newest}: a stale entry");
+                        newest = latest;
+                        if stop {
+                            return newest;
+                        }
+                    }
+                })
+            });
+            for n in 1..=SAMPLES {
+                k.push_sample(m, &pad(n));
+            }
+            done.store(true, Release);
+            for r in readers {
+                assert_eq!(r.join().unwrap(), SAMPLES, "the last sample, read once the writer stopped");
+            }
+        });
     }
 }

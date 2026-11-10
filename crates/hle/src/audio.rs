@@ -141,7 +141,8 @@ impl Audio {
                     k.mem.write(*ring + 0x80 + u64::from(w) * 0x40, &e).ok()?;
                     w = (w + 1) % *slots;
                 }
-                k.mem.write(*ring + 4, &w.to_le_bytes()).ok()?;
+                // Last, with a release store: the SDK polls the ring from any thread.
+                k.mem.store_u32(*ring + 4, w).ok()?;
                 if k.journal.few("hwopus execute", 3) {
                     k.log(&format!("hwopus: {n} tasks decoded, producer index {w}"));
                 }

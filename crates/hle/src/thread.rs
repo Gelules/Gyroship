@@ -507,13 +507,12 @@ impl Kernel {
         let k = self.timers[i].k;
         match self.timers[i].action {
             TimerAction::AudioSink { ring, slots, data, channels, event } => {
-                // The sink plays everything written: frames from the read index to the write
-                // index go to the host (nothing goes back to the guest), then the read index
-                // catches up with the write index.
-                let index = |k: &Self, at: u64| {
-                    let mut w = [0; 4];
-                    k.mem.read(at, &mut w).map(|()| u32::from_le_bytes(w)).unwrap_or(u32::MAX)
-                };
+                // The sink plays everything written: frames from the read index to the
+                // write index go to the host (nothing goes back to the guest), then the
+                // read index catches up with the write index. The game may write the ring
+                // meanwhile: the write index is loaded (acquire) before the frames, the
+                // read index stored (release) after them, as the SDK's WriteStream expects.
+                let index = |k: &Self, at: u64| k.mem.load_u32(at).unwrap_or(u32::MAX);
                 let (read, write) = (index(self, ring + 0x44), index(self, ring + 0x1004));
                 if write < slots {
                     if read < slots && (self.audio_out.is_some() || self.audio_samples.is_some()) {
@@ -534,7 +533,7 @@ impl Kernel {
                             out(&frames, self.audio_gain);
                         }
                     }
-                    let _ = self.mem.write(ring + 0x44, &write.to_le_bytes());
+                    let _ = self.mem.store_u32(ring + 0x44, write);
                 }
                 self.signal_event(event);
                 if k == 1 || k.is_multiple_of(100) {
@@ -680,5 +679,63 @@ pub fn switch_to(next: Option<Fiber>) {
         // SAFETY: a live fiber of this host thread; the kernel borrow is released.
         unsafe { fiber::switch(f) };
         crate::with(|k| k.reap());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Config;
+    use crate::journal::Journal;
+    use gyroship_runtime::mem::Memory;
+    use std::sync::atomic::{AtomicU32, Ordering::{Acquire, Relaxed, Release}};
+    use std::time::{Duration, Instant};
+
+    const SLOTS: u32 = 9;
+    const FRAMES: u32 = 100_000;
+
+    /// The SDK's WriteStream on another core, one channel: frames 1, 2… as
+    /// f32, as many as the ring has room for, then the write index (release).
+    fn produce(ring: usize, deadline: Instant) {
+        // SAFETY: aligned indices of a ring that stays mapped while this runs.
+        let index = |o: usize| unsafe { AtomicU32::from_ptr((ring + o) as *mut u32) };
+        let mut next = 1;
+        while next <= FRAMES && Instant::now() < deadline {
+            let (write, read) = (index(0x1004).load(Relaxed), index(0x44).load(Acquire));
+            let n = (SLOTS - 1 - (write + SLOTS - read) % SLOTS).min(FRAMES + 1 - next);
+            for i in 0..n {
+                let at = ring + 0x1040 + 4 * ((write + i) % SLOTS) as usize;
+                // SAFETY: a free slot: the sink reads it only once the write index covers it.
+                unsafe { (at as *mut f32).write((next + i) as f32) };
+            }
+            next += n;
+            index(0x1004).store((write + n) % SLOTS, Release);
+        }
+    }
+
+    /// While a producer writes the ring on another thread, the sink plays
+    /// every frame once, in order: it loads the write index before the frames
+    /// and stores the read index after them.
+    #[test]
+    fn the_sink_plays_every_frame_once_while_the_game_writes() {
+        const RING: u64 = layout::ALIAS.0;
+        let mut k = Kernel::new(Memory::new().unwrap(), Journal::memory(), Config::default());
+        k.mem.map(RING, 0x2000, Block::new(state::NORMAL, perm::RW)).unwrap();
+        let (w, r) = k.create_event().unwrap();
+        k.handles.close(w);
+        let event = k.event_of(r).unwrap();
+        k.timers.push(Timer { start: 0, k: 1, num: 1, den: 1, action: TimerAction::AudioSink { ring: RING, slots: SLOTS, data: RING + 0x1040, channels: 1, event } });
+        k.audio_samples = Some(Vec::new());
+        let ring = k.mem.base() as usize + RING as usize;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        std::thread::scope(|s| {
+            s.spawn(|| produce(ring, deadline));
+            while k.audio_samples.as_ref().unwrap().len() < FRAMES as usize {
+                assert!(Instant::now() < deadline, "the sink stalled");
+                k.fire(0, 0);
+            }
+        });
+        let want: Vec<f32> = (1..=FRAMES).map(|f| f as f32).collect();
+        assert_eq!(k.audio_samples.take().unwrap(), want);
     }
 }
