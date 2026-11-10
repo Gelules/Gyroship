@@ -165,8 +165,9 @@ pub struct Thread {
 // `Sched::drop`) and tied to no host thread. The host thread running this
 // guest thread uses it (generated code, its own hooks); kernel code under the
 // kernel lock uses it only while the guest thread is not running (created, or
-// parked at a switch point: `wake`, `pick`'s deadlines). `fiber` and
-// `host_thread` are Send.
+// parked at a switch point: `wake`, `pick`'s deadlines; in the play engine,
+// Waiting until its `play::wait` sees it Ready under the lock again). `fiber`
+// and `host_thread` are Send.
 unsafe impl Send for Thread {}
 
 /// How a run of the threads ended.
@@ -359,7 +360,9 @@ impl Kernel {
     /// Wakes waiting thread `t` now, with Result `result` (and x1 = `x1`).
     pub fn wake(&mut self, t: usize, result: u32, x1: Option<u64>) {
         let cpu = self.sched.threads[t].cpu;
-        // SAFETY: a waiting thread is parked at a switch point; nothing else uses its context.
+        // SAFETY: a waiting thread runs no guest code (parked at a switch point, or
+        // in its play hook until `play::wait` sees it Ready under this lock):
+        // nothing else uses its context.
         unsafe {
             (*cpu).x[0] = u64::from(result);
             if let Some(v) = x1 {
@@ -368,6 +371,10 @@ impl Kernel {
         }
         let now = self.now();
         self.ready(t, now);
+        // Play engine: its host thread is unparked once this scope releases the lock.
+        if let Some(h) = &self.sched.threads[t].host_thread {
+            self.sched.unparks.push(h.thread().clone());
+        }
     }
 
     /// Waiting threads whose wait matches, highest priority first, then in arrival order.

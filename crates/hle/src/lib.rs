@@ -3,8 +3,8 @@
 //! A run's kernel sits behind one lock. Each host thread reaches it through a
 //! thread-local handle: the thread that installs it, and the threads that
 //! attach to it; each test thread installs a kernel of its own. The lock is
-//! never held across a guest fiber switch. In the play engine (`play`) each
-//! guest thread has a host thread of its own.
+//! never held across a guest fiber switch, a park, a sleep or a yield. In the
+//! play engine (`play`) each guest thread has a host thread of its own.
 
 pub mod account;
 pub mod am;
@@ -565,7 +565,9 @@ impl Deferred {
 
 // Each hook leaves `with` (releasing the kernel lock) before it switches
 // fibers: the next thread takes the lock too. `on_svc` also releases it
-// around the SVC's deferred work.
+// around the SVC's deferred work. The play hooks park, sleep and yield only
+// after `with` returns; an IPC handler that blocks only calls `block()` and
+// returns, so its reply is written before the lock is released.
 
 unsafe fn on_svc(cpu: *mut Cpu, pc: u64, imm: u32) {
     // The play engine, on a guest thread's own host thread (never in the deterministic engine).

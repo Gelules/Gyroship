@@ -4,7 +4,7 @@
 //! engine (D19): `me()` is None on every one of its host threads.
 
 use crate::Kernel;
-use crate::thread::{Outcome, State};
+use crate::thread::{Outcome, State, Wait};
 use gyroship_runtime::{self as rt, Cpu};
 use std::cell::Cell;
 use std::sync::LazyLock;
@@ -28,6 +28,7 @@ const CHECK: Duration = Duration::from_millis(250);
 /// real time from this call, this thread stops the run: the watchdog of
 /// headless runs.
 pub fn run_play() -> Outcome {
+    rt::fine_timers();
     let start = real_ticks();
     let limit = crate::with(|k| {
         assert!(k.config.play, "the play engine runs with Config::play");
@@ -99,7 +100,7 @@ pub(crate) unsafe fn svc(cpu: *mut Cpu, pc: u64, imm: u32, me: usize) {
         crate::with(|k| k.stop(crate::STOP_EXIT, &why));
     }
     match state {
-        State::Waiting => crate::with(|k| k.stop(crate::STOP_EXIT, "play engine: blocking SVCs are not implemented yet")),
+        State::Waiting => wait(me),
         // ExitThread inside guest frames, which must never run again: they stay on
         // this host stack, as a deleted fiber's do, and the thread parks for good.
         // ponytail: one parked host thread per ExitThread (one in the tutorial); a fiber per host thread frees them if a session piles them up.
@@ -108,6 +109,62 @@ pub(crate) unsafe fn svc(cpu: *mut Cpu, pc: u64, imm: u32, me: usize) {
         },
         _ if yields => std::thread::yield_now(),
         _ => {}
+    }
+}
+
+/// After its SVC, the calling host thread waits here while its guest thread
+/// `me` is Waiting. Each round runs under the kernel lock:
+/// - a waker made it Ready, writing x0/x1 under the lock: it returns, and
+///   having taken the lock again makes those writes visible to its code;
+/// - past its deadline, it ends its own wait (x0 = `on_timeout`, as `pick`
+///   does), so a timeout and a wake can never both win;
+/// - otherwise the round releases the lock and waits: `park` without a
+///   deadline, `park_timeout` (a waker may end it early; to the millisecond
+///   once `fine_timers` ran), or `sleep` for a Sleep, which nothing ends early.
+///
+/// Wakers queue the unpark, and `with` issues it once the lock is free; std
+/// keeps an unpark that comes before the park, so no wake-up is lost, and a
+/// spurious return just goes round again.
+fn wait(me: usize) {
+    enum Then {
+        Run,
+        Park,
+        ParkFor(Duration),
+        Sleep(Duration),
+    }
+    loop {
+        let then = crate::with(|k| {
+            let now = k.now();
+            let th = &k.sched.threads[me];
+            let (state, sleep, deadline, cpu, on_timeout) = (th.state, th.wait == Wait::Sleep, th.deadline, th.cpu, th.on_timeout);
+            if state != State::Waiting {
+                return Then::Run;
+            }
+            match deadline {
+                None => Then::Park,
+                Some(d) if now < d => {
+                    let left = Duration::from_nanos((d - now).saturating_mul(32));
+                    if sleep { Then::Sleep(left) } else { Then::ParkFor(left) }
+                }
+                Some(d) => {
+                    // SAFETY: this thread's own context; its code is stopped in this hook.
+                    unsafe { (*cpu).x[0] = u64::from(on_timeout) };
+                    k.ready(me, now);
+                    // How late timed waits end, for the summary line.
+                    k.count(if sleep { "play sleeps" } else { "play timed waits" });
+                    if now - d > 31_250 {
+                        k.count(if sleep { "play sleeps over 1 ms late" } else { "play timed waits over 1 ms late" });
+                    }
+                    Then::Run
+                }
+            }
+        });
+        match then {
+            Then::Run => return,
+            Then::Park => std::thread::park(),
+            Then::ParkFor(left) => std::thread::park_timeout(left),
+            Then::Sleep(left) => std::thread::sleep(left),
+        }
     }
 }
 

@@ -170,6 +170,32 @@ pub unsafe fn run(cpu: *mut Cpu) {
     }
 }
 
+/// The play engine (D41), once before its guest threads start: timed waits
+/// end within about a millisecond (the timer interrupt runs at 1 ms instead of
+/// 15.6), even while the window is minimized or hidden, which Windows 11
+/// otherwise ignores the request for; and the process is never put in
+/// efficiency mode (EcoQoS). Windows restores both when the process exits.
+#[cfg(windows)]
+pub fn fine_timers() {
+    use windows_sys::Win32::Media::timeBeginPeriod;
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE, ProcessPowerThrottling, SetProcessInformation,
+    };
+    let state = PROCESS_POWER_THROTTLING_STATE {
+        Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        StateMask: 0,
+    };
+    // SAFETY: plain calls; `state` outlives the call. A failure (older Windows) keeps the defaults.
+    unsafe {
+        timeBeginPeriod(1);
+        SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, (&raw const state).cast(), size_of_val(&state) as u32);
+    }
+}
+
+#[cfg(not(windows))]
+pub fn fine_timers() {}
+
 /// Untranslated instructions the interpreter does not cover either (each logged once).
 pub static UNHANDLED: AtomicU64 = AtomicU64::new(0);
 
