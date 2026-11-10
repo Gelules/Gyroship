@@ -216,7 +216,8 @@ pub struct HostWindow {
     pub size: (u32, u32),
     /// Called after each frame shown, with its virtual time (ticks): waits for
     /// that time on the wall clock (D27), then gives the window's size, or
-    /// None once the window is closed.
+    /// None once the window is closed. In play mode it never waits: it runs
+    /// under the kernel lock, and guest time is the wall clock already.
     pub pace: crate::Pace,
     /// The controller's live state (keyboard now, controllers later), read at each hid sample.
     pub input: crate::LiveInput,
