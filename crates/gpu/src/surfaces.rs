@@ -468,6 +468,8 @@ pub(crate) struct Memo {
     staged: FxMap<(u8, u64, usize, usize, usize), Dated<Slice>>,
     /// (address, index size, count, restart index) -> the staged indices.
     indices: FxMap<(u64, usize, u32, Option<u32>), Dated<Indices>>,
+    /// Address -> a texture or sampler header (two guest reads per texture slot of every draw).
+    descriptors: FxMap<u64, Dated<[u8; 32]>>,
     /// The epoch of each page written by the GPU in this submit, in page order:
     /// an entry's check visits only the written pages inside it.
     pages: BTreeMap<u64, u64>,
@@ -479,6 +481,7 @@ impl Memo {
         self.reads.clear();
         self.staged.clear();
         self.indices.clear();
+        self.descriptors.clear();
         self.pages.clear();
     }
 
@@ -854,6 +857,22 @@ impl Surfaces {
         let found = self.memo.indices.get(&(addr, size, count, restart)).filter(|(_, epoch)| self.memo.fresh(addr, len, *epoch)).map(|(indices, _)| indices.clone());
         self.note_read(Read::Index, len, found.is_some());
         found
+    }
+
+    /// The 32-byte texture or sampler header at `addr`, read once a submit while
+    /// the GPU does not write it; None if not readable.
+    pub(crate) fn descriptor(&mut self, addr: u64, mem: crate::draw::Mem) -> Option<[u8; 32]> {
+        if let Some((d, epoch)) = self.memo.descriptors.get(&addr)
+            && self.memo.fresh(addr, 32, *epoch)
+        {
+            return Some(*d);
+        }
+        let mut d = [0u8; 32];
+        if !mem(addr, &mut d) {
+            return None;
+        }
+        self.memo.descriptors.insert(addr, (d, self.memo.epoch));
+        Some(d)
     }
 
     /// Records a block the caller staged from guest memory at `addr` (see
@@ -1501,6 +1520,13 @@ mod tests {
         s.new_submit();
         read(&mut s);
         assert_eq!(reads.get(), 3);
+        // Texture and sampler headers alike.
+        assert_eq!(s.descriptor(0x2000, &mut mem), Some([7; 32]));
+        assert_eq!(s.descriptor(0x2000, &mut mem), Some([7; 32]));
+        assert_eq!(reads.get(), 4);
+        s.invalidate(0x2010, 4);
+        s.descriptor(0x2000, &mut mem);
+        assert_eq!(reads.get(), 5);
     }
 
     /// Vertices read straight into the arena: the guest's bytes then zeros to a

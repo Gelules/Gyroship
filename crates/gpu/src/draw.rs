@@ -960,10 +960,7 @@ impl Surfaces {
                 TexDim::ArrayCube => (V::CubeArray, &[TextureType::CubemapArray]),
                 other => return Err(format!("texture {other:?} (compare {})", x.compare)),
             };
-            let mut header = [0u8; 32];
-            if !mem(headers.entry(handle.header).ok_or("texture index past the pool")?, &mut header) {
-                return Err("texture header not readable".into());
-            }
+            let header = self.descriptor(headers.entry(handle.header).ok_or("texture index past the pool")?, mem).ok_or("texture header not readable")?;
             let tic = textures::tic(&header).ok_or("texture header layout")?;
             if attached.contains(&tic.address) {
                 return Err("texture is a target of the same draw".into());
@@ -1072,10 +1069,7 @@ impl Surfaces {
                         SamplerBinding::Independently => handle.sampler,
                         SamplerBinding::ViaHeaderBinding => handle.header,
                     };
-                    let mut bytes = [0u8; 32];
-                    if !mem(samplers.entry(index).ok_or("sampler index past the pool")?, &mut bytes) {
-                        return Err("sampler header not readable".into());
-                    }
+                    let bytes = self.descriptor(samplers.entry(index).ok_or("sampler index past the pool")?, mem).ok_or("sampler header not readable")?;
                     // A comparison sampler filters (PCF) whatever the depth format.
                     Some(self.sampler(bytes, !depth || x.compare, x.compare))
                 }
