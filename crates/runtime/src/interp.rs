@@ -117,6 +117,16 @@ fn vec(o: &O) -> Result<(usize, bool, u32)> {
     }
 }
 
+/// A vector operand, or a scalar register as a vector of one element (the
+/// scalar forms of element-wise operations, e.g. `cmeq d2, d19, d2`):
+/// (register, 16 bytes, element bits, one element only).
+fn vec_or_scalar(o: &O) -> Result<(usize, bool, u32, bool)> {
+    match *o {
+        O::SIMDRegister(s, n) => Ok((n as usize, false, ebits(s), true)),
+        _ => vec(o).map(|(n, q, e)| (n, q, e, false)),
+    }
+}
+
 /// One element: (register, element bits, lane).
 fn elem(o: &O) -> Result<(usize, u32, u32)> {
     match *o {
@@ -1358,10 +1368,11 @@ fn convert(c: &mut Cpu, i: &Instruction) -> Result {
     }
 }
 
-/// Element-wise integer operations on vectors (and vector forms of logic ops).
+/// Element-wise integer operations on vectors (and vector forms of logic ops),
+/// and their scalar forms: one element, the rest of the register cleared.
 fn int_vector(c: &mut Cpu, i: &Instruction) -> Result {
     let o = &i.operands;
-    let (d, q, e) = vec(&o[0])?;
+    let (d, q, e, one) = vec_or_scalar(&o[0])?;
     // Vector-immediate forms of ORR/BIC: [Vd, #imm].
     if let (C::ORR | C::BIC, O::ImmShift(..) | O::Immediate(_)) = (i.opcode, &o[1]) {
         let k = imm(&o[1])?;
@@ -1373,9 +1384,9 @@ fn int_vector(c: &mut Cpu, i: &Instruction) -> Result {
         set_v(c, d, r, q);
         return Ok(());
     }
-    let a = c.vr[vec(&o[1])?.0];
+    let a = c.vr[vec_or_scalar(&o[1])?.0];
     let b = match o[2] {
-        O::SIMDRegisterElements(..) => Some(c.vr[vec(&o[2])?.0]),
+        O::SIMDRegisterElements(..) | O::SIMDRegister(..) => Some(c.vr[vec_or_scalar(&o[2])?.0]),
         O::SIMDRegisterElementsLane(..) => {
             let (b, be, l) = elem(&o[2])?;
             let x = lane(c.vr[b], l, be);
@@ -1391,7 +1402,7 @@ fn int_vector(c: &mut Cpu, i: &Instruction) -> Result {
         C::SMAX | C::SMIN | C::SQADD | C::SQSUB | C::SHADD | C::SHSUB | C::SRHADD | C::SABD | C::SABA | C::CMGE | C::CMGT | C::CMLE | C::CMLT
             | C::SQDMULH | C::SQRDMULH | C::SSHL | C::SQSHL | C::NEG | C::ABS | C::SMAXP | C::SMINP
     );
-    let n = lanes(q, e);
+    let n = if one { 1 } else { lanes(q, e) };
     let mut r = 0;
     for j in 0..n {
         let (x, y) = (lane(a, j, e), bv(j));

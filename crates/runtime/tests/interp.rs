@@ -17,6 +17,25 @@ fn run(c: &mut Cpu, word: u32) {
     execute(c, 0x1000, word).unwrap_or_else(|e| panic!("{word:08x}: {e}"));
 }
 
+/// Scalar forms of element-wise integer operations: one element, the rest of
+/// the register cleared (`cmeq d2, d19, d2` ran in the tutorial's all-range mode).
+#[test]
+fn scalar_integer_forms() {
+    let mut c = Cpu::new(std::ptr::null_mut());
+    c.vr[19] = 7 << 64 | 42;
+    c.vr[2] = 9 << 64 | 42;
+    run(&mut c, 0x7ee28e62); // cmeq d2, d19, d2
+    assert_eq!(c.vr[2], u128::from(u64::MAX), "equal: all ones, the rest cleared");
+    c.vr[2] = 41;
+    run(&mut c, 0x7ee28e62);
+    assert_eq!(c.vr[2], 0, "different: zero");
+    c.vr[0] = u128::MAX;
+    c.vr[1] = 3 << 64 | 5;
+    c.vr[2] = 1 << 64 | 7;
+    run(&mut c, 0x5ee28420); // add d0, d1, d2
+    assert_eq!(c.vr[0], 12, "the low elements' sum, the rest cleared");
+}
+
 #[test]
 fn vector_lanes() {
     let mut c = Cpu::new(std::ptr::null_mut());
