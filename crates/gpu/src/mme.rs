@@ -132,7 +132,7 @@ pub struct Mme {
     /// What the calls did, for `--perf` (host statistics, not GPU state).
     pub stats: Stats,
     /// Each macro's last call: a hash of the parameters it took.
-    last: std::collections::HashMap<usize, u64>,
+    last: Vec<Option<u64>>,
 }
 
 /// What macro calls did, for the speed work: the calls; those a memo could
@@ -157,7 +157,7 @@ impl std::ops::AddAssign for Stats {
 
 impl Default for Mme {
     fn default() -> Mme {
-        Mme { code: vec![0; CODE_WORDS], starts: vec![u32::MAX; MACROS], data: vec![0; DATA_WORDS], code_ptr: 0, start_ptr: 0, groups: vec![decoded([0; 3]); CODE_WORDS / 3], stats: Stats::default(), last: Default::default() }
+        Mme { code: vec![0; CODE_WORDS], starts: vec![u32::MAX; MACROS], data: vec![0; DATA_WORDS], code_ptr: 0, start_ptr: 0, groups: vec![decoded([0; 3]); CODE_WORDS / 3], stats: Stats::default(), last: vec![None; MACROS] }
     }
 }
 
@@ -277,7 +277,7 @@ impl Mme {
             }
             if end_next || run.stop {
                 self.stats.calls += 1;
-                let last = self.last.insert(index, run.params);
+                let last = self.last.get_mut(index).and_then(|l| l.replace(run.params));
                 self.stats.repeats += u64::from(!run.reads && last == Some(run.params));
                 return Ok(());
             }

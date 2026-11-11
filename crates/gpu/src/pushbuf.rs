@@ -288,8 +288,10 @@ pub struct Channel {
     pending: Option<Pending>,
     /// The macro unit, out of the channel while a macro runs.
     pub mme: Option<Box<Mme>>,
-    /// A macro call still gathering its parameters: subchannel, index, parameters.
-    call: Option<(usize, usize, Vec<u32>)>,
+    /// A macro call still gathering its parameters (subchannel, index), and them:
+    /// one buffer reused by every call (some 26,000 a frame in a busy scene).
+    call: Option<(usize, usize)>,
+    params: Vec<u32>,
     /// The macro running now, if any.
     running: Option<usize>,
     /// The 3D class's constant-buffer bindings and memory writes.
@@ -333,6 +335,7 @@ impl Default for Channel {
             pending: None,
             mme: Some(Box::default()),
             call: None,
+            params: Vec::new(),
             running: None,
             resources: Resources::default(),
             uploads: Default::default(),
@@ -347,7 +350,7 @@ impl Default for Channel {
 struct MacroHost<'a> {
     channel: &'a mut Channel,
     subchannel: usize,
-    params: std::vec::IntoIter<u32>,
+    params: std::iter::Copied<std::slice::Iter<'a, u32>>,
     effects: &'a mut Vec<Effect>,
     read: Mem<'a>,
 }
@@ -396,7 +399,10 @@ fn push_write(effects: &mut Vec<Effect>, address: u64, bytes: &[u8]) {
     {
         last.data.extend_from_slice(bytes);
     } else {
-        effects.push(Effect::Write(MemWrite { address, data: bytes.to_vec() }));
+        // Room for a run of words (one per method) without regrowing.
+        let mut data = Vec::with_capacity(bytes.len().max(256));
+        data.extend_from_slice(bytes);
+        effects.push(Effect::Write(MemWrite { address, data }));
     }
 }
 
@@ -494,12 +500,17 @@ impl Channel {
 
     /// Runs the macro call gathered so far, if any.
     fn flush_call(&mut self, effects: &mut Vec<Effect>, read: Mem) {
-        let Some((subchannel, index, params)) = self.call.take() else { return };
+        let Some((subchannel, index)) = self.call.take() else { return };
         let Some(mut unit) = self.mme.take() else { return };
+        let params = std::mem::take(&mut self.params);
         self.running = Some(index);
-        let result = unit.call(index, &mut MacroHost { channel: self, subchannel, params: params.into_iter(), effects, read });
+        let result = unit.call(index, &mut MacroHost { channel: self, subchannel, params: params.iter().copied(), effects, read });
         self.running = None;
         self.mme = Some(unit);
+        // The buffer back, unless the macro began a call of its own.
+        if self.call.is_none() {
+            self.params = params;
+        }
         if let Err(fault) = result {
             effects.push(Effect::MacroFault { index, fault });
         }
@@ -516,16 +527,20 @@ impl Channel {
             if let Some(t) = &mut self.trace {
                 t.push(Traced { subchannel, class: self.classes[subchannel], method, value, from_macro: self.running });
             }
-            match &mut self.call {
-                Some((s, i, params)) if method % 8 == 4 && *s == subchannel && *i == index => params.push(value),
+            match self.call {
+                Some((s, i)) if method % 8 == 4 && s == subchannel && i == index => self.params.push(value),
                 _ => {
                     self.flush_call(effects, &mut *read);
-                    self.call = Some((subchannel, index, vec![value]));
+                    self.call = Some((subchannel, index));
+                    self.params.clear();
+                    self.params.push(value);
                 }
             }
             return;
         }
-        self.flush_call(effects, &mut *read);
+        if self.call.is_some() {
+            self.flush_call(effects, &mut *read);
+        }
         if let Some(t) = &mut self.trace {
             t.push(Traced { subchannel, class: if method < HOST_METHODS { 0 } else { self.classes[subchannel] }, method, value, from_macro: self.running });
         }
@@ -570,8 +585,12 @@ impl Channel {
         if three_d {
             let regs = &self.engine[subchannel * 0x1000..(subchannel + 1) * 0x1000];
             self.resources.method(method, value, &|m| regs.get((m / 4) as usize).copied().unwrap_or(0), &mut |a, b| push_write(effects, a, b));
-            effects.extend(self.resources.unsupported.drain(..).map(Effect::Unsupported));
-            effects.extend(self.resources.semaphores.drain(..).map(Effect::Semaphore));
+            if !self.resources.unsupported.is_empty() {
+                effects.extend(self.resources.unsupported.drain(..).map(Effect::Unsupported));
+            }
+            if !self.resources.semaphores.is_empty() {
+                effects.extend(self.resources.semaphores.drain(..).map(Effect::Semaphore));
+            }
         } else if self.classes[subchannel] & 0xff == 0xc0 && (LOAD_INLINE_QMD_DATA..LOAD_INLINE_QMD_DATA + 0x100).contains(&method) {
             // LOAD_INLINE_QMD_DATA(i): word i of the QMD at SET_INLINE_QMD_ADDRESS_A/B << 8.
             let at = (u64::from(self.reg(subchannel, SET_INLINE_QMD_ADDRESS)) << 32 | u64::from(self.reg(subchannel, SET_INLINE_QMD_ADDRESS + 4))) << 8;
@@ -920,6 +939,14 @@ mod tests {
         assert_eq!(c.run(&words), vec![Effect::Release(Release { method: REPORT_SEMAPHORE_D, addr: 0x10_5fc1_1000, value: 2, width: 4, timestamp: false })]);
         // An unloaded macro is a fault.
         assert!(matches!(c.run(&[header(1, 1, 0, CALL_MME.start + 8), 0])[..], [Effect::MacroFault { index: 1, .. }]));
+        // Two calls in a row each take their own parameters (one buffer, reused)...
+        let call = |hi: u32, lo: u32, value: u32| [header(5, 4, 0, CALL_MME.start + 5 * 8), hi, lo, value, 0x1000_f010];
+        let release = |addr: u64, value: u64| Effect::Release(Release { method: REPORT_SEMAPHORE_D, addr, value, width: 4, timestamp: false });
+        assert_eq!(c.run(&[call(0x10, 0x1000, 2), call(0x20, 0x2000, 3)].concat()), [release(0x10_0000_1000, 2), release(0x20_0000_2000, 3)]);
+        // ...also when they continue into the next segment.
+        let split = call(0x30, 0x3000, 4);
+        assert!(c.run(&split[..3]).is_empty());
+        assert_eq!(c.run(&split[3..]), [release(0x30_0000_3000, 4)]);
     }
 
     #[test]
