@@ -269,6 +269,7 @@ pub fn run(table: Vec<rt::Entry>, window: Option<HostWindow>) {
         record: value("--record").map(Into::into),
         audio_dump: value("--dump-audio").map(Into::into),
         play: flag("--play"),
+        pipeline_cache: value("--pipeline-cache").map(Into::into),
         ..Config::default()
     };
     if config.play {
@@ -313,6 +314,13 @@ pub fn run(table: Vec<rt::Entry>, window: Option<HostWindow>) {
                 k.log(&format!("gpu: host renderer {}", s.describe()));
                 // D42: in play mode a pipeline the driver takes seconds over holds no frame.
                 s.background = k.config.play;
+                // Said on stderr only: the journal of a run with the cache stays comparable.
+                if let Some(dir) = &k.config.pipeline_cache {
+                    match s.use_pipeline_cache(dir) {
+                        Ok((file, size)) => eprintln!("gyroship: pipeline cache {} ({} KiB)", file.display(), size / 1024),
+                        Err(e) => eprintln!("gyroship: --pipeline-cache {}: {e}; pipelines are compiled every run", dir.display()),
+                    }
+                }
                 if k.config.perf.is_some() && !s.measure_frames() {
                     eprintln!("gyroship: --perf: this GPU has no timestamps inside command encoders: no GPU frame times");
                 }

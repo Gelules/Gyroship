@@ -170,7 +170,26 @@ pub struct Surfaces {
     pub background: bool,
     /// The worker threads' queue, started at the first pipeline they make.
     pub(crate) workers: Option<std::sync::mpsc::Sender<crate::draw::Job>>,
+    /// Pipelines the worker threads made since the caller took them: label, time.
+    pub finished: Arc<Mutex<Vec<(String, std::time::Duration)>>>,
+    /// `--pipeline-cache`: the driver's compiled pipelines, kept on disk.
+    pub(crate) disk_cache: Option<DiskCache>,
 }
+
+/// A pipeline cache kept in a file between runs (`--pipeline-cache`): the
+/// driver's compiled pipelines, which it then reuses instead of compiling.
+pub(crate) struct DiskCache {
+    pub(crate) cache: wgpu::PipelineCache,
+    file: std::path::PathBuf,
+    /// The data's size when last written (it only grows), whether a write
+    /// runs, and when the last one started.
+    written: Arc<std::sync::atomic::AtomicUsize>,
+    busy: Arc<std::sync::atomic::AtomicBool>,
+    last: std::time::Instant,
+}
+
+/// How often a run writes its pipeline cache: a killed run loses at most that much.
+const CACHE_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Shader modules (translation and WGSL check) and pipelines made, and the
 /// host time they took: what a frame showing new materials spends before it
@@ -186,6 +205,9 @@ pub struct Compile {
     pub made: Vec<String>,
     /// Draws and dispatches skipped while their pipeline was made (play mode).
     pub waited: u64,
+    /// Pipelines the worker threads made, and their time (play mode).
+    pub background: u32,
+    pub background_time: std::time::Duration,
 }
 
 impl std::ops::AddAssign for Compile {
@@ -195,6 +217,8 @@ impl std::ops::AddAssign for Compile {
         self.pipelines += o.pipelines;
         self.pipeline_time += o.pipeline_time;
         self.waited += o.waited;
+        self.background += o.background;
+        self.background_time += o.background_time;
     }
 }
 
@@ -485,6 +509,7 @@ impl Surfaces {
             | wgpu::Features::FLOAT32_FILTERABLE
             | wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER
             | wgpu::Features::SUBGROUP
+            | wgpu::Features::PIPELINE_CACHE
             | crate::timing::Timing::wanted();
         let info = adapter.get_info();
         check_adapter(adapter.features(), info.subgroup_min_size, info.subgroup_max_size).map_err(|e| format!("{} ({:?}): {e}", info.name, info.backend))?;
@@ -536,7 +561,7 @@ impl Surfaces {
         let arena = (arena_buffer(&device, 16 << 20), Vec::new());
         let window = window.map(|(surface, size)| Window::new(&adapter, &device, surface, size));
         let timing = crate::timing::Timing::new(&device, &queue);
-        Ok(Surfaces { adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pass: None, pending: None, timing, clock: None, present: 0, readbacks: Default::default(), hasher: None, arena, staging: Staging::default(), staged: FxMap::default(), last_color: None, window, memo: Memo::default(), compile: Compile::default(), compile_total: Compile::default(), background: false, workers: None })
+        Ok(Surfaces { adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pass: None, pending: None, timing, clock: None, present: 0, readbacks: Default::default(), hasher: None, arena, staging: Staging::default(), staged: FxMap::default(), last_color: None, window, memo: Memo::default(), compile: Compile::default(), compile_total: Compile::default(), background: false, workers: None, finished: Default::default(), disk_cache: None })
     }
 
     /// Shows the presented image (the color target written last, its top-left
@@ -612,6 +637,78 @@ impl Surfaces {
     pub fn frame_times(&mut self) -> (Vec<f64>, u64) {
         self.flush();
         self.clock.as_mut().map_or((Vec::new(), 0), |c| (c.finish(&self.device), c.stalls))
+    }
+
+    /// `--pipeline-cache DIR`: the driver's compiled pipelines are kept in DIR, in
+    /// a file named after the adapter (wgpu also checks the driver's version and
+    /// starts empty on a mismatch), for the next runs to reuse. Vulkan only.
+    /// Returns the file and the size it had.
+    pub fn use_pipeline_cache(&mut self, dir: &std::path::Path) -> Result<(std::path::PathBuf, usize), String> {
+        if !self.device.features().contains(wgpu::Features::PIPELINE_CACHE) {
+            return Err("this GPU backend keeps no pipeline cache (Vulkan only)".into());
+        }
+        let name = wgpu::util::pipeline_cache_key(&self.adapter.get_info()).ok_or("no pipeline cache for this adapter")?;
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let file = dir.join(name);
+        let data = std::fs::read(&file).ok();
+        let errors = self.errors.lock().map_or(0, |e| e.len());
+        // SAFETY: the data comes from get_data on an adapter of this name (the
+        // file's); a stale one (another driver) is dropped, as `fallback` asks.
+        let cache = unsafe { self.device.create_pipeline_cache(&wgpu::PipelineCacheDescriptor { label: Some("pipelines"), data: data.as_deref(), fallback: true }) };
+        // A cache that failed to be made would void every pipeline made with it.
+        if self.errors.lock().map_or(0, |e| e.len()) > errors {
+            return Err("the pipeline cache could not be made".into());
+        }
+        let size = data.map_or(0, |d| d.len());
+        let written = Arc::new(std::sync::atomic::AtomicUsize::new(size));
+        self.disk_cache = Some(DiskCache { cache, file: file.clone(), written, busy: Default::default(), last: std::time::Instant::now() });
+        Ok((file, size))
+    }
+
+    /// Writes the pipeline cache to its file if it grew, on a thread of its own
+    /// (the driver may hold the cache while it compiles), through a temporary
+    /// file and a rename: a run killed meanwhile leaves the last whole file.
+    /// Every CACHE_EVERY at most, unless `now`; returns the writing thread.
+    pub fn save_pipeline_cache(&mut self, now: bool) -> Option<std::thread::JoinHandle<()>> {
+        use std::sync::atomic::Ordering;
+        let d = self.disk_cache.as_mut()?;
+        if (!now && d.last.elapsed() < CACHE_EVERY) || d.busy.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+        d.last = std::time::Instant::now();
+        let (cache, file, written, busy) = (d.cache.clone(), d.file.clone(), d.written.clone(), d.busy.clone());
+        std::thread::Builder::new()
+            .name("pipeline cache".into())
+            .spawn(move || {
+                if let Some(data) = cache.get_data()
+                    && data.len() > written.load(Ordering::Acquire)
+                {
+                    let tmp = file.with_extension(format!("{}.tmp", std::process::id()));
+                    match std::fs::write(&tmp, &data).and_then(|()| std::fs::rename(&tmp, &file)) {
+                        Ok(()) => written.store(data.len(), Ordering::Release),
+                        Err(e) => eprintln!("gyroship: --pipeline-cache {}: {e}", file.display()),
+                    }
+                }
+                busy.store(false, Ordering::Release);
+            })
+            .ok()
+    }
+
+    /// The run's last write of the pipeline cache, waited for `patience` at most
+    /// (a driver stuck on a compile may hold the cache).
+    pub fn finish_pipeline_cache(&mut self, patience: std::time::Duration) {
+        let since = std::time::Instant::now();
+        while since.elapsed() < patience {
+            if self.disk_cache.as_ref().is_none_or(|d| !d.busy.load(std::sync::atomic::Ordering::Acquire)) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if let Some(writer) = self.save_pipeline_cache(true) {
+            while !writer.is_finished() && since.elapsed() < patience {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
     }
 
     pub(crate) fn record(&mut self, encoder: wgpu::CommandEncoder) {

@@ -521,6 +521,15 @@ impl Kernel {
             let c = std::mem::take(&mut s.compile);
             s.compile_total += c.clone();
             let overdue = if self.config.play { s.overdue(OVERDUE) } else { Vec::new() };
+            // Pipelines the worker threads finished since (play mode), and the cache's write.
+            let finished = s.finished.lock().map(|mut f| std::mem::take(&mut *f)).unwrap_or_default();
+            s.compile_total.background += finished.len() as u32;
+            s.compile_total.background_time += finished.iter().map(|f| f.1).sum::<std::time::Duration>();
+            let _ = s.save_pipeline_cache(false);
+            if !finished.is_empty() {
+                let made: Vec<String> = finished.iter().map(|(label, t)| format!("{label} {} ms", t.as_millis())).collect();
+                self.log(&format!("gpu: present #{n}: made off the frame: {}", made.join(", ")));
+            }
             if self.config.play && c.module_time + c.pipeline_time >= SLOW_COMPILE {
                 self.log(&format!("gpu: present #{n}: {} modules in {} ms, {} pipelines in {} ms: {}", c.modules, c.module_time.as_millis(), c.pipelines, c.pipeline_time.as_millis(), c.made.join(" ")));
             }

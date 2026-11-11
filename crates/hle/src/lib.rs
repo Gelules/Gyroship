@@ -131,11 +131,14 @@ pub struct Config {
     /// `--play`: the play engine (D41). Each guest thread runs on a host thread
     /// of its own, in real time; never a reference run (D38).
     pub play: bool,
+    /// `--pipeline-cache DIR`: the driver's compiled pipelines, kept between runs
+    /// (game-derived: a data folder, never Git). Same images, faster starts.
+    pub pipeline_cache: Option<std::path::PathBuf>,
 }
 
 impl Default for Config {
     fn default() -> Config {
-        Config { seed: 0x5EED, explore: false, non_system_memory: 0x2_6410_0000, time_limit: None, frames: None, save_dir: None, vsync: true, work_time: false, gpfifo_dump: None, frames_dump: None, dump_every: 1, dump_draws: None, shaders_dump: None, replay: None, profile: None, perf: None, hashes: None, record: None, audio_dump: None, play: false }
+        Config { seed: 0x5EED, explore: false, non_system_memory: 0x2_6410_0000, time_limit: None, frames: None, save_dir: None, vsync: true, work_time: false, gpfifo_dump: None, frames_dump: None, dump_every: 1, dump_draws: None, shaders_dump: None, replay: None, profile: None, perf: None, hashes: None, record: None, audio_dump: None, play: false, pipeline_cache: None }
     }
 }
 
@@ -311,6 +314,9 @@ impl Kernel {
     /// Writes the host-side reports a run asked for (`--profile`, `--perf`).
     pub fn host_reports(&mut self) {
         gyroship_runtime::profile::finish(&|a| self.symbolize(a));
+        if let Some(s) = self.surfaces.as_mut() {
+            s.finish_pipeline_cache(std::time::Duration::from_secs(3));
+        }
         if let Some(path) = &self.config.perf {
             let (gpu, stalls) = self.surfaces.as_mut().map_or((Vec::new(), 0), |s| s.frame_times());
             gyroship_runtime::profile::write_perf(path, self.config.profile.as_ref().map_or(600, |p| p.1 as usize), &gpu);
@@ -320,7 +326,17 @@ impl Kernel {
             if let Some(s) = &self.surfaces {
                 eprintln!("gyroship: staging over {} presents: {:?}", self.gs.presents, s.staging);
                 let c = &s.compile_total;
-                eprintln!("gyroship: shaders over {} presents: {} modules in {:.1} s, {} pipelines in {:.1} s; {} draws and dispatches waited for theirs", self.gs.presents, c.modules, c.module_time.as_secs_f64(), c.pipelines, c.pipeline_time.as_secs_f64(), c.waited);
+                eprintln!(
+                    "gyroship: shaders over {} presents: {} modules in {:.1} s, {} pipelines in {:.1} s on the frame, {} made off it in {:.1} s; {} draws and dispatches waited for theirs",
+                    self.gs.presents,
+                    c.modules,
+                    c.module_time.as_secs_f64(),
+                    c.pipelines,
+                    c.pipeline_time.as_secs_f64(),
+                    c.background,
+                    c.background_time.as_secs_f64(),
+                    c.waited
+                );
             }
             // The play engine charges no host time at switch points: each guest
             // thread's host thread reports its CPU time instead (parked time is not in it).

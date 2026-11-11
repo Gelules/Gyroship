@@ -358,10 +358,14 @@ impl Surfaces {
             return Made::Ready(make());
         }
         let cell = std::sync::Arc::new(std::sync::OnceLock::new());
-        let done = cell.clone();
+        let (done, finished, name) = (cell.clone(), self.finished.clone(), label.clone());
         let workers = self.workers.get_or_insert_with(pipeline_workers);
         let _ = workers.send(Box::new(move || {
+            let since = std::time::Instant::now();
             let _ = done.set(make());
+            if let Ok(mut f) = finished.lock() {
+                f.push((name, since.elapsed()));
+            }
         }));
         Made::Pending(cell, std::time::Instant::now(), label, false)
     }
@@ -599,6 +603,7 @@ impl Surfaces {
             let buffers: Vec<(u64, wgpu::VertexStepMode, Vec<wgpu::VertexAttribute>)> = layouts.iter().map(|(_, step, stride, attributes)| (*stride, *step, attributes.clone())).collect();
             let (device, vertex, pixel) = (self.device.clone(), vs.1.clone(), ps.as_ref().map(|p| p.1.clone()));
             let (primitive, targets, depth_stencil) = (*primitive, color_states.clone(), depth_state.clone());
+            let cache = self.disk_cache.as_ref().map(|d| d.cache.clone());
             let make = move || {
                 let buffers: Vec<Option<wgpu::VertexBufferLayout>> = buffers.iter().map(|(stride, step, attributes)| Some(wgpu::VertexBufferLayout { array_stride: *stride, step_mode: *step, attributes })).collect();
                 device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -610,7 +615,7 @@ impl Surfaces {
                     depth_stencil,
                     multisample: Default::default(),
                     multiview_mask: None,
-                    cache: None,
+                    cache: cache.as_ref(),
                 })
             };
             let label = format!("p{:016x}+{}", vs.0.key, ps.as_ref().map_or("none".into(), |p| format!("{:016x}", p.0.key)));
@@ -1525,5 +1530,33 @@ mod tests {
             std::thread::yield_now();
         }
         assert_eq!((slow.ready(), quick.ready()), (Some(8), Some(9)));
+    }
+
+    /// `--pipeline-cache`: a pipeline made with the cache is written to its file,
+    /// which the next run reads back without an error (Vulkan only).
+    #[test]
+    fn the_pipeline_cache_is_written_and_read_back() {
+        // Next to the test binary, in the target folder.
+        let exe = std::env::current_exe().unwrap();
+        let dir = exe.parent().unwrap().join(format!("pipeline-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
+            eprintln!("no GPU adapter: test skipped");
+            return;
+        };
+        let Ok((file, 0)) = s.use_pipeline_cache(&dir) else {
+            eprintln!("no pipeline cache on this backend: test skipped");
+            return;
+        };
+        let module = s.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl("@compute @workgroup_size(1) fn main() {}".into()) });
+        let cache = s.disk_cache.as_ref().map(|d| d.cache.clone());
+        let _ = s.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: None, module: &module, entry_point: Some("main"), compilation_options: Default::default(), cache: cache.as_ref() });
+        s.save_pipeline_cache(true).expect("a writing thread").join().unwrap();
+        assert!(std::fs::read(&file).unwrap().starts_with(b"WGPUPLCH"));
+        let Ok(mut next) = Surfaces::headless(crate::Backend::Auto) else { panic!("the adapter went away") };
+        let (_, size) = next.use_pipeline_cache(&dir).unwrap();
+        assert!(size > 0);
+        assert!(s.errors.lock().unwrap().is_empty() && next.errors.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

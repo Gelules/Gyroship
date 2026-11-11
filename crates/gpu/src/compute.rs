@@ -245,7 +245,7 @@ impl Surfaces {
                 module,
                 entry_point: Some("main"),
                 compilation_options: Default::default(),
-                cache: None,
+                cache: self.disk_cache.as_ref().map(|d| &d.cache),
             });
             self.cache.compute_pipelines.insert(id.clone(), (pipeline, layout));
             self.compile.pipelines += 1;
