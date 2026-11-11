@@ -567,6 +567,7 @@ impl Surfaces {
             | wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER
             | wgpu::Features::SUBGROUP
             | wgpu::Features::PIPELINE_CACHE
+            | wgpu::Features::TEXTURE_ATOMIC
             | crate::timing::Timing::wanted();
         let info = adapter.get_info();
         check_adapter(adapter.features(), info.subgroup_min_size, info.subgroup_max_size).map_err(|e| format!("{} ({:?}): {e}", info.name, info.backend))?;

@@ -111,6 +111,9 @@ impl Surfaces {
             if img.read && !self.adapter.get_texture_format_features(format).flags.contains(wgpu::TextureFormatFeatureFlags::STORAGE_READ_WRITE) {
                 return Err(format!("image format {format:?} both read and written"));
             }
+            if img.atomic && !self.device.features().contains(wgpu::Features::TEXTURE_ATOMIC) {
+                return Err("image atomics need TEXTURE_ATOMIC".into());
+            }
             images.push((tic, format, name.to_string(), header));
         }
         let mut queried = BTreeMap::new();
@@ -136,7 +139,7 @@ impl Surfaces {
             let size = wgpu::Extent3d { width: tic.width, height: tic.height, depth_or_array_layers: if three_d || array { tic.depth.max(1) } else { 1 } };
             let target = self.map.values().find(|e| {
                 let t = &e.texture;
-                e.surface.addr == tic.address && t.format() == *format && t.width() == size.width && t.height() == size.height && !three_d && !array && t.usage().contains(wgpu::TextureUsages::STORAGE_BINDING)
+                e.surface.addr == tic.address && t.format() == *format && t.width() == size.width && t.height() == size.height && !three_d && !array && !img.atomic && t.usage().contains(wgpu::TextureUsages::STORAGE_BINDING)
             });
             if let Some(e) = target {
                 views.push(e.texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2), array_layer_count: Some(1), ..Default::default() }));
@@ -148,6 +151,9 @@ impl Surfaces {
             }
             let fresh = self.cache.images.get(&tic.address).is_none_or(|x| x.size() != size || x.format() != *format);
             if fresh {
+                // r32 images may be reduced into: every one can be bound for atomics.
+                let r32 = matches!(format, wgpu::TextureFormat::R32Uint | wgpu::TextureFormat::R32Sint) && self.device.features().contains(wgpu::Features::TEXTURE_ATOMIC);
+                let atomic = if r32 { wgpu::TextureUsages::STORAGE_ATOMIC } else { wgpu::TextureUsages::empty() };
                 let texture = self.device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("image"),
                     size,
@@ -155,7 +161,7 @@ impl Surfaces {
                     sample_count: 1,
                     dimension: if three_d { wgpu::TextureDimension::D3 } else { wgpu::TextureDimension::D2 },
                     format: *format,
-                    usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+                    usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST | atomic,
                     view_formats: if header == format { &[] } else { std::slice::from_ref(header) },
                 });
                 self.cache.images.insert(tic.address, texture);
@@ -216,7 +222,17 @@ impl Surfaces {
             layout_entries.push(wgpu::BindGroupLayoutEntry {
                 binding: IMAGE_BINDING + i as u32,
                 visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::StorageTexture { access: if img.read { wgpu::StorageTextureAccess::ReadWrite } else { wgpu::StorageTextureAccess::WriteOnly }, format: *format, view_dimension },
+                ty: wgpu::BindingType::StorageTexture {
+                    access: if img.atomic {
+                        wgpu::StorageTextureAccess::Atomic
+                    } else if img.read {
+                        wgpu::StorageTextureAccess::ReadWrite
+                    } else {
+                        wgpu::StorageTextureAccess::WriteOnly
+                    },
+                    format: *format,
+                    view_dimension,
+                },
                 count: None,
             });
         }
@@ -749,6 +765,56 @@ mod tests {
         code.extend([sust(10, 12), sust(20, 16)]);
         let Some(words) = run_warp(&code, Vec::new(), 1, 0) else { return };
         assert!(words.iter().all(|&x| x == 0x3f80_0000), "{words:x?}");
+    }
+
+    #[test]
+    fn an_image_reduction_adds_atomically_on_the_gpu() {
+        let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
+            eprintln!("no GPU adapter: test skipped");
+            return;
+        };
+        if !s.device.features().contains(wgpu::Features::TEXTURE_ATOMIC) {
+            eprintln!("no texture atomics: test skipped");
+            return;
+        }
+        s.background = true;
+        const PROGRAM: u64 = 0x10_0000;
+        const CBUF: u64 = 0x20_0000;
+        const HEADERS: u64 = 0x40_0000;
+        const IMAGE: u64 = 0x50_0000;
+        // R0 = R1 = 0, R3 = 1; 32 lanes SURED.ADD.U32 R3 at (R0, R1) of the 2D image c[0][0x20].
+        let mov = |d: u128, v: u128| w(0x802, &[(16, d), (32, v), (72, 0xf)]);
+        let sured = w(0x59f, &[(24, 0), (32, 3), (40, 0x20 / 4), (54, 0), (61, 3), (77, 7), (84, 1)]);
+        let closing = [w(0x94d, &[(87, 7)]), w(0x947, &[(87, 7), (32, (-16i64 as u64 as u128) & ((1 << 50) - 1))])];
+        let mut program = [mov(0, 0), mov(1, 0), mov(3, 1), sured, closing[0], closing[1]].concat();
+        program.resize(0x1000, 0);
+        // Header 0: a 64 × 1 pitch R32 UINT image at IMAGE.
+        let mut header = [0u8; 32];
+        for (hi, lo, v) in [(6, 0, 0x0f), (9, 7, 4), (12, 10, 4), (15, 13, 4), (18, 16, 4), (21, 19, 2), (24, 22, 3), (27, 25, 4), (30, 28, 5), (63, 37, (IMAGE >> 5) as u32), (87, 85, 2), (111, 96, 256 >> 5), (144, 128, 63), (154, 151, 1), (191, 191, 1)] {
+            put(&mut header, hi, lo, v);
+        }
+        let regions: Vec<(u64, Vec<u8>)> = vec![(PROGRAM, program), (CBUF, vec![0u8; 0x10000]), (HEADERS, header.to_vec())];
+        let mut mem = |addr: u64, out: &mut [u8]| {
+            regions.iter().any(|(at, data)| {
+                let Some(src) = addr.checked_sub(*at).and_then(|o| data.get(o as usize..o as usize + out.len())) else { return false };
+                out.copy_from_slice(src);
+                true
+            })
+        };
+        let reg = |m: u32| if m == 0x1578 { HEADERS as u32 } else { 0 };
+        let pools = Pools { headers: resources::header_pool(&reg), samplers: resources::sampler_pool(&reg), sampler_binding: resources::sampler_binding(&reg) };
+        let launch = Launch { program: PROGRAM, grid: [1, 1, 1], block: [32, 1, 1], shared: 0, cbufs: vec![(0, CBUF, 0x10000)] };
+        s.dispatch(&launch, pools, &mut mem).unwrap_or_else(|e| panic!("{e}"));
+        s.flush();
+        let buffer = s.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 4, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+        let mut encoder = s.device.create_command_encoder(&Default::default());
+        let layout = wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: None, rows_per_image: None };
+        encoder.copy_texture_to_buffer(s.cache.images[&IMAGE].as_image_copy(), wgpu::TexelCopyBufferInfo { buffer: &buffer, layout }, wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 });
+        s.queue.submit([encoder.finish()]);
+        buffer.slice(..).map_async(wgpu::MapMode::Read, |r| r.expect("readback mapping failed"));
+        s.device.poll(wgpu::PollType::wait_indefinitely()).expect("GPU poll");
+        let texel = buffer.slice(..).get_mapped_range().expect("mapped").to_vec();
+        assert_eq!(texel, 32u32.to_le_bytes(), "{:?}", s.errors.lock().unwrap());
     }
 
     #[test]
