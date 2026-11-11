@@ -102,6 +102,98 @@ pub fn cpu_time(handle: usize) -> Option<std::time::Duration> {
     Some(std::time::Duration::from_nanos((hundreds(kernel) + hundreds(user)) * 100))
 }
 
+/// The calling host thread's Windows id, for [`stack_of`].
+#[cfg(windows)]
+pub fn thread_id() -> u32 {
+    // SAFETY: reads the calling thread's id.
+    unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }
+}
+
+#[cfg(not(windows))]
+pub fn thread_id() -> u32 {
+    0
+}
+
+/// Where host thread `tid` (a Windows thread id) stands, for a watchdog: its
+/// instruction pointer, then the return addresses on its stack (words just
+/// after a call instruction, up to 64 KiB above its stack pointer, innermost
+/// first; a stale one may show up), symbolized. The thread is suspended only
+/// to read its context and copy its stack: nothing allocates or locks meanwhile.
+#[cfg(windows)]
+pub fn stack_of(tid: u32) -> Vec<String> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Diagnostics::Debug::{CONTEXT, CONTEXT_CONTROL_AMD64, GetThreadContext};
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+    use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, SuspendThread, THREAD_GET_CONTEXT, THREAD_SUSPEND_RESUME};
+    const WORDS: usize = 8192;
+    let mut stack = vec![0u64; WORDS];
+    #[repr(C, align(16))]
+    struct Aligned(CONTEXT);
+    // SAFETY: a zeroed CONTEXT is valid; only its control registers are asked for.
+    let mut aligned: Aligned = unsafe { std::mem::zeroed() };
+    aligned.0.ContextFlags = CONTEXT_CONTROL_AMD64;
+    // SAFETY: opens a thread of this process; closed below.
+    let handle = unsafe { OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, 0, tid) };
+    if handle.is_null() {
+        return vec![format!("cannot open thread {tid}: {}", std::io::Error::last_os_error())];
+    }
+    let mut copied = None;
+    // SAFETY: while the thread is suspended, its context is read and its stack
+    // copied from its stack pointer to the end of that committed region at
+    // most, into a buffer allocated before; then it resumes.
+    unsafe {
+        if SuspendThread(handle) != u32::MAX {
+            if GetThreadContext(handle, &mut aligned.0) != 0 {
+                let rsp = aligned.0.Rsp as usize;
+                let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+                let n = if VirtualQuery(rsp as *const _, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) != 0 { ((info.BaseAddress as usize + info.RegionSize - rsp) / 8).min(WORDS) } else { 0 };
+                std::ptr::copy_nonoverlapping(rsp as *const u64, stack.as_mut_ptr(), n);
+                copied = Some(n);
+            }
+            ResumeThread(handle);
+        }
+        CloseHandle(handle);
+    }
+    let Some(n) = copied else { return vec![format!("cannot read thread {tid}: {}", std::io::Error::last_os_error())] };
+    let rip = aligned.0.Rip;
+    let line = |a: u64| format!("{a:#x} [{}] {}", module(a), symbol(a));
+    std::iter::once(line(rip)).chain(stack[..n].iter().filter(|&&w| after_call(w)).take(40).map(|&w| line(w))).collect()
+}
+
+#[cfg(not(windows))]
+pub fn stack_of(_tid: u32) -> Vec<String> {
+    vec!["no stack on this platform".into()]
+}
+
+/// Whether `w` is the address right after a call instruction in executable
+/// memory (a return address): call rel32, or call through a register or
+/// memory operand (the common encodings).
+#[cfg(windows)]
+fn after_call(w: u64) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, VirtualQuery};
+    let at = w as usize;
+    if at < 0x10000 {
+        return false;
+    }
+    // SAFETY: a query; it reads nothing at `at`.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { VirtualQuery(at as *const _, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 {
+        return false;
+    }
+    let exec = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    if info.State != MEM_COMMIT || info.Protect & exec == 0 || at - 6 < info.BaseAddress as usize {
+        return false;
+    }
+    // SAFETY: the 6 bytes before `at` lie in its committed executable region.
+    let b: [u8; 6] = unsafe { std::ptr::read_unaligned((at - 6) as *const [u8; 6]) };
+    b[1] == 0xE8
+        || b[0] == 0xFF && (b[1] == 0x15 || b[1] & 0xF8 == 0x90)
+        || b[2] == 0xFF && b[3] == 0x54
+        || b[3] == 0xFF && b[4] & 0xF8 == 0x50
+        || b[3] == 0x41 && b[4] == 0xFF && b[5] & 0xF8 == 0xD0
+        || b[4] == 0xFF && (b[5] & 0xF8 == 0xD0 || b[5] & 0xF8 == 0x10)
+}
+
 /// Counts an instruction the interpreter runs, while a profile runs.
 #[inline]
 pub fn count_interpreted(word: u32) {
@@ -361,5 +453,40 @@ mod tests {
         assert!(busy_time > Duration::from_millis(100) && idle_time < Duration::from_millis(50), "busy {busy_time:?}, idle {idle_time:?}");
         busy.join().unwrap();
         idle.join().unwrap();
+    }
+
+    /// A thread spinning in a known function: its instruction pointer is in
+    /// that function, and the return address into its caller is on its stack.
+    #[test]
+    fn a_watched_thread_shows_where_it_spins() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        static STOP: AtomicBool = AtomicBool::new(false);
+        static TID: AtomicU32 = AtomicU32::new(0);
+        #[inline(never)]
+        fn spin() -> u64 {
+            let mut n = 0u64;
+            while !STOP.load(Ordering::Relaxed) {
+                n = std::hint::black_box(n + 1);
+            }
+            n
+        }
+        #[inline(never)]
+        fn caller() -> u64 {
+            TID.store(super::thread_id(), Ordering::Relaxed);
+            std::hint::black_box(spin()) + 1
+        }
+        let t = std::thread::spawn(caller);
+        while TID.load(Ordering::Relaxed) == 0 {
+            std::thread::yield_now();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        let lines = super::stack_of(TID.load(Ordering::Relaxed));
+        STOP.store(true, Ordering::Relaxed);
+        t.join().unwrap();
+        let addrs: Vec<usize> = lines.iter().filter_map(|l| usize::from_str_radix(l.split_whitespace().next()?.trim_start_matches("0x"), 16).ok()).collect();
+        let within = |f: usize, a: usize| (f..f + 0x400).contains(&a);
+        let (spin, caller) = (spin as fn() -> u64 as usize, caller as fn() -> u64 as usize);
+        assert!(addrs.first().is_some_and(|&a| within(spin, a)), "{lines:?}");
+        assert!(addrs.iter().skip(1).any(|&a| within(caller, a)), "{lines:?}");
     }
 }

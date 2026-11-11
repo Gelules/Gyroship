@@ -445,6 +445,15 @@ thread_local! {
     static KERNEL: Cell<Option<KernelRef>> = const { Cell::new(None) };
 }
 
+/// The play engine's kernel lock: its holder's host thread (a Windows thread
+/// id, 0: nobody) and since when (real ticks), which the watchdog reads
+/// without the lock (`play.rs`).
+// ponytail: one pair per process (one play run); concurrent test runs share it, which only blurs the watchdog.
+pub(crate) static HOLDER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+pub(crate) static HELD_SINCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The guest thread whose host thread holds it (0: a timer or the boot thread).
+pub(crate) static HOLDER_GUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The kernel the last [`install`] made, for a host thread outside the run
 /// (the window's) to stop it: [`stop_from_outside`].
 static INSTALLED: std::sync::atomic::AtomicPtr<Mutex<Option<Kernel>>> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
@@ -563,10 +572,16 @@ pub fn with<R>(f: impl FnOnce(&mut Kernel) -> R) -> R {
         k.sched.current = play::me();
         // Read once the lock is taken: scopes take turns, so kernel time never goes back.
         k.sched.real_now = k.sched.real_now.max(play::real_ticks());
+        HELD_SINCE.store(k.sched.real_now, std::sync::atomic::Ordering::Relaxed);
+        HOLDER_GUEST.store(k.sched.current.map_or(0, |t| k.sched.threads[t].id), std::sync::atomic::Ordering::Relaxed);
+        HOLDER.store(gyroship_runtime::profile::thread_id(), std::sync::atomic::Ordering::Relaxed);
     }
     let r = f(&mut *k);
-    if k.config.play && play::real_ticks().saturating_sub(k.sched.real_now) > play::LONG_HOLD {
-        k.count("play: kernel lock held over 40 ms");
+    if k.config.play {
+        if play::real_ticks().saturating_sub(k.sched.real_now) > play::LONG_HOLD {
+            k.count("play: kernel lock held over 40 ms");
+        }
+        HOLDER.store(0, std::sync::atomic::Ordering::Relaxed);
     }
     let unparks = std::mem::take(&mut k.sched.unparks);
     drop(guard);

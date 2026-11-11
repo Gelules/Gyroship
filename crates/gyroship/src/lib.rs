@@ -129,9 +129,12 @@ impl ApplicationHandler for App {
             // The guest ends the run at its next frame (its journal flushed). With no
             // frame 2 s later (a long loading, a frozen game), it stops from here,
             // threads' states, journal, reports and --record written, unless the
-            // kernel stays busy.
+            // kernel stays busy. Clicks after the first change nothing.
             WindowEvent::CloseRequested => {
-                self.shared.closed.store(true, Ordering::Relaxed);
+                if self.shared.closed.swap(true, Ordering::Relaxed) {
+                    return;
+                }
+                eprintln!("gyroship: window closed: the run stops at its next frame, or within 5 s");
                 std::thread::spawn(|| {
                     std::thread::sleep(Duration::from_secs(2));
                     gyroship_hle::stop_from_outside("window closed while no frame came", gyroship_hle::CLOSE_WAIT);

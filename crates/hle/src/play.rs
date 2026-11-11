@@ -43,10 +43,13 @@ pub fn run_play() -> Outcome {
         k.config.time_limit.map(|l| start.saturating_add(l))
     });
     let timers = spawn_timers(crate::kernel_ref());
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watchdog = spawn_watchdog(done.clone());
     loop {
         if let Some(outcome) = crate::with(|k| k.sched.outcome.clone()) {
+            done.store(true, std::sync::atomic::Ordering::Relaxed);
             // They see the outcome too, and leave the kernel before it is uninstalled.
-            for t in timers {
+            for t in timers.into_iter().chain([watchdog]) {
                 t.thread().unpark();
                 let _ = t.join();
             }
@@ -198,6 +201,42 @@ fn spawn_timers(kernel: crate::KernelRef) -> [std::thread::JoinHandle<()>; 2] {
             .expect("a timer thread")
     };
     [spawn("audio sink", run_sinks), spawn("hid sampler", run_hid)]
+}
+
+/// How long the kernel lock may stay held before the watchdog shows where its
+/// holder stands (a long GPU batch takes seconds, until Stage 4).
+const WATCHDOG: Duration = Duration::from_secs(5);
+
+/// The watchdog: every half second it reads the kernel lock's holder without
+/// the lock; a holder past WATCHDOG, then past 4 WATCHDOG, gets its host
+/// stack written to stderr (the journal needs the lock). Returns once `done`.
+fn spawn_watchdog(done: std::sync::Arc<std::sync::atomic::AtomicBool>) -> std::thread::JoinHandle<()> {
+    use std::sync::atomic::Ordering::Relaxed;
+    std::thread::Builder::new()
+        .name("watchdog".into())
+        .spawn(move || {
+            let (mut hold, mut shown) = (0, 0);
+            while !done.load(Relaxed) {
+                std::thread::park_timeout(Duration::from_millis(500));
+                let (since, tid, guest) = (crate::HELD_SINCE.load(Relaxed), crate::HOLDER.load(Relaxed), crate::HOLDER_GUEST.load(Relaxed));
+                if tid == 0 || crate::HELD_SINCE.load(Relaxed) != since {
+                    continue;
+                }
+                if since != hold {
+                    (hold, shown) = (since, 0);
+                }
+                let held = real_ticks().saturating_sub(since);
+                let due = [WATCHDOG, 4 * WATCHDOG].into_iter().filter(|&d| held >= ticks_in(d)).count();
+                if due > shown {
+                    shown = due;
+                    eprintln!("gyroship: watchdog: the kernel lock has been held for {:.1} s by guest thread {guest} (host thread {tid}, 0: a timer or the boot thread); where it stands:", held as f64 / 31_250_000.0);
+                    for line in rt::profile::stack_of(tid) {
+                        eprintln!("gyroship:   {line}");
+                    }
+                }
+            }
+        })
+        .expect("the watchdog thread")
 }
 
 /// The audio sinks, on their grid of real time. A tick copies the ring and
