@@ -162,14 +162,21 @@ pub struct Cache {
     crops: FxMap<(u64, u32, u32, u32), (u64, wgpu::Texture)>,
 }
 
-/// The bytes of each jump table's bank, as bound, in table order; None if a
-/// bank is unbound or unreadable.
-fn jump_banks(tables: &[(u8, u32)], banks: &[Option<(u64, u32)>], mem: Mem) -> Option<Vec<Vec<u8>>> {
+/// How far a jump table of unknown length is read: 256 entries.
+const TABLE_MAX: usize = 1024;
+
+/// The bytes of each jump table, in table order, from its offset in its bank as
+/// bound: its entries when known, else up to TABLE_MAX bytes. None if a bank is
+/// unbound or unreadable. The rest of the bank (other constants, which may
+/// change every frame) never reaches the targets: a program keeps one variant.
+fn jump_banks(tables: &[shader::JumpTable], banks: &[Option<(u64, u32)>], mem: Mem) -> Option<Vec<Vec<u8>>> {
     let mut out = Vec::with_capacity(tables.len());
-    for &(bank, _) in tables {
+    for &(bank, _, offset, entries) in tables {
         let (addr, size) = (*banks.get(usize::from(bank))?)?;
-        let mut data = vec![0u8; (size as usize).min(CBUF_BYTES)];
-        if !mem(addr, &mut data) {
+        let start = usize::from(offset).min(size as usize);
+        let len = entries.map_or(TABLE_MAX, |n| 4 * n as usize).min((size as usize).min(CBUF_BYTES).saturating_sub(start));
+        let mut data = vec![0u8; len];
+        if !mem(addr + start as u64, &mut data) {
             return None;
         }
         out.push(data);
@@ -177,17 +184,19 @@ fn jump_banks(tables: &[(u8, u32)], banks: &[Option<(u64, u32)>], mem: Mem) -> O
     Some(out)
 }
 
-/// The instructions a program's jump tables may send it to: every word of each
-/// table's bank (`jump_banks`) that, added to the jump's base, is an
-/// instruction's byte offset (a 16-byte multiple inside the program). Words that
-/// are not table entries only split blocks more.
-fn jump_targets(tables: &[(u8, u32)], bytes: &[Vec<u8>], code_len: usize) -> BTreeSet<usize> {
+/// The instructions a program's jump tables may send it to: each entry that,
+/// added to the jump's base, is an instruction's byte offset (a 16-byte multiple
+/// inside the program). A table of unknown length ends at its first word that is
+/// not one.
+fn jump_targets(tables: &[shader::JumpTable], bytes: &[Vec<u8>], code_len: usize) -> BTreeSet<usize> {
     let mut targets = BTreeSet::new();
-    for (&(_, base), data) in tables.iter().zip(bytes) {
+    for (&(_, base, _, entries), data) in tables.iter().zip(bytes) {
         for w in data.as_chunks::<4>().0 {
             let at = u32::from_le_bytes(*w).wrapping_add(base);
             if at % 16 == 0 && (at as usize) < code_len {
                 targets.insert(at as usize / 16);
+            } else if entries.is_none() {
+                break;
             }
         }
     }
@@ -739,11 +748,15 @@ impl Surfaces {
         .ok_or("program not readable")?;
         let pair = pixel.map(|p| p.key);
         let mask = ints.iter().fold(0u64, |m, (&l, &signed)| m | 1 << (l % 32) | u64::from(signed) << (32 + l % 32));
-        // Jump tables: the translation without them says where they are; the bound
-        // banks' words give the targets, and the module with exact blocks is keyed
-        // by them too (another table content, another module).
+        // Jump tables: the translation without them (variant 0) says where they are;
+        // the tables' words give the targets, and the module with exact blocks is
+        // keyed by them too. Both are made in one call: variant 0 (every instruction
+        // a block, a switch of thousands of cases the driver took minutes over)
+        // serves only while a table's bank cannot be read.
         let mut id = (key, pair, mask, 0);
-        let mut jump = None;
+        if !self.cache.modules.contains_key(&id) {
+            self.translate_module(id, pixel, ints, None);
+        }
         if let Some(Ok(m)) = self.cache.modules.get(&id)
             && let Some(tables) = m.0.interface.jump_tables.clone()
             && let Some(bytes) = jump_banks(&tables, banks, mem)
@@ -760,28 +773,34 @@ impl Surfaces {
                         h.finish() | 1
                     };
                     self.cache.jumps.insert((key, pair, mask), (bytes, id.3));
-                    jump = Some(targets);
+                    if !self.cache.modules.contains_key(&id) {
+                        self.translate_module(id, pixel, ints, Some(targets));
+                    }
                 }
             }
         }
-        if !self.cache.modules.contains_key(&id) {
-            let since = std::time::Instant::now();
-            let options = Options { varyings: pixel.map(|p| p.interface.varyings.clone()).unwrap_or_default(), int_attributes: ints.clone(), jump_targets: jump, ..Default::default() };
-            let made = shader::translate_with(&self.cache.code[&key], &options).map_err(|e| format!("program {key:016x}: {e}")).and_then(|mut t| {
-                // GYROSHIP_WGSL_OVERRIDE=<dir>: <dir>/<key>.wgsl replaces the translation (a
-                // debugging aid: a program edited to show its intermediate values).
-                if let Some(text) = std::env::var_os("GYROSHIP_WGSL_OVERRIDE").and_then(|d| std::fs::read_to_string(std::path::Path::new(&d).join(format!("{key:016x}.wgsl"))).ok()) {
-                    t.wgsl = text;
-                }
-                let m = self.shader_module(&format!("{key:016x}"), &t.wgsl).map_err(|()| format!("program {key:016x}: invalid WGSL"))?;
-                Ok(std::sync::Arc::new((t, m)))
-            });
-            self.cache.modules.insert(id, made);
-            self.compile.modules += 1;
-            self.compile.module_time += since.elapsed();
-            self.compile.made.push(format!("m{key:016x}/{:x}", id.3));
-        }
         self.cache.modules[&id].clone()
+    }
+
+    /// Translates program `id.0` (paired with `pixel`, attributes `ints`, the
+    /// jump targets of variant `id.3`) into the module cache.
+    fn translate_module(&mut self, id: (u64, Option<u64>, u64, u64), pixel: Option<&Translation>, ints: &BTreeMap<u8, bool>, jump: Option<BTreeSet<usize>>) {
+        let key = id.0;
+        let since = std::time::Instant::now();
+        let options = Options { varyings: pixel.map(|p| p.interface.varyings.clone()).unwrap_or_default(), int_attributes: ints.clone(), jump_targets: jump, ..Default::default() };
+        let made = shader::translate_with(&self.cache.code[&key], &options).map_err(|e| format!("program {key:016x}: {e}")).and_then(|mut t| {
+            // GYROSHIP_WGSL_OVERRIDE=<dir>: <dir>/<key>.wgsl replaces the translation (a
+            // debugging aid: a program edited to show its intermediate values).
+            if let Some(text) = std::env::var_os("GYROSHIP_WGSL_OVERRIDE").and_then(|d| std::fs::read_to_string(std::path::Path::new(&d).join(format!("{key:016x}.wgsl"))).ok()) {
+                t.wgsl = text;
+            }
+            let m = self.shader_module(&format!("{key:016x}"), &t.wgsl).map_err(|()| format!("program {key:016x}: invalid WGSL"))?;
+            Ok(std::sync::Arc::new((t, m)))
+        });
+        self.cache.modules.insert(id, made);
+        self.compile.modules += 1;
+        self.compile.module_time += since.elapsed();
+        self.compile.made.push(format!("m{key:016x}/{:x}", id.3));
     }
 
     /// A module from translated WGSL, parsed and validated once, by wgpu; refused
@@ -1500,6 +1519,17 @@ mod tests {
             }";
         assert_eq!(run(&mut s, x, tic, tsc, Vec::new(), wgsl, 2), vec![0.25, 4.0]);
         assert!(s.skipped.is_empty(), "{:?}", s.skipped);
+    }
+
+    /// Jump targets come from the table alone: its entries when its length is
+    /// known, else its words up to the first that is not an instruction offset.
+    #[test]
+    fn jump_targets_come_from_the_table_alone() {
+        let words = |w: &[u32]| w.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        // Base 0x100: 0x10 and 0x30 are instructions 17 and 19 of a 0x400-byte program.
+        assert_eq!(jump_targets(&[(1, 0x100, 0, Some(2))], &[words(&[0x10, 0x30])], 0x400), BTreeSet::from([17, 19]));
+        // 0x13 is no instruction offset: the table ended before it.
+        assert_eq!(jump_targets(&[(1, 0x100, 0, None)], &[words(&[0x10, 0x30, 0x13, 0x50])], 0x400), BTreeSet::from([17, 19]));
     }
 
     /// D42: the deterministic engine makes a pipeline at once; play mode hands

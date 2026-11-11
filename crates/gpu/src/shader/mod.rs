@@ -79,11 +79,16 @@ pub struct Interface {
     /// holding the buffer's 64-bit address, in binding order (`BUFFER_BINDING` + i).
     pub buffers: Vec<(u8, u16)>,
     /// The program jumps indirectly (RET, BRX) only to targets read just before from
-    /// a constant bank (a compiled switch's table): (bank, byte base the word is
-    /// added to), per jump. With the bank's words, `Options::jump_targets` gives
-    /// the exact blocks; else every instruction starts one (a switch case each).
-    pub jump_tables: Option<Vec<(u8, u32)>>,
+    /// a constant bank (a compiled switch's table), one `JumpTable` per jump. With
+    /// the tables' words, `Options::jump_targets` gives the exact blocks; else every
+    /// instruction starts one (a switch case each).
+    pub jump_tables: Option<Vec<JumpTable>>,
 }
+
+/// An indirect jump's table: its constant bank, the byte base its words are added
+/// to, its byte offset in the bank, and its entries when the index is bounded
+/// before (`clamped`).
+pub type JumpTable = (u8, u32, u16, Option<u32>);
 
 /// The binding of global-memory buffer 0; buffer i is at `BUFFER_BINDING + i`.
 pub const BUFFER_BINDING: u32 = 600;
@@ -170,13 +175,51 @@ pub struct Options {
     pub jump_targets: Option<BTreeSet<usize>>,
 }
 
-/// Per indirect jump (RET, BRX), the constant bank and byte base its target comes
-/// from, when each one's register is loaded by a 32-bit LDC a few instructions
-/// before, with nothing between that writes it or is a branch target (a compiled
-/// switch: the table's words are byte offsets). None if one is not so.
-/// ponytail: "writes it" is read from the ops' Debug text (any `dst*` field within
-/// the four registers up to it); a register-writes table if ops ever need one.
-fn jump_tables(ops: &[Op], target: &impl Fn(usize, i64) -> Option<usize>) -> Option<Vec<(u8, u32)>> {
+/// Whether `op` may write register `r`.
+/// ponytail: read from the op's Debug text (any `dst*` field within the four
+/// registers up to `r`); a register-writes table if ops ever need one.
+fn writes(op: &Op, r: u8) -> bool {
+    let text = format!("{op:?}");
+    text.match_indices("dst").any(|(at, _)| {
+        let rest = &text[at..];
+        let digits: String = rest.split_once(": ").map(|(_, v)| v.chars().take_while(char::is_ascii_digit).collect()).unwrap_or_default();
+        digits.parse::<u8>().is_ok_and(|d| d <= r && r - d < 4)
+    })
+}
+
+/// The entries of the table an LDC at `at` reads through index register `index`,
+/// when a compiled switch bounds the index just before: `IMNMX r = min(r, n)`
+/// (unsigned, unconditional), then `SHF index = r << 2`, nothing else writing
+/// them in between: n + 1 entries. None otherwise.
+fn clamped(ops: &[Op], at: usize, index: u8) -> Option<u32> {
+    let mut shifted = None;
+    for op in ops[at.saturating_sub(8)..at].iter().rev() {
+        match (op, shifted) {
+            (Op::Int(IntOp::Shf { dst, lo: Operand { src: Src::Reg(r), .. }, shift, hi, right: false, dst_hi: false, .. }), None)
+                if *dst == index && shift.src == Src::Imm(2) && hi.src == Src::Reg(RZ) =>
+            {
+                shifted = Some(*r);
+            }
+            (Op::Int(IntOp::IMnMx { dst, a, b: Operand { src: Src::Imm(n), .. }, signed: false, min }), Some(r))
+                if *dst == r && a.src == Src::Reg(r) && *min == Pred::TRUE =>
+            {
+                return n.checked_add(1);
+            }
+            (op, None) if writes(op, index) => return None,
+            (op, Some(r)) if writes(op, r) => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Per indirect jump (RET, BRX), its table: the constant bank, the byte base
+/// its words are added to, the table's byte offset in the bank, and its
+/// entries when the index is bounded before (`clamped`). Found when each jump's
+/// register is loaded by a 32-bit LDC a few instructions before, with nothing
+/// between that writes it or is a branch target (a compiled switch: the table's
+/// words are byte offsets). None if one is not so.
+fn jump_tables(ops: &[Op], target: &impl Fn(usize, i64) -> Option<usize>) -> Option<Vec<JumpTable>> {
     let landing: BTreeSet<usize> = ops
         .iter()
         .enumerate()
@@ -185,14 +228,6 @@ fn jump_tables(ops: &[Op], target: &impl Fn(usize, i64) -> Option<usize>) -> Opt
             _ => None,
         })
         .collect();
-    let writes = |op: &Op, r: u8| {
-        let text = format!("{op:?}");
-        text.match_indices("dst").any(|(at, _)| {
-            let rest = &text[at..];
-            let digits: String = rest.split_once(": ").map(|(_, v)| v.chars().take_while(char::is_ascii_digit).collect()).unwrap_or_default();
-            digits.parse::<u8>().is_ok_and(|d| d <= r && r - d < 4)
-        })
-    };
     let mut tables = Vec::new();
     for (i, op) in ops.iter().enumerate() {
         let (r, offset) = match op {
@@ -206,8 +241,8 @@ fn jump_tables(ops: &[Op], target: &impl Fn(usize, i64) -> Option<usize>) -> Opt
                 break;
             }
             match &ops[j] {
-                Op::Memory(MemoryOp::Ldc { dst, bank, mode: LdcMode::Indexed, ty: MemType::B32, .. }) if *dst == r => {
-                    found = Some((*bank, base));
+                Op::Memory(MemoryOp::Ldc { dst, index, bank, offset, mode: LdcMode::Indexed, ty: MemType::B32 }) if *dst == r => {
+                    found = Some((*bank, base, *offset, clamped(ops, j, *index)));
                     break;
                 }
                 Op::Control(_) => break,
@@ -2529,7 +2564,7 @@ mod tests {
         let body = [s2r(20), ldc, brx, s2r(1), exit(), s2r(2), exit()];
         let options = Options { workgroup: [8, 1, 1], ..Default::default() };
         let t = compute(&body, &options);
-        assert_eq!(t.interface.jump_tables, Some(vec![(1, 0)]));
+        assert_eq!(t.interface.jump_tables, Some(vec![(1, 0, 0, None)]));
         let cases = |t: &Translation| t.wgsl.matches("case ").count();
         assert!(cases(&t) >= body.len(), "{}", t.wgsl);
         let t = compute(&body, &Options { jump_targets: Some(BTreeSet::from([3, 5])), ..options.clone() });
@@ -2537,6 +2572,24 @@ mod tests {
         // R54 written between the load and the jump: not a table.
         let body = [s2r(20), ldc, s2r(54), brx, s2r(1), exit()];
         assert_eq!(compute(&body, &options).interface.jump_tables, None);
+    }
+
+    #[test]
+    fn a_bounded_switch_gives_its_table_offset_and_entries() {
+        // S2R R20 = tid.x; IMNMX R20 = min(R20, 3) (unsigned); SHF R20 = R20 << 2;
+        // LDC R54 = c[1][R20 + 0x10]; BRX R54 (absolute: base 0): 4 entries at 0x10.
+        let s2r = |dst: u128| w(0x919, &[(16, dst), (72, 0x21)]);
+        let imnmx = w(0x817, &[(16, 20), (24, 20), (32, 3), (87, 7)]);
+        let shf = w(0x819, &[(16, 20), (24, 20), (32, 2), (64, 255), (73, 3)]);
+        let ldc = w(0xb82, &[(16, 54), (24, 20), (54, 1), (38, 0x10), (73, 4)]);
+        let brx = w(0x949, &[(24, 54), (34, ((-80i64 / 4) as u64 as u128) & ((1 << 48) - 1)), (87, 7)]);
+        let body = [s2r(20), imnmx, shf, ldc, brx, s2r(1), exit(), s2r(2), exit()];
+        let options = Options { workgroup: [8, 1, 1], ..Default::default() };
+        assert_eq!(compute(&body, &options).interface.jump_tables, Some(vec![(1, 0, 0x10, Some(4))]));
+        // A signed bound is not a clamp of the index.
+        let signed = w(0x817, &[(16, 20), (24, 20), (32, 3), (87, 7), (73, 1)]);
+        let body = [s2r(20), signed, shf, ldc, brx, s2r(1), exit()];
+        assert_eq!(compute(&body, &options).interface.jump_tables, Some(vec![(1, 0, 0x10, None)]));
     }
 
     #[test]
