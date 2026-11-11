@@ -270,6 +270,7 @@ pub fn run(table: Vec<rt::Entry>, window: Option<HostWindow>) {
         audio_dump: value("--dump-audio").map(Into::into),
         play: flag("--play"),
         pipeline_cache: value("--pipeline-cache").map(Into::into),
+        late_frames: flag("--late-frames"),
         ..Config::default()
     };
     if config.play {

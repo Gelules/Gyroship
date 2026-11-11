@@ -134,11 +134,14 @@ pub struct Config {
     /// `--pipeline-cache DIR`: the driver's compiled pipelines, kept between runs
     /// (game-derived: a data folder, never Git). Same images, faster starts.
     pub pipeline_cache: Option<std::path::PathBuf>,
+    /// `--late-frames` (play mode): a frame later than its vsync is shown at once
+    /// instead of at the next vsync: more frames, an uneven cadence (D48).
+    pub late_frames: bool,
 }
 
 impl Default for Config {
     fn default() -> Config {
-        Config { seed: 0x5EED, explore: false, non_system_memory: 0x2_6410_0000, time_limit: None, frames: None, save_dir: None, vsync: true, work_time: false, gpfifo_dump: None, frames_dump: None, dump_every: 1, dump_draws: None, shaders_dump: None, replay: None, profile: None, perf: None, hashes: None, record: None, audio_dump: None, play: false, pipeline_cache: None }
+        Config { seed: 0x5EED, explore: false, non_system_memory: 0x2_6410_0000, time_limit: None, frames: None, save_dir: None, vsync: true, work_time: false, gpfifo_dump: None, frames_dump: None, dump_every: 1, dump_draws: None, shaders_dump: None, replay: None, profile: None, perf: None, hashes: None, record: None, audio_dump: None, play: false, pipeline_cache: None, late_frames: false }
     }
 }
 

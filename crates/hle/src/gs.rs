@@ -426,12 +426,14 @@ fn vsync(k: u64) -> u64 {
 /// The vsync a present is shown at, after the last one `last`, with swap
 /// `interval`, `first` being the first vsync from now; and whether the
 /// presenting thread waits for it. A frame later than its vsync waits for the
-/// next one, except in play mode, where it is shown at once as the console's
-/// spare window images allow (the game has three): 24 frames a second in the
-/// tutorial instead of 16 (runs 53n, 53v). An early frame always waits.
-fn next_vsync(last: u64, interval: u64, first: u64, play: bool) -> (u64, bool) {
+/// next one (an even cadence), unless `late` (`--late-frames`, play mode):
+/// then it is shown at once, as the console's spare window images allow (the
+/// game has three): 24 frames a second in the tutorial instead of 16 (runs
+/// 53n, 53v), but an uneven cadence, which looked slower and choppier in a
+/// cutscene (D48). An early frame always waits.
+fn next_vsync(last: u64, interval: u64, first: u64, late: bool) -> (u64, bool) {
     let due = last + interval;
-    if play && first > due { (first - 1, false) } else { (due.max(first), true) }
+    if late && first > due { (first - 1, false) } else { (due.max(first), true) }
 }
 
 /// Stores event `e` at index `n` of a numbered table.
@@ -611,7 +613,7 @@ impl Kernel {
         if self.config.vsync {
             let interval = u64::from((req.u32_at(0x10 + 0x18).unwrap_or(0) >> 16).max(1));
             let first = (self.now() * 60).div_ceil(TICKS_PER_SECOND);
-            let (next, wait) = next_vsync(self.gs.vsync, interval, first, self.config.play);
+            let (next, wait) = next_vsync(self.gs.vsync, interval, first, self.config.play && self.config.late_frames);
             self.gs.vsync = next;
             if wait {
                 self.block(crate::thread::Wait::Sleep, Some(vsync(next)), crate::result::SUCCESS);
@@ -668,11 +670,11 @@ impl Kernel {
 mod tests {
     use super::*;
 
-    /// An early frame waits for its vsync in both engines; a late one waits for
-    /// the next vsync in the deterministic engine and is shown at once in play
-    /// mode, the grid then starting from the vsync just past.
+    /// An early frame waits for its vsync; a late one waits for the next vsync,
+    /// or with `--late-frames` is shown at once, the grid then starting from the
+    /// vsync just past.
     #[test]
-    fn late_frames_wait_for_no_vsync_in_play_mode() {
+    fn late_frames_wait_for_no_vsync_with_late_frames() {
         // Last shown at vsync 10, interval 1, now before vsync 11: wait for 11.
         assert_eq!(super::next_vsync(10, 1, 11, false), (11, true));
         assert_eq!(super::next_vsync(10, 1, 11, true), (11, true));
