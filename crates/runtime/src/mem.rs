@@ -13,17 +13,18 @@
 //! check has released it.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use windows_sys::Win32::Foundation::EXCEPTION_ACCESS_VIOLATION;
-use windows_sys::Win32::System::Diagnostics::Debug::{AddVectoredExceptionHandler, EXCEPTION_CONTINUE_SEARCH, EXCEPTION_POINTERS};
+use windows_sys::Win32::System::Diagnostics::Debug::{AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH, EXCEPTION_POINTERS};
 /// MEM_WRITE_WATCH (winnt.h) and WRITE_WATCH_FLAG_RESET (memoryapi.h):
 /// windows-sys lists them under SystemServices, a feature this crate does not enable.
 const MEM_WRITE_WATCH: windows_sys::Win32::System::Memory::VIRTUAL_ALLOCATION_TYPE = 0x0020_0000;
 const WRITE_WATCH_FLAG_RESET: u32 = 0x01;
 use windows_sys::Win32::System::Memory::{
-    GetWriteWatch, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_PROTECTION_FLAGS, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualProtect,
+    GetWriteWatch, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, PAGE_PROTECTION_FLAGS, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualProtect,
+    VirtualQuery,
 };
 
 /// Size of the guest address space (39 bits, from the NPDM).
@@ -135,6 +136,8 @@ pub enum Error {
 pub struct Memory {
     base: *mut u8,
     blocks: RwLock<Table>,
+    /// The pages takes found clean, made at the first take (see [`Armed`]).
+    armed: OnceLock<Option<&'static Armed>>,
 }
 
 // SAFETY: `base` never changes and the reservation is ours until drop; the
@@ -157,6 +160,91 @@ const CHUNK: usize = 1 << 20;
 /// Base of the reservation the fault handler reports on (0 when none).
 static RESERVATION: AtomicUsize = AtomicUsize::new(0);
 
+/// The pages a take found clean (see [`Memory::take_written`]), one bit per
+/// guest page, set while the page is read-only on the host: its next write
+/// faults, the fault handler makes it writable again and clears its bit, and
+/// the write, retried, reaches the OS write watch. Takes ask the watch only
+/// about pages not armed: its cost is per page asked (2 ms a frame for the
+/// tutorial's 265k texture pages), and most texture pages are never written
+/// again. Leaked: the fault handler may hold one while its `Memory` drops.
+///
+/// Never pass guest memory to an OS call that writes it (ReadFile, recv): on
+/// an armed page it would fail with ERROR_NOACCESS instead of faulting.
+struct Armed {
+    /// The reservation's host base.
+    base: usize,
+    bits: Box<[AtomicU64]>,
+    /// Arming, disarming and reprotecting exclude each other: a page must never
+    /// stay read-only unarmed, as its next write would be taken for a guest
+    /// fault. A spin lock: the fault handler takes no other lock and allocates
+    /// nothing (a faulting HLE copy holds the table's read lock).
+    busy: AtomicBool,
+    /// Faults since the last take: past FAULTS, a fault disarms the page's
+    /// whole armed run (a texture being rewritten), not one page.
+    faults: AtomicU32,
+}
+
+const FAULTS: u32 = 64;
+/// How far such a run reaches on each side of the fault, in pages (64 MiB).
+const RUN: u64 = 0x4000;
+
+/// The armed pages of each live `Memory` that took written pages: the fault
+/// handler finds a fault's reservation here (tests hold several at once).
+static ARMED: [AtomicPtr<Armed>; 8] = [const { AtomicPtr::new(std::ptr::null_mut()) }; 8];
+
+impl Armed {
+    fn lock(&self) {
+        while self.busy.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            std::hint::spin_loop();
+        }
+    }
+
+    fn unlock(&self) {
+        self.busy.store(false, Ordering::Release);
+    }
+
+    fn get(&self, page: u64) -> bool {
+        self.bits[(page / 64) as usize].load(Ordering::Relaxed) >> (page % 64) & 1 != 0
+    }
+
+    /// The first page of `[from, to)` whose bit is `on`, else `to`.
+    fn find(&self, mut from: u64, to: u64, on: bool) -> u64 {
+        while from < to {
+            let w = self.bits[(from / 64) as usize].load(Ordering::Relaxed);
+            let w = (if on { w } else { !w }) >> (from % 64);
+            if w != 0 {
+                return (from + u64::from(w.trailing_zeros())).min(to);
+            }
+            from = (from / 64 + 1) * 64;
+        }
+        to
+    }
+
+    /// Sets (`on`) or clears the bits of pages `[from, to)`.
+    fn set(&self, mut from: u64, to: u64, on: bool) {
+        while from < to {
+            let (i, lo) = ((from / 64) as usize, from % 64);
+            let n = (64 - lo).min(to - from);
+            let mask = (u64::MAX >> (64 - n)) << lo;
+            if on {
+                self.bits[i].fetch_or(mask, Ordering::Relaxed);
+            } else {
+                self.bits[i].fetch_and(!mask, Ordering::Relaxed);
+            }
+            from += n;
+        }
+    }
+}
+
+/// The armed pages of the reservation that holds host address `host`.
+fn armed_at(host: usize) -> Option<&'static Armed> {
+    ARMED.iter().find_map(|slot| {
+        // SAFETY: registered `Armed` are leaked, never freed.
+        let a = unsafe { slot.load(Ordering::Acquire).as_ref() }?;
+        (host >= a.base && host - a.base < SPACE as usize).then_some(a)
+    })
+}
+
 impl Memory {
     /// Reserves the address space, plus a guard that is never committed: an
     /// access that starts below 2^39 and runs past it faults inside the
@@ -171,7 +259,45 @@ impl Memory {
             return Err(Error::Host(last_error()));
         }
         RESERVATION.store(base as usize, Ordering::Release);
-        Ok(Memory { base, blocks: RwLock::default() })
+        Ok(Memory { base, blocks: RwLock::default(), armed: OnceLock::new() })
+    }
+
+    /// The armed pages, made at the first take; None when every slot of `ARMED`
+    /// is taken (many `Memory` at once, in tests): the write watch alone then.
+    fn armed(&self) -> Option<&'static Armed> {
+        *self.armed.get_or_init(|| {
+            // SAFETY: zeroed atomics are valid zeros; the pages come committed on demand.
+            let bits = unsafe { Box::<[AtomicU64]>::new_zeroed_slice((SPACE / PAGE / 64) as usize).assume_init() };
+            let a: &'static Armed = Box::leak(Box::new(Armed { base: self.base as usize, bits, busy: AtomicBool::new(false), faults: AtomicU32::new(0) }));
+            let ptr = std::ptr::from_ref(a).cast_mut();
+            let free = ARMED.iter().any(|slot| slot.compare_exchange(std::ptr::null_mut(), ptr, Ordering::AcqRel, Ordering::Acquire).is_ok());
+            free.then(|| {
+                install_fault_handler();
+                a
+            })
+        })
+    }
+
+    /// Arms the pages of `[s, e)` (page-aligned) mapped read-write on the host:
+    /// their bits, then read-only. The table's read lock keeps their blocks as
+    /// they are meanwhile.
+    fn arm(&self, armed: &Armed, s: u64, e: u64) {
+        let t = self.table();
+        armed.lock();
+        let first = t.0.range(..=s).next_back().map_or(s, |(&k, _)| k);
+        for (&start, &(end, block)) in t.0.range(first..e) {
+            let (a, b) = (start.max(s), end.min(e));
+            if a >= b || block.host_protection() != PAGE_READWRITE {
+                continue;
+            }
+            armed.set(a / PAGE, b / PAGE, true);
+            let mut old = 0;
+            // SAFETY: committed pages of our reservation (a mapped block).
+            if unsafe { VirtualProtect(self.base.add(a as usize).cast(), (b - a) as usize, PAGE_READONLY, &mut old) } == 0 {
+                armed.set(a / PAGE, b / PAGE, false);
+            }
+        }
+        armed.unlock();
     }
 
     // The table's lock, recovered from poison like the crate's other locks.
@@ -188,8 +314,35 @@ impl Memory {
     /// Taking them resets their watch in the same call, so a write that races
     /// the call is reported by it or by the next take. Empty for an empty range
     /// or one that leaves the space.
+    ///
+    /// Pages found clean are armed (see [`Armed`]): later takes skip them until
+    /// a write disarms them; a write racing the arming shows in the second look
+    /// at the watch that follows it.
     pub fn take_written(&self, addr: u64, len: u64) -> Vec<u64> {
         let Some(end) = addr.checked_add(len).filter(|&e| e <= SPACE && len > 0) else { return Vec::new() };
+        let Some(armed) = self.armed() else { return self.watched(addr, end) };
+        armed.faults.store(0, Ordering::Relaxed);
+        let (mut out, mut p, last) = (Vec::new(), addr / PAGE, end.div_ceil(PAGE));
+        loop {
+            p = armed.find(p, last, false);
+            if p == last {
+                break;
+            }
+            let q = armed.find(p, last, true);
+            let (s, e) = ((p * PAGE).max(addr), (q * PAGE).min(end));
+            out.extend(self.watched(s, e));
+            self.arm(armed, p * PAGE, q * PAGE);
+            out.extend(self.watched(s, e));
+            p = q;
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// The OS write watch's pages of `[addr, end)`, reset as they are reported.
+    fn watched(&self, addr: u64, end: u64) -> Vec<u64> {
+        let len = end - addr;
         // Room for every page of the range, so one call reports and resets all of it
         // (how far a reset reaches when the buffer fills is not documented).
         // ponytail: 8 bytes a page, on every span of every submit; cut a huge span
@@ -428,11 +581,23 @@ impl Memory {
         for s in starts {
             t.0.remove(&s);
         }
+        let armed = self.disarm(addr, end);
         // SAFETY: committed pages of our reservation.
-        if unsafe { VirtualFree(self.base.add(addr as usize).cast(), size as usize, MEM_DECOMMIT) } == 0 {
+        let freed = unsafe { VirtualFree(self.base.add(addr as usize).cast(), size as usize, MEM_DECOMMIT) } != 0;
+        armed.inspect(|a| a.unlock());
+        if !freed {
             return Err(Error::Host(last_error()));
         }
         Ok(())
+    }
+
+    /// Before an unmap or a reprotect of `[addr, end)` (on the table's write
+    /// lock): its pages unarmed, the armed pages locked until the caller is done.
+    fn disarm(&self, addr: u64, end: u64) -> Option<&'static Armed> {
+        let a = self.armed.get().copied().flatten()?;
+        a.lock();
+        a.set(addr / PAGE, end / PAGE, false);
+        Some(a)
     }
 
     /// Applies `f` to every block of a fully mapped range, then reprotects it.
@@ -440,14 +605,19 @@ impl Memory {
         let end = t.mapped(addr, size)?;
         t.split(addr);
         t.split(end);
+        let armed = self.disarm(addr, end);
+        let mut result = Ok(());
         for (&start, (e, block)) in t.0.range_mut(addr..end) {
             f(block);
             let mut old = 0;
             // SAFETY: committed pages of our reservation.
             if unsafe { VirtualProtect(self.base.add(start as usize).cast(), (*e - start) as usize, block.host_protection(), &mut old) } == 0 {
-                return Err(Error::Host(last_error()));
+                result = Err(Error::Host(last_error()));
+                break;
             }
         }
+        armed.inspect(|a| a.unlock());
+        result?;
         t.merge(addr, end);
         Ok(())
     }
@@ -545,6 +715,10 @@ impl Table {
 impl Drop for Memory {
     fn drop(&mut self) {
         let _ = RESERVATION.compare_exchange(self.base as usize, 0, Ordering::AcqRel, Ordering::Acquire);
+        if let Some(Some(a)) = self.armed.get() {
+            let ptr = std::ptr::from_ref(*a).cast_mut();
+            ARMED.iter().for_each(|slot| _ = slot.compare_exchange(ptr, std::ptr::null_mut(), Ordering::AcqRel, Ordering::Acquire));
+        }
         // SAFETY: releases our own reservation; nothing points into it any more.
         unsafe { VirtualFree(self.base.cast(), 0, MEM_RELEASE) };
     }
@@ -580,10 +754,41 @@ unsafe extern "system" fn on_exception(info: *mut EXCEPTION_POINTERS) -> i32 {
     // SAFETY: Windows passes a valid record.
     let rec = unsafe { &*(*info).ExceptionRecord };
     let base = RESERVATION.load(Ordering::Acquire);
-    if rec.ExceptionCode != EXCEPTION_ACCESS_VIOLATION || base == 0 || rec.NumberParameters < 2 {
+    if rec.ExceptionCode != EXCEPTION_ACCESS_VIOLATION || rec.NumberParameters < 2 {
         return EXCEPTION_CONTINUE_SEARCH;
     }
     let host = rec.ExceptionInformation[1];
+    // A write to an armed page: writable again, unarmed, and retried.
+    if rec.ExceptionInformation[0] == 1
+        && let Some(a) = armed_at(host)
+    {
+        let page = ((host - a.base) as u64) / PAGE;
+        a.lock();
+        let hit = a.get(page);
+        if hit {
+            let (from, to) = if a.faults.fetch_add(1, Ordering::Relaxed) < FAULTS {
+                (page, page + 1)
+            } else {
+                let mut from = page;
+                while from > page.saturating_sub(RUN) && a.get(from - 1) {
+                    from -= 1;
+                }
+                (from, a.find(page, (page + RUN).min(SPACE / PAGE), false))
+            };
+            a.set(from, to, false);
+            let mut old = 0;
+            // SAFETY: armed pages are committed pages of a read-write block.
+            unsafe { VirtualProtect((a.base + (from * PAGE) as usize) as *const _, ((to - from) * PAGE) as usize, PAGE_READWRITE, &mut old) };
+        }
+        a.unlock();
+        // Not armed: another thread may have just disarmed it.
+        if hit || writable(host) {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+    if base == 0 {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
     if host < base || host - base >= (SPACE + GUARD) as usize {
         return EXCEPTION_CONTINUE_SEARCH;
     }
@@ -596,4 +801,11 @@ unsafe extern "system" fn on_exception(info: *mut EXCEPTION_POINTERS) -> i32 {
     let near = crate::function_at_host(rip).map_or_else(|| "none".to_string(), |g| format!("{g:#x}"));
     let what = format!("guest fault: {kind} at guest address {:#x} (nearest recompiled function: {near})", host - base);
     crate::fatal(&what)
+}
+
+/// Whether the host page at `host` is writable now.
+fn writable(host: usize) -> bool {
+    // SAFETY: a query; it reads nothing at `host`.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    unsafe { VirtualQuery(host as *const _, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) != 0 && info.Protect == PAGE_READWRITE }
 }

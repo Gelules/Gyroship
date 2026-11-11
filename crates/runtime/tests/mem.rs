@@ -279,6 +279,57 @@ fn written_pages_are_taken_once() {
     assert!(m.take_written(HEAP, 0).is_empty() && m.take_written(mem::SPACE - 0x1000, 0x2000).is_empty());
 }
 
+/// Pages a take found clean are armed (read-only on the host): a guest store
+/// or an HLE write to them faults, is retried, and shows at the next take.
+#[test]
+fn armed_pages_still_report_their_writes() {
+    let m = Memory::new().unwrap();
+    m.map(HEAP, 0x4000, Block::new(state::NORMAL, perm::RW)).unwrap();
+    m.take_written(HEAP, 0x4000);
+    assert!(m.take_written(HEAP, 0x4000).is_empty());
+    // SAFETY: an aligned word of a page mapped for the whole test.
+    unsafe { AtomicU32::from_ptr(m.base().add(HEAP as usize + 0x1010).cast()) }.store(7, Ordering::Release);
+    m.write(HEAP + 0x2020, &[1, 2]).unwrap();
+    m.write_object(HEAP + 0x3030, &[3]).unwrap();
+    assert_eq!(m.take_written(HEAP, 0x4000), [HEAP + 0x1000, HEAP + 0x2000, HEAP + 0x3000]);
+    assert!(m.take_written(HEAP, 0x4000).is_empty());
+    let mut b = [0; 2];
+    m.read(HEAP + 0x2020, &mut b).unwrap();
+    assert_eq!(b, [1, 2]);
+}
+
+/// A reprotect or an unmap of armed pages unarms them: writes after still show.
+#[test]
+fn a_reprotect_or_a_remap_keeps_writes_visible() {
+    let m = Memory::new().unwrap();
+    m.map(HEAP, 0x2000, Block::new(state::NORMAL, perm::RW)).unwrap();
+    m.take_written(HEAP, 0x2000);
+    m.protect(HEAP, 0x2000, perm::R).unwrap();
+    m.protect(HEAP, 0x2000, perm::RW).unwrap();
+    m.write(HEAP + 0x10, &[1]).unwrap();
+    assert_eq!(m.take_written(HEAP, 0x2000), [HEAP]);
+    m.unmap(HEAP, 0x2000).unwrap();
+    m.map(HEAP, 0x2000, Block::new(state::NORMAL, perm::RW)).unwrap();
+    m.take_written(HEAP, 0x2000);
+    m.write(HEAP + 0x1010, &[2]).unwrap();
+    assert_eq!(m.take_written(HEAP, 0x2000), [HEAP + 0x1000]);
+}
+
+/// A rewrite of a large armed range (past the faults after which a fault
+/// unarms a whole run) reports every page written.
+#[test]
+fn a_rewrite_of_many_armed_pages_shows_whole() {
+    let m = Memory::new().unwrap();
+    m.map(HEAP, 0x20_0000, Block::new(state::NORMAL, perm::RW)).unwrap();
+    m.take_written(HEAP, 0x20_0000);
+    for page in (0..0x200u64).step_by(2) {
+        m.write(HEAP + page * 0x1000 + 8, &[page as u8]).unwrap();
+    }
+    let want: Vec<u64> = (0..0x200u64).step_by(2).map(|p| HEAP + p * 0x1000).collect();
+    assert_eq!(m.take_written(HEAP, 0x20_0000), want);
+    assert!(m.take_written(HEAP, 0x20_0000).is_empty());
+}
+
 /// A write that races a take shows at that take or the next one. Each round
 /// one thread writes the round's number once, while the other keeps taking
 /// the page and copying the word after each take that reports it (as a
