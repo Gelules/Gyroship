@@ -38,12 +38,44 @@ pub(crate) fn color_format(f: u32) -> Option<wgpu::TextureFormat> {
     })
 }
 
-/// A view of `texture` in `format` when it is the texture's sRGB or linear
-/// counterpart (one of its view formats), limited then to `usage` (an sRGB view
-/// cannot carry the texture's storage usage); else in the texture's format.
-pub(crate) fn view_as(texture: &wgpu::Texture, format: Option<wgpu::TextureFormat>, usage: wgpu::TextureUsages, desc: wgpu::TextureViewDescriptor) -> wgpu::TextureView {
-    let other = format.filter(|f| *f != texture.format() && f.remove_srgb_suffix() == texture.format().remove_srgb_suffix());
-    texture.create_view(&wgpu::TextureViewDescriptor { format: other, usage: other.map(|_| usage), ..desc })
+/// A cache that forgets what two presents in a row left unused: `now` holds
+/// what this frame made or used, `before` the previous frame's.
+pub(crate) struct Aged<K, V> {
+    now: FxMap<K, V>,
+    before: FxMap<K, V>,
+}
+
+impl<K, V> Default for Aged<K, V> {
+    fn default() -> Self {
+        Aged { now: FxMap::default(), before: FxMap::default() }
+    }
+}
+
+impl<K: std::hash::Hash + Eq, V: Clone> Aged<K, V> {
+    fn get_or(&mut self, key: K, make: impl FnOnce(&K) -> V) -> V {
+        if let Some(v) = self.now.get(&key) {
+            return v.clone();
+        }
+        let v = self.before.remove(&key).unwrap_or_else(|| make(&key));
+        self.now.insert(key, v.clone());
+        v
+    }
+
+    fn age(&mut self) {
+        std::mem::swap(&mut self.now, &mut self.before);
+        self.now.clear();
+    }
+}
+
+/// A texture view's texture and description (all of it but the label).
+type ViewKey = (wgpu::Texture, Option<wgpu::TextureFormat>, Option<wgpu::TextureViewDimension>, Option<wgpu::TextureUsages>, wgpu::TextureAspect, u32, Option<u32>, u32, Option<u32>);
+
+/// A bind group's resource at a binding: a buffer range, a view or a sampler.
+#[derive(PartialEq, Eq, Hash)]
+pub(crate) enum Bound {
+    Buffer(u32, wgpu::Buffer, u64, u64),
+    View(u32, wgpu::TextureView),
+    Sampler(u32, wgpu::Sampler),
 }
 
 /// The wgpu format of a depth target format (SET_ZT_FORMAT).
@@ -174,6 +206,13 @@ pub struct Surfaces {
     pub finished: Arc<Mutex<Vec<(String, std::time::Duration)>>>,
     /// `--pipeline-cache`: the driver's compiled pipelines, kept on disk.
     pub(crate) disk_cache: Option<DiskCache>,
+    /// Texture views and bind groups, made once while the frames use them: a
+    /// view per texture slot and a bind group per draw cost wgpu and the
+    /// driver more than the rest of the draw.
+    views: Aged<ViewKey, wgpu::TextureView>,
+    bind_groups: Aged<(wgpu::BindGroupLayout, Vec<Bound>), wgpu::BindGroup>,
+    /// The device's limit on uniform buffers bound at dynamic offsets.
+    pub(crate) dynamic_max: u32,
 }
 
 /// A pipeline cache kept in a file between runs (`--pipeline-cache`): the
@@ -331,6 +370,9 @@ pub struct Staging {
     pub read_bytes: [u64; 5],
     pub memo_hits: [u64; 5],
     pub memo_bytes: [u64; 5],
+    /// Texture views and bind groups made, then asked for (the rest came from their caches).
+    pub views: [u64; 2],
+    pub bind_groups: [u64; 2],
 }
 
 /// What a guest read for the GPU was for, an index into [`Staging`]'s arrays.
@@ -559,9 +601,10 @@ impl Surfaces {
         });
         let fill = (fill_module, fill_layout, Default::default());
         let arena = (arena_buffer(&device, 16 << 20), Vec::new());
+        let dynamic_max = device.limits().max_dynamic_uniform_buffers_per_pipeline_layout;
         let window = window.map(|(surface, size)| Window::new(&adapter, &device, surface, size));
         let timing = crate::timing::Timing::new(&device, &queue);
-        Ok(Surfaces { adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pass: None, pending: None, timing, clock: None, present: 0, readbacks: Default::default(), hasher: None, arena, staging: Staging::default(), staged: FxMap::default(), last_color: None, window, memo: Memo::default(), compile: Compile::default(), compile_total: Compile::default(), background: false, workers: None, finished: Default::default(), disk_cache: None })
+        Ok(Surfaces { adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pass: None, pending: None, timing, clock: None, present: 0, readbacks: Default::default(), hasher: None, arena, staging: Staging::default(), staged: FxMap::default(), last_color: None, window, memo: Memo::default(), compile: Compile::default(), compile_total: Compile::default(), background: false, workers: None, finished: Default::default(), disk_cache: None, views: Aged::default(), bind_groups: Aged::default(), dynamic_max })
     }
 
     /// Shows the presented image (the color target written last, its top-left
@@ -874,6 +917,61 @@ impl Surfaces {
         (self.arena.0.clone(), at as u64, range as u64)
     }
 
+    /// A view of `texture` as `desc` describes it.
+    pub(crate) fn view(&mut self, texture: &wgpu::Texture, desc: &wgpu::TextureViewDescriptor) -> wgpu::TextureView {
+        let key = (texture.clone(), desc.format, desc.dimension, desc.usage, desc.aspect, desc.base_mip_level, desc.mip_level_count, desc.base_array_layer, desc.array_layer_count);
+        let views = &mut self.staging.views;
+        views[1] += 1;
+        self.views.get_or(key, |_| {
+            views[0] += 1;
+            texture.create_view(desc)
+        })
+    }
+
+    /// A view of `texture` in `format` when it is the texture's sRGB or linear
+    /// counterpart (one of its view formats), limited then to `usage` (an sRGB
+    /// view cannot carry the texture's storage usage); else in the texture's format.
+    pub(crate) fn view_as(&mut self, texture: &wgpu::Texture, format: Option<wgpu::TextureFormat>, usage: wgpu::TextureUsages, desc: wgpu::TextureViewDescriptor) -> wgpu::TextureView {
+        let other = format.filter(|f| *f != texture.format() && f.remove_srgb_suffix() == texture.format().remove_srgb_suffix());
+        self.view(texture, &wgpu::TextureViewDescriptor { format: other, usage: other.map(|_| usage), ..desc })
+    }
+
+    /// A bind group of `layout` with these buffer ranges (bound from 0 when
+    /// their offsets are dynamic), then the slots' views and samplers.
+    pub(crate) fn bind_group(&mut self, layout: &wgpu::BindGroupLayout, buffers: &[(u32, Slice)], textures: &[crate::draw::Slot], dynamic: bool) -> wgpu::BindGroup {
+        let mut bound = Vec::with_capacity(buffers.len() + 2 * textures.len());
+        for (binding, (buffer, at, size)) in buffers {
+            bound.push(Bound::Buffer(*binding, buffer.clone(), if dynamic { 0 } else { *at }, *size));
+        }
+        for (slot, s) in textures.iter().enumerate() {
+            bound.push(Bound::View(32 + 2 * slot as u32, s.view.clone()));
+            if let Some(sampler) = &s.sampler {
+                bound.push(Bound::Sampler(33 + 2 * slot as u32, sampler.clone()));
+            }
+        }
+        let (device, made) = (&self.device, &mut self.staging.bind_groups);
+        made[1] += 1;
+        self.bind_groups.get_or((layout.clone(), bound), |(layout, bound)| {
+            made[0] += 1;
+            let entries: Vec<wgpu::BindGroupEntry> = bound
+                .iter()
+                .map(|b| match b {
+                    Bound::Buffer(binding, buffer, at, size) => wgpu::BindGroupEntry { binding: *binding, resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer, offset: *at, size: wgpu::BufferSize::new(*size) }) },
+                    Bound::View(binding, view) => wgpu::BindGroupEntry { binding: *binding, resource: wgpu::BindingResource::TextureView(view) },
+                    Bound::Sampler(binding, sampler) => wgpu::BindGroupEntry { binding: *binding, resource: wgpu::BindingResource::Sampler(sampler) },
+                })
+                .collect();
+            device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout, entries: &entries })
+        })
+    }
+
+    /// A frame was presented: the views and bind groups neither it nor the
+    /// one before used are dropped.
+    pub fn next_frame(&mut self) {
+        self.views.age();
+        self.bind_groups.age();
+    }
+
     /// A color target was written.
     pub(crate) fn wrote(&mut self, key: (u64, u32)) {
         self.touched.insert(key);
@@ -1009,7 +1107,8 @@ impl Surfaces {
             });
             self.map.insert(key, Entry { surface: *s, texture, written: 0 });
         }
-        view_as(&self.map[&key].texture, Some(format), wgpu::TextureUsages::RENDER_ATTACHMENT, wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2), array_layer_count: Some(1), ..Default::default() })
+        let texture = self.map[&key].texture.clone();
+        self.view_as(&texture, Some(format), wgpu::TextureUsages::RENDER_ATTACHMENT, wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2), array_layer_count: Some(1), ..Default::default() })
     }
 
     /// Runs a clear on the host textures.
@@ -1224,6 +1323,27 @@ impl Surfaces {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_aged_cache_forgets_what_two_frames_left_unused() {
+        let mut c: Aged<u32, u32> = Aged::default();
+        let mut made = 0;
+        let mut get = |c: &mut Aged<u32, u32>, k: u32| {
+            c.get_or(k, |k| {
+                made += 1;
+                k * 10
+            })
+        };
+        assert_eq!((get(&mut c, 1), get(&mut c, 1)), (10, 10));
+        c.age();
+        // Used the frame before: carried over.
+        assert_eq!(get(&mut c, 1), 10);
+        c.age();
+        c.age();
+        // Unused for two frames: made again.
+        assert_eq!(get(&mut c, 1), 10);
+        assert_eq!(made, 2);
+    }
 
     /// Synthetic adapter descriptions: subgroups of 32 pass; none, or other
     /// sizes (AMD's 64, Intel's 8 to 32), are refused with a reason.

@@ -17,7 +17,7 @@ use crate::shader::{self, Handle, Options, Translation};
 use crate::state::resources::{Pool, SamplerBinding, TexHandle};
 use crate::state::textures::{self, Layout, TextureType};
 use crate::state::vertex::{AttrKind, wgpu_vertex_format};
-use crate::surfaces::{FxMap, Surfaces, color_format, depth_format, uniform};
+use crate::surfaces::{FxMap, Surfaces, color_format, depth_format};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Reads guest memory at a GPU address; false if a byte is not readable.
@@ -137,6 +137,8 @@ pub struct Cache {
     /// mask of the attributes fetched as integers, hash of the jump targets or 0).
     modules: FxMap<(u64, Option<u64>, u64, u64), Module>,
     pipelines: FxMap<PipelineKey, (Made<wgpu::RenderPipeline>, Vec<wgpu::BindGroupLayout>)>,
+    /// Bind group layouts by their entries, shared by the pipelines.
+    layouts: FxMap<Vec<wgpu::BindGroupLayoutEntry>, wgpu::BindGroupLayout>,
     /// Uploaded textures by address and header, with the end of the memory they came from.
     textures: FxMap<(u64, [u8; 32]), (wgpu::Texture, u64)>,
     /// Samplers by header, filtering and compare.
@@ -597,52 +599,71 @@ impl Surfaces {
             ..Default::default()
         };
         // Bind groups: 0 vertex, 1 pixel; constant banks at their bank, textures at 32 + 2i, samplers at 33 + 2i.
+        // The uniform buffers take dynamic offsets when the device allows that many: a bind
+        // group then serves every draw with the same layout, textures and samplers.
+        let uniforms: usize = stages.iter().map(|b| b.cbufs.len() + usize::from(b.swizzles.is_some())).sum();
+        let dynamic = uniforms <= self.dynamic_max as usize;
         let visibility = [wgpu::ShaderStages::VERTEX, wgpu::ShaderStages::FRAGMENT];
         let mut group_layouts: Vec<Vec<wgpu::BindGroupLayoutEntry>> = stages.iter().zip(visibility).map(|(b, v)| b.layout(v)).collect();
+        if dynamic {
+            for e in group_layouts.iter_mut().flatten() {
+                if let wgpu::BindingType::Buffer { has_dynamic_offset, .. } = &mut e.ty {
+                    *has_dynamic_offset = true;
+                }
+            }
+        }
         let groups = group_layouts.iter().rposition(|e| !e.is_empty()).map_or(0, |g| g + 1);
         group_layouts.truncate(groups);
         let key: PipelineKey = ((vs.0.key, vs.0.wgsl.len()), ps.as_ref().map(|p| (p.0.key, p.0.wgsl.len())), layouts, primitive, color_states, depth_state, group_layouts);
-        if !self.cache.pipelines.contains_key(&key) {
-            let since = std::time::Instant::now();
-            let (_, _, layouts, primitive, color_states, depth_state, group_layouts) = &key;
-            let bind_layouts: Vec<wgpu::BindGroupLayout> = group_layouts.iter().map(|entries| self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries })).collect();
-            let refs: Vec<Option<&wgpu::BindGroupLayout>> = bind_layouts.iter().map(Some).collect();
-            let layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &refs, ..Default::default() });
-            // Owned: a worker thread may make it.
-            let buffers: Vec<(u64, wgpu::VertexStepMode, Vec<wgpu::VertexAttribute>)> = layouts.iter().map(|(_, step, stride, attributes)| (*stride, *step, attributes.clone())).collect();
-            let (device, vertex, pixel) = (self.device.clone(), vs.1.clone(), ps.as_ref().map(|p| p.1.clone()));
-            let (primitive, targets, depth_stencil) = (*primitive, color_states.clone(), depth_state.clone());
-            let cache = self.disk_cache.as_ref().map(|d| d.cache.clone());
-            let make = move || {
-                let buffers: Vec<Option<wgpu::VertexBufferLayout>> = buffers.iter().map(|(stride, step, attributes)| Some(wgpu::VertexBufferLayout { array_stride: *stride, step_mode: *step, attributes })).collect();
-                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: None,
-                    layout: Some(&layout),
-                    vertex: wgpu::VertexState { module: &vertex, entry_point: Some("main"), compilation_options: Default::default(), buffers: &buffers },
-                    fragment: pixel.as_ref().map(|module| wgpu::FragmentState { module, entry_point: Some("main"), compilation_options: Default::default(), targets: &targets }),
-                    primitive,
-                    depth_stencil,
-                    multisample: Default::default(),
-                    multiview_mask: None,
-                    cache: cache.as_ref(),
-                })
-            };
-            let label = format!("p{:016x}+{}", vs.0.key, ps.as_ref().map_or("none".into(), |p| format!("{:016x}", p.0.key)));
-            let made = self.make(make, label.clone());
-            self.cache.pipelines.insert(key.clone(), (made, bind_layouts));
-            self.compile.pipelines += 1;
-            self.compile.pipeline_time += since.elapsed();
-            self.compile.made.push(label);
-        }
-        let (made, bind_layouts) = self.cache.pipelines.get_mut(&key).ok_or("pipeline")?;
-        let Some(pipeline) = made.ready() else {
+        let found = self.cache.pipelines.get_mut(&key).map(|(made, layouts)| (made.ready(), layouts.clone()));
+        let (pipeline, bind_layouts) = match found {
+            Some(found) => found,
+            None => {
+                let since = std::time::Instant::now();
+                let (_, _, layouts, primitive, color_states, depth_state, group_layouts) = &key;
+                // Pipelines with the same group layouts share them, and so their bind groups.
+                let bind_layouts: Vec<wgpu::BindGroupLayout> = group_layouts
+                    .iter()
+                    .map(|entries| self.cache.layouts.entry(entries.clone()).or_insert_with(|| self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries })).clone())
+                    .collect();
+                let refs: Vec<Option<&wgpu::BindGroupLayout>> = bind_layouts.iter().map(Some).collect();
+                let layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &refs, ..Default::default() });
+                // Owned: a worker thread may make it.
+                let buffers: Vec<(u64, wgpu::VertexStepMode, Vec<wgpu::VertexAttribute>)> = layouts.iter().map(|(_, step, stride, attributes)| (*stride, *step, attributes.clone())).collect();
+                let (device, vertex, pixel) = (self.device.clone(), vs.1.clone(), ps.as_ref().map(|p| p.1.clone()));
+                let (primitive, targets, depth_stencil) = (*primitive, color_states.clone(), depth_state.clone());
+                let cache = self.disk_cache.as_ref().map(|d| d.cache.clone());
+                let make = move || {
+                    let buffers: Vec<Option<wgpu::VertexBufferLayout>> = buffers.iter().map(|(stride, step, attributes)| Some(wgpu::VertexBufferLayout { array_stride: *stride, step_mode: *step, attributes })).collect();
+                    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                        label: None,
+                        layout: Some(&layout),
+                        vertex: wgpu::VertexState { module: &vertex, entry_point: Some("main"), compilation_options: Default::default(), buffers: &buffers },
+                        fragment: pixel.as_ref().map(|module| wgpu::FragmentState { module, entry_point: Some("main"), compilation_options: Default::default(), targets: &targets }),
+                        primitive,
+                        depth_stencil,
+                        multisample: Default::default(),
+                        multiview_mask: None,
+                        cache: cache.as_ref(),
+                    })
+                };
+                let label = format!("p{:016x}+{}", vs.0.key, ps.as_ref().map_or("none".into(), |p| format!("{:016x}", p.0.key)));
+                let mut made = self.make(make, label.clone());
+                let ready = made.ready();
+                self.cache.pipelines.insert(key, (made, bind_layouts.clone()));
+                self.compile.pipelines += 1;
+                self.compile.pipeline_time += since.elapsed();
+                self.compile.made.push(label);
+                (ready, bind_layouts)
+            }
+        };
+        let Some(pipeline) = pipeline else {
             // Being made on a worker thread (play mode): the frame goes on without this draw.
             self.compile.waited += 1;
             return Ok(());
         };
-        let bind_layouts = bind_layouts.clone();
 
-        let mut bind_groups = Vec::new();
+        let mut bind_groups = Vec::with_capacity(bind_layouts.len());
         for (g, layout) in bind_layouts.iter().enumerate() {
             let Bindings { cbufs, textures, swizzles, .. } = &stages[g];
             let mut buffers: Vec<(u32, (wgpu::Buffer, u64, u64))> = cbufs
@@ -656,14 +677,9 @@ impl Surfaces {
                 let bytes: Vec<u8> = codes.iter().flat_map(|c| c.to_le_bytes()).collect();
                 buffers.push((shader::SWIZZLE_BINDING, self.stage(&bytes)));
             }
-            let mut entries: Vec<wgpu::BindGroupEntry> = buffers.iter().map(|(b, u)| wgpu::BindGroupEntry { binding: *b, resource: uniform(u) }).collect();
-            for (slot, Slot { view, sampler, .. }) in textures.iter().enumerate() {
-                entries.push(wgpu::BindGroupEntry { binding: 32 + 2 * slot as u32, resource: wgpu::BindingResource::TextureView(view) });
-                if let Some(sampler) = sampler {
-                    entries.push(wgpu::BindGroupEntry { binding: 33 + 2 * slot as u32, resource: wgpu::BindingResource::Sampler(sampler) });
-                }
-            }
-            bind_groups.push(self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout, entries: &entries }));
+            // In binding order, as wgpu takes them: the banks', then the swizzles' (binding 999).
+            let offsets: Vec<u32> = if dynamic { buffers.iter().map(|(_, (_, at, _))| u32::try_from(*at).unwrap_or(u32::MAX)).collect() } else { Vec::new() };
+            bind_groups.push((self.bind_group(layout, &buffers, textures, dynamic), offsets));
         }
         let index_buffer = indices;
 
@@ -706,8 +722,8 @@ impl Surfaces {
             let [cr, cg, cb, ca] = r.blend_constant.map(f64::from);
             pass.set_blend_constant(wgpu::Color { r: cr, g: cg, b: cb, a: ca });
             pass.set_stencil_reference(u32::from(ds.front.reference));
-            for (g, group) in bind_groups.iter().enumerate() {
-                pass.set_bind_group(g as u32, group, &[]);
+            for (g, (group, offsets)) in bind_groups.iter().enumerate() {
+                pass.set_bind_group(g as u32, group, offsets);
             }
             for (slot, (buffer, at, size)) in vertex_buffers.iter().enumerate() {
                 pass.set_vertex_buffer(slot as u32, buffer.slice(*at..at + size));
@@ -909,9 +925,9 @@ impl Surfaces {
                 let device = &self.device;
                 let texture = self.cache.queried.entry((size.width, size.height, size.depth_or_array_layers, levels)).or_insert_with(|| {
                     device.create_texture(&wgpu::TextureDescriptor { label: Some("queried"), size, mip_level_count: levels, sample_count: 1, dimension: dim, format: wgpu::TextureFormat::R8Unorm, usage: wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[] })
-                });
+                }).clone();
                 let dimension = if three_d { V::D3 } else { V::D2 };
-                textures.push(Slot { view: texture.create_view(&Default::default()), sampler: None, depth: false, compare: false, dimension });
+                textures.push(Slot { view: self.view(&texture, &Default::default()), sampler: None, depth: false, compare: false, dimension });
                 continue;
             }
             // An image a compute program wrote, or a render target at that address: its host texture.
@@ -924,9 +940,10 @@ impl Surfaces {
                             let twin = self.float_twin(&self.cache.images[&tic.address].clone())?;
                             self.cache.twins.entry(tic.address).or_insert(twin)
                         }
-                    };
-                    fits(image)?;
-                    let view = crate::surfaces::view_as(image, textures::wgpu_texture_format(&tic), wgpu::TextureUsages::TEXTURE_BINDING, view_desc(wgpu::TextureAspect::All));
+                    }
+                    .clone();
+                    fits(&image)?;
+                    let view = self.view_as(&image, textures::wgpu_texture_format(&tic), wgpu::TextureUsages::TEXTURE_BINDING, view_desc(wgpu::TextureAspect::All));
                     (view, false, "image")
                 }
                 Some(e) => {
@@ -944,7 +961,7 @@ impl Surfaces {
                     let (w, h) = (tic.width.min(texture.width()), tic.height.min(texture.height()));
                     let texture = if !depth && w > 0 && h > 0 && (w, h) != (texture.width(), texture.height()) { self.cropped(key, stamp, &texture, w, h) } else { texture };
                     let aspect = if depth { wgpu::TextureAspect::DepthOnly } else { wgpu::TextureAspect::All };
-                    (crate::surfaces::view_as(&texture, textures::wgpu_texture_format(&tic), wgpu::TextureUsages::TEXTURE_BINDING, view_desc(aspect)), depth, "target")
+                    (self.view_as(&texture, textures::wgpu_texture_format(&tic), wgpu::TextureUsages::TEXTURE_BINDING, view_desc(aspect)), depth, "target")
                 }
                 None => match self.upload(&tic, header, mem) {
                     // A color texture read with a compare (the 1x1 stand-in bound when
@@ -958,11 +975,11 @@ impl Surfaces {
                                 d
                             }
                         };
-                        (depth.create_view(&view_desc(wgpu::TextureAspect::DepthOnly)), true, "memory")
+                        (self.view(&depth, &view_desc(wgpu::TextureAspect::DepthOnly)), true, "memory")
                     }
                     Ok(texture) => {
                         let depth = texture.format().is_depth_stencil_format();
-                        (texture.create_view(&view_desc(if depth { wgpu::TextureAspect::DepthOnly } else { wgpu::TextureAspect::All })), depth, "memory")
+                        (self.view(&texture, &view_desc(if depth { wgpu::TextureAspect::DepthOnly } else { wgpu::TextureAspect::All })), depth, "memory")
                     }
                     Err(why) if x.compare => {
                         // Where the nearest depth targets are, to tell a missing shadow pass from an offset view.
