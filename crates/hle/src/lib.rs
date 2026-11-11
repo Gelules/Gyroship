@@ -585,7 +585,9 @@ pub fn uninstall() -> Option<Kernel> {
 /// for the lock.
 pub fn with<R>(f: impl FnOnce(&mut Kernel) -> R) -> R {
     let kernel = KERNEL.get().expect("no kernel installed on this thread");
+    let asked = std::time::Instant::now();
     let mut guard = kernel.lock().unwrap_or_else(PoisonError::into_inner);
+    let waited = asked.elapsed();
     let k = guard.as_mut().expect("no kernel installed on this thread");
     if k.config.play {
         k.sched.current = play::me();
@@ -594,6 +596,11 @@ pub fn with<R>(f: impl FnOnce(&mut Kernel) -> R) -> R {
         HELD_SINCE.store(k.sched.real_now, std::sync::atomic::Ordering::Relaxed);
         HOLDER_GUEST.store(k.sched.current.map_or(0, |t| k.sched.threads[t].id), std::sync::atomic::Ordering::Relaxed);
         HOLDER.store(gyroship_runtime::profile::thread_id(), std::sync::atomic::Ordering::Relaxed);
+        if k.config.perf.is_some() {
+            let who = k.sched.current.map_or_else(|| std::thread::current().name().unwrap_or("host").to_string(), |t| format!("thread {}", k.sched.threads[t].id));
+            let w = k.census.lock_waits.entry(who).or_default();
+            *w = (w.0 + waited, w.1.max(waited), w.2 + u64::from(waited.as_micros() >= 1000), w.3 + 1);
+        }
     }
     let r = f(&mut *k);
     if k.config.play {
@@ -696,8 +703,11 @@ pub struct Census {
     /// RomFS reads: (present, offset, size).
     romfs: Vec<(u64, u64, u64)>,
     /// (command, thread id) -> count, for the IPC commands the multi-core plan
-    /// needs counted (syncpt 22, 103 and 201).
+    /// needs counted (syncpt 22, 103 and 201; GPU maps, submits, presents).
     ipc: std::collections::BTreeMap<(&'static str, u64), u64>,
+    /// Play mode: the waits for the kernel lock, by guest thread (by host thread
+    /// name for the others): total, longest, waits of 1 ms or more, scopes.
+    lock_waits: std::collections::BTreeMap<String, (std::time::Duration, std::time::Duration, u64, u64)>,
 }
 
 const COUNTER: u32 = 0x100;
@@ -778,6 +788,12 @@ impl Kernel {
         out += "# counted IPC commands, by command and guest thread\n";
         for (&(command, id), &n) in &self.census.ipc {
             let _ = writeln!(out, "{command}  thread {id}: {n} ({:.2} per present)", n as f64 / presents);
+        }
+        out += "# kernel lock waits (play mode): total, per present, longest, waits of 1 ms or more, scopes\n";
+        let mut waits: Vec<_> = self.census.lock_waits.iter().collect();
+        waits.sort_by_key(|w| std::cmp::Reverse(w.1.0));
+        for (who, (total, longest, long, scopes)) in waits {
+            let _ = writeln!(out, "{who}: {:.2} s, {:.2} ms per present, longest {:.1} ms, {long} of 1 ms or more, {scopes} scopes", total.as_secs_f64(), total.as_secs_f64() * 1e3 / presents, longest.as_secs_f64() * 1e3);
         }
         out += "# threads at the end: priority, ideal core (-1: none), core, affinity mask\n";
         for t in &self.sched.threads {

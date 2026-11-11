@@ -321,6 +321,7 @@ impl Nvdrv {
                 let flags = u32_at(&input, 0xc);
                 put32(&mut out, 0xc, 0);
                 let n = k.count("submits");
+                k.census_ipc("nvdrv submit");
                 let mut fence = String::new();
                 if flags & 2 != 0 {
                     let s = &mut k.gs.syncpts[CHANNEL_SYNCPT as usize];

@@ -248,6 +248,7 @@ impl Gs {
             // change kind answer the fallback kind (no compression).
             // Unmap: the mapping goes; then its event.
             (Gs::GpuMemory, 213) => {
+                k.census_ipc("gpu memory 213");
                 let (space, first, last) = (req.u32_at(0)?, req.u64_at(4)?, req.u64_at(0xc)?);
                 k.gs.gpu_maps.retain(|m| m.0 != space || m.2 < first || m.1 > last);
                 k.gs.gpu_table = flatten(&k.gs.gpu_maps);
@@ -267,6 +268,7 @@ impl Gs {
                         Reply::ok()
                     }
                     211 => {
+                        k.census_ipc("gpu memory 211");
                         if k.journal.few("gpu memory 211", 4) {
                             let d = &req.data;
                             k.log(&format!(
@@ -406,6 +408,7 @@ impl Gs {
             // release fence that is already reached ({0, 0, 0}).
             (Gs::Vi2, c @ (228 | 229)) => {
                 if c == 229 {
+                    k.census_ipc("vi2 present");
                     k.present(req);
                 }
                 Reply::with(&[&FREE_SLOTS.to_le_bytes()[..], &[0u8; 16]].concat())
