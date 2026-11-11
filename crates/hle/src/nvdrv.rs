@@ -217,10 +217,17 @@ impl GpuSide {
 
 impl Kernel {
     /// Hands GPU work over to the GPU side, where it runs under the GPU lock
-    /// alone; then what it leaves (`After`) runs under the kernel lock.
-    // ponytail: run at once in both engines; the play engine defers it past the kernel lock next (Stage 4).
+    /// alone; then what it leaves (`After`) runs under the kernel lock. The
+    /// deterministic engine runs it at once. The play engine queues it
+    /// (`Deferred`, Stage 4): the caller's host thread runs it once the SVC's
+    /// reply is written and the kernel lock released, before its guest code
+    /// goes on, while the other threads use the kernel.
     pub(crate) fn gpu_work(&mut self, job: GpuJob) {
         let phase = Phase { now: self.now(), thread: self.sched.current.map_or(0, |t| self.sched.threads[t].id), presents: self.gs.presents, submits: self.tally().counts.get("submits").copied().unwrap_or(0), maps: self.gs.maps.clone() };
+        if self.config.play && self.deferred.is_none() {
+            self.deferred = Some(crate::Deferred::Gpu { side: self.gpu_side.clone(), phase, job });
+            return;
+        }
         let done = run(&self.gpu_side, phase, job);
         self.after(done);
     }
@@ -229,6 +236,13 @@ impl Kernel {
 /// Runs `job` on the GPU side, handed over at `phase`; what it leaves for the kernel lock.
 pub fn run(side: &Mutex<GpuSide>, phase: Phase, job: GpuJob) -> Result<After, Stop> {
     let mut g = crate::lock(side);
+    // The play engine's watchdog sees who holds the GPU side, and since when.
+    let play = g.config.play;
+    if play {
+        crate::GPU_SINCE.store(crate::play::real_ticks(), Ordering::Relaxed);
+        crate::GPU_GUEST.store(phase.thread, Ordering::Relaxed);
+        crate::GPU_HOLDER.store(gyroship_runtime::profile::thread_id(), Ordering::Relaxed);
+    }
     let at = phase.now;
     g.at = phase;
     let done = match &job {
@@ -237,6 +251,10 @@ pub fn run(side: &Mutex<GpuSide>, phase: Phase, job: GpuJob) -> Result<After, St
     };
     // The mappings' snapshot goes: a change to them need not copy them.
     g.at = Phase::default();
+    if play {
+        crate::GPU_HOLDER.store(0, Ordering::Relaxed);
+    }
+    drop(g);
     done?;
     Ok(match job {
         GpuJob::Present { n, interval, .. } => After::Present { n, interval, at },
@@ -959,6 +977,28 @@ mod tests {
         k.mem.read(page, &mut b).unwrap();
         assert_eq!(b, [0; 4], "the write after the anomaly is not applied");
         assert_eq!(k.tally().anomalies["gpu method ignored"], 1);
+    }
+
+    /// The play engine leaves GPU work for after the kernel lock, as the SVC's
+    /// deferred work; the deterministic engine runs it at once. Here a
+    /// present's GPU part finds its fence not reached, then its rest runs.
+    #[test]
+    fn the_play_engine_runs_gpu_work_after_the_kernel_lock() {
+        use gyroship_runtime::mem::Memory;
+        for play in [false, true] {
+            let config = crate::Config { play, explore: true, vsync: false, ..crate::Config::default() };
+            let mut k = Kernel::new(Memory::new().unwrap(), crate::journal::Journal::memory(), config);
+            k.gpu_work(GpuJob::Present { n: 1, fence: (!CHANNEL_SYNCPT, 5), area: 0, interval: 1 });
+            let ran = |k: &Kernel| k.tally().anomalies.get("present fence not reached").copied();
+            if play {
+                assert_eq!(ran(&k), None, "queued, not run");
+                let done = k.deferred.take().expect("a deferred job").run();
+                assert!(matches!(done, Ok(After::Present { n: 1, interval: 1, at: 0 })));
+                k.after(done);
+            }
+            assert!(k.deferred.is_none());
+            assert_eq!(ran(&k), Some(1));
+        }
     }
 }
 

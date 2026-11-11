@@ -169,7 +169,7 @@ impl ApplicationHandler for App {
 /// virtual time on the wall clock; more than a frame late, the origin moves
 /// to now (the game slows down, it never skips or catches up). With `--play`
 /// guest time is the wall clock already: nothing to wait for, and this runs
-/// under the kernel lock, which must never sleep.
+/// under the GPU side's lock, which must never sleep.
 fn pace(shared: Arc<Shared>) -> gyroship_hle::Pace {
     let play = std::env::args().any(|a| a == "--play");
     let mut origin: Option<(Instant, u64)> = None;

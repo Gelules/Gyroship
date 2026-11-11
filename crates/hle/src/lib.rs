@@ -4,7 +4,9 @@
 //! thread-local handle: the thread that installs it, and the threads that
 //! attach to it; each test thread installs a kernel of its own. The lock is
 //! never held across a guest fiber switch, a park, a sleep or a yield. In the
-//! play engine (`play`) each guest thread has a host thread of its own.
+//! play engine (`play`) each guest thread has a host thread of its own, and
+//! GPU work runs under the GPU side's lock alone (`nvdrv::GpuSide`), which is
+//! taken after the kernel's when both are, never the other way.
 
 pub mod account;
 pub mod am;
@@ -521,6 +523,10 @@ pub(crate) static HOLDER: std::sync::atomic::AtomicU32 = std::sync::atomic::Atom
 pub(crate) static HELD_SINCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// The guest thread whose host thread holds it (0: a timer or the boot thread).
 pub(crate) static HOLDER_GUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The same three for the GPU side's lock, which the play engine's GPU work holds alone.
+pub(crate) static GPU_HOLDER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+pub(crate) static GPU_SINCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static GPU_GUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The kernel the last [`install`] made, for a host thread outside the run
 /// (the window's) to stop it: [`stop_from_outside`].
@@ -548,8 +554,8 @@ pub(crate) fn kernel_ref() -> KernelRef {
 }
 
 /// How long a fault report tries for the kernel lock: another host thread may
-/// hold it a while (the play engine's GPU work, until Stage 4). Well under the
-/// 5 s a later fault waits in the runtime's `fatal`.
+/// hold it a while (a load). Well under the 5 s a later fault waits in the
+/// runtime's `fatal`.
 const FAULT_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// A guest fault: the message and the stack at the last SVC go to the
@@ -601,7 +607,7 @@ fn lock_within<T>(m: &Mutex<T>, patience: std::time::Duration) -> Option<MutexGu
 const GPU_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// How long a window closed while no frame comes waits for the kernel lock:
-/// a long GPU batch may hold it (the play engine, until Stage 4).
+/// another thread may hold it a while (a load).
 pub const CLOSE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Stops the run from a host thread outside it: the window's, closed while

@@ -209,35 +209,41 @@ fn spawn_timers(kernel: crate::KernelRef) -> [std::thread::JoinHandle<()>; 2] {
     [spawn("audio sink", run_sinks), spawn("hid sampler", run_hid)]
 }
 
-/// How long the kernel lock may stay held before the watchdog shows where its
-/// holder stands (a long GPU batch takes seconds, until Stage 4).
+/// How long the kernel lock or the GPU side's may stay held before the
+/// watchdog shows where its holder stands (a pipeline the driver compiles for
+/// minutes, a long load).
 const WATCHDOG: Duration = Duration::from_secs(5);
 
-/// The watchdog: every half second it reads the kernel lock's holder without
-/// the lock; a holder past WATCHDOG, then past 4 WATCHDOG, gets its host
-/// stack written to stderr (the journal needs the lock). Returns once `done`.
+/// The watchdog: every half second it reads the holders of the kernel lock
+/// and of the GPU side's without the locks; a holder past WATCHDOG, then past
+/// 4 WATCHDOG, gets its host stack written to stderr (the journal needs the
+/// kernel lock). Returns once `done`.
 fn spawn_watchdog(done: std::sync::Arc<std::sync::atomic::AtomicBool>) -> std::thread::JoinHandle<()> {
     use std::sync::atomic::Ordering::Relaxed;
+    let locks = [("kernel lock", &crate::HOLDER, &crate::HELD_SINCE, &crate::HOLDER_GUEST), ("GPU lock", &crate::GPU_HOLDER, &crate::GPU_SINCE, &crate::GPU_GUEST)];
     std::thread::Builder::new()
         .name("watchdog".into())
         .spawn(move || {
-            let (mut hold, mut shown) = (0, 0);
+            // By lock: the hold watched (its start) and the reports it got.
+            let mut watched = [(0, 0); 2];
             while !done.load(Relaxed) {
                 std::thread::park_timeout(Duration::from_millis(500));
-                let (since, tid, guest) = (crate::HELD_SINCE.load(Relaxed), crate::HOLDER.load(Relaxed), crate::HOLDER_GUEST.load(Relaxed));
-                if tid == 0 || crate::HELD_SINCE.load(Relaxed) != since {
-                    continue;
-                }
-                if since != hold {
-                    (hold, shown) = (since, 0);
-                }
-                let held = real_ticks().saturating_sub(since);
-                let due = [WATCHDOG, 4 * WATCHDOG].into_iter().filter(|&d| held >= ticks_in(d)).count();
-                if due > shown {
-                    shown = due;
-                    eprintln!("gyroship: watchdog: the kernel lock has been held for {:.1} s by guest thread {guest} (host thread {tid}, 0: a timer or the boot thread); where it stands:", held as f64 / 31_250_000.0);
-                    for line in rt::profile::stack_of(tid) {
-                        eprintln!("gyroship:   {line}");
+                for ((what, holder, held_since, holder_guest), (hold, shown)) in locks.iter().zip(&mut watched) {
+                    let (since, tid, guest) = (held_since.load(Relaxed), holder.load(Relaxed), holder_guest.load(Relaxed));
+                    if tid == 0 || held_since.load(Relaxed) != since {
+                        continue;
+                    }
+                    if since != *hold {
+                        (*hold, *shown) = (since, 0);
+                    }
+                    let held = real_ticks().saturating_sub(since);
+                    let due = [WATCHDOG, 4 * WATCHDOG].into_iter().filter(|&d| held >= ticks_in(d)).count();
+                    if due > *shown {
+                        *shown = due;
+                        eprintln!("gyroship: watchdog: the {what} has been held for {:.1} s by guest thread {guest} (host thread {tid}, 0: a timer or the boot thread); where it stands:", held as f64 / 31_250_000.0);
+                        for line in rt::profile::stack_of(tid) {
+                            eprintln!("gyroship:   {line}");
+                        }
                     }
                 }
             }
@@ -247,8 +253,8 @@ fn spawn_watchdog(done: std::sync::Arc<std::sync::atomic::AtomicBool>) -> std::t
 
 /// The audio sinks, on their grid of real time. A tick copies the ring and
 /// hands it to the host outside the kernel lock, so that the sound does not
-/// wait for a holder (thread 17 holds it through its GPU work until Stage 4);
-/// then one scope signals the streams' events, takes new sinks and the gain.
+/// wait for a holder; then one scope signals the streams' events, takes new
+/// sinks and the gain.
 /// A holder past a whole period still delays the next tick.
 // ponytail: QPC's grid, which the sound device's own clock drifts from (a gap or a dropped tick every few minutes); pace on the device's queue level if that is heard.
 fn run_sinks() {
@@ -352,7 +358,7 @@ pub fn me() -> Option<usize> {
 }
 
 /// A kernel scope that holds the lock longer than this (40 ms, about one audio
-/// ring) is counted in the summary line: t17's GPU work holds it until Stage 4.
+/// ring) is counted in the summary line.
 pub(crate) const LONG_HOLD: u64 = 40 * 31_250;
 
 /// Real time since the process first read it, in ticks of 31.25 MHz, the rate
