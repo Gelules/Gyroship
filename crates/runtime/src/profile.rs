@@ -102,6 +102,18 @@ pub fn cpu_time(handle: usize) -> Option<std::time::Duration> {
     Some(std::time::Duration::from_nanos((hundreds(kernel) + hundreds(user)) * 100))
 }
 
+/// The calling host thread's CPU time, as [`cpu_time`].
+#[cfg(windows)]
+pub fn own_cpu_time() -> Option<std::time::Duration> {
+    // SAFETY: the calling thread's pseudo-handle, which needs no closing.
+    cpu_time(unsafe { windows_sys::Win32::System::Threading::GetCurrentThread() } as usize)
+}
+
+#[cfg(not(windows))]
+pub fn own_cpu_time() -> Option<std::time::Duration> {
+    None
+}
+
 /// The calling host thread's Windows id, for [`stack_of`].
 #[cfg(windows)]
 pub fn thread_id() -> u32 {

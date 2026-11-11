@@ -1092,6 +1092,7 @@ impl Surfaces {
         if let Some((t, _)) = self.cache.textures.get(&(tic.address, header)) {
             return Ok(t.clone());
         }
+        let started = std::time::Instant::now();
         let three_d = tic.texture_type == TextureType::ThreeD;
         let format = textures::wgpu_texture_format(tic).ok_or_else(|| format!("texture format {:?}", tic.components))?;
         let zf32 = format == wgpu::TextureFormat::Depth32Float && !three_d;
@@ -1123,7 +1124,14 @@ impl Surfaces {
                     if !mem(tic.address + layer * stride + offset, &mut raw) {
                         return Err("texture not readable".into());
                     }
-                    data.extend(l.deswizzle(&raw));
+                    // Every layer's room at once (an 85 MiB pool would otherwise regrow ~10 times).
+                    let texels = l.deswizzle(&raw);
+                    if data.is_empty() {
+                        data = texels;
+                        data.reserve_exact(data.len() * (layers as usize - 1));
+                    } else {
+                        data.extend_from_slice(&texels);
+                    }
                 }
                 end = tic.address + u64::from(layers - 1) * stride + offset + raw.len() as u64;
                 data
@@ -1166,6 +1174,8 @@ impl Surfaces {
         }
         self.cache.textures.insert((tic.address, header), (texture.clone(), end));
         self.cache.spans = None;
+        self.staging.uploads[0] += data.len() as u64;
+        self.staging.uploads[1] += started.elapsed().as_nanos() as u64;
         Ok(texture)
     }
 

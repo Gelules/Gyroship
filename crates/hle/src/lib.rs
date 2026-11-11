@@ -420,6 +420,13 @@ impl Kernel {
             if let Err(e) = std::fs::write(&census, self.census_report()) {
                 eprintln!("gyroship: --perf {}: {e}", census.display());
             }
+            let frames = g.as_ref().map_or("", |g| &g.frames[..]);
+            for (name, header, rows) in [("frames.csv", FRAME_COLUMNS, frames), ("threads.csv", "present,thread,cpu_ms\n", &self.census.threads_cpu[..])] {
+                let file = path.with_extension(name);
+                if let Err(e) = std::fs::write(&file, format!("{header}{rows}")) {
+                    eprintln!("gyroship: --perf {}: {e}", file.display());
+                }
+            }
             let rewrites = g.as_ref().map_or(&[][..], |g| &g.rewrites[..]);
             for (name, header, rows) in [("rewrites.csv", "present,gpu,size\n", rewrites), ("romfs.csv", "present,offset,size\n", &self.census.romfs[..])] {
                 let file = path.with_extension(name);
@@ -789,7 +796,15 @@ pub struct Census {
     /// Play mode: the waits for the kernel lock, by guest thread (by host thread
     /// name for the others): total, longest, waits of 1 ms or more, scopes.
     lock_waits: std::collections::BTreeMap<String, (std::time::Duration, std::time::Duration, u64, u64)>,
+    /// Play mode: every 60 presents, each guest thread's host CPU time so far,
+    /// as CSV rows (present, thread, ms): which thread a slow scene waits for.
+    threads_cpu: String,
 }
+
+/// The `--perf` frames file: per present, counters so far (cpu_ms: the
+/// presenting host thread's CPU time; watched_pages: pages the textures' write
+/// watch went over); only `skipped` is the present's own.
+pub(crate) const FRAME_COLUMNS: &str = "present,cpu_ms,draws,skipped,views_made,bind_groups_made,flushed_bytes,upload_bytes,upload_ms,macro_calls,watched_pages\n";
 
 const COUNTER: u32 = 0x100;
 const WAIT: u32 = 0x200;

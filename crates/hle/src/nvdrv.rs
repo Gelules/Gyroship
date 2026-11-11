@@ -152,6 +152,10 @@ pub struct GpuSide {
     pub window: Option<(crate::Pace, (u32, u32))>,
     /// Textures found rewritten by the CPU: (present, GPU address, size), for `--perf`.
     pub rewrites: Vec<(u64, u64, u64)>,
+    /// `--perf`: the frames file's rows (`FRAME_COLUMNS`), and the pages the
+    /// textures' write watch went over so far.
+    pub frames: String,
+    pub watched: u64,
     pub mem: Arc<Memory>,
     pub journal: crate::journal::Journal,
     pub tally: Arc<Mutex<crate::Tally>>,
@@ -184,7 +188,7 @@ pub enum GpuJob {
 
 impl GpuSide {
     pub fn new(mem: Arc<Memory>, journal: crate::journal::Journal, tally: Arc<Mutex<crate::Tally>>, syncpts: Arc<[AtomicU32; 32]>, config: crate::Config) -> GpuSide {
-        GpuSide { surfaces: None, gpu: Gpu::default(), frame_hashes: Vec::new(), window: None, rewrites: Vec::new(), mem, journal, tally, syncpts, config, at: Phase::default() }
+        GpuSide { surfaces: None, gpu: Gpu::default(), frame_hashes: Vec::new(), window: None, rewrites: Vec::new(), frames: String::new(), watched: 0, mem, journal, tally, syncpts, config, at: Phase::default() }
     }
 
     /// The kernel time the work was handed over at.
@@ -540,7 +544,8 @@ fn forget_written_textures(k: &mut GpuSide, space: u32) {
     // (GPU start, GPU end, CPU address), by CPU address.
     let mut cpu: Vec<(u64, u64, u64)> = ranges.iter().map(|&(start, end)| (start, end, k.gpu_to_cpu(space, start))).collect();
     cpu.sort_unstable_by_key(|c| c.2);
-    let written = written_textures(&k.mem, &cpu);
+    let (written, pages) = written_textures(&k.mem, &cpu);
+    k.watched += pages;
     if let Some(s) = k.surfaces.as_mut() {
         for (start, end) in written {
             s.invalidate(start, end - start);
@@ -559,15 +564,16 @@ fn forget_written_textures(k: &mut GpuSide, space: u32) {
 /// span's written pages are reported and reset in one call, so a write that
 /// races it shows at the next submit, and every texture of the span is tested
 /// against them, so textures sharing a page all see its write. Spans share no
-/// page: taking one hides nothing from another.
-fn written_textures(mem: &Memory, cpu: &[(u64, u64, u64)]) -> Vec<(u64, u64)> {
-    let mut written = Vec::new();
+/// page: taking one hides nothing from another. Also the pages the takes went over.
+fn written_textures(mem: &Memory, cpu: &[(u64, u64, u64)]) -> (Vec<(u64, u64)>, u64) {
+    let (mut written, mut watched) = (Vec::new(), 0);
     for span in page_spans(cpu) {
         let (first, last) = (span[0].2, span.iter().map(|&(start, end, at)| at + (end - start)).max().unwrap_or(0));
         let pages = mem.take_written(first, last - first);
+        watched += (last - first).div_ceil(PAGE);
         written.extend(span.iter().filter(|&&(start, end, at)| touches(&pages, at, end - start)).map(|&(start, end, _)| (start, end)));
     }
-    written
+    (written, watched)
 }
 
 /// Whether `[at, at + len)` holds a byte of one of `pages` (sorted page addresses).
@@ -1018,8 +1024,8 @@ mod page_span_tests {
         let cpu = [(0x100, 0x900, AT + 0x1000), (0x900, 0xa00, AT + 0x1800), (0xa00, 0xb00, AT + 0x2000)];
         written_textures(&m, &cpu);
         m.write(AT + 0x1ff0, &[1]).unwrap();
-        assert_eq!(written_textures(&m, &cpu), [(0x100, 0x900), (0x900, 0xa00)]);
-        assert!(written_textures(&m, &cpu).is_empty(), "taken once");
+        assert_eq!(written_textures(&m, &cpu).0, [(0x100, 0x900), (0x900, 0xa00)]);
+        assert!(written_textures(&m, &cpu).0.is_empty(), "taken once");
     }
 
     #[test]

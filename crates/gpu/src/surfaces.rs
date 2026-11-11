@@ -385,6 +385,9 @@ pub struct Staging {
     /// Texture views and bind groups made, then asked for (the rest came from their caches).
     pub views: [u64; 2],
     pub bind_groups: [u64; 2],
+    /// Textures uploaded from guest memory: bytes, and host nanoseconds (read,
+    /// deswizzle, copy, and the wait after a large one).
+    pub uploads: [u64; 2],
 }
 
 /// What a guest read for the GPU was for, an index into [`Staging`]'s arrays.

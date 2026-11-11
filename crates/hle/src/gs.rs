@@ -519,6 +519,15 @@ impl Kernel {
         }
         if self.config.perf.is_some() {
             gyroship_runtime::profile::mark_frame();
+            #[cfg(windows)]
+            if self.config.play && n.is_multiple_of(60) {
+                use std::os::windows::io::AsRawHandle;
+                for t in &self.sched.threads {
+                    if let Some(cpu) = t.host_thread.as_ref().and_then(|h| gyroship_runtime::profile::cpu_time(h.as_raw_handle() as usize)) {
+                        self.census.threads_cpu += &format!("{n},{},{:.1}\n", t.id, cpu.as_secs_f64() * 1e3);
+                    }
+                }
+            }
         }
         if n <= 3 || n.is_multiple_of(60) {
             let (layer, image) = (req.u64_at(0).unwrap_or(0), req.u32_at(0xc).unwrap_or(0));
@@ -587,6 +596,22 @@ impl GpuSide {
             s.flush();
             s.next_frame();
             let skipped = std::mem::take(&mut s.skipped);
+            if self.config.perf.is_some() {
+                let cpu = gyroship_runtime::profile::own_cpu_time().unwrap_or_default().as_secs_f64() * 1e3;
+                let (st, calls) = (&s.staging, self.gpu.mme_stats().calls);
+                let row = format!(
+                    "{n},{cpu:.1},{},{},{},{},{},{},{:.1},{calls},{}\n",
+                    s.drawn,
+                    skipped.values().sum::<u64>(),
+                    st.views[0],
+                    st.bind_groups[0],
+                    st.flushed,
+                    st.uploads[0],
+                    st.uploads[1] as f64 / 1e6,
+                    self.watched
+                );
+                self.frames += &row;
+            }
             let errors = s.errors.lock().map(|mut e| std::mem::take(&mut *e)).unwrap_or_default();
             // Shader work that held this frame back: host time, so in the play
             // journal only (the deterministic one stays byte-identical).
