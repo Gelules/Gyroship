@@ -31,6 +31,28 @@ pub(crate) type Bank = (u64, std::sync::Arc<Vec<u8>>);
 /// without a pixel program). Draws with the same key share the open pass.
 pub(crate) type PassKey = (Vec<Option<(Surface, wgpu::TextureFormat)>>, Option<(Surface, wgpu::TextureFormat)>, bool);
 
+/// What the open pass was last given: a draw sets only what changed (wgpu
+/// validates and encodes each call again, and consecutive draws mostly repeat).
+/// Pipelines and bind groups wgpu already skips when repeated.
+#[derive(Default)]
+pub(crate) struct PassState {
+    viewport: Option<[f32; 6]>,
+    scissor: Option<[u32; 4]>,
+    blend: Option<[f32; 4]>,
+    stencil: Option<u32>,
+    vertex: Vec<Option<crate::surfaces::Slice>>,
+    index: Option<(crate::surfaces::Slice, wgpu::IndexFormat)>,
+}
+
+/// Stores `new` in `old`; whether it differed.
+fn changed<T: PartialEq>(old: &mut Option<T>, new: T) -> bool {
+    let differs = old.as_ref() != Some(&new);
+    if differs {
+        *old = Some(new);
+    }
+    differs
+}
+
 /// The bytes of a constant bank as the translated programs declare it.
 const CBUF_BYTES: usize = 0x10000;
 
@@ -175,6 +197,8 @@ pub struct Cache {
     /// GPU writes to guest memory not yet applied to `textures`, as (start, end):
     /// applied once before the next read of the cache (`drain_invalidations`).
     pending: Vec<(u64, u64)>,
+    /// `textures`' ranges as [`spans`] indexes them; None once `textures` changed.
+    spans: Option<Vec<(u64, u64)>>,
     /// Color targets read through a smaller texture header, cropped to it, by
     /// (address, format, width, height), with the target's write stamp when copied.
     crops: FxMap<(u64, u32, u32, u32), (u64, wgpu::Texture)>,
@@ -240,6 +264,23 @@ fn merged(ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
 fn overlaps(ranges: &[(u64, u64)], a: u64, b: u64) -> bool {
     let i = ranges.partition_point(|r| r.1 <= a);
     ranges.get(i).is_some_and(|r| r.0 < b)
+}
+
+/// Ranges [a, b) sorted by start, each end replaced by the furthest end so far.
+fn spans(ranges: impl Iterator<Item = (u64, u64)>) -> Vec<(u64, u64)> {
+    let mut s: Vec<(u64, u64)> = ranges.collect();
+    s.sort_unstable();
+    s.iter_mut().fold(0, |max, r| {
+        r.1 = r.1.max(max);
+        r.1
+    });
+    s
+}
+
+/// Whether [s, e) overlaps one of the ranges `spans` indexed (as [`overlaps`]: a < e && b > s).
+fn hits(spans: &[(u64, u64)], s: u64, e: u64) -> bool {
+    let i = spans.partition_point(|r| r.0 < e);
+    i > 0 && spans[i - 1].1 > s
 }
 
 /// The binding size of each bank a program reads (`Interface::cbuf_sizes`).
@@ -705,7 +746,7 @@ impl Surfaces {
         // one. Anything else recorded ends it (`Surfaces::encoder`). Timed draws
         // each keep a pass of their own.
         let key: PassKey = (colors.clone(), depth, ps.is_some());
-        if self.timing.is_some() || self.pass.as_ref().is_none_or(|(open, _)| *open != key) {
+        if self.timing.is_some() || self.pass.as_ref().is_none_or(|(open, ..)| *open != key) {
             let color_views: Vec<Option<wgpu::TextureView>> = colors.iter().map(|c| c.map(|(s, f)| self.texture(&s, f))).collect();
             let depth_view = depth.map(|(s, f)| (self.texture(&s, f), f));
             let timed = self.timing.as_mut().and_then(|t| t.next(format!("draw vs {:016x} ps {}", vs.0.key, ps.as_ref().map_or("none".into(), |p| format!("{:016x}", p.0.key)))));
@@ -728,25 +769,38 @@ impl Surfaces {
             });
             let pass = pass.forget_lifetime();
             self.record(encoder);
-            self.pass = Some((key, pass));
+            self.pass = Some((key, pass, PassState::default()));
         }
         {
-            let Some((_, pass)) = self.pass.as_mut() else { return Err("no open render pass".into()) };
+            let Some((_, pass, last)) = self.pass.as_mut() else { return Err("no open render pass".into()) };
             pass.set_pipeline(&pipeline);
-            pass.set_viewport(v.x, v.y, v.width, v.height, v.min_depth, v.max_depth);
-            pass.set_scissor_rect(x, y, x1 - x, y1 - y);
-            let [cr, cg, cb, ca] = r.blend_constant.map(f64::from);
-            pass.set_blend_constant(wgpu::Color { r: cr, g: cg, b: cb, a: ca });
-            pass.set_stencil_reference(u32::from(ds.front.reference));
+            if changed(&mut last.viewport, [v.x, v.y, v.width, v.height, v.min_depth, v.max_depth]) {
+                pass.set_viewport(v.x, v.y, v.width, v.height, v.min_depth, v.max_depth);
+            }
+            if changed(&mut last.scissor, [x, y, x1 - x, y1 - y]) {
+                pass.set_scissor_rect(x, y, x1 - x, y1 - y);
+            }
+            if changed(&mut last.blend, r.blend_constant) {
+                let [cr, cg, cb, ca] = r.blend_constant.map(f64::from);
+                pass.set_blend_constant(wgpu::Color { r: cr, g: cg, b: cb, a: ca });
+            }
+            if changed(&mut last.stencil, u32::from(ds.front.reference)) {
+                pass.set_stencil_reference(u32::from(ds.front.reference));
+            }
             for (g, (group, offsets)) in bind_groups.iter().enumerate() {
                 pass.set_bind_group(g as u32, group, offsets);
             }
-            for (slot, (buffer, at, size)) in vertex_buffers.iter().enumerate() {
-                pass.set_vertex_buffer(slot as u32, buffer.slice(*at..at + size));
+            last.vertex.resize(last.vertex.len().max(vertex_buffers.len()), None);
+            for (slot, b @ (buffer, at, size)) in vertex_buffers.iter().enumerate() {
+                if changed(&mut last.vertex[slot], b.clone()) {
+                    pass.set_vertex_buffer(slot as u32, buffer.slice(*at..at + size));
+                }
             }
             match &index_buffer {
-                Some(((buffer, at, size), format)) => {
-                    pass.set_index_buffer(buffer.slice(*at..at + size), *format);
+                Some((b @ (buffer, at, size), format)) => {
+                    if changed(&mut last.index, (b.clone(), *format)) {
+                        pass.set_index_buffer(buffer.slice(*at..at + size), *format);
+                    }
                     pass.draw_indexed(0..d.count, d.base_vertex, 0..1);
                 }
                 None => pass.draw(d.first..d.first + d.count, 0..1),
@@ -1111,6 +1165,7 @@ impl Surfaces {
             let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         }
         self.cache.textures.insert((tic.address, header), (texture.clone(), end));
+        self.cache.spans = None;
         Ok(texture)
     }
 
@@ -1240,12 +1295,21 @@ impl Surfaces {
         if self.cache.pending.is_empty() {
             return;
         }
-        let written = merged(&std::mem::take(&mut self.cache.pending));
-        let before = self.cache.textures.len();
-        self.cache.textures.retain(|(addr, _), (_, last)| !overlaps(&written, *addr, *last));
-        if self.cache.textures.len() != before {
-            let textures = &self.cache.textures;
-            self.cache.compare_depths.retain(|k, _| textures.contains_key(k));
+        let c = &mut self.cache;
+        let written = merged(&c.pending);
+        c.pending.clear();
+        // Most writes (constant-buffer loads, before nearly every draw) overlap no
+        // texture: checked against the spans index before passing over them all.
+        let spans = c.spans.get_or_insert_with(|| spans(c.textures.iter().map(|((a, _), (_, b))| (*a, *b))));
+        if !written.iter().any(|&(s, e)| hits(spans, s, e)) {
+            return;
+        }
+        let before = c.textures.len();
+        c.textures.retain(|(addr, _), (_, last)| !overlaps(&written, *addr, *last));
+        if c.textures.len() != before {
+            c.spans = None;
+            let textures = &c.textures;
+            c.compare_depths.retain(|k, _| textures.contains_key(k));
         }
     }
 
@@ -1470,6 +1534,34 @@ mod tests {
             }
         }
         assert!(!overlaps(&merged(&[]), 0, u64::MAX));
+    }
+
+    #[test]
+    fn the_spans_index_finds_a_write_over_any_texture() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        for round in 0..2000 {
+            // Textures and writes, some empty, nested or touching.
+            let (t, w) = (next(12), 1 + next(6));
+            let mut ranges = |count: u64, len: u64| -> Vec<(u64, u64)> {
+                (0..count)
+                    .map(|_| {
+                        let a = next(4000);
+                        (a, a + next(len))
+                    })
+                    .collect()
+            };
+            let textures = ranges(t, 600);
+            let writes = merged(&ranges(w, 40));
+            let index = spans(textures.iter().copied());
+            let fast = writes.iter().any(|&(s, e)| hits(&index, s, e));
+            assert_eq!(fast, textures.iter().any(|&(a, b)| overlaps(&writes, a, b)), "round {round}: {textures:?} {writes:?}");
+        }
     }
 
     #[test]

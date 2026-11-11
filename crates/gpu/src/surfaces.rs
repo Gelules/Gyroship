@@ -78,6 +78,16 @@ pub(crate) enum Bound {
     Sampler(u32, wgpu::Sampler),
 }
 
+/// Whether `device` can render to `format` (and read it back).
+fn renderable_on(adapter: &wgpu::Adapter, device: &wgpu::Device, format: wgpu::TextureFormat) -> bool {
+    let features = if device.features().contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES) {
+        adapter.get_texture_format_features(format)
+    } else {
+        format.guaranteed_format_features(device.features())
+    };
+    features.allowed_usages.contains(wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC)
+}
+
 /// The wgpu format of a depth target format (SET_ZT_FORMAT).
 pub(crate) fn depth_format(f: u32) -> Option<wgpu::TextureFormat> {
     use wgpu::TextureFormat as T;
@@ -169,7 +179,9 @@ pub struct Surfaces {
     /// to the same targets (a pass per draw cost a begin and an end each, ~585 a
     /// frame); anything else recorded ends it first ([`Surfaces::encoder`]).
     /// Declared before `pending`, so that it ends before its encoder is dropped.
-    pub(crate) pass: Option<(crate::draw::PassKey, wgpu::RenderPass<'static>)>,
+    pub(crate) pass: Option<(crate::draw::PassKey, wgpu::RenderPass<'static>, crate::draw::PassState)>,
+    /// Whether each target format is renderable here, asked once (a driver query per draw otherwise).
+    renderable: Vec<(wgpu::TextureFormat, bool)>,
     /// The work recorded since the last [`Surfaces::flush`], in order.
     pending: Option<wgpu::CommandEncoder>,
     /// GPU time per program, when asked for (`timing.rs`).
@@ -604,7 +616,8 @@ impl Surfaces {
         let dynamic_max = device.limits().max_dynamic_uniform_buffers_per_pipeline_layout;
         let window = window.map(|(surface, size)| Window::new(&adapter, &device, surface, size));
         let timing = crate::timing::Timing::new(&device, &queue);
-        Ok(Surfaces { adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pass: None, pending: None, timing, clock: None, present: 0, readbacks: Default::default(), hasher: None, arena, staging: Staging::default(), staged: FxMap::default(), last_color: None, window, memo: Memo::default(), compile: Compile::default(), compile_total: Compile::default(), background: false, workers: None, finished: Default::default(), disk_cache: None, views: Aged::default(), bind_groups: Aged::default(), dynamic_max })
+        let renderable = (0..=0xff).filter_map(color_format).chain((0..=0xff).filter_map(depth_format)).map(|f| (f, renderable_on(&adapter, &device, f))).collect();
+        Ok(Surfaces { renderable, adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pass: None, pending: None, timing, clock: None, present: 0, readbacks: Default::default(), hasher: None, arena, staging: Staging::default(), staged: FxMap::default(), last_color: None, window, memo: Memo::default(), compile: Compile::default(), compile_total: Compile::default(), background: false, workers: None, finished: Default::default(), disk_cache: None, views: Aged::default(), bind_groups: Aged::default(), dynamic_max })
     }
 
     /// Shows the presented image (the color target written last, its top-left
@@ -1077,12 +1090,7 @@ impl Surfaces {
 
     /// Whether this device can render to `format` (and read it back).
     pub(crate) fn renderable(&self, format: wgpu::TextureFormat) -> bool {
-        let features = if self.device.features().contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES) {
-            self.adapter.get_texture_format_features(format)
-        } else {
-            format.guaranteed_format_features(self.device.features())
-        };
-        features.allowed_usages.contains(wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC)
+        self.renderable.iter().find(|(f, _)| *f == format).map_or_else(|| renderable_on(&self.adapter, &self.device, format), |(_, r)| *r)
     }
 
     pub(crate) fn skip(&mut self, why: impl Into<String>) {
