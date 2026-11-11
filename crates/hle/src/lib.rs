@@ -443,11 +443,16 @@ thread_local! {
     static KERNEL: Cell<Option<KernelRef>> = const { Cell::new(None) };
 }
 
+/// The kernel the last [`install`] made, for a host thread outside the run
+/// (the window's) to stop it: [`stop_from_outside`].
+static INSTALLED: std::sync::atomic::AtomicPtr<Mutex<Option<Kernel>>> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
 /// Makes `kernel` the one this host thread's guest code talks to; returns its
 /// handle, for the run's other host threads to [`attach`].
 pub fn install(kernel: Kernel) -> KernelRef {
     // ponytail: one Mutex box leaked per install (the kernel leaves with `uninstall`); a run installs once, a test binary a few hundred times.
     let kernel: KernelRef = Box::leak(Box::new(Mutex::new(Some(kernel))));
+    INSTALLED.store(std::ptr::from_ref(kernel).cast_mut(), std::sync::atomic::Ordering::Release);
     KERNEL.set(Some(kernel));
     gyroship_runtime::set_hooks(Hooks { svc: on_svc, counter: on_counter, wait: on_wait, probe: boot::on_probe, fault: on_fault });
     kernel
@@ -474,15 +479,7 @@ const FAULT_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 /// faulting in HLE code, or by another one), nothing is written.
 fn on_fault(what: &str) {
     let Some(kernel) = KERNEL.get() else { return };
-    let since = std::time::Instant::now();
-    let mut guard = loop {
-        match kernel.try_lock() {
-            Ok(guard) => break guard,
-            Err(TryLockError::Poisoned(e)) => break e.into_inner(),
-            Err(TryLockError::WouldBlock) if since.elapsed() < FAULT_WAIT => std::thread::sleep(std::time::Duration::from_millis(1)),
-            Err(TryLockError::WouldBlock) => return,
-        }
-    };
+    let Some(mut guard) = lock_within(kernel, FAULT_WAIT) else { return };
     let Some(k) = guard.as_mut() else { return };
     // The faulting thread, not the lock's last holder (play engine).
     if k.config.play {
@@ -503,6 +500,45 @@ fn on_fault(what: &str) {
         k.log(&line);
     }
     k.journal.flush();
+}
+
+/// The kernel lock, tried for up to `patience`, never waited for: None if it
+/// stays held (by this thread, faulting in HLE code, or by another one).
+fn lock_within(kernel: KernelRef, patience: std::time::Duration) -> Option<std::sync::MutexGuard<'static, Option<Kernel>>> {
+    let since = std::time::Instant::now();
+    loop {
+        match kernel.try_lock() {
+            Ok(guard) => return Some(guard),
+            Err(TryLockError::Poisoned(e)) => return Some(e.into_inner()),
+            Err(TryLockError::WouldBlock) if since.elapsed() < patience => std::thread::sleep(std::time::Duration::from_millis(1)),
+            Err(TryLockError::WouldBlock) => return None,
+        }
+    }
+}
+
+/// How long a window closed while no frame comes waits for the kernel lock:
+/// a long GPU batch may hold it (the play engine, until Stage 4).
+pub const CLOSE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Stops the run from a host thread outside it: the window's, closed while
+/// no frame came to stop it (`HostWindow::pace`). As [`Kernel::stop`], exit
+/// code 0: every thread's state, the journal, the reports and `--record` are
+/// written. Returns if no kernel runs or its lock stays held past `patience`.
+pub fn stop_from_outside(why: &str, patience: std::time::Duration) {
+    let p = INSTALLED.load(std::sync::atomic::Ordering::Acquire);
+    if p.is_null() {
+        return;
+    }
+    // SAFETY: `install` leaks every kernel's lock: it lives as long as the process.
+    let kernel: KernelRef = unsafe { &*p };
+    let Some(mut guard) = lock_within(kernel, patience) else { return };
+    let Some(k) = guard.as_mut() else { return };
+    // No guest thread runs here; the line is stamped now, as a scope would be.
+    if k.config.play {
+        k.sched.current = None;
+        k.sched.real_now = k.sched.real_now.max(play::real_ticks());
+    }
+    k.stop(0, why);
 }
 
 /// Takes this thread's kernel back; threads attached to it find none.

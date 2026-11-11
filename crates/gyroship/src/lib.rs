@@ -126,13 +126,16 @@ impl ApplicationHandler for App {
 
     fn window_event(&mut self, _event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
-            // The guest ends the run at its next frame (its journal flushed); one
-            // busy loading ends here 2 s later.
+            // The guest ends the run at its next frame (its journal flushed). With no
+            // frame 2 s later (a long loading, a frozen game), it stops from here,
+            // threads' states, journal, reports and --record written, unless the
+            // kernel stays busy.
             WindowEvent::CloseRequested => {
                 self.shared.closed.store(true, Ordering::Relaxed);
                 std::thread::spawn(|| {
                     std::thread::sleep(Duration::from_secs(2));
-                    eprintln!("gyroship: window closed while no frame came");
+                    gyroship_hle::stop_from_outside("window closed while no frame came", gyroship_hle::CLOSE_WAIT);
+                    eprintln!("gyroship: window closed while no frame came, and the kernel stayed busy: nothing written");
                     std::process::exit(0);
                 });
             }

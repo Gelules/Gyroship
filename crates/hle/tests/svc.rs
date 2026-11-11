@@ -300,6 +300,52 @@ fn a_fault_report_waits_for_another_threads_lock() {
     assert!(journal.contains("stack at the last SVC:"), "{journal}");
 }
 
+/// Only does something when started by `a_closed_window_stops_a_frozen_run`.
+#[test]
+fn close_wait_child() {
+    let Ok(dir) = std::env::var("GYROSHIP_CLOSE_WAIT_CHILD") else { return };
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(20));
+        std::process::exit(99);
+    });
+    let dir = std::path::Path::new(&dir);
+    let (mut k, _cpu) = kernel(Config { record: Some(dir.join("record.txt")), ..Config::default() });
+    k.journal = Journal::file(&dir.join("journal.log")).unwrap();
+    k.recorded.as_mut().unwrap().push("5 A".into());
+    let shared = gyroship_hle::install(k);
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let b = barrier.clone();
+    // Another host thread holds the kernel a while: the stop waits for it.
+    let _holder = std::thread::spawn(move || {
+        gyroship_hle::attach(shared);
+        gyroship_hle::with(|_| {
+            b.wait();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        });
+    });
+    barrier.wait();
+    gyroship_hle::stop_from_outside("window closed while no frame came", gyroship_hle::CLOSE_WAIT);
+}
+
+/// A window closed while no frame comes (a frozen game): the window's thread
+/// stops the run once the kernel is free, its journal and `--record` written.
+#[test]
+fn a_closed_window_stops_a_frozen_run() {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("close-wait");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "close_wait_child", "--nocapture", "--test-threads=1"])
+        .env("GYROSHIP_CLOSE_WAIT_CHILD", &dir)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    let journal = std::fs::read_to_string(dir.join("journal.log")).unwrap();
+    assert!(journal.contains("window closed while no frame came"), "{journal}");
+    assert_eq!(std::fs::read_to_string(dir.join("record.txt")).unwrap(), "5 A\n1 end\n", "{stderr}");
+}
+
 /// Only does something when started by `stops_are_logged`.
 #[test]
 fn stop_child() {
