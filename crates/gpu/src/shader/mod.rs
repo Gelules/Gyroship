@@ -1095,6 +1095,15 @@ impl Cx {
                 let (x, y) = (self.f(a)?, self.f(b)?);
                 self.set(out, *dst, &format!("pack2x16float(vec2<f32>({y}, {x}))"));
             }
+            // UIMAD: the low word of a × b + c on the uniform datapath (signedness only
+            // changes a high word). The .X and carry forms stay refused: the game's 102
+            // UIMAD have neither (carry-out UPT, carry-in !UPT).
+            Fp16Op::Uimad { dst, a, b, c, x: false, carry_out: PT, carry_in, .. } if *carry_in == (Pred { reg: PT, not: true }) => {
+                let known = self.uvals([a, b, c]).map(|x| UExpr::Mad(Box::new(x)));
+                let (x, y, z) = (self.i(a, false)?, self.i(b, false)?, self.i(c, false)?);
+                self.set_ur(out, *dst, &format!("{x} * {y} + {z}"));
+                self.known(*dst, known);
+            }
             other => return Err(format!("unsupported: Fp16({other:?})")),
         }
         Ok(())
@@ -1356,16 +1365,7 @@ impl Cx {
             }
             // LEA, with the carry out of the add when asked (the low half of a 64-bit address).
             IntOp::Lea { dst, a, b, c, shift, hi, x: false, neg_shifted, overflow, carry } if *carry == (Pred { reg: PT, not: true }) => {
-                let (lo, add, high) = (self.raw(a)?, self.i(b, false)?, self.raw(c)?);
-                let s = u32::from(*shift);
-                let shifted = match (*hi, s) {
-                    (false, _) => format!("({lo} << {s}u)"),
-                    (true, 0) => high,
-                    (true, _) => format!("(({high} << {s}u) | ({lo} >> {}u))", 32 - s),
-                };
-                let shifted = if *neg_shifted { format!("(0u - {shifted})") } else { shifted };
-                let (t, sum) = (self.temp(), self.temp());
-                let _ = writeln!(out, "let {t} = {shifted};\nlet {sum} = {t} + {add};");
+                let (t, sum) = self.lea(out, [a, b, c], *shift, *hi, *neg_shifted)?;
                 self.set_p(out, *overflow, &format!("{sum} < {t}"));
                 self.set(out, *dst, &sum);
                 if !*hi {
@@ -1392,6 +1392,21 @@ impl Cx {
             other => return Err(format!("unsupported: {other:?}")),
         }
         Ok(())
+    }
+
+    /// LEA's shifted value and sum, as two `let`s (shared by LEA and ULEA).
+    fn lea(&mut self, out: &mut String, [a, b, c]: [&Operand; 3], shift: u8, hi: bool, neg: bool) -> R<(String, String)> {
+        let (lo, add, high) = (self.raw(a)?, self.i(b, false)?, self.raw(c)?);
+        let s = u32::from(shift);
+        let shifted = match (hi, s) {
+            (false, _) => format!("({lo} << {s}u)"),
+            (true, 0) => high,
+            (true, _) => format!("(({high} << {s}u) | ({lo} >> {}u))", 32 - s),
+        };
+        let shifted = if neg { format!("(0u - {shifted})") } else { shifted };
+        let (t, sum) = (self.temp(), self.temp());
+        let _ = writeln!(out, "let {t} = {shifted};\nlet {sum} = {t} + {add};");
+        Ok((t, sum))
     }
 
     fn moves(&mut self, out: &mut String, op: &MovesOp) -> R<()> {
@@ -1569,6 +1584,21 @@ impl Cx {
                 let (e1, e2) = (bool_op(*set_op as u8, &t, &acc), bool_op(*set_op as u8, &format!("!{t}"), &acc));
                 self.set_up(out, dst[0], &e1);
                 self.set_up(out, dst[1], &e2);
+            }
+            // As LEA, on the uniform datapath (the game's 29 are (UR << 1..3) + imm);
+            // the .X and carry-in forms stay refused.
+            MovesOp::ULea { dst, a, b, c, neg_shifted, x: false, shift, hi, overflow, carry } if *carry == (Pred { reg: PT, not: true }) => {
+                let known = match (self.uval(a), self.uval(b)) {
+                    (Some(a), Some(b)) if !*hi && !*neg_shifted => {
+                        let shifted = UExpr::Shf { parts: Box::new([a, UExpr::Imm(u32::from(*shift)), UExpr::Imm(0)]), limit: 31, wrap: false, right: false, signed: false, hi: false };
+                        Some(UExpr::Add(Box::new([shifted, b, UExpr::Imm(0)])))
+                    }
+                    _ => None,
+                };
+                let (t, sum) = self.lea(out, [a, b, c], *shift, *hi, *neg_shifted)?;
+                self.set_up(out, *overflow, &format!("{sum} < {t}"));
+                self.set_ur(out, *dst, &sum);
+                self.known(*dst, known);
             }
             other => return Err(format!("unsupported: {other:?}")),
         }
@@ -2501,6 +2531,24 @@ mod tests {
         let t = translate_with(&code, options).unwrap_or_else(|e| panic!("{e}"));
         validate(&t.wgsl).unwrap_or_else(|e| panic!("{e}\n{}", t.wgsl));
         t
+    }
+
+    #[test]
+    fn uniform_multiply_adds_and_shifted_adds_translate() {
+        // UMOV UR4, UR5; UIMAD UR6 = UR5 × 7 + UR4; ULEA UR7, UP0 = (UR4 << 3) + 0xfffffff9;
+        // MOV R0 = UR6, R1 = UR7.
+        let umov = |d: u128, v: u128| w(0x882, &[(16, d), (32, v)]);
+        let uimad = |extra: &[(u32, u128)]| w(0x8a4, &[&[(16, 6), (24, 5), (32, 7), (64, 4), (81, 7), (87, 7), (90, 1), (91, 1)], extra].concat());
+        let ulea = w(0x891, &[(16, 7), (24, 4), (32, 0xffff_fff9), (64, 63), (75, 3), (81, 0), (87, 7), (90, 1)]);
+        let mov = |d: u128, u: u128| w(0xc02, &[(16, d), (32, u), (72, 0xf), (91, 1)]);
+        let options = Options { workgroup: [1, 1, 1], ..Default::default() };
+        let t = compute(&[umov(4, 0x8000_0001), umov(5, 0xffff_fff3), uimad(&[]), ulea, mov(0, 6), mov(1, 7)], &options);
+        for want in ["ur6 = ur5 * 0x7u + ur4;", "(ur4 << 3u)", "up0 = "] {
+            assert!(t.wgsl.contains(want), "{want}\n{}", t.wgsl);
+        }
+        // The .X form stays refused.
+        let code: Vec<u8> = [uimad(&[(74, 1)]), exit(), bra(-16)].concat();
+        assert!(translate_with(&code, &options).is_err());
     }
 
     #[test]

@@ -15,6 +15,8 @@ pub enum UExpr {
     Lop3(u8, Box<[UExpr; 3]>),
     /// a + b + c.
     Add(Box<[UExpr; 3]>),
+    /// a × b + c, the low word (UIMAD).
+    Mad(Box<[UExpr; 3]>),
     /// Funnel shift of high:low by `amount`, as SHF: masked by `limit` when
     /// `wrap`, else clamped to `limit + 1`; the high word when `hi`.
     Shf { parts: Box<[UExpr; 3]>, limit: u32, wrap: bool, right: bool, signed: bool, hi: bool },
@@ -35,6 +37,10 @@ impl UExpr {
             UExpr::Add(x) => {
                 let [a, b, c] = all(x)?;
                 a.wrapping_add(b).wrapping_add(c)
+            }
+            UExpr::Mad(x) => {
+                let [a, b, c] = all(x)?;
+                a.wrapping_mul(b).wrapping_add(c)
             }
             UExpr::Shf { parts, limit, wrap, right, signed, hi } => {
                 let [low, shift, high] = all(parts)?;
@@ -57,7 +63,7 @@ impl UExpr {
             UExpr::CBuf(bank, _) => {
                 out.insert(*bank);
             }
-            UExpr::Lop3(_, x) | UExpr::Add(x) | UExpr::Shf { parts: x, .. } => x.iter().for_each(|e| e.banks(out)),
+            UExpr::Lop3(_, x) | UExpr::Add(x) | UExpr::Mad(x) | UExpr::Shf { parts: x, .. } => x.iter().for_each(|e| e.banks(out)),
         }
     }
 }
@@ -80,6 +86,7 @@ mod tests {
         let sampler = UExpr::Shf { parts: Box::new([UExpr::Imm(0), UExpr::Imm(20), handle.clone()]), limit: 31, wrap: false, right: true, signed: false, hi: true };
         assert_eq!(sampler.eval(&words), Some(0x23));
         assert_eq!(UExpr::Add(Box::new([UExpr::Imm(u32::MAX), UExpr::Imm(2), UExpr::CBuf(2, 0x40)])).eval(&words), Some(0x43));
+        assert_eq!(UExpr::Mad(Box::new([UExpr::Imm(0xffff_fff3), UExpr::Imm(7), UExpr::CBuf(2, 0x40)])).eval(&words), Some(0xffff_fff3u32.wrapping_mul(7) + 0x42));
         assert_eq!(UExpr::CBuf(3, 0).eval(&words), None);
         let mut banks = BTreeSet::new();
         sampler.banks(&mut banks);
