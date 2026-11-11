@@ -162,9 +162,10 @@ impl Service {
             // prepo: reports are accepted and dropped (offline).
             (Service::Prepo, _) => Reply::ok(),
             (Service::Ssl, 5) => Reply::ok(),
-            // chat:u: open a session, then 3 and 11 (11 at every frame) succeed empty.
+            // chat:u: open a session, then 3, 11 (at every frame) and 23
+            // (SetScreenSharingMode, at the end of the tutorial) succeed empty.
             (Service::Chat { session: false }, 0) => Reply::object(Service::Chat { session: true }),
-            (Service::Chat { session: false }, 3 | 11) => Reply::ok(),
+            (Service::Chat { session: false }, 3 | 11 | 23) => Reply::ok(),
             // The session's event: never signaled.
             (Service::Chat { session: true }, 1) => match k.lone_event() {
                 Some(h) => Reply { copy_handles: vec![h], ..Reply::ok() },

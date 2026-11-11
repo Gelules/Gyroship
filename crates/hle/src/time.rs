@@ -70,6 +70,8 @@ impl Time {
             (Time::SystemClock(_), 2) => Reply::with(&[0; 0x20]),
             // GetCurrentTimePoint: seconds since boot and a clock source id.
             (Time::SteadyClock, 0) => Reply::with(&[&((k.now() / 31_250_000) as i64).to_le_bytes()[..], &[0; 16]].concat()),
+            // ToCalendarTimeWithMyRule: the device's zone is UTC.
+            (Time::ZoneService, 101) => Reply::with(&calendar(req.u64_at(0).unwrap_or_default() as i64)),
             _ => return None,
         })
     }
@@ -98,20 +100,31 @@ fn snapshot(k: &Kernel, seconds: i64) -> Vec<u8> {
     s[0x00..0x08].copy_from_slice(&EPOCH.to_le_bytes());
     s[0x10..0x20].copy_from_slice(&id);
     s[0x40..0x48].copy_from_slice(&seconds.to_le_bytes());
-    // User calendar time and its additional information (day of week, day of year, zone "UTC").
-    let days = seconds.div_euclid(86_400);
-    let secs = seconds.rem_euclid(86_400);
-    let (year, month, day) = civil(days);
-    s[0x50..0x52].copy_from_slice(&(year as u16).to_le_bytes());
-    s[0x52..0x57].copy_from_slice(&[month, day, (secs / 3600) as u8, (secs / 60 % 60) as u8, (secs % 60) as u8]);
-    s[0x60..0x64].copy_from_slice(&((days + 4).rem_euclid(7) as u32).to_le_bytes());
-    s[0x64..0x68].copy_from_slice(&((days - civil_days(year)) as u32).to_le_bytes());
-    s[0x68..0x6B].copy_from_slice(b"UTC");
+    // User calendar time and its additional information.
+    let c = calendar(seconds);
+    s[0x50..0x58].copy_from_slice(&c[..8]);
+    s[0x60..0x78].copy_from_slice(&c[8..]);
     // Steady clock time point, location name, then automatic correction off.
     s[0x90..0x98].copy_from_slice(&steady.to_le_bytes());
     s[0x98..0xA8].copy_from_slice(&id);
     s[0xA8..0xAB].copy_from_slice(b"UTC");
     s
+}
+
+/// The CalendarTime (8 bytes) then the CalendarAdditionalInfo (0x18: day of
+/// week, day of year, zone "UTC", no daylight saving, no offset) of POSIX
+/// time `seconds`, in UTC.
+fn calendar(seconds: i64) -> [u8; 0x20] {
+    let days = seconds.div_euclid(86_400);
+    let secs = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil(days);
+    let mut c = [0u8; 0x20];
+    c[0x00..0x02].copy_from_slice(&(year as u16).to_le_bytes());
+    c[0x02..0x07].copy_from_slice(&[month, day, (secs / 3600) as u8, (secs / 60 % 60) as u8, (secs % 60) as u8]);
+    c[0x08..0x0C].copy_from_slice(&((days + 4).rem_euclid(7) as u32).to_le_bytes());
+    c[0x0C..0x10].copy_from_slice(&((days - civil_days(year)) as u32).to_le_bytes());
+    c[0x10..0x13].copy_from_slice(b"UTC");
+    c
 }
 
 /// Days from 1970-01-01 to January 1st of `year`.
@@ -173,5 +186,15 @@ mod tests {
         assert_eq!(civil_days(2026), 20_454);
         // 2026-01-01 is a Thursday (0 is Sunday).
         assert_eq!((20_454 + 4) % 7, 4);
+    }
+
+    #[test]
+    fn calendar_of_a_posix_time() {
+        // 2026-03-01 13:11:32 UTC: a Sunday, day 59 of the year.
+        let c = calendar(EPOCH + 59 * 86_400 + 13 * 3600 + 11 * 60 + 32);
+        assert_eq!(c[..8], [0xEA, 0x07, 3, 1, 13, 11, 32, 0]);
+        assert_eq!(c[8..16], [0, 0, 0, 0, 59, 0, 0, 0]);
+        assert_eq!(c[16..24], *b"UTC\0\0\0\0\0");
+        assert_eq!(c[24..], [0; 8]);
     }
 }
