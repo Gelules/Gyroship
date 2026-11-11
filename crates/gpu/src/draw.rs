@@ -65,6 +65,61 @@ fn read_until(mem: Mem, gpu: u64, key: fn(&[u8]) -> Option<(u64, usize)>) -> Opt
 /// of the WGSL (some programs are 300 KB of text, drawn a dozen times a frame).
 type Module = Result<std::sync::Arc<(Translation, wgpu::ShaderModule)>, String>;
 
+/// Work for the pipeline worker threads (play mode, D42).
+pub(crate) type Job = Box<dyn FnOnce() + Send>;
+
+/// How many pipelines are made at once off the GPU thread: one that never
+/// returns (the driver once worked on one for minutes) holds its thread only.
+const WORKERS: usize = 3;
+
+/// A pipeline, or one a worker thread is making: the worker sets the cell;
+/// since when, its label (`p<program>+<pixel program>`), and whether it was
+/// reported as slow.
+pub(crate) enum Made<T> {
+    Ready(T),
+    Pending(std::sync::Arc<std::sync::OnceLock<T>>, std::time::Instant, String, bool),
+}
+
+impl<T: Clone> Made<T> {
+    /// The pipeline, once made (a pending one done since becomes ready).
+    pub(crate) fn ready(&mut self) -> Option<T> {
+        if let Made::Pending(cell, ..) = self
+            && let Some(p) = cell.get()
+        {
+            *self = Made::Ready(p.clone());
+        }
+        match self {
+            Made::Ready(p) => Some(p.clone()),
+            Made::Pending(..) => None,
+        }
+    }
+}
+
+/// The worker threads and their queue. The SPIR-V of a program is written
+/// inside the pipeline call (wgpu-hal): their stacks are the size of the
+/// guest threads', which made pipelines until then.
+fn pipeline_workers() -> std::sync::mpsc::Sender<Job> {
+    let (tx, rx) = std::sync::mpsc::channel::<Job>();
+    let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+    for i in 0..WORKERS {
+        let rx = rx.clone();
+        let spawned = std::thread::Builder::new().name(format!("pipelines {i}")).stack_size(16 << 20).spawn(move || {
+            loop {
+                // A statement of its own: the queue's lock is released before the job runs.
+                let job = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).recv();
+                match job {
+                    Ok(job) => job(),
+                    Err(_) => return,
+                }
+            }
+        });
+        if let Err(e) = spawned {
+            eprintln!("gyroship: no pipeline worker thread: {e}");
+        }
+    }
+    tx
+}
+
 /// The caches below are hashed with `Fx`: SipHash cost more than the lookups,
 /// every draw hashing a pipeline key, texture and sampler headers.
 #[derive(Default)]
@@ -76,12 +131,12 @@ pub struct Cache {
     /// images compute programs wrote, by GPU address (see `compute.rs`).
     pub(crate) compute_programs: FxMap<u64, Option<u64>>,
     pub(crate) compute: FxMap<String, crate::compute::Compiled>,
-    pub(crate) compute_pipelines: FxMap<String, (wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
+    pub(crate) compute_pipelines: FxMap<String, (Made<wgpu::ComputePipeline>, wgpu::BindGroupLayout)>,
     pub(crate) images: FxMap<u64, wgpu::Texture>,
     /// Translations by (program key, key of the pixel program it pairs with,
     /// mask of the attributes fetched as integers, hash of the jump targets or 0).
     modules: FxMap<(u64, Option<u64>, u64, u64), Module>,
-    pipelines: FxMap<PipelineKey, (wgpu::RenderPipeline, Vec<wgpu::BindGroupLayout>)>,
+    pipelines: FxMap<PipelineKey, (Made<wgpu::RenderPipeline>, Vec<wgpu::BindGroupLayout>)>,
     /// Uploaded textures by address and header, with the end of the memory they came from.
     textures: FxMap<(u64, [u8; 32]), (wgpu::Texture, u64)>,
     /// Samplers by header, filtering and compare.
@@ -282,7 +337,42 @@ impl Bindings {
     }
 }
 
+impl<T> Made<T> {
+    /// Its label, the first time it is found still being made `after` it was asked for.
+    fn overdue(&mut self, after: std::time::Duration) -> Option<String> {
+        match self {
+            Made::Pending(cell, since, label, reported) if !*reported && cell.get().is_none() && since.elapsed() >= after => {
+                *reported = true;
+                Some(label.clone())
+            }
+            _ => None,
+        }
+    }
+}
+
 impl Surfaces {
+    /// A pipeline `make` makes: at once in the deterministic engine; on a
+    /// worker thread in play mode (D42), pending until it is done.
+    pub(crate) fn make<T: Send + Sync + 'static>(&mut self, make: impl FnOnce() -> T + Send + 'static, label: String) -> Made<T> {
+        if !self.background {
+            return Made::Ready(make());
+        }
+        let cell = std::sync::Arc::new(std::sync::OnceLock::new());
+        let done = cell.clone();
+        let workers = self.workers.get_or_insert_with(pipeline_workers);
+        let _ = workers.send(Box::new(move || {
+            let _ = done.set(make());
+        }));
+        Made::Pending(cell, std::time::Instant::now(), label, false)
+    }
+
+    /// The pipelines still being made `after` they were asked for, each named
+    /// once (play mode: the driver may take seconds, or never return).
+    pub fn overdue(&mut self, after: std::time::Duration) -> Vec<String> {
+        let c = &mut self.cache;
+        c.pipelines.values_mut().filter_map(|(m, _)| m.overdue(after)).chain(c.compute_pipelines.values_mut().filter_map(|(m, _)| m.overdue(after))).collect()
+    }
+
     /// The guest memory each uploaded texture came from, as GPU address ranges
     /// (start, end): the HLE forgets those the CPU has written since.
     pub fn texture_ranges(&self) -> Vec<(u64, u64)> {
@@ -500,32 +590,44 @@ impl Surfaces {
         let groups = group_layouts.iter().rposition(|e| !e.is_empty()).map_or(0, |g| g + 1);
         group_layouts.truncate(groups);
         let key: PipelineKey = ((vs.0.key, vs.0.wgsl.len()), ps.as_ref().map(|p| (p.0.key, p.0.wgsl.len())), layouts, primitive, color_states, depth_state, group_layouts);
-        let (pipeline, bind_layouts) = match self.cache.pipelines.get(&key) {
-            Some(p) => p.clone(),
-            None => {
-                let since = std::time::Instant::now();
-                let (_, _, layouts, primitive, color_states, depth_state, group_layouts) = &key;
-                let bind_layouts: Vec<wgpu::BindGroupLayout> = group_layouts.iter().map(|entries| self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries })).collect();
-                let refs: Vec<Option<&wgpu::BindGroupLayout>> = bind_layouts.iter().map(Some).collect();
-                let layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &refs, ..Default::default() });
-                let buffers: Vec<Option<wgpu::VertexBufferLayout>> = layouts.iter().map(|(_, step, stride, attributes)| Some(wgpu::VertexBufferLayout { array_stride: *stride, step_mode: *step, attributes })).collect();
-                let p = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        if !self.cache.pipelines.contains_key(&key) {
+            let since = std::time::Instant::now();
+            let (_, _, layouts, primitive, color_states, depth_state, group_layouts) = &key;
+            let bind_layouts: Vec<wgpu::BindGroupLayout> = group_layouts.iter().map(|entries| self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries })).collect();
+            let refs: Vec<Option<&wgpu::BindGroupLayout>> = bind_layouts.iter().map(Some).collect();
+            let layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &refs, ..Default::default() });
+            // Owned: a worker thread may make it.
+            let buffers: Vec<(u64, wgpu::VertexStepMode, Vec<wgpu::VertexAttribute>)> = layouts.iter().map(|(_, step, stride, attributes)| (*stride, *step, attributes.clone())).collect();
+            let (device, vertex, pixel) = (self.device.clone(), vs.1.clone(), ps.as_ref().map(|p| p.1.clone()));
+            let (primitive, targets, depth_stencil) = (*primitive, color_states.clone(), depth_state.clone());
+            let make = move || {
+                let buffers: Vec<Option<wgpu::VertexBufferLayout>> = buffers.iter().map(|(stride, step, attributes)| Some(wgpu::VertexBufferLayout { array_stride: *stride, step_mode: *step, attributes })).collect();
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                     label: None,
                     layout: Some(&layout),
-                    vertex: wgpu::VertexState { module: &vs.1, entry_point: Some("main"), compilation_options: Default::default(), buffers: &buffers },
-                    fragment: ps.as_ref().map(|p| wgpu::FragmentState { module: &p.1, entry_point: Some("main"), compilation_options: Default::default(), targets: color_states }),
-                    primitive: *primitive,
-                    depth_stencil: depth_state.clone(),
+                    vertex: wgpu::VertexState { module: &vertex, entry_point: Some("main"), compilation_options: Default::default(), buffers: &buffers },
+                    fragment: pixel.as_ref().map(|module| wgpu::FragmentState { module, entry_point: Some("main"), compilation_options: Default::default(), targets: &targets }),
+                    primitive,
+                    depth_stencil,
                     multisample: Default::default(),
                     multiview_mask: None,
                     cache: None,
-                });
-                self.cache.pipelines.insert(key, (p.clone(), bind_layouts.clone()));
-                self.compile.pipelines += 1;
-                self.compile.pipeline_time += since.elapsed();
-                (p, bind_layouts)
-            }
+                })
+            };
+            let label = format!("p{:016x}+{}", vs.0.key, ps.as_ref().map_or("none".into(), |p| format!("{:016x}", p.0.key)));
+            let made = self.make(make, label.clone());
+            self.cache.pipelines.insert(key.clone(), (made, bind_layouts));
+            self.compile.pipelines += 1;
+            self.compile.pipeline_time += since.elapsed();
+            self.compile.made.push(label);
+        }
+        let (made, bind_layouts) = self.cache.pipelines.get_mut(&key).ok_or("pipeline")?;
+        let Some(pipeline) = made.ready() else {
+            // Being made on a worker thread (play mode): the frame goes on without this draw.
+            self.compile.waited += 1;
+            return Ok(());
         };
+        let bind_layouts = bind_layouts.clone();
 
         let mut bind_groups = Vec::new();
         for (g, layout) in bind_layouts.iter().enumerate() {
@@ -673,6 +775,7 @@ impl Surfaces {
             self.cache.modules.insert(id, made);
             self.compile.modules += 1;
             self.compile.module_time += since.elapsed();
+            self.compile.made.push(format!("m{key:016x}/{:x}", id.3));
         }
         self.cache.modules[&id].clone()
     }
@@ -1393,5 +1496,35 @@ mod tests {
             }";
         assert_eq!(run(&mut s, x, tic, tsc, Vec::new(), wgsl, 2), vec![0.25, 4.0]);
         assert!(s.skipped.is_empty(), "{:?}", s.skipped);
+    }
+
+    /// D42: the deterministic engine makes a pipeline at once; play mode hands
+    /// it to a worker thread, pending until done, and names a slow one once.
+    #[test]
+    fn play_mode_makes_pipelines_on_worker_threads() {
+        let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
+            eprintln!("no GPU adapter: test skipped");
+            return;
+        };
+        assert!(matches!(s.make(|| 7u32, "now".into()), Made::Ready(7)));
+        s.background = true;
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let mut slow = s.make(move || rx.recv().map_or(0, |()| 8u32), "slow".into());
+        assert_eq!(slow.ready(), None);
+        assert_eq!(slow.overdue(std::time::Duration::ZERO).as_deref(), Some("slow"));
+        assert_eq!(slow.overdue(std::time::Duration::ZERO), None, "named once");
+        // One that never returns holds its own worker only.
+        let mut quick = s.make(|| 9u32, "quick".into());
+        let since = std::time::Instant::now();
+        while quick.ready().is_none() {
+            assert!(since.elapsed() < std::time::Duration::from_secs(5), "a stuck worker held the others");
+            std::thread::yield_now();
+        }
+        tx.send(()).unwrap();
+        while slow.ready().is_none() {
+            assert!(since.elapsed() < std::time::Duration::from_secs(5));
+            std::thread::yield_now();
+        }
+        assert_eq!((slow.ready(), quick.ready()), (Some(8), Some(9)));
     }
 }

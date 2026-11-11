@@ -232,26 +232,36 @@ impl Surfaces {
             });
         }
         let id = format!("{key:x}/{:?}/{:#x}/{layout_entries:?}", l.block, l.shared);
-        let (pipeline, layout) = match self.cache.compute_pipelines.get(&id) {
-            Some(p) => p.clone(),
-            None => {
-                let since = std::time::Instant::now();
-                let layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &layout_entries });
-                let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&layout)], ..Default::default() });
-                let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        if !self.cache.compute_pipelines.contains_key(&id) {
+            let since = std::time::Instant::now();
+            let layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &layout_entries });
+            let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&layout)], ..Default::default() });
+            // Owned: a worker thread may make it.
+            let (device, module) = (self.device.clone(), module.clone());
+            let make = move || {
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: Some(&format!("{key:016x}")),
                     layout: Some(&pipeline_layout),
-                    module,
+                    module: &module,
                     entry_point: Some("main"),
                     compilation_options: Default::default(),
                     cache: None,
-                });
-                self.cache.compute_pipelines.insert(id, (pipeline.clone(), layout.clone()));
-                self.compile.pipelines += 1;
-                self.compile.pipeline_time += since.elapsed();
-                (pipeline, layout)
-            }
+                })
+            };
+            let label = format!("p{key:016x}+compute");
+            let made = self.make(make, label.clone());
+            self.cache.compute_pipelines.insert(id.clone(), (made, layout));
+            self.compile.pipelines += 1;
+            self.compile.pipeline_time += since.elapsed();
+            self.compile.made.push(label);
+        }
+        let (made, layout) = self.cache.compute_pipelines.get_mut(&id).ok_or("compute pipeline")?;
+        let Some(pipeline) = made.ready() else {
+            // Being made on a worker thread (play mode): the frame goes on without this dispatch.
+            self.compile.waited += 1;
+            return Ok(());
         };
+        let layout = layout.clone();
         let mut buffers: Vec<(u32, (wgpu::Buffer, u64, u64))> = bindings
             .cbufs
             .iter()
@@ -310,6 +320,7 @@ impl Surfaces {
         self.cache.compute.insert(id, made.clone());
         self.compile.modules += 1;
         self.compile.module_time += since.elapsed();
+        self.compile.made.push(format!("m{key:016x}/compute"));
         made
     }
 }

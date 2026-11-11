@@ -311,6 +311,8 @@ pub fn run(table: Vec<rt::Entry>, window: Option<HostWindow>) {
         match surfaces {
             Ok(mut s) => {
                 k.log(&format!("gpu: host renderer {}", s.describe()));
+                // D42: in play mode a pipeline the driver takes seconds over holds no frame.
+                s.background = k.config.play;
                 if k.config.perf.is_some() && !s.measure_frames() {
                     eprintln!("gyroship: --perf: this GPU has no timestamps inside command encoders: no GPU frame times");
                 }

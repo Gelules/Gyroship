@@ -16,6 +16,9 @@ use crate::thread::Object;
 /// is journaled: the frame's whole budget at 20 frames a second.
 const SLOW_COMPILE: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// How long a pipeline may compile on a worker thread before it is reported.
+const OVERDUE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// State the graphics sessions share (plain data).
 #[derive(Debug, Default)]
 pub struct State {
@@ -516,9 +519,16 @@ impl Kernel {
             // Shader work that held this frame back: host time, so in the play
             // journal only (the deterministic one stays byte-identical).
             let c = std::mem::take(&mut s.compile);
-            s.compile_total += c;
+            s.compile_total += c.clone();
+            let overdue = if self.config.play { s.overdue(OVERDUE) } else { Vec::new() };
             if self.config.play && c.module_time + c.pipeline_time >= SLOW_COMPILE {
-                self.log(&format!("gpu: present #{n}: {} modules in {} ms, {} pipelines in {} ms", c.modules, c.module_time.as_millis(), c.pipelines, c.pipeline_time.as_millis()));
+                self.log(&format!("gpu: present #{n}: {} modules in {} ms, {} pipelines in {} ms: {}", c.modules, c.module_time.as_millis(), c.pipelines, c.pipeline_time.as_millis(), c.made.join(" ")));
+            }
+            // D42: a pipeline the driver works on that long; its draws wait meanwhile.
+            for label in overdue {
+                let line = format!("gpu: present #{n}: pipeline {label} still compiling after {} s; its draws wait", OVERDUE.as_secs());
+                eprintln!("gyroship: {line}");
+                self.log(&line);
             }
             for (why, count) in skipped {
                 // Each distinct reason is journaled once, past the anomaly's first few lines.
