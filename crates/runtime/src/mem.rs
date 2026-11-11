@@ -128,9 +128,10 @@ pub enum Error {
 /// The guest address space, shared by every host thread that runs guest code
 /// or the HLE. The block table sits behind a lock: map, unmap, protect and
 /// attribute changes take it to write, checks take it to read, and the access
-/// a check allows runs once it is released. Changes made of several calls
-/// (query, then map) rely on the kernel lock, under which every table change
-/// runs.
+/// a check allows runs under the same read lock (copies chunk by chunk, see
+/// CHUNK), so that no unmap decommits pages under it. Changes made of several
+/// calls (query, then map) rely on the kernel lock, under which every table
+/// change runs.
 pub struct Memory {
     base: *mut u8,
     blocks: RwLock<Table>,
@@ -147,6 +148,11 @@ unsafe impl Sync for Memory {}
 /// Mapped blocks only: start -> (end, block). Gaps are Free.
 #[derive(Default)]
 struct Table(BTreeMap<u64, (u64, Block)>);
+
+/// HLE copies run in chunks of this size, each checked and copied under the
+/// table's read lock: an unmap on another host thread (play mode) waits for one
+/// chunk at most, and a copy of 128 MiB never holds the lock throughout.
+const CHUNK: usize = 1 << 20;
 
 /// Base of the reservation the fault handler reports on (0 when none).
 static RESERVATION: AtomicUsize = AtomicUsize::new(0);
@@ -261,36 +267,52 @@ impl Memory {
     /// Reads a guest-supplied buffer for the HLE. Every byte must be mapped
     /// with guest permission R: guest addresses are checked here, never trusted.
     pub fn read(&self, addr: u64, out: &mut [u8]) -> Result<(), Error> {
-        self.accessible(addr, out.len() as u64, perm::R)?;
-        // SAFETY: checked just above.
-        unsafe { std::ptr::copy_nonoverlapping(self.base.add(addr as usize), out.as_mut_ptr(), out.len()) };
-        Ok(())
+        let to = out.as_mut_ptr();
+        // SAFETY: each chunk is copied under the read lock it was checked under.
+        self.chunked(addr, out.len(), |t, a, n| t.accessible(a, n, perm::R), |at, n| unsafe { std::ptr::copy_nonoverlapping(self.base.add(addr as usize + at), to.add(at), n) })
     }
 
     /// Writes a guest-supplied buffer for the HLE; every byte needs guest
     /// permission W.
     pub fn write(&self, addr: u64, data: &[u8]) -> Result<(), Error> {
-        self.accessible(addr, data.len() as u64, perm::W)?;
-        // SAFETY: checked just above.
-        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), self.base.add(addr as usize), data.len()) };
-        Ok(())
+        // SAFETY: as in `read`.
+        self.chunked(addr, data.len(), |t, a, n| t.accessible(a, n, perm::W), |at, n| unsafe { std::ptr::copy_nonoverlapping(data.as_ptr().add(at), self.base.add(addr as usize + at), n) })
     }
 
     /// Writes memory the HLE owns (shared memory, locked pages): the guest
     /// may only have R there, but the host pages are writable.
     pub fn write_object(&self, addr: u64, data: &[u8]) -> Result<(), Error> {
-        self.table().host_accessible(addr, data.len() as u64, PAGE_READWRITE)?;
-        // SAFETY: checked just above.
-        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), self.base.add(addr as usize), data.len()) };
-        Ok(())
+        // SAFETY: as in `read`.
+        self.chunked(addr, data.len(), |t, a, n| t.host_accessible(a, n, PAGE_READWRITE), |at, n| unsafe { std::ptr::copy_nonoverlapping(data.as_ptr().add(at), self.base.add(addr as usize + at), n) })
     }
 
     /// Reads memory the HLE owns, whatever the guest's permission.
     pub fn read_object(&self, addr: u64, out: &mut [u8]) -> Result<(), Error> {
-        self.table().host_accessible(addr, out.len() as u64, PAGE_READWRITE)?;
-        // SAFETY: checked just above.
-        unsafe { std::ptr::copy_nonoverlapping(self.base.add(addr as usize), out.as_mut_ptr(), out.len()) };
-        Ok(())
+        let to = out.as_mut_ptr();
+        // SAFETY: as in `read`.
+        self.chunked(addr, out.len(), |t, a, n| t.host_accessible(a, n, PAGE_READWRITE), |at, n| unsafe { std::ptr::copy_nonoverlapping(self.base.add(addr as usize + at), to.add(at), n) })
+    }
+
+    /// `copy(offset, len)` over `len` bytes from `addr`, CHUNK bytes at a time,
+    /// each under the table's read lock once `ok` holds for it. A range longer
+    /// than a chunk is checked whole first: a refused range copies nothing,
+    /// unless it is unmapped meanwhile, which stops the copy at that chunk.
+    fn chunked(&self, addr: u64, len: usize, ok: impl Fn(&Table, u64, u64) -> Result<(), Error>, mut copy: impl FnMut(usize, usize)) -> Result<(), Error> {
+        if len > CHUNK {
+            ok(&self.table(), addr, len as u64)?;
+        }
+        let mut at = 0;
+        loop {
+            let n = CHUNK.min(len - at);
+            let t = self.table();
+            ok(&t, addr + at as u64, n as u64)?;
+            copy(at, n);
+            drop(t);
+            at += n;
+            if at >= len {
+                return Ok(());
+            }
+        }
     }
 
     /// Whether every byte of `[addr, addr + len)` is mapped with the guest
@@ -299,33 +321,33 @@ impl Memory {
         self.table().accessible(addr, len, need)
     }
 
-    /// The naturally aligned guest word at `addr` as host atomic `A`, once the
-    /// guest permission `need` is checked as `read` (R) and `write` (W) check
-    /// it. The table lock is released before the caller's access, as for copies.
-    fn word<A>(&self, addr: u64, need: u32) -> Result<&A, Error> {
+    /// `f` on the naturally aligned guest word at `addr` as host atomic `A`,
+    /// once the guest permission `need` is checked as `read` (R) and `write` (W)
+    /// check it, under the same read lock.
+    fn word<A, R>(&self, addr: u64, need: u32, f: impl FnOnce(&A) -> R) -> Result<R, Error> {
         if !addr.is_multiple_of(size_of::<A>() as u64) {
             return Err(Error::InvalidRange);
         }
-        self.accessible(addr, size_of::<A>() as u64, need)?;
-        // SAFETY: mapped with `need` (checked just above) and aligned; the
-        // reservation lives as long as `self`.
-        Ok(unsafe { &*self.base.add(addr as usize).cast::<A>() })
+        let t = self.table();
+        t.accessible(addr, size_of::<A>() as u64, need)?;
+        // SAFETY: mapped with `need` (checked just above, the lock still held) and
+        // aligned; the reference does not leave `f`.
+        Ok(f(unsafe { &*self.base.add(addr as usize).cast::<A>() }))
     }
 
     /// Loads a naturally aligned guest word with Acquire ordering, checked as
     /// `read` (Err(InvalidRange) when unaligned). A plain load: it never writes.
     pub fn load_u32(&self, addr: u64) -> Result<u32, Error> {
-        Ok(self.word::<AtomicU32>(addr, perm::R)?.load(Ordering::Acquire))
+        self.word(addr, perm::R, |w: &AtomicU32| w.load(Ordering::Acquire))
     }
 
     pub fn load_u64(&self, addr: u64) -> Result<u64, Error> {
-        Ok(self.word::<AtomicU64>(addr, perm::R)?.load(Ordering::Acquire))
+        self.word(addr, perm::R, |w: &AtomicU64| w.load(Ordering::Acquire))
     }
 
     /// Stores a naturally aligned guest word with Release ordering, checked as `write`.
     pub fn store_u32(&self, addr: u64, v: u32) -> Result<(), Error> {
-        self.word::<AtomicU32>(addr, perm::W)?.store(v, Ordering::Release);
-        Ok(())
+        self.word(addr, perm::W, |w: &AtomicU32| w.store(v, Ordering::Release))
     }
 
     /// Replaces the guest word v by f(v) in one compare-exchange loop (`f` may
@@ -333,7 +355,7 @@ impl Memory {
     /// checked for R and W first. The inner result is the value replaced (Ok)
     /// or refused (Err).
     pub fn update_u32(&self, addr: u64, f: impl FnMut(u32) -> Option<u32>) -> Result<Result<u32, u32>, Error> {
-        Ok(self.word::<AtomicU32>(addr, perm::RW)?.try_update(Ordering::AcqRel, Ordering::Acquire, f))
+        self.word(addr, perm::RW, |w: &AtomicU32| w.try_update(Ordering::AcqRel, Ordering::Acquire, f))
     }
 
     /// Writes memory the HLE owns, as `write_object` does, with one word last:
@@ -346,8 +368,9 @@ impl Memory {
     /// the whole range is host-writable.
     pub fn publish_object(&self, addr: u64, width: usize, rest: &[u8], mut f: impl FnMut(u64) -> u64) -> Result<u64, Error> {
         assert!(width <= 8, "a word of at most 8 bytes");
-        self.table().host_accessible(addr, (width + rest.len()) as u64, PAGE_READWRITE)?;
-        // SAFETY: the whole range is mapped and host-writable (checked just above);
+        let t = self.table();
+        t.host_accessible(addr, (width + rest.len()) as u64, PAGE_READWRITE)?;
+        // SAFETY: the whole range is mapped and host-writable (checked just above, under `t`);
         // an aligned guest address is an aligned host one (the base is 64 KiB-aligned).
         unsafe {
             let p = self.base.add(addr as usize);

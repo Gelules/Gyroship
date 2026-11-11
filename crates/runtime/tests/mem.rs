@@ -52,6 +52,39 @@ fn host_threads_share_one_memory() {
     assert_eq!(m.blocks().count(), 1, "merged back");
 }
 
+/// Copies and an atomic on three host threads while a fourth maps and unmaps
+/// their range (its pages decommitted) again and again: each call returns Ok
+/// or Err and none faults, as each chunk is copied under the read lock it was
+/// checked under.
+#[test]
+fn unmaps_never_pull_pages_from_under_a_copy() {
+    const SIZE: u64 = 4 << 20;
+    let m = Memory::new().unwrap();
+    let done = AtomicBool::new(false);
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            for _ in 0..200 {
+                m.map(HEAP, SIZE, Block::new(state::NORMAL, perm::RW)).unwrap();
+                m.unmap(HEAP, SIZE).unwrap();
+            }
+            done.store(true, Ordering::Relaxed);
+        });
+        for t in 0..3 {
+            let (m, done) = (&m, &done);
+            s.spawn(move || {
+                let mut b = vec![0u8; SIZE as usize];
+                while !done.load(Ordering::Relaxed) {
+                    let _ = match t {
+                        0 => m.read(HEAP, &mut b),
+                        1 => m.write_object(HEAP, &b),
+                        _ => m.load_u32(HEAP + SIZE - 4).map(drop),
+                    };
+                }
+            });
+        }
+    });
+}
+
 #[test]
 fn walk_sees_free_gaps_and_the_inaccessible_tail() {
     let m = Memory::new().unwrap();
