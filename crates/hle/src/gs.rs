@@ -7,10 +7,13 @@
 //! The fake GPU is complaisant: every fence it hands out is already
 //! reached, and every wait it is asked about succeeds at once.
 
-use crate::Kernel;
 use crate::ipc::{Reply, Request};
+use crate::nvdrv::GpuSide;
 use crate::service::Service;
 use crate::thread::Object;
+use crate::{Kernel, Stop};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// A frame's shader work (modules and pipelines, host time) from which it
 /// is journaled: the frame's whole budget at 20 frames a second.
@@ -30,8 +33,8 @@ pub struct State {
     /// vi2 229: frames presented, and the vsync the last one waited for.
     pub presents: u64,
     pub vsync: u64,
-    /// Syncpoint values (syncpt GetCount says 32).
-    pub syncpts: [u32; 32],
+    /// Syncpoint values (syncpt GetCount says 32), shared with the GPU side.
+    pub syncpts: Arc<[AtomicU32; 32]>,
     /// syncpt 22: the event of each wait index.
     pub syncpt_waits: Vec<Option<usize>>,
     /// vi2 31: the native event of each index, which the change bindings signal.
@@ -48,10 +51,17 @@ pub struct State {
     pub memory_calls: [u64; 4],
     /// GPU memories (gpu 101): CPU address, by handle - 1.
     pub gpu_mems: Vec<u64>,
-    /// GPU mappings (gpu 211): address space, GPU range (bounds included), CPU address.
-    pub gpu_maps: Vec<(u32, u64, u64, u64)>,
-    /// `gpu_maps` flattened for lookups (derived: rebuilt from it after a load).
-    pub gpu_table: Table,
+    /// GPU mappings (gpu 211). GPU work takes them as they stand when it is
+    /// handed over (`Phase`); a change copies them only while it holds them.
+    pub maps: Arc<Mappings>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct Mappings {
+    /// Address space, GPU range (bounds included), CPU address.
+    pub list: Vec<(u32, u64, u64, u64)>,
+    /// `list` flattened for lookups (derived: rebuilt from it after a load).
+    pub table: Table,
 }
 
 /// Disjoint GPU ranges by address space, sorted: (space, first) -> (last, CPU
@@ -107,12 +117,12 @@ fn span(table: &Table, space: u32, gpu: u64) -> (u64, u64) {
     }
 }
 
-impl crate::Kernel {
+impl GpuSide {
     /// The CPU address of a GPU address in address space `space`, through the
     /// mapping made last that covers it; addresses no mapping covers are taken
     /// as CPU addresses (NVN maps the CPU's ASLR region one to one).
-    pub fn gpu_to_cpu(&mut self, space: u32, gpu: u64) -> u64 {
-        lookup(&self.gs.gpu_table, space, gpu)
+    pub fn gpu_to_cpu(&self, space: u32, gpu: u64) -> u64 {
+        lookup(&self.at.maps.table, space, gpu)
     }
 
     /// Writes `bytes` at GPU address `gpu` of `space`, each part through the
@@ -120,7 +130,7 @@ impl crate::Kernel {
     /// Err with the CPU address of a part that is not writable.
     pub fn write_gpu(&mut self, space: u32, mut gpu: u64, mut bytes: &[u8]) -> Result<(), u64> {
         while !bytes.is_empty() {
-            let (at, room) = span(&self.gs.gpu_table, space, gpu);
+            let (at, room) = span(&self.at.maps.table, space, gpu);
             let n = bytes.len().min(usize::try_from(room).unwrap_or(usize::MAX));
             self.mem.write_object(at, &bytes[..n]).map_err(|_| at)?;
             (gpu, bytes) = (gpu + n as u64, &bytes[n..]);
@@ -250,8 +260,9 @@ impl Gs {
             (Gs::GpuMemory, 213) => {
                 k.census_ipc("gpu memory 213");
                 let (space, first, last) = (req.u32_at(0)?, req.u64_at(4)?, req.u64_at(0xc)?);
-                k.gs.gpu_maps.retain(|m| m.0 != space || m.2 < first || m.1 > last);
-                k.gs.gpu_table = flatten(&k.gs.gpu_maps);
+                let maps = Arc::make_mut(&mut k.gs.maps);
+                maps.list.retain(|m| m.0 != space || m.2 < first || m.1 > last);
+                maps.table = flatten(&maps.list);
                 k.signal_gpu(req.u32_at(0x18)? as usize);
                 Reply::ok()
             }
@@ -278,8 +289,9 @@ impl Gs {
                         }
                         let (space, first, last, mem, offset) = (req.u32_at(0)?, req.u64_at(4)?, req.u64_at(0xc)?, req.u32_at(0x14)?, req.u64_at(0x18)?);
                         if let Some(&base) = k.gs.gpu_mems.get(mem.wrapping_sub(1) as usize) {
-                            k.gs.gpu_maps.push((space, first, last, base + offset));
-                            paint(&mut k.gs.gpu_table, space, first, last, base + offset);
+                            let maps = Arc::make_mut(&mut k.gs.maps);
+                            maps.list.push((space, first, last, base + offset));
+                            paint(&mut maps.table, space, first, last, base + offset);
                         }
                         k.signal_gpu(req.u32_at(0x3c)? as usize);
                         Reply::with(&[*req.data.get(0x2c)?])
@@ -293,7 +305,7 @@ impl Gs {
             // syncpt: the value of a syncpoint (on the wire, its id inverted), mode 0.
             (Gs::Syncpt, 103) => {
                 k.census_ipc("syncpt 103");
-                let v = k.gs.syncpts.get(!req.u32_at(0)? as usize).copied().unwrap_or(0);
+                let v = k.gs.syncpts.get(!req.u32_at(0)? as usize).map_or(0, |s| s.load(Ordering::Acquire));
                 Reply::with(&[&u64::from(v).to_le_bytes()[..], &[0]].concat())
             }
             // The event of a wait index.
@@ -314,13 +326,10 @@ impl Gs {
                 let (n, id, threshold) = (req.u32_at(0)? as usize, !req.u32_at(4)? as usize, req.u64_at(8)? as u32);
                 if k.journal.few("syncpt 201", 4) {
                     let armed = k.gs.syncpt_waits.get(n).copied().flatten().is_some();
-                    let now = k.gs.syncpts.get(id).copied();
+                    let now = k.gs.syncpts.get(id).map(|s| s.load(Ordering::Acquire));
                     k.log(&format!("gsv syncpt 201: wait index {n} syncpoint {id} threshold {threshold} mode {} value {now:?} event {armed}", req.data.get(0x10).copied().unwrap_or(0)));
                 }
-                if let Some(s) = k.gs.syncpts.get_mut(id)
-                    && (threshold.wrapping_sub(*s) as i32) > 0
-                {
-                    *s = threshold;
+                if k.gs.syncpts.get(id).is_some_and(|s| s.try_update(Ordering::AcqRel, Ordering::Acquire, |v| ((threshold.wrapping_sub(v) as i32) > 0).then_some(threshold)).is_ok()) {
                     k.count("syncpoint waits raised");
                 }
                 k.signal_wait(n);
@@ -501,10 +510,6 @@ impl Kernel {
         if self.config.perf.is_some() {
             gyroship_runtime::profile::mark_frame();
         }
-        // The GPU work submitted from here to the end of this present is this frame's.
-        if let Some(s) = self.surfaces.as_mut() {
-            s.present = n;
-        }
         if n <= 3 || n.is_multiple_of(60) {
             let (layer, image) = (req.u64_at(0).unwrap_or(0), req.u32_at(0xc).unwrap_or(0));
             let (fence_id, fence) = (req.u32_at(0x50).unwrap_or(0), req.u64_at(0x58).unwrap_or(0));
@@ -517,14 +522,54 @@ impl Kernel {
             self.gs.drawn_area = area;
             self.log(&format!("vi2: present #{n}: drawn area {}x{}", (area & 0xffff) + 1, (area >> 16) + 1));
         }
+        // The frame's acquire fence (syncpoint id inverted, value) and swap interval.
+        let fence = (req.u32_at(0x50).unwrap_or(0), req.u64_at(0x58).unwrap_or(0) as u32);
+        let interval = u64::from((req.u32_at(0x10 + 0x18).unwrap_or(0) >> 16).max(1));
+        self.gpu_work(crate::nvdrv::GpuJob::Present { n, fence, area, interval });
+    }
+
+    /// The rest of present `n`, once its GPU part ran (`GpuSide::present`):
+    /// the frame limit, the summary line, and the display's cadence, from
+    /// kernel time `at`, when the present was handed over.
+    pub(crate) fn present_end(&mut self, n: u64, interval: u64, at: u64) {
+        if self.config.frames.is_some_and(|f| n >= f) {
+            self.stop(0, &format!("{n} frames presented"));
+        }
+        if n.is_multiple_of(600) {
+            let summary = self.summary();
+            self.log(&summary);
+        }
+        // The display's cadence (as a console's compositor, or Lichii's pace to
+        // vblank): the presenting thread resumes at the next vsync its swap
+        // interval allows, on a 60 Hz grid computed from k (no drift).
+        if self.config.vsync {
+            let first = (at * 60).div_ceil(TICKS_PER_SECOND);
+            let (next, wait) = next_vsync(self.gs.vsync, interval, first, self.config.play && self.config.late_frames);
+            self.gs.vsync = next;
+            if wait {
+                self.block(crate::thread::Wait::Sleep, Some(vsync(next)), crate::result::SUCCESS);
+            }
+        }
+    }
+}
+
+impl GpuSide {
+    /// Present `n`'s GPU part: the channels waiting for the CPU go on, the
+    /// acquire fence (syncpoint id inverted, value) is checked, the host GPU's
+    /// refusals and shader work are reported, and the image of drawn `area`
+    /// is hashed, shown and dumped.
+    pub(crate) fn present(&mut self, n: u64, (fence_id, fence): (u32, u32), area: u32) -> Result<(), Stop> {
+        // The GPU work submitted from here to the end of this present is this frame's.
+        if let Some(s) = self.surfaces.as_mut() {
+            s.present = n;
+        }
         // GPU work that waited for the CPU's semaphores runs before the frame is shown.
-        crate::nvdrv::poll(self);
-        // The frame's acquire fence (syncpoint id inverted, value) must be reached by now.
-        let (fence_id, fence) = (req.u32_at(0x50).unwrap_or(0), req.u64_at(0x58).unwrap_or(0) as u32);
-        if let Some(&now) = self.gs.syncpts.get(!fence_id as usize)
+        crate::nvdrv::poll(self)?;
+        // The frame's acquire fence must be reached by now.
+        if let Some(now) = self.syncpts.get(!fence_id as usize).map(|s| s.load(Ordering::Acquire))
             && (fence.wrapping_sub(now) as i32) > 0
         {
-            self.anomaly("present fence not reached", &format!("present #{n}: syncpoint {} at {now}, fence {fence}", !fence_id));
+            self.anomaly("present fence not reached", &format!("present #{n}: syncpoint {} at {now}, fence {fence}", !fence_id))?;
         }
         // The host GPU's refusals since the last present.
         // ponytail: checked once per frame; per operation if a stop needs the guest stack.
@@ -560,10 +605,10 @@ impl Kernel {
                 if self.journal.first(&format!("gpu not done {why}")) {
                     self.log(&format!("gpu: first refusal of its kind, frame {n}: {why}"));
                 }
-                self.anomaly("gpu operation not done", &format!("frame {n}: {why} ({count} times)"));
+                self.anomaly("gpu operation not done", &format!("frame {n}: {why} ({count} times)"))?;
             }
             for e in errors {
-                self.anomaly("wgpu error", &format!("frame {n}: {e}"));
+                self.anomaly("wgpu error", &format!("frame {n}: {e}"))?;
             }
         }
         // The presented image's hash, over the drawn area but its last row: the game's
@@ -572,19 +617,19 @@ impl Kernel {
         if self.config.hashes.is_some()
             && let Some(s) = self.surfaces.as_mut()
         {
-            let (w, h) = ((self.gs.drawn_area & 0xffff) + 1, (self.gs.drawn_area >> 16) + 1);
+            let (w, h) = ((area & 0xffff) + 1, (area >> 16) + 1);
             if !s.hash_presented(n, w, h.saturating_sub(1)) {
                 self.frame_hashes.push((n, None));
             }
         }
         // The host window: show the frame, then wait for its time on the wall clock.
         let now = self.now();
-        let area = ((self.gs.drawn_area & 0xffff) + 1, (self.gs.drawn_area >> 16) + 1);
+        let shown = ((area & 0xffff) + 1, (area >> 16) + 1);
         if let (Some(s), Some((pace, size))) = (self.surfaces.as_mut(), self.window.as_mut()) {
-            s.show(area, *size);
+            s.show(shown, *size);
             match pace(now) {
                 Some(new) => *size = new,
-                None => self.stop(0, "window closed"),
+                None => return Err((0, "window closed".into())),
             }
         }
         // The render targets this frame touched, as PNG files (game output: never committed).
@@ -603,26 +648,11 @@ impl Kernel {
         if let Some(s) = self.surfaces.as_mut() {
             s.present = n + 1;
         }
-        if self.config.frames.is_some_and(|f| n >= f) {
-            self.stop(0, &format!("{n} frames presented"));
-        }
-        if n.is_multiple_of(600) {
-            let summary = self.summary();
-            self.log(&summary);
-        }
-        // The display's cadence (as a console's compositor, or Lichii's pace to
-        // vblank): the presenting thread resumes at the next vsync its swap
-        // interval allows, on a 60 Hz grid computed from k (no drift).
-        if self.config.vsync {
-            let interval = u64::from((req.u32_at(0x10 + 0x18).unwrap_or(0) >> 16).max(1));
-            let first = (self.now() * 60).div_ceil(TICKS_PER_SECOND);
-            let (next, wait) = next_vsync(self.gs.vsync, interval, first, self.config.play && self.config.late_frames);
-            self.gs.vsync = next;
-            if wait {
-                self.block(crate::thread::Wait::Sleep, Some(vsync(next)), crate::result::SUCCESS);
-            }
-        }
+        Ok(())
     }
+}
+
+impl Kernel {
 
     /// Signals the event of GPU event id `n`, as if the GPU had finished.
     pub fn signal_gpu(&mut self, n: usize) {

@@ -5,34 +5,55 @@
 
 use std::collections::BTreeSet;
 use std::io::Write;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 enum Sink {
     Memory(Vec<u8>),
     File(std::io::BufWriter<std::fs::File>),
 }
 
-pub struct Journal {
+struct Inner {
     sink: Sink,
     seen: BTreeSet<String>,
     counts: std::collections::BTreeMap<String, u32>,
+}
+
+/// A handle on a journal; [`Journal::share`] makes another one on the same
+/// lines (the GPU side's), each call taking the journal's own lock, which no
+/// other lock is ever taken under.
+pub struct Journal {
+    inner: Arc<Mutex<Inner>>,
     /// Every SVC, instead of the first of each kind.
     pub all_svcs: bool,
 }
 
 impl Journal {
+    fn with(sink: Sink) -> Journal {
+        Journal { inner: Arc::new(Mutex::new(Inner { sink, seen: BTreeSet::new(), counts: Default::default() })), all_svcs: false }
+    }
+
     /// A journal kept in memory (tests).
     pub fn memory() -> Journal {
-        Journal { sink: Sink::Memory(Vec::new()), seen: BTreeSet::new(), counts: Default::default(), all_svcs: false }
+        Journal::with(Sink::Memory(Vec::new()))
     }
 
     pub fn file(path: &std::path::Path) -> std::io::Result<Journal> {
-        Ok(Journal { sink: Sink::File(std::io::BufWriter::new(std::fs::File::create(path)?)), seen: BTreeSet::new(), counts: Default::default(), all_svcs: false })
+        Ok(Journal::with(Sink::File(std::io::BufWriter::new(std::fs::File::create(path)?))))
+    }
+
+    /// Another handle on the same journal.
+    pub fn share(&self) -> Journal {
+        Journal { inner: self.inner.clone(), all_svcs: self.all_svcs }
+    }
+
+    fn inner(&self) -> MutexGuard<'_, Inner> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Logs one line at virtual time `time` for guest thread `thread`.
-    pub fn line(&mut self, time: u64, thread: u64, text: &str) {
+    pub fn line(&self, time: u64, thread: u64, text: &str) {
         let line = format!("{time:>12} t{thread} {text}\n");
-        match &mut self.sink {
+        match &mut self.inner().sink {
             Sink::Memory(v) => v.extend_from_slice(line.as_bytes()),
             Sink::File(f) => {
                 let _ = f.write_all(line.as_bytes());
@@ -41,27 +62,29 @@ impl Journal {
     }
 
     /// Whether `key` is new; it is then remembered.
-    pub fn first(&mut self, key: &str) -> bool {
-        !self.seen.contains(key) && self.seen.insert(key.to_string())
+    pub fn first(&self, key: &str) -> bool {
+        let mut i = self.inner();
+        !i.seen.contains(key) && i.seen.insert(key.to_string())
     }
 
     /// Whether `key` has been seen fewer than `n` times; counts this one.
-    pub fn few(&mut self, key: &str, n: u32) -> bool {
-        let c = self.counts.entry(key.to_string()).or_insert(0);
+    pub fn few(&self, key: &str, n: u32) -> bool {
+        let mut i = self.inner();
+        let c = i.counts.entry(key.to_string()).or_insert(0);
         *c += 1;
         *c <= n
     }
 
     /// What a memory journal holds so far.
-    pub fn text(&self) -> &str {
-        match &self.sink {
-            Sink::Memory(v) => std::str::from_utf8(v).unwrap_or(""),
-            Sink::File(_) => "",
+    pub fn text(&self) -> String {
+        match &self.inner().sink {
+            Sink::Memory(v) => String::from_utf8_lossy(v).into_owned(),
+            Sink::File(_) => String::new(),
         }
     }
 
-    pub fn flush(&mut self) {
-        if let Sink::File(f) = &mut self.sink {
+    pub fn flush(&self) {
+        if let Sink::File(f) = &mut self.inner().sink {
             let _ = f.flush();
         }
     }

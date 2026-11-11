@@ -105,9 +105,15 @@ pub(crate) unsafe fn svc(cpu: *mut Cpu, pc: u64, imm: u32, me: usize) {
         k.svc(unsafe { &mut *cpu }, pc, imm);
         (k.deferred.take(), k.sched.threads[me].state)
     });
-    if let Some(why) = job.and_then(|job| job.run().err()) {
-        crate::with(|k| k.stop(crate::STOP_EXIT, &why));
-    }
+    // What the work leaves (a stop, the rest of a present) runs under the lock
+    // again; the rest of a present may make the thread wait (vsync).
+    let state = match job.map(crate::Deferred::run) {
+        None | Some(Ok(crate::After::Nothing)) => state,
+        Some(done) => crate::with(|k| {
+            k.after(done);
+            k.sched.threads[me].state
+        }),
+    };
     match state {
         State::Waiting => wait(me),
         // ExitThread inside guest frames, which must never run again: they stay on

@@ -31,7 +31,7 @@ use gyroship_runtime::{Cpu, Hooks};
 use gyroship_runtime::mem::Memory;
 use journal::Journal;
 use std::cell::Cell;
-use std::sync::{Arc, Mutex, PoisonError, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 
 /// Horizon result codes of the kernel module (1); the description is the
 /// public one from switchbrew.
@@ -188,18 +188,11 @@ pub struct Kernel {
     pub saves: std::collections::BTreeMap<String, save::SaveFs>,
     /// Virtual timers (the audio sink).
     pub timers: Vec<thread::Timer>,
-    /// The host render targets, when something renders (`--dump-frames`).
-    pub surfaces: Option<gyroship_gpu::surfaces::Surfaces>,
-    /// The GPU channels and what they ran.
-    pub gpu: nvdrv::Gpu,
-    /// Normal activity, by name (submits, draws…), for the summary line.
-    pub counts: std::collections::BTreeMap<&'static str, u64>,
-    /// Named anomalies seen (D32), for the summary line.
-    pub anomalies: std::collections::BTreeMap<&'static str, u64>,
-    /// `--hashes`: the presents with no image to hash (the others come back from the GPU).
-    pub frame_hashes: Vec<(u64, Option<(u64, u64)>)>,
-    /// The host window's pace hook and its last size (`boot::HostWindow`).
-    pub window: Option<(Pace, (u32, u32))>,
+    /// What GPU work needs (the host render targets, the channels, the
+    /// window), behind a lock of its own (`gpu_work`).
+    pub gpu_side: Arc<Mutex<nvdrv::GpuSide>>,
+    /// Activity and anomaly counts, shared with the GPU side.
+    pub tally: Arc<Mutex<Tally>>,
     /// The host's live controller state, read at each hid sample.
     pub live_input: Option<LiveInput>,
     /// `--record`: the script lines so far.
@@ -234,30 +227,76 @@ pub const STOP_EXIT: i32 = 0x48;
 /// Anomalies strict mode lets pass for now, each until a known fix (D32).
 const TOLERATED: &[&str] = &[];
 
-impl Kernel {
-    pub fn new(mem: Memory, mut journal: Journal, config: Config) -> Kernel {
-        let mode = if config.explore { "exploration (not a validation run)" } else { "strict" };
-        // The deterministic header keeps its bytes.
-        let engine = if config.play { ", play engine (a host thread per guest thread, real time): a log, never a reference" } else { "" };
-        journal.line(0, 0, &format!("gyroship hle: mode {mode}, seed {:#x}, non-system memory {:#x}{engine}", config.seed, config.non_system_memory));
-        let recorded = config.record.as_ref().map(|_| Vec::new());
-        let audio_samples = config.audio_dump.as_ref().map(|_| Vec::new());
-        Kernel { mem: Arc::new(mem), journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None, sessions: Vec::new(), objects: Vec::new(), domains: Vec::new(), allowed_services: Vec::new(), shared: Vec::new(), transfers: Vec::new(), time_shared: None, frame: (0, 0, 0), symbols: Vec::new(), romfs: None, deferred: None, gs: gs::State::default(), hid_shared: None, input: Default::default(), spin: Vec::new(), census: Census::default(), saves: Default::default(), timers: Vec::new(), surfaces: None, gpu: Default::default(), counts: Default::default(), anomalies: Default::default(), frame_hashes: Vec::new(), window: None, live_input: None, recorded, audio_out: None, audio_samples, opus: Default::default(), audio_gain: 1.0, audio_format: (2, 48_000) }
-    }
+/// A stop the kernel makes next: exit code and why.
+pub type Stop = (i32, String);
 
-    /// Counts one more `name` (normal activity); returns the new count.
+/// Activity and anomaly counts, for the summary line, shared by the kernel
+/// and its GPU side behind a lock of their own, under which no other lock is
+/// taken.
+#[derive(Default)]
+pub struct Tally {
+    /// Normal activity, by name (submits, draws…).
+    pub counts: std::collections::BTreeMap<&'static str, u64>,
+    /// Named anomalies seen (D32).
+    pub anomalies: std::collections::BTreeMap<&'static str, u64>,
+}
+
+impl Tally {
+    /// Counts one more `name`; returns the new count.
     pub fn count(&mut self, name: &'static str) -> u64 {
         let c = self.counts.entry(name).or_default();
         *c += 1;
         *c
     }
 
+    /// Counts anomaly `name`; returns its line and whether it stops the run
+    /// (strict mode, unless tolerated).
+    fn anomaly(&mut self, name: &'static str, text: &str, explore: bool) -> (String, bool) {
+        *self.anomalies.entry(name).or_default() += 1;
+        (format!("anomaly {name}: {text}"), !explore && !TOLERATED.contains(&name))
+    }
+}
+
+/// A lock, recovered from poison like the crate's other locks.
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl Kernel {
+    pub fn new(mem: Memory, journal: Journal, config: Config) -> Kernel {
+        let mode = if config.explore { "exploration (not a validation run)" } else { "strict" };
+        // The deterministic header keeps its bytes.
+        let engine = if config.play { ", play engine (a host thread per guest thread, real time): a log, never a reference" } else { "" };
+        journal.line(0, 0, &format!("gyroship hle: mode {mode}, seed {:#x}, non-system memory {:#x}{engine}", config.seed, config.non_system_memory));
+        let recorded = config.record.as_ref().map(|_| Vec::new());
+        let audio_samples = config.audio_dump.as_ref().map(|_| Vec::new());
+        let (mem, tally, gs) = (Arc::new(mem), Arc::new(Mutex::new(Tally::default())), gs::State::default());
+        let gpu_side = Arc::new(Mutex::new(nvdrv::GpuSide::new(mem.clone(), journal.share(), tally.clone(), gs.syncpts.clone(), config.clone())));
+        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None, sessions: Vec::new(), objects: Vec::new(), domains: Vec::new(), allowed_services: Vec::new(), shared: Vec::new(), transfers: Vec::new(), time_shared: None, frame: (0, 0, 0), symbols: Vec::new(), romfs: None, deferred: None, gs, hid_shared: None, input: Default::default(), spin: Vec::new(), census: Census::default(), saves: Default::default(), timers: Vec::new(), gpu_side, tally, live_input: None, recorded, audio_out: None, audio_samples, opus: Default::default(), audio_gain: 1.0, audio_format: (2, 48_000) }
+    }
+
+    /// The activity and anomaly counts.
+    pub fn tally(&self) -> MutexGuard<'_, Tally> {
+        lock(&self.tally)
+    }
+
+    /// The GPU side. Kernel code takes it only where no GPU work runs (boot,
+    /// tests) or for a while at most (`host_reports`): in the play engine, GPU
+    /// work holds it without the kernel lock.
+    pub fn gpu_side(&self) -> MutexGuard<'_, nvdrv::GpuSide> {
+        lock(&self.gpu_side)
+    }
+
+    /// Counts one more `name` (normal activity); returns the new count.
+    pub fn count(&mut self, name: &'static str) -> u64 {
+        self.tally().count(name)
+    }
+
     /// A named anomaly (D32): counted, journaled the first times, and fatal
     /// in strict mode unless tolerated.
     pub fn anomaly(&mut self, name: &'static str, text: &str) {
-        *self.anomalies.entry(name).or_default() += 1;
-        let line = format!("anomaly {name}: {text}");
-        if !self.config.explore && !TOLERATED.contains(&name) {
+        let (line, fatal) = self.tally().anomaly(name, text, self.config.explore);
+        if fatal {
             self.stop(STOP_EXIT, &line);
         }
         if self.journal.few(name, 4) {
@@ -265,12 +304,14 @@ impl Kernel {
         }
     }
 
-    /// One line: presents, activity, then the anomalies (or none).
+    /// One line: presents, activity, then the anomalies (or none), and the
+    /// host's caches unless GPU work holds them (play engine).
     pub fn summary(&self) -> String {
+        let t = self.tally();
         let list = |m: &std::collections::BTreeMap<&str, u64>| m.iter().map(|(n, c)| format!("{n} {c}")).collect::<Vec<_>>().join(", ");
-        let anomalies = if self.anomalies.is_empty() { "none".to_string() } else { list(&self.anomalies) };
-        let host = self.surfaces.as_ref().map_or(String::new(), |s| format!("; host: {}", s.cache_sizes()));
-        format!("summary: {} presents; activity: {}; anomalies: {anomalies}{host}", self.gs.presents, list(&self.counts))
+        let anomalies = if t.anomalies.is_empty() { "none".to_string() } else { list(&t.anomalies) };
+        let host = self.gpu_side.try_lock().ok().and_then(|g| Some(format!("; host: {}", g.surfaces.as_ref()?.cache_sizes()))).unwrap_or_default();
+        format!("summary: {} presents; activity: {}; anomalies: {anomalies}{host}", self.gs.presents, list(&t.counts))
     }
 
     /// Logs a line for the running thread (0 when none runs).
@@ -317,16 +358,23 @@ impl Kernel {
     /// Writes the host-side reports a run asked for (`--profile`, `--perf`).
     pub fn host_reports(&mut self) {
         gyroship_runtime::profile::finish(&|a| self.symbolize(a));
-        if let Some(s) = self.surfaces.as_mut() {
+        // The GPU side, unless GPU work keeps it past GPU_WAIT (play engine): its reports are then left out.
+        let side = self.gpu_side.clone();
+        let mut g = lock_within(&side, GPU_WAIT);
+        if g.is_none() {
+            eprintln!("gyroship: GPU work kept the GPU side past {} s: no GPU reports", GPU_WAIT.as_secs());
+        }
+        let mut g = g.as_deref_mut();
+        if let Some(s) = g.as_mut().and_then(|g| g.surfaces.as_mut()) {
             s.finish_pipeline_cache(std::time::Duration::from_secs(3));
         }
         if let Some(path) = &self.config.perf {
-            let (gpu, stalls) = self.surfaces.as_mut().map_or((Vec::new(), 0), |s| s.frame_times());
+            let (gpu, stalls) = g.as_mut().and_then(|g| g.surfaces.as_mut()).map_or((Vec::new(), 0), |s| s.frame_times());
             gyroship_runtime::profile::write_perf(path, self.config.profile.as_ref().map_or(600, |p| p.1 as usize), &gpu);
             if stalls > 0 {
                 eprintln!("gyroship: GPU frame times: {stalls} flushes waited for the GPU to free a timing slot");
             }
-            if let Some(s) = &self.surfaces {
+            if let Some(s) = g.as_ref().and_then(|g| g.surfaces.as_ref()) {
                 eprintln!("gyroship: staging over {} presents: {:?}", self.gs.presents, s.staging);
                 let c = &s.compile_total;
                 eprintln!(
@@ -370,14 +418,15 @@ impl Kernel {
             if let Err(e) = std::fs::write(&census, self.census_report()) {
                 eprintln!("gyroship: --perf {}: {e}", census.display());
             }
-            for (name, header, rows) in [("rewrites.csv", "present,gpu,size\n", &self.census.rewrites), ("romfs.csv", "present,offset,size\n", &self.census.romfs)] {
+            let rewrites = g.as_ref().map_or(&[][..], |g| &g.rewrites[..]);
+            for (name, header, rows) in [("rewrites.csv", "present,gpu,size\n", rewrites), ("romfs.csv", "present,offset,size\n", &self.census.romfs[..])] {
                 let file = path.with_extension(name);
                 let csv: String = std::iter::once(header.to_string()).chain(rows.iter().map(|(n, at, size)| format!("{n},{at:#x},{size:#x}\n"))).collect();
                 if let Err(e) = std::fs::write(&file, csv) {
                     eprintln!("gyroship: --perf {}: {e}", file.display());
                 }
             }
-            let m = self.gpu.mme_stats();
+            let m = g.as_ref().map(|g| g.gpu.mme_stats()).unwrap_or_default();
             eprintln!(
                 "gyroship: macros over {} presents: {} calls, {:.1}% repeating their macro's last parameters without reading registers or memory; {} zero-count LOOPs; {} taken branches with bit 14 ({} with an END pending)",
                 self.gs.presents,
@@ -403,8 +452,8 @@ impl Kernel {
             }
         }
         if let Some(path) = &self.config.hashes {
-            let mut rows = std::mem::take(&mut self.frame_hashes);
-            if let Some(s) = self.surfaces.as_mut() {
+            let mut rows = g.as_mut().map(|g| std::mem::take(&mut g.frame_hashes)).unwrap_or_default();
+            if let Some(s) = g.as_mut().and_then(|g| g.surfaces.as_mut()) {
                 rows.extend(s.presented_hashes().into_iter().map(|(n, target, hash)| (n, Some((target, hash)))));
             }
             rows.sort_unstable();
@@ -532,12 +581,13 @@ fn on_fault(what: &str) {
     k.journal.flush();
 }
 
-/// The kernel lock, tried for up to `patience`, never waited for: None if it
-/// stays held (by this thread, faulting in HLE code, or by another one).
-fn lock_within(kernel: KernelRef, patience: std::time::Duration) -> Option<std::sync::MutexGuard<'static, Option<Kernel>>> {
+/// A lock (the kernel's, the GPU side's), tried for up to `patience`, never
+/// waited for: None if it stays held (by this thread, faulting in HLE code, or
+/// by another one).
+fn lock_within<T>(m: &Mutex<T>, patience: std::time::Duration) -> Option<MutexGuard<'_, T>> {
     let since = std::time::Instant::now();
     loop {
-        match kernel.try_lock() {
+        match m.try_lock() {
             Ok(guard) => return Some(guard),
             Err(TryLockError::Poisoned(e)) => return Some(e.into_inner()),
             Err(TryLockError::WouldBlock) if since.elapsed() < patience => std::thread::sleep(std::time::Duration::from_millis(1)),
@@ -545,6 +595,10 @@ fn lock_within(kernel: KernelRef, patience: std::time::Duration) -> Option<std::
         }
     }
 }
+
+/// How long the end of a run waits for GPU work on another thread (play
+/// engine) to leave the GPU side, for its reports.
+const GPU_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// How long a window closed while no frame comes waits for the kernel lock:
 /// a long GPU batch may hold it (the play engine, until Stage 4).
@@ -625,19 +679,42 @@ pub enum Deferred {
     /// IStorage Read: `len` bytes of the image at `offset` into guest `addr`
     /// (found writable when queued).
     RomFsRead { romfs: Arc<fs::RomFs>, mem: Arc<Memory>, offset: u64, addr: u64, len: u64 },
+    /// GPU work (`Kernel::gpu_work`), on the GPU side, handed over at `phase`.
+    Gpu { side: Arc<Mutex<nvdrv::GpuSide>>, phase: nvdrv::Phase, job: nvdrv::GpuJob },
+}
+
+/// What deferred work leaves for the kernel lock (`Kernel::after`).
+pub enum After {
+    Nothing,
+    /// The rest of present `n` (`Kernel::present_end`): its swap interval and
+    /// the kernel time it was handed over at.
+    Present { n: u64, interval: u64, at: u64 },
 }
 
 impl Deferred {
-    /// Does the work; `Err` is the line the run stops with.
-    pub fn run(self) -> Result<(), String> {
+    /// Does the work; Ok holds what it leaves for the kernel lock, Err the stop it asks for.
+    pub fn run(self) -> Result<After, Stop> {
         match self {
             Deferred::RomFsRead { romfs, mem, offset, addr, len } => {
                 let mut bytes = vec![0; len as usize];
-                romfs.read(offset, &mut bytes).map_err(|e| format!("RomFS read at {offset:#x}+{len:#x}: {e}"))?;
+                romfs.read(offset, &mut bytes).map_err(|e| (STOP_EXIT, format!("RomFS read at {offset:#x}+{len:#x}: {e}")))?;
                 // Checked again: only another host thread (play mode) can have
                 // unmapped it since, which Horizon forbids during the request.
-                mem.write(addr, &bytes).map_err(|e| format!("RomFS read at {offset:#x}+{len:#x}: {addr:#x} no longer writable ({e:?})"))
+                mem.write(addr, &bytes).map_err(|e| (STOP_EXIT, format!("RomFS read at {offset:#x}+{len:#x}: {addr:#x} no longer writable ({e:?})")))?;
+                Ok(After::Nothing)
             }
+            Deferred::Gpu { side, phase, job } => nvdrv::run(&side, phase, job),
+        }
+    }
+}
+
+impl Kernel {
+    /// What deferred work left, under the kernel lock: a stop, or the rest of a present.
+    pub fn after(&mut self, done: Result<After, Stop>) {
+        match done {
+            Err((code, why)) => self.stop(code, &why),
+            Ok(After::Nothing) => {}
+            Ok(After::Present { n, interval, at }) => self.present_end(n, interval, at),
         }
     }
 }
@@ -669,10 +746,10 @@ unsafe fn on_svc(cpu: *mut Cpu, pc: u64, imm: u32) {
     // SVC's virtual time and on its thread.
     // ponytail: two kernel scopes per SVC even without a job; re-lock only when
     // there is one if the uncontended lock ever shows in --perf.
-    let failed = job.and_then(|job| job.run().err());
+    let done = job.map(Deferred::run);
     let next = with(|k| {
-        if let Some(why) = failed {
-            k.stop(STOP_EXIT, &why);
+        if let Some(done) = done {
+            k.after(done);
         }
         k.reschedule()
     });
@@ -698,8 +775,6 @@ pub struct Census {
     sites: std::collections::HashMap<(u64, u64), u64>,
     /// Thread id -> its frame chain at its first switch point (its body is at the end).
     first: std::collections::BTreeMap<u64, Vec<String>>,
-    /// Textures found rewritten by the CPU: (present, GPU address, size).
-    rewrites: Vec<(u64, u64, u64)>,
     /// RomFS reads: (present, offset, size).
     romfs: Vec<(u64, u64, u64)>,
     /// (command, thread id) -> count, for the IPC commands the multi-core plan

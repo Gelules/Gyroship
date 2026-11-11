@@ -176,7 +176,7 @@ fn host_threads_share_one_kernel() {
         w.join().unwrap();
     }
     assert!(std::thread::spawn(|| gyroship_hle::with(|_| ())).join().is_err(), "a thread that did not attach has no kernel");
-    assert_eq!(gyroship_hle::uninstall().unwrap().counts["lock test"], 40_000);
+    assert_eq!(gyroship_hle::uninstall().unwrap().tally().counts["lock test"], 40_000);
 }
 
 /// The play engine's kernel time: one value per scope, which never goes back
@@ -217,7 +217,7 @@ fn a_long_play_scope_is_counted() {
     gyroship_hle::with(|_| std::thread::sleep(std::time::Duration::from_millis(45)));
     gyroship_hle::with(|_| std::thread::sleep(std::time::Duration::from_millis(1)));
     let k = gyroship_hle::uninstall().unwrap();
-    assert_eq!(k.counts.get("play: kernel lock held over 40 ms"), Some(&1));
+    assert_eq!(k.tally().counts.get("play: kernel lock held over 40 ms"), Some(&1));
 }
 
 /// Only does something when started by `a_fault_inside_the_kernel_exits`.
@@ -376,7 +376,7 @@ fn anomalies_are_counted_and_summarized() {
     for _ in 0..6 {
         k.anomaly("gpu watchdog", "w");
     }
-    assert_eq!(k.anomalies["gpu watchdog"], 6);
+    assert_eq!(k.tally().anomalies["gpu watchdog"], 6);
     assert_eq!(k.journal.text().matches("anomaly gpu watchdog: w").count(), 4, "journaled the first times only");
 }
 

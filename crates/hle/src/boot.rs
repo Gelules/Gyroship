@@ -303,7 +303,7 @@ pub fn run(table: Vec<rt::Entry>, window: Option<HostWindow>) {
         };
         let surfaces = match window {
             Some(w) => {
-                k.window = Some((w.pace, w.size));
+                k.gpu_side().window = Some((w.pace, w.size));
                 k.live_input = Some(w.input);
                 k.audio_out = w.audio;
                 gyroship_gpu::surfaces::Surfaces::windowed(&w.instance, w.surface, w.size)
@@ -325,7 +325,7 @@ pub fn run(table: Vec<rt::Entry>, window: Option<HostWindow>) {
                 if k.config.perf.is_some() && !s.measure_frames() {
                     eprintln!("gyroship: --perf: this GPU has no timestamps inside command encoders: no GPU frame times");
                 }
-                k.surfaces = Some(s);
+                k.gpu_side().surfaces = Some(s);
             }
             Err(e) => {
                 k.log(&format!("gpu: no host renderer: {e}"));

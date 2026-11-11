@@ -261,7 +261,7 @@ fn a_romfs_read_is_checked_at_once_and_lands_after_the_svc() {
     let mut dest = [0; 3];
     k.mem.read(DATA + 0x800, &mut dest).unwrap();
     assert_eq!(dest, [0; 3], "the bytes come with the deferred work");
-    assert_eq!(k.counts["romfs reads"], 1);
+    assert_eq!(k.tally().counts["romfs reads"], 1);
     k.deferred.take().expect("a deferred read").run().unwrap();
     k.mem.read(DATA + 0x800, &mut dest).unwrap();
     assert_eq!(&dest, b"xyz");
@@ -270,5 +270,5 @@ fn a_romfs_read_is_checked_at_once_and_lands_after_the_svc() {
     assert!(k.deferred.is_none());
     // Over the message (the TLS): the reply would no longer win there.
     assert_eq!(read(&mut k, &mut cpu, TLS + 0x80), SUCCESS);
-    assert_eq!(k.anomalies["romfs read buffer"], 2);
+    assert_eq!(k.tally().anomalies["romfs read buffer"], 2);
 }
