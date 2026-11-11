@@ -11,3 +11,10 @@ gyroship-hle = { path = "../hle" }
 gyroship-runtime = { path = "../runtime" }
 winit = "0.30"
 libloading = "0.8"
+mimalloc = { version = "0.1", optional = true }
+
+[features]
+# mimalloc as the global allocator (D52): faster than the Windows heap, which each
+# draw's many small blocks went through; off with --no-default-features.
+default = ["mimalloc"]
+mimalloc = ["dep:mimalloc"]

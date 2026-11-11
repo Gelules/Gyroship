@@ -2,6 +2,10 @@
 //! sound come next. The generated harness calls [`main`]. `boot --headless`
 //! (tests, reference runs) runs without a window, as before.
 
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 pub mod pads;
 pub mod sdl;
 
