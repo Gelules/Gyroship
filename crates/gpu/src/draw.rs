@@ -567,18 +567,21 @@ impl Surfaces {
                 let (slice, format, max) = match self.staged_indices(addr, size, d.count, restart) {
                     Some(found) => found,
                     None => {
-                        let mut raw = vec![0u8; size * d.count as usize];
-                        if !mem(addr, &mut raw) {
-                            return Err("index buffer not readable".into());
-                        }
-                        let max = index_max(&raw, size, restart);
-                        let (bytes, format) = match size {
-                            4 => (raw, wgpu::IndexFormat::Uint32),
-                            2 => (raw, wgpu::IndexFormat::Uint16),
-                            1 => (raw.iter().flat_map(|&b| u16::from(b).to_le_bytes()).collect(), wgpu::IndexFormat::Uint16),
-                            _ => (raw.chunks_exact(size).flat_map(|c| (index_value(c) as u16).to_le_bytes()).collect(), wgpu::IndexFormat::Uint16),
+                        let len = size * d.count as usize;
+                        let found = if let 2 | 4 = size {
+                            // Read straight into the arena: wgpu takes these as they are.
+                            let slice = self.stage_read(addr, len, mem).ok_or("index buffer not readable")?;
+                            let max = index_max(self.arena_bytes(&slice, len), size, restart);
+                            (slice, if size == 4 { wgpu::IndexFormat::Uint32 } else { wgpu::IndexFormat::Uint16 }, max)
+                        } else {
+                            let mut raw = vec![0u8; len];
+                            if !mem(addr, &mut raw) {
+                                return Err("index buffer not readable".into());
+                            }
+                            let max = index_max(&raw, size, restart);
+                            let bytes: Vec<u8> = if size == 1 { raw.iter().flat_map(|&b| u16::from(b).to_le_bytes()).collect() } else { raw.chunks_exact(size).flat_map(|c| (index_value(c) as u16).to_le_bytes()).collect() };
+                            (self.stage(&bytes), wgpu::IndexFormat::Uint16, max)
                         };
-                        let found = (self.stage(&bytes), format, max);
                         self.remember_indices(addr, size, d.count, restart, found.clone());
                         found
                     }
@@ -600,11 +603,9 @@ impl Surfaces {
             let slice = match self.staged_guest(crate::surfaces::Read::Vertex, s.address, padded, 0, 0) {
                 Some(slice) => slice,
                 None => {
-                    let mut data = vec![0u8; padded];
-                    if !mem(s.address, &mut data[..bytes as usize]) {
-                        return Err("vertex stream not readable".into());
-                    }
-                    self.stage_guest(crate::surfaces::Read::Vertex, s.address, &data, 0, 0)
+                    let slice = self.stage_read(s.address, bytes as usize, mem).ok_or("vertex stream not readable")?;
+                    self.remember_staged(crate::surfaces::Read::Vertex, s.address, padded, slice.clone());
+                    slice
                 }
             };
             vertex_buffers.push(slice);
