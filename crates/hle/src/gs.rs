@@ -141,14 +141,24 @@ impl GpuSide {
     /// Reads guest memory at a GPU address for the GPU; false if a byte is
     /// not readable. A naturally aligned 4- or 8-byte read (the semaphore an
     /// acquire polls while guest threads release it) is one Acquire load.
-    // ponytail: a read crossing into another GPU mapping follows the first
-    // one's CPU range; split the read per mapping if a buffer ever does.
-    pub fn read_gpu(&mut self, space: u32, gpu: u64, out: &mut [u8]) -> bool {
-        let at = self.gpu_to_cpu(space, gpu);
+    /// Other reads go through the mapping that covers each part, as `write_gpu`.
+    pub fn read_gpu(&mut self, space: u32, mut gpu: u64, mut out: &mut [u8]) -> bool {
+        let (mut at, mut room) = span(&self.at.maps.table, space, gpu);
         let word = match out.len() {
             4 if at.is_multiple_of(4) => self.mem.load_u32(at).map(u64::from),
             8 if at.is_multiple_of(8) => self.mem.load_u64(at),
-            _ => return self.mem.read(at, out).is_ok(),
+            _ => loop {
+                let n = out.len().min(usize::try_from(room).unwrap_or(usize::MAX));
+                let (part, rest) = std::mem::take(&mut out).split_at_mut(n);
+                if self.mem.read(at, part).is_err() {
+                    return false;
+                }
+                if rest.is_empty() {
+                    return true;
+                }
+                (gpu, out) = (gpu + n as u64, rest);
+                (at, room) = span(&self.at.maps.table, space, gpu);
+            },
         };
         word.map(|v| out.copy_from_slice(&v.to_le_bytes()[..out.len()])).is_ok()
     }

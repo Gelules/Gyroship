@@ -71,23 +71,20 @@ impl Surfaces {
             return Ok(());
         }
         let key = match self.cache.compute_programs.get(&l.program) {
-            Some(k) => *k,
+            Some(&k) => k,
             None => {
-                let k = crate::draw::read_compute_program(mem, l.program).map(|(key, code)| {
-                    self.cache.code.insert(key, code);
-                    key
-                });
+                let (k, code) = crate::draw::read_compute_program(mem, l.program).ok_or_else(|| format!("compute program at {:#x} not readable", l.program))?;
+                self.cache.code.insert(k, code);
                 self.cache.compute_programs.insert(l.program, k);
                 k
             }
-        }
-        .ok_or("compute program not readable")?;
+        };
         if l.shared > self.device.limits().max_compute_workgroup_storage_size {
             return Err(format!("{:#x} bytes of shared memory", l.shared));
         }
         let mut banks = BTreeMap::new();
         for &(bank, addr, size) in &l.cbufs {
-            let data = self.read_guest(crate::surfaces::Read::ComputeBank, addr, (size as usize).min(CBUF_BYTES), mem).ok_or("compute constant buffer not readable")?;
+            let data = self.read_guest(crate::surfaces::Read::ComputeBank, addr, (size as usize).min(CBUF_BYTES), mem).ok_or_else(|| format!("compute constant bank {bank} at {addr:#x} not readable"))?;
             banks.insert(bank, (addr, data));
         }
         let word = |banks: &BTreeMap<u8, Bank>, h: &Handle| -> Option<u32> {

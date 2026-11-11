@@ -791,8 +791,15 @@ impl Surfaces {
         }
         self.note_read(kind, len, false);
         let mut bytes = vec![0u8; len];
+        // ponytail: a bank may be bound at its full size near the end of a mapping
+        // (a ring buffer): its readable pages, then zeros, as programs never read
+        // past them (the console's GPU would fault).
         if !mem(addr, &mut bytes) {
-            return None;
+            let n = crate::draw::read_pages(mem, addr, &mut bytes);
+            if n == 0 {
+                return None;
+            }
+            bytes[n..].fill(0);
         }
         let bytes = Arc::new(bytes);
         self.memo.reads.insert(key, (bytes.clone(), self.memo.epoch));

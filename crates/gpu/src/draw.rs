@@ -48,8 +48,10 @@ pub fn read_compute_program(mem: Mem, gpu: u64) -> Option<(u64, Vec<u8>)> {
 fn read_until(mem: Mem, gpu: u64, key: fn(&[u8]) -> Option<(u64, usize)>) -> Option<(u64, Vec<u8>)> {
     let mut code = Vec::new();
     while code.len() < 0x4_0000 {
-        let mut chunk = vec![0u8; 0x1000];
-        if !mem(gpu + code.len() as u64, &mut chunk) {
+        // To the end of a page: never past the page that holds the closing self-branch.
+        let at = gpu + code.len() as u64;
+        let mut chunk = vec![0u8; (0x1000 - (at & 0xfff)) as usize];
+        if !mem(at, &mut chunk) {
             return None;
         }
         code.extend(chunk);
@@ -59,6 +61,20 @@ fn read_until(mem: Mem, gpu: u64, key: fn(&[u8]) -> Option<(u64, usize)>) -> Opt
         }
     }
     None
+}
+
+/// Reads `out` from `addr` page by page: the bytes readable before the first page that is not.
+pub(crate) fn read_pages(mem: Mem, addr: u64, out: &mut [u8]) -> usize {
+    let mut done = 0;
+    while done < out.len() {
+        let at = addr + done as u64;
+        let n = ((0x1000 - (at & 0xfff)) as usize).min(out.len() - done);
+        if !mem(at, &mut out[done..done + n]) {
+            break;
+        }
+        done += n;
+    }
+    done
 }
 
 /// A translation and its module, shared: draws take a reference count, not a copy
@@ -125,11 +141,11 @@ fn pipeline_workers() -> std::sync::mpsc::Sender<Job> {
 #[derive(Default)]
 pub struct Cache {
     /// Program key by GPU address, and code by key.
-    programs: FxMap<u64, Option<u64>>,
+    programs: FxMap<u64, u64>,
     pub(crate) code: FxMap<u64, Vec<u8>>,
     /// Compute program keys by GPU address, compiled compute programs, and the
     /// images compute programs wrote, by GPU address (see `compute.rs`).
-    pub(crate) compute_programs: FxMap<u64, Option<u64>>,
+    pub(crate) compute_programs: FxMap<u64, u64>,
     pub(crate) compute: FxMap<String, crate::compute::Compiled>,
     pub(crate) compute_pipelines: FxMap<String, (wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
     pub(crate) images: FxMap<u64, wgpu::Texture>,
@@ -750,18 +766,16 @@ impl Surfaces {
     /// The translation and WGSL module of the program at `at`; a vertex
     /// program pairs with its pixel program's varyings.
     fn module(&mut self, mem: Mem, at: u64, pixel: Option<&Translation>, ints: &BTreeMap<u8, bool>, banks: &[Option<(u64, u32)>]) -> Module {
+        // A failed read is not kept: play mode may read while guest threads map memory.
         let key = match self.cache.programs.get(&at) {
-            Some(key) => *key,
+            Some(&key) => key,
             None => {
-                let key = read_program(mem, at).map(|(key, code)| {
-                    self.cache.code.insert(key, code);
-                    key
-                });
+                let (key, code) = read_program(mem, at).ok_or_else(|| format!("program at {at:#x} not readable"))?;
+                self.cache.code.insert(key, code);
                 self.cache.programs.insert(at, key);
                 key
             }
-        }
-        .ok_or("program not readable")?;
+        };
         let pair = pixel.map(|p| p.key);
         let mask = ints.iter().fold(0u64, |m, (&l, &signed)| m | 1 << (l % 32) | u64::from(signed) << (32 + l % 32));
         // Jump tables: the translation without them (variant 0) says where they are;
@@ -839,7 +853,7 @@ impl Surfaces {
         for b in t.interface.cbufs.iter().copied().chain(handle_banks) {
             let (addr, size) = d.cbufs[stage].get(usize::from(b)).copied().flatten().ok_or_else(|| format!("constant bank {b} not bound"))?;
             // Its bound size only: binding it as 64 KiB is `stage_window`'s.
-            let data = self.read_guest(crate::surfaces::Read::Bank, addr, (size as usize).min(CBUF_BYTES), mem).ok_or("constant buffer not readable")?;
+            let data = self.read_guest(crate::surfaces::Read::Bank, addr, (size as usize).min(CBUF_BYTES), mem).ok_or_else(|| format!("constant bank {b} at {addr:#x} not readable"))?;
             banks.insert(b, (addr, data));
         }
         let (textures, swizzles) = self.texture_slots(t, &banks, d.headers, d.samplers, d.sampler_binding, attached, mem)?;
@@ -1456,6 +1470,27 @@ mod tests {
             }
         }
         assert!(!overlaps(&merged(&[]), 0, u64::MAX));
+    }
+
+    #[test]
+    fn programs_and_banks_are_read_no_further_than_their_readable_pages() {
+        // Readable memory: [0x10_0f00, 0x10_1000) only, an SPH, EXIT and the closing self-branch.
+        let w = |op: u128, f: u128| (op | 7 << 12 | f).to_le_bytes();
+        let mut page = vec![0u8; crate::sass::SPH_SIZE];
+        page.extend(w(0x94d, 7 << 87));
+        page.extend(w(0x947, 7 << 87 | ((-16i64 as u64 as u128) & ((1 << 50) - 1)) << 32));
+        page.resize(0x100, 0xaa);
+        let mut mem = |a: u64, buf: &mut [u8]| {
+            let Some(at) = a.checked_sub(0x10_0f00).map(|at| at as usize).filter(|at| at + buf.len() <= page.len()) else { return false };
+            buf.copy_from_slice(&page[at..at + buf.len()]);
+            true
+        };
+        let (_, code) = read_program(&mut mem, 0x10_0f00).expect("readable up to its page end");
+        assert_eq!(code.len(), crate::sass::SPH_SIZE + 0x20);
+        let mut bank = vec![0u8; 0x10000];
+        assert_eq!(read_pages(&mut mem, 0x10_0f80, &mut bank), 0x80);
+        assert_eq!(bank[..0x80], page[0x80..]);
+        assert_eq!(read_pages(&mut mem, 0x10_1000, &mut bank), 0);
     }
 
     #[test]
