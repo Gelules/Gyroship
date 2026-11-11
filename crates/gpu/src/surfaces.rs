@@ -161,6 +161,30 @@ pub struct Surfaces {
     window: Option<Window>,
     /// This submit's guest reads and staged blocks, for the reads that repeat.
     pub(crate) memo: Memo,
+    /// Shader modules and pipelines made since the caller last took them, and
+    /// in the whole run (the caller adds what it takes).
+    pub compile: Compile,
+    pub compile_total: Compile,
+}
+
+/// Shader modules (translation and WGSL check) and pipelines made, and the
+/// host time they took: what a frame showing new materials spends before it
+/// draws (D42).
+#[derive(Default, Clone, Copy, Debug)]
+pub struct Compile {
+    pub modules: u32,
+    pub module_time: std::time::Duration,
+    pub pipelines: u32,
+    pub pipeline_time: std::time::Duration,
+}
+
+impl std::ops::AddAssign for Compile {
+    fn add_assign(&mut self, o: Compile) {
+        self.modules += o.modules;
+        self.module_time += o.module_time;
+        self.pipelines += o.pipelines;
+        self.pipeline_time += o.pipeline_time;
+    }
 }
 
 /// A presented image copied for hashing: mapped when the GPU gets to it.
@@ -501,7 +525,7 @@ impl Surfaces {
         let arena = (arena_buffer(&device, 16 << 20), Vec::new());
         let window = window.map(|(surface, size)| Window::new(&adapter, &device, surface, size));
         let timing = crate::timing::Timing::new(&device, &queue);
-        Ok(Surfaces { adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pass: None, pending: None, timing, clock: None, present: 0, readbacks: Default::default(), hasher: None, arena, staging: Staging::default(), staged: FxMap::default(), last_color: None, window, memo: Memo::default() })
+        Ok(Surfaces { adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pass: None, pending: None, timing, clock: None, present: 0, readbacks: Default::default(), hasher: None, arena, staging: Staging::default(), staged: FxMap::default(), last_color: None, window, memo: Memo::default(), compile: Compile::default(), compile_total: Compile::default() })
     }
 
     /// Shows the presented image (the color target written last, its top-left

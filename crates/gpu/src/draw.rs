@@ -503,6 +503,7 @@ impl Surfaces {
         let (pipeline, bind_layouts) = match self.cache.pipelines.get(&key) {
             Some(p) => p.clone(),
             None => {
+                let since = std::time::Instant::now();
                 let (_, _, layouts, primitive, color_states, depth_state, group_layouts) = &key;
                 let bind_layouts: Vec<wgpu::BindGroupLayout> = group_layouts.iter().map(|entries| self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries })).collect();
                 let refs: Vec<Option<&wgpu::BindGroupLayout>> = bind_layouts.iter().map(Some).collect();
@@ -520,6 +521,8 @@ impl Surfaces {
                     cache: None,
                 });
                 self.cache.pipelines.insert(key, (p.clone(), bind_layouts.clone()));
+                self.compile.pipelines += 1;
+                self.compile.pipeline_time += since.elapsed();
                 (p, bind_layouts)
             }
         };
@@ -656,6 +659,7 @@ impl Surfaces {
             }
         }
         if !self.cache.modules.contains_key(&id) {
+            let since = std::time::Instant::now();
             let options = Options { varyings: pixel.map(|p| p.interface.varyings.clone()).unwrap_or_default(), int_attributes: ints.clone(), jump_targets: jump, ..Default::default() };
             let made = shader::translate_with(&self.cache.code[&key], &options).map_err(|e| format!("program {key:016x}: {e}")).and_then(|mut t| {
                 // GYROSHIP_WGSL_OVERRIDE=<dir>: <dir>/<key>.wgsl replaces the translation (a
@@ -667,6 +671,8 @@ impl Surfaces {
                 Ok(std::sync::Arc::new((t, m)))
             });
             self.cache.modules.insert(id, made);
+            self.compile.modules += 1;
+            self.compile.module_time += since.elapsed();
         }
         self.cache.modules[&id].clone()
     }

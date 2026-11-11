@@ -235,6 +235,7 @@ impl Surfaces {
         let (pipeline, layout) = match self.cache.compute_pipelines.get(&id) {
             Some(p) => p.clone(),
             None => {
+                let since = std::time::Instant::now();
                 let layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &layout_entries });
                 let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&layout)], ..Default::default() });
                 let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -246,6 +247,8 @@ impl Surfaces {
                     cache: None,
                 });
                 self.cache.compute_pipelines.insert(id, (pipeline.clone(), layout.clone()));
+                self.compile.pipelines += 1;
+                self.compile.pipeline_time += since.elapsed();
                 (pipeline, layout)
             }
         };
@@ -298,12 +301,15 @@ impl Surfaces {
         if let Some(c) = self.cache.compute.get(&id) {
             return c.clone();
         }
+        let since = std::time::Instant::now();
         let options = Options { workgroup: l.block, shared: l.shared, images, queried, ..Default::default() };
         let made = shader::translate_with(&self.cache.code[&key], &options).map_err(|e| format!("compute program {key:016x}: {e}")).and_then(|t| {
             let module = self.shader_module(&format!("{key:016x}"), &t.wgsl).map_err(|()| format!("compute program {key:016x}: invalid WGSL"))?;
             Ok(std::sync::Arc::new((t, module)))
         });
         self.cache.compute.insert(id, made.clone());
+        self.compile.modules += 1;
+        self.compile.module_time += since.elapsed();
         made
     }
 }

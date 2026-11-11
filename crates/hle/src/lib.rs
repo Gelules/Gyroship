@@ -319,6 +319,8 @@ impl Kernel {
             }
             if let Some(s) = &self.surfaces {
                 eprintln!("gyroship: staging over {} presents: {:?}", self.gs.presents, s.staging);
+                let c = s.compile_total;
+                eprintln!("gyroship: shaders over {} presents: {} modules in {:.1} s, {} pipelines in {:.1} s", self.gs.presents, c.modules, c.module_time.as_secs_f64(), c.pipelines, c.pipeline_time.as_secs_f64());
             }
             // The play engine charges no host time at switch points: each guest
             // thread's host thread reports its CPU time instead (parked time is not in it).

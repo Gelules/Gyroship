@@ -12,6 +12,10 @@ use crate::ipc::{Reply, Request};
 use crate::service::Service;
 use crate::thread::Object;
 
+/// A frame's shader work (modules and pipelines, host time) from which it
+/// is journaled: the frame's whole budget at 20 frames a second.
+const SLOW_COMPILE: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// State the graphics sessions share (plain data).
 #[derive(Debug, Default)]
 pub struct State {
@@ -509,6 +513,13 @@ impl Kernel {
             s.flush();
             let skipped = std::mem::take(&mut s.skipped);
             let errors = s.errors.lock().map(|mut e| std::mem::take(&mut *e)).unwrap_or_default();
+            // Shader work that held this frame back: host time, so in the play
+            // journal only (the deterministic one stays byte-identical).
+            let c = std::mem::take(&mut s.compile);
+            s.compile_total += c;
+            if self.config.play && c.module_time + c.pipeline_time >= SLOW_COMPILE {
+                self.log(&format!("gpu: present #{n}: {} modules in {} ms, {} pipelines in {} ms", c.modules, c.module_time.as_millis(), c.pipelines, c.pipeline_time.as_millis()));
+            }
             for (why, count) in skipped {
                 // Each distinct reason is journaled once, past the anomaly's first few lines.
                 if self.journal.first(&format!("gpu not done {why}")) {
