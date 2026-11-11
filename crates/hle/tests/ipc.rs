@@ -239,6 +239,36 @@ fn a_cloned_session_reaches_the_same_object() {
     assert_eq!(k.objects.iter().filter(|o| matches!(o, gyroship_hle::service::Service::Lm)).count(), 1, "one lm object");
 }
 
+/// The NFC reader is there and never finds an amiibo: ListDevices gives one
+/// handle, the activate event is never signaled, detection only searches.
+#[test]
+fn the_nfc_reader_is_listed_and_finds_no_tag() {
+    let (mut k, mut cpu) = kernel();
+    k.allowed_services.push("nfp:user".to_string());
+    let sm = connect_sm(&mut k, &mut cpu);
+    let (_, nfp) = get_service(&mut k, &mut cpu, sm, "nfp:user");
+    let (_, w) = send(&mut k, &mut cpu, nfp, &cmif(&[4], 0, &[], None));
+    let user = moved(&w);
+    // ListDevices into a B buffer at DATA + 0x100.
+    k.mem.write(DATA + 0x100, &[0xff; 8]).unwrap();
+    let at = DATA + 0x100;
+    let b = [8, at as u32, ((at >> 32 & 0xF) << 28 | (at >> 36 & 7) << 2) as u32];
+    let (_, w) = send(&mut k, &mut cpu, user, &cmif(&[4 | 1 << 24, b[0], b[1], b[2]], 2, &[], None));
+    assert_eq!((cmif_result(&w, 2), w[8]), (SUCCESS, 1), "{w:x?}");
+    let mut handle = [0xffu8; 8];
+    k.mem.read(at, &mut handle).unwrap();
+    assert_eq!(handle, [0; 8]);
+    // AttachActivateEvent: an event never signaled.
+    let (_, w) = send(&mut k, &mut cpu, user, &cmif(&[4], 17, &[0, 0], None));
+    assert_eq!((w[1] >> 31, w[2]), (1, 0x2), "one copied handle: {w:x?}");
+    assert!(!k.events[k.event_of(w[3]).expect("a readable event")].signaled);
+    // GetDeviceState: initialized, then searching once StartDetection ran.
+    let state = |k: &mut Kernel, cpu: &mut Cpu| send(k, cpu, user, &cmif(&[4], 20, &[0, 0], None)).1[8];
+    assert_eq!(state(&mut k, &mut cpu), 0);
+    send(&mut k, &mut cpu, user, &cmif(&[4], 3, &[0, 0], None));
+    assert_eq!(state(&mut k, &mut cpu), 1);
+}
+
 /// IStorage Read: the destination is checked and the read counted at once, the
 /// bytes come with the deferred work, and a read over the message is an anomaly.
 #[test]

@@ -70,6 +70,9 @@ pub enum Service {
     /// `aoc:u` and `ectx:aw`: no command seen yet.
     Aoc,
     Ectx,
+    /// `nfp:user` and its IUser: one NFC reader (the right controller's), which
+    /// never finds a tag: no amiibo on the host. `detecting` once asked to look.
+    Nfp { user: bool, detecting: bool },
 }
 
 #[derive(Debug, Default)]
@@ -108,6 +111,8 @@ impl Service {
             Service::Chat { session: false } => "chat:u".to_string(),
             Service::Chat { session: true } => "chat:u session".to_string(),
             Service::Ectx => "ectx:aw".to_string(),
+            Service::Nfp { user: false, .. } => "nfp:user".to_string(),
+            Service::Nfp { user: true, .. } => "nfp:user IUser".to_string(),
         }
     }
 
@@ -174,6 +179,29 @@ impl Service {
                 Some(h) => Reply { copy_handles: vec![h], ..Reply::ok() },
                 None => Reply::error(crate::result::OUT_OF_HANDLES),
             },
+            // nfp:user CreateUserInterface; IUser Initialize, Finalize; ListDevices:
+            // one reader, handle 0 (npad 1); Start/StopDetection; the activate,
+            // deactivate and availability-change events (never signaled); GetState
+            // (initialized), GetDeviceState (searching once started), GetNpadId.
+            (Service::Nfp { user: false, .. }, 0) => Reply::object(Service::Nfp { user: true, detecting: false }),
+            (Service::Nfp { user: true, .. }, 0 | 1) => Reply::ok(),
+            (Service::Nfp { user: true, .. }, 2) => {
+                if let Some(b) = req.out_buffer(0) {
+                    let _ = k.mem.write(b.addr, &0u64.to_le_bytes());
+                }
+                Reply::with(&1u32.to_le_bytes())
+            }
+            (Service::Nfp { user: true, detecting }, c @ (3 | 4)) => {
+                *detecting = c == 3;
+                Reply::ok()
+            }
+            (Service::Nfp { user: true, .. }, 17 | 18 | 23) => match k.lone_event() {
+                Some(h) => Reply { copy_handles: vec![h], ..Reply::ok() },
+                None => Reply::error(crate::result::OUT_OF_HANDLES),
+            },
+            (Service::Nfp { user: true, .. }, 19) => Reply::with(&1u32.to_le_bytes()),
+            (Service::Nfp { user: true, detecting }, 20) => Reply::with(&u32::from(*detecting).to_le_bytes()),
+            (Service::Nfp { user: true, .. }, 21) => Reply::with(&0u32.to_le_bytes()),
             (Service::Sm(sm), 0) => {
                 sm.registered = true;
                 Reply::ok()
@@ -248,6 +276,7 @@ impl Kernel {
             "ssl" => Service::Ssl,
             "chat:u" => Service::Chat { session: false },
             "ectx:aw" => Service::Ectx,
+            "nfp:user" => Service::Nfp { user: false, detecting: false },
             _ if self.config.explore => Service::Stub(name.clone()),
             _ => self.stop(crate::STOP_EXIT, &format!("sm: service {name:?} is not implemented")),
         };
