@@ -592,6 +592,8 @@ fn on_fault(what: &str) {
         k.log(&line);
     }
     k.journal.flush();
+    // The host reports (--perf, --profile, the pipeline cache), as at a stop.
+    k.host_reports();
 }
 
 /// A lock (the kernel's, the GPU side's), tried for up to `patience`, never
