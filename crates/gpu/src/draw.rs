@@ -131,7 +131,7 @@ pub struct Cache {
     /// images compute programs wrote, by GPU address (see `compute.rs`).
     pub(crate) compute_programs: FxMap<u64, Option<u64>>,
     pub(crate) compute: FxMap<String, crate::compute::Compiled>,
-    pub(crate) compute_pipelines: FxMap<String, (Made<wgpu::ComputePipeline>, wgpu::BindGroupLayout)>,
+    pub(crate) compute_pipelines: FxMap<String, (wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
     pub(crate) images: FxMap<u64, wgpu::Texture>,
     /// Translations by (program key, key of the pixel program it pairs with,
     /// mask of the attributes fetched as integers, hash of the jump targets or 0).
@@ -369,8 +369,7 @@ impl Surfaces {
     /// The pipelines still being made `after` they were asked for, each named
     /// once (play mode: the driver may take seconds, or never return).
     pub fn overdue(&mut self, after: std::time::Duration) -> Vec<String> {
-        let c = &mut self.cache;
-        c.pipelines.values_mut().filter_map(|(m, _)| m.overdue(after)).chain(c.compute_pipelines.values_mut().filter_map(|(m, _)| m.overdue(after))).collect()
+        self.cache.pipelines.values_mut().filter_map(|(m, _)| m.overdue(after)).collect()
     }
 
     /// The guest memory each uploaded texture came from, as GPU address ranges

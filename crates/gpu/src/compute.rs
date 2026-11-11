@@ -232,36 +232,27 @@ impl Surfaces {
             });
         }
         let id = format!("{key:x}/{:?}/{:#x}/{layout_entries:?}", l.block, l.shared);
+        // Made at once, even in play mode (D42 skips draws only): a dispatch skipped while
+        // its pipeline compiles can lose state the game computes once (run 45c: every
+        // presented image black for good).
         if !self.cache.compute_pipelines.contains_key(&id) {
             let since = std::time::Instant::now();
             let layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &layout_entries });
             let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&layout)], ..Default::default() });
-            // Owned: a worker thread may make it.
-            let (device, module) = (self.device.clone(), module.clone());
-            let make = move || {
-                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some(&format!("{key:016x}")),
-                    layout: Some(&pipeline_layout),
-                    module: &module,
-                    entry_point: Some("main"),
-                    compilation_options: Default::default(),
-                    cache: None,
-                })
-            };
-            let label = format!("p{key:016x}+compute");
-            let made = self.make(make, label.clone());
-            self.cache.compute_pipelines.insert(id.clone(), (made, layout));
+            let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(&format!("{key:016x}")),
+                layout: Some(&pipeline_layout),
+                module,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+            self.cache.compute_pipelines.insert(id.clone(), (pipeline, layout));
             self.compile.pipelines += 1;
             self.compile.pipeline_time += since.elapsed();
-            self.compile.made.push(label);
+            self.compile.made.push(format!("p{key:016x}+compute"));
         }
-        let (made, layout) = self.cache.compute_pipelines.get_mut(&id).ok_or("compute pipeline")?;
-        let Some(pipeline) = made.ready() else {
-            // Being made on a worker thread (play mode): the frame goes on without this dispatch.
-            self.compile.waited += 1;
-            return Ok(());
-        };
-        let layout = layout.clone();
+        let (pipeline, layout) = self.cache.compute_pipelines[&id].clone();
         let mut buffers: Vec<(u32, (wgpu::Buffer, u64, u64))> = bindings
             .cbufs
             .iter()
@@ -370,6 +361,9 @@ mod tests {
             eprintln!("no GPU adapter: test skipped");
             return None;
         };
+        // Play mode's worker threads too: a dispatch never waits for its pipeline
+        // (skipped, it gave black images for good), so every warp test runs whole.
+        s.background = true;
         const PROGRAM: u64 = 0x10_0000;
         const CBUF: u64 = 0x20_0000;
         const GLOBAL: u64 = 0x30_0000;
