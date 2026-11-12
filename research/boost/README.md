@@ -29,8 +29,9 @@ How much it matters (average boost speed over a full boost + cooldown cycle):
 | Landmaster | **125** (100%) | 125 | 78 | 69 |
 | Blue-Marine | **285 to 295** (hold + quick releases) | 140 | 230 | 247 |
 
-"Boost speed" here is the **extra** speed boosting adds on top of your normal speed. Its
-average over a whole cycle is what decides how much ground you gain.
+"Boost speed" here is the **extra** speed boosting adds on top of your cruise speed, in
+the game's distance units per second (see "Units"). Its average over a whole cycle is
+what decides how much ground you gain.
 
 ## How the boost meter really works (all three vehicles)
 
@@ -56,7 +57,8 @@ cooldown. That is where each vehicle's optimum comes from.
 
 ## The numbers
 
-Per second, and per frame at 60 fps (divide by 60).
+Per second, and per frame at 60 fps (divide by 60). Speeds are in the game's distance
+units per second (see "Units" below the table).
 
 | | Arwing | Blue-Marine | Landmaster |
 |---|---|---|---|
@@ -64,13 +66,30 @@ Per second, and per frame at 60 fps (divide by 60).
 | Meter fill while boosting | 60/s (1 per frame) | 40/s (0.67 per frame) | 30/s (0.5 per frame) |
 | Meter drain during cooldown | 30/s (0.5 per frame) | 20/s (0.33 per frame) | 30/s (0.5 per frame) |
 | Full meter lasts | 1.5 s (90 frames) | 2.25 s (135 frames) | 3 s (180 frames) |
+| Cruise speed (no boost) | 1200 | 400 | 425 |
 | Boost speed max | 900 | 300 | 300 (eases in) |
+| Speed at max boost (cruise + boost) | 2100 (×1.75) | 700 (×1.75) | 725 (×1.71) |
 | Boost speed build-up | +1800/s (+30 per frame) | +250/s (+4.17 per frame) | up to +3 per frame, then easing in |
 | Boost speed fade (not boosting) | −900/s (−15 per frame) | −100/s (−1.67 per frame) | −5% of its value per frame |
 | Brake | −900/s down to −600, comes back at +450/s | −125/s down to −300, comes back at +100/s | eases toward −300 |
 
 Boost and brake at the same time: boost wins on the Arwing and the Blue-Marine, brake wins
 on the Landmaster.
+
+### Units
+
+- **Speeds are in the game's own distance units per second**: the same units as the
+  positions in the game world. Boost speed adds to the cruise speed, and the sum is how
+  fast you move: at 60 fps, each frame moves you (cruise speed + boost speed) / 60 units.
+  The Arwing covers 20 units per frame with no boost, and 35 at full boost.
+- **Build-up and fade are changes of the boost speed.** +1800/s means the boost speed goes
+  up by 1,800 every second (+30 every frame), so it reaches 900 after 30 frames.
+- **Braking makes the boost speed negative**, and the sum still holds: at −600, the Arwing
+  moves at 1,200 − 600 = 600.
+- **The meter (0 to 90) has its own units**, unrelated to distance.
+- **How long is a unit in real life?** Unknown: nothing we found ties it to meters.
+  Compare with the cruise speed instead: full boost adds 75% on the Arwing and the
+  Blue-Marine, and 71% on the Landmaster.
 
 ## Arwing: let go at 1/3
 
@@ -271,6 +290,14 @@ this post and draws the charts. Run `python boost_math.py`; the charts need
   (boost, brake, both or nothing, from a tap to a full meter): for example, a 61-frame
   Arwing boost gives exactly 122 frames of cooldown, and boost speed takes exactly 60
   frames to fade from 900 to 0.
+- **The cruise speed and the unit.** Each vehicle's movement code adds the boost speed to
+  its cruise speed and moves the vehicle by that sum times the frame time, in the
+  direction it is heading. The logs confirm it frame by frame: the cruise speed never
+  changed (1,200, 400 and 425 in the windows of "Checked in real levels"), and on the
+  Arwing and the Blue-Marine each frame's step along the course was (cruise speed + boost
+  speed) / 60, to the rounding of the position (0.002 unit at worst over 1,499 frames per
+  run, and over 239 Arwing frames of braking). The Landmaster's road turns and climbs, so
+  its step along a single axis varies.
 - **Then the math.** The tables are exact frame-by-frame simulations of those rules, over
   many cycles, once they settle.
 
@@ -333,7 +360,8 @@ repository.
   Landmaster its easing steps and the buttons its boost code read. Probes on the four
   shields scripts give it the hits.
 - **The distance.** More probes log the vehicle's position and the speeds its movement
-  code uses, every frame. The ground gained by run A over run B is the difference of their
-  positions; the prediction adds up `(boost speed A - boost speed B) * dt`, frame by
+  code uses, every frame: the cruise speed (the movement script's `speed` setting) and the
+  boost speed it adds to it. The ground gained by run A over run B is the difference of
+  their positions; the prediction adds up `(boost speed A - boost speed B) * dt`, frame by
   frame.
 - **The tables and charts.** `python boost_math.py`, in this folder.
