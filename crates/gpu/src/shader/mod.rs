@@ -175,6 +175,10 @@ pub struct Options {
     /// The instructions the indirect jumps of `Interface::jump_tables` may land on,
     /// from the bound banks' words: only they (and direct targets) start blocks.
     pub jump_targets: Option<BTreeSet<usize>>,
+    /// Vertex: the user clip planes the draw enables (SET_USER_CLIP_ENABLE, bit
+    /// i for CLIP_DIST_i). Their distances become WGSL clip distances (the
+    /// device needs Features::CLIP_DISTANCES); the others are dropped.
+    pub clip_planes: u8,
 }
 
 /// Whether `op` may write register `r`.
@@ -288,6 +292,7 @@ pub fn translate_with(code: &[u8], options: &Options) -> Result<Translation, Err
     cx.queried = options.queried.clone();
     cx.int_attributes = options.int_attributes.clone();
     cx.jump_targets = options.jump_targets.clone();
+    cx.clip_planes = options.clip_planes;
     // Images the program both stores to and loads from: their loads read the image itself.
     let handles = |load: bool| -> BTreeSet<(u8, u16)> {
         ops.iter()
@@ -410,6 +415,8 @@ struct Cx {
     queried: BTreeMap<usize, TexDim>,
     int_attributes: BTreeMap<u8, bool>,
     jump_targets: Option<BTreeSet<usize>>,
+    /// `Options::clip_planes`.
+    clip_planes: u8,
     /// Compute: the program uses shared memory (`shm`, words as atomics so
     /// that ATOMS and plain accesses can share it).
     shm: bool,
@@ -456,7 +463,7 @@ const SHM_CAS: &str = "fn shm_cas(i: u32, op: u32, v: u32) -> u32 {
 
 impl Cx {
     fn new(sph: Sph) -> Cx {
-        Cx { sph, regs: BTreeSet::new(), preds: BTreeSet::new(), uregs: BTreeSet::new(), upreds: BTreeSet::new(), iface: Interface::default(), decls: String::new(), helpers: BTreeSet::new(), temps: 0, uexpr: BTreeMap::new(), gexpr: BTreeMap::new(), images: Vec::new(), queried: BTreeMap::new(), int_attributes: BTreeMap::new(), jump_targets: None, read_write: BTreeSet::new(), atomic: BTreeSet::new(), shm: false, lane: false, roots: BTreeMap::new() }
+        Cx { sph, regs: BTreeSet::new(), preds: BTreeSet::new(), uregs: BTreeSet::new(), upreds: BTreeSet::new(), iface: Interface::default(), decls: String::new(), helpers: BTreeSet::new(), temps: 0, uexpr: BTreeMap::new(), gexpr: BTreeMap::new(), images: Vec::new(), queried: BTreeMap::new(), int_attributes: BTreeMap::new(), jump_targets: None, clip_planes: 0, read_write: BTreeSet::new(), atomic: BTreeSet::new(), shm: false, lane: false, roots: BTreeMap::new() }
     }
 
     /// A shared memory access's byte address, `reg × stride + ureg + offset`, as a new `let`.
@@ -926,6 +933,14 @@ impl Cx {
                 self.iface.varyings.insert(v, mode);
                 let _ = writeln!(vout, "@location({v}) @interpolate({}) v{v}: vec4<f32>,", interp_attribute(mode));
                 let _ = writeln!(init, "o.v{v} = vec4<f32>(0.0, 0.0, 0.0, 1.0);");
+            }
+            // The enabled clip planes, up to the last one; a plane the program leaves
+            // unwritten (or the draw leaves disabled) keeps 1.0: nothing is clipped.
+            let planes = 8 - options.clip_planes.leading_zeros();
+            if planes > 0 {
+                m.insert_str(0, "enable clip_distances;\n");
+                let _ = writeln!(vout, "@builtin(clip_distances) clip: array<f32, {planes}>,");
+                let _ = writeln!(init, "o.clip = array<f32, {planes}>({});", vec!["1.0"; planes as usize].join(", "));
             }
             vout.push_str("};\n");
             let _ = write!(m, "{vin}{vout}\n@vertex\nfn main(i: VsIn) -> VsOut {{\n{init}{locals}{body}}}\n");
@@ -1665,9 +1680,16 @@ impl Cx {
                         }
                         // Point size: not a WGSL output.
                         0x6c => {}
-                        // ponytail: clip and cull distances (NAK_ATTR_CLIP_CULL_DIST_0..7) are
-                        // dropped; wgpu's CLIP_DISTANCES feature can carry them when a scene needs it.
-                        0x2c0..=0x2dc => {}
+                        // Clip and cull distances (NAK_ATTR_CLIP_CULL_DIST_0..7): those of the
+                        // planes the draw enables clip (Corneria's water reflection keeps what is
+                        // above the water so). ponytail: a plane set to cull (SET_USER_CLIP_OP)
+                        // clips too; WGSL has no cull distances.
+                        0x2c0..=0x2dc => {
+                            let plane = (a - 0x2c0) / 4;
+                            if self.clip_planes >> plane & 1 != 0 {
+                                let _ = writeln!(out, "o.clip[{plane}] = f({v});");
+                            }
+                        }
                         _ => return Err(format!("AST to attribute {a:#x}")),
                     }
                 }
@@ -2436,6 +2458,22 @@ mod tests {
         assert_eq!(t.stage, Stage::Vertex);
         assert_eq!(t.interface.attributes, BTreeMap::from([(0, 3), (1, 3)]));
         assert!(t.wgsl.contains("o.pos[0] = f(r2);"), "{}", t.wgsl);
+    }
+
+    #[test]
+    fn a_clip_distance_clips_only_on_an_enabled_plane() {
+        // As above, plus AST R0 to clip distance 0 (0x2c0), as Corneria's water reflection does.
+        let ald = |dst: u128, attr: u128| w(0x321, &[(16, dst), (24, 255), (32, 255), (40, attr), (74, 1)]);
+        let ast = |data: u128, attr: u128, comps: u128| w(0x322, &[(24, 255), (32, data), (64, 255), (40, attr), (74, comps)]);
+        let code = program(&[(0, 0x020c_0481), (6, 0x33), (13, 0x3_3000)], &[ald(0, 0x90), ald(2, 0x80), ast(2, 0x70, 1), ast(0, 0x80, 1), ast(0, 0x2c0, 0), exit()]);
+        let on = translate_with(&code, &Options { clip_planes: 1, ..Default::default() }).unwrap_or_else(|e| panic!("{e}"));
+        validate(&on.wgsl).unwrap_or_else(|e| panic!("{e}\n{}", on.wgsl));
+        for want in ["enable clip_distances;", "@builtin(clip_distances) clip: array<f32, 1>", "o.clip = array<f32, 1>(1.0);", "o.clip[0] = f(r0);"] {
+            assert!(on.wgsl.contains(want), "{want}\n{}", on.wgsl);
+        }
+        // The plane disabled (or no device feature): the distance is dropped.
+        let off = ok(&code);
+        assert!(!off.wgsl.contains("clip_distances") && !off.wgsl.contains("o.clip"), "{}", off.wgsl);
     }
 
     #[test]

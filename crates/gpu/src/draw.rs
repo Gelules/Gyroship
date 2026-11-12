@@ -187,8 +187,9 @@ pub struct Cache {
     pub(crate) compute_pipelines: FxMap<String, (wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
     pub(crate) images: FxMap<u64, wgpu::Texture>,
     /// Translations by (program key, key of the pixel program it pairs with,
-    /// mask of the attributes fetched as integers, hash of the jump targets or 0).
-    modules: FxMap<(u64, Option<u64>, u64, u64), Module>,
+    /// mask of the attributes fetched as integers, hash of the jump targets or
+    /// 0, user clip planes enabled).
+    modules: FxMap<ModuleId, Module>,
     pipelines: FxMap<PipelineKey, (Made<wgpu::RenderPipeline>, Vec<wgpu::BindGroupLayout>)>,
     /// Bind group layouts by their entries, shared by the pipelines.
     layouts: FxMap<Vec<wgpu::BindGroupLayoutEntry>, wgpu::BindGroupLayout>,
@@ -336,7 +337,10 @@ fn float_format(f: wgpu::TextureFormat) -> Option<wgpu::TextureFormat> {
 
 /// Per program (key, paired pixel key, integer mask): jump-table bank bytes and the
 /// module variant they gave.
-type JumpMemo = FxMap<(u64, Option<u64>, u64), (Vec<Vec<u8>>, u64)>;
+type JumpMemo = FxMap<(u64, Option<u64>, u64, u8), (Vec<Vec<u8>>, u64)>;
+
+/// A module's key in the cache: see `Cache::modules`.
+type ModuleId = (u64, Option<u64>, u64, u64, u8);
 
 /// What a render pipeline is made from, as a hashable key: the vertex program
 /// (key, WGSL length), the pixel program's, the vertex buffer layouts (stream,
@@ -513,12 +517,14 @@ impl Surfaces {
             return Err("vertex-A, tessellation or geometry program".into());
         }
         let ps = match d.programs[5] {
-            Some(at) => Some(self.module(mem, at, None, &BTreeMap::new(), &d.cbufs[4])?),
+            Some(at) => Some(self.module(mem, at, None, &BTreeMap::new(), &d.cbufs[4], 0)?),
             None => None,
         };
         // Attributes fetched as integers: the vertex program declares them so.
         let ints: BTreeMap<u8, bool> = d.attributes.iter().filter(|a| !a.constant && matches!(a.format.kind, AttrKind::Uint | AttrKind::Sint)).map(|a| (a.location, a.format.kind == AttrKind::Sint)).collect();
-        let vs = self.module(mem, d.programs[1].ok_or("no vertex program")?, ps.as_ref().map(|p| &p.0), &ints, &d.cbufs[0])?;
+        // The user clip planes the draw enables, where the device can clip (else none).
+        let clip = if self.clip_distances { d.render.user_clip } else { 0 };
+        let vs = self.module(mem, d.programs[1].ok_or("no vertex program")?, ps.as_ref().map(|p| &p.0), &ints, &d.cbufs[0], clip)?;
 
         // Attachments: the locations the pixel program writes, and depth when tested.
         let none = BTreeMap::new();
@@ -563,9 +569,12 @@ impl Surfaces {
             let format = wgpu_vertex_format(&a.format).ok_or_else(|| format!("vertex attribute format {:#x}", a.raw))?;
             let s = d.streams.iter().find(|s| s.index == a.stream).ok_or("vertex attribute on a disabled stream")?;
             let attribute = wgpu::VertexAttribute { format, offset: u64::from(a.offset), shader_location: u32::from(location) };
+            // An instance stream: one element, that of the instance drawn, read by every
+            // instance (stride 0); an instanced draw comes as one draw per instance.
             match layouts.iter_mut().find(|l| l.0 == s.index) {
                 Some(l) => l.3.push(attribute),
-                None => layouts.push((s.index, if s.per_instance { wgpu::VertexStepMode::Instance } else { wgpu::VertexStepMode::Vertex }, u64::from(s.stride), vec![attribute])),
+                None if s.per_instance => layouts.push((s.index, wgpu::VertexStepMode::Instance, 0, vec![attribute])),
+                None => layouts.push((s.index, wgpu::VertexStepMode::Vertex, u64::from(s.stride), vec![attribute])),
             }
         }
 
@@ -608,18 +617,23 @@ impl Surfaces {
         let mut vertex_buffers = Vec::new();
         for (index, step, stride, attributes) in &layouts {
             let s = d.streams.iter().find(|s| s.index == *index).ok_or("stream")?;
-            let elements = if *step == wgpu::VertexStepMode::Instance { 1 } else { last + 1 };
+            let per_instance = *step == wgpu::VertexStepMode::Instance;
+            // The instance's element (instance / divisor; a divisor of 0 keeps element 0, as
+            // Vulkan's, which NVK writes unchanged).
+            let element = if per_instance && s.divisor != 0 { u64::from(d.instance / s.divisor) } else { 0 };
+            let start = s.address + element * u64::from(s.stride);
+            let elements = if per_instance { 1 } else { last + 1 };
             let reach = attributes.iter().map(|a| a.offset + a.format.size()).max().unwrap_or(0);
             let bytes = (elements - 1) * stride + reach;
-            if s.end.wrapping_sub(s.address) < bytes - 1 || bytes > 64 << 20 {
+            if (element > 0 && start > s.end) || s.end.wrapping_sub(start) < bytes - 1 || bytes > 64 << 20 {
                 return Err("vertex stream shorter than the draw".into());
             }
             let padded = bytes.next_multiple_of(4) as usize;
-            let slice = match self.staged_guest(crate::surfaces::Read::Vertex, s.address, padded, 0, 0) {
+            let slice = match self.staged_guest(crate::surfaces::Read::Vertex, start, padded, 0, 0) {
                 Some(slice) => slice,
                 None => {
-                    let slice = self.stage_read(s.address, bytes as usize, mem).ok_or("vertex stream not readable")?;
-                    self.remember_staged(crate::surfaces::Read::Vertex, s.address, padded, slice.clone());
+                    let slice = self.stage_read(start, bytes as usize, mem).ok_or("vertex stream not readable")?;
+                    self.remember_staged(crate::surfaces::Read::Vertex, start, padded, slice.clone());
                     slice
                 }
             };
@@ -824,9 +838,9 @@ impl Surfaces {
                     if changed(&mut last.index, (b.clone(), *format)) {
                         pass.set_index_buffer(buffer.slice(*at..at + size), *format);
                     }
-                    pass.draw_indexed(0..d.count, d.base_vertex, 0..1);
+                    pass.draw_indexed(0..d.count, d.base_vertex, d.instance..d.instance + 1);
                 }
-                None => pass.draw(d.first..d.first + d.count, 0..1),
+                None => pass.draw(d.first..d.first + d.count, d.instance..d.instance + 1),
             }
         }
         for (s, _) in colors.iter().flatten() {
@@ -842,7 +856,7 @@ impl Surfaces {
 
     /// The translation and WGSL module of the program at `at`; a vertex
     /// program pairs with its pixel program's varyings.
-    fn module(&mut self, mem: Mem, at: u64, pixel: Option<&Translation>, ints: &BTreeMap<u8, bool>, banks: &[Option<(u64, u32)>]) -> Module {
+    fn module(&mut self, mem: Mem, at: u64, pixel: Option<&Translation>, ints: &BTreeMap<u8, bool>, banks: &[Option<(u64, u32)>], clip: u8) -> Module {
         // A failed read is not kept: play mode may read while guest threads map memory.
         let key = match self.cache.programs.get(&at) {
             Some(&key) => key,
@@ -860,7 +874,7 @@ impl Surfaces {
         // keyed by them too. Both are made in one call: variant 0 (every instruction
         // a block, a switch of thousands of cases the driver took minutes over)
         // serves only while a table's bank cannot be read.
-        let mut id = (key, pair, mask, 0);
+        let mut id = (key, pair, mask, 0, clip);
         if !self.cache.modules.contains_key(&id) {
             self.translate_module(id, pixel, ints, None);
         }
@@ -868,7 +882,7 @@ impl Surfaces {
             && let Some(tables) = m.0.interface.jump_tables.clone()
             && let Some(bytes) = jump_banks(&tables, banks, mem)
         {
-            match self.cache.jumps.get(&(key, pair, mask)) {
+            match self.cache.jumps.get(&(key, pair, mask, clip)) {
                 // The variant these bytes gave: its module is in the cache since.
                 Some((seen, variant)) if *seen == bytes => id.3 = *variant,
                 _ => {
@@ -879,7 +893,7 @@ impl Surfaces {
                         targets.hash(&mut h);
                         h.finish() | 1
                     };
-                    self.cache.jumps.insert((key, pair, mask), (bytes, id.3));
+                    self.cache.jumps.insert((key, pair, mask, clip), (bytes, id.3));
                     if !self.cache.modules.contains_key(&id) {
                         self.translate_module(id, pixel, ints, Some(targets));
                     }
@@ -891,10 +905,10 @@ impl Surfaces {
 
     /// Translates program `id.0` (paired with `pixel`, attributes `ints`, the
     /// jump targets of variant `id.3`) into the module cache.
-    fn translate_module(&mut self, id: (u64, Option<u64>, u64, u64), pixel: Option<&Translation>, ints: &BTreeMap<u8, bool>, jump: Option<BTreeSet<usize>>) {
+    fn translate_module(&mut self, id: ModuleId, pixel: Option<&Translation>, ints: &BTreeMap<u8, bool>, jump: Option<BTreeSet<usize>>) {
         let key = id.0;
         let since = std::time::Instant::now();
-        let options = Options { varyings: pixel.map(|p| p.interface.varyings.clone()).unwrap_or_default(), int_attributes: ints.clone(), jump_targets: jump, ..Default::default() };
+        let options = Options { varyings: pixel.map(|p| p.interface.varyings.clone()).unwrap_or_default(), int_attributes: ints.clone(), jump_targets: jump, clip_planes: id.4, ..Default::default() };
         let made = shader::translate_with(&self.cache.code[&key], &options).map_err(|e| format!("program {key:016x}: {e}")).and_then(|mut t| {
             // GYROSHIP_WGSL_OVERRIDE=<dir>: <dir>/<key>.wgsl replaces the translation (a
             // debugging aid: a program edited to show its intermediate values).

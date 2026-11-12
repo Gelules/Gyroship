@@ -565,6 +565,8 @@ pub struct RenderState {
     pub blend_constant: [f32; 4],
     pub depth_stencil: DepthStencil,
     pub raster: Raster,
+    /// SET_USER_CLIP_ENABLE: bit i enables the vertex program's clip distance i.
+    pub user_clip: u8,
 }
 
 impl RenderState {
@@ -826,6 +828,7 @@ pub fn render_state(r: Reg) -> RenderState {
         blend_constant: [float(r, 0x131c), float(r, 0x1320), float(r, 0x1324), float(r, 0x1328)],
         depth_stencil,
         raster,
+        user_clip: r(0x1510) as u8,
     }
 }
 

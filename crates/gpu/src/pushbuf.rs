@@ -114,6 +114,9 @@ pub enum Effect {
 pub struct Draw {
     /// BEGIN's primitive (4 = triangles).
     pub topology: u32,
+    /// The instance drawn: 0 after a BEGIN with INSTANCE_ID FIRST, one more after
+    /// each SUBSEQUENT (an instanced draw is one BEGIN per instance).
+    pub instance: u32,
     pub index: Option<IndexBuffer>,
     /// First vertex (vertex arrays).
     pub first: u32,
@@ -304,6 +307,8 @@ pub struct Channel {
     wait: Option<Acquire>,
     /// Every method executed, when set (for study tools).
     pub trace: Option<Vec<Traced>>,
+    /// Per subchannel: the instance the next draw draws (BEGIN's INSTANCE_ID).
+    instance: [u32; 8],
 }
 
 /// One executed method, for tracing.
@@ -342,6 +347,7 @@ impl Default for Channel {
             queue: VecDeque::new(),
             wait: None,
             trace: None,
+            instance: [0; 8],
         }
     }
 }
@@ -573,6 +579,14 @@ impl Channel {
             }
         }
         self.engine[i] = value;
+        // BEGIN's INSTANCE_ID (27:26): FIRST, SUBSEQUENT (the next instance), UNCHANGED.
+        if three_d && method == BEGIN {
+            match value >> 26 & 3 {
+                0 => self.instance[subchannel] = 0,
+                1 => self.instance[subchannel] += 1,
+                _ => {}
+            }
+        }
         if macros && let Some(unit) = self.mme.as_mut() {
             match method {
                 LOAD_MME_INSTRUCTION_RAM_POINTER => unit.set_code_pointer(value),
@@ -727,6 +741,7 @@ impl Channel {
         let render = raster::render_state(&reg);
         Draw {
             topology: reg(BEGIN) & 0xffff,
+            instance: self.instance[sub],
             index: indexed.then(|| vertex::index_buffer(&reg)),
             first: if indexed { 0 } else { reg(VERTEX_ARRAY_START) },
             count,
@@ -1016,6 +1031,16 @@ mod tests {
         assert_eq!((d.topology, d.first, d.count, d.programs), (4, 0, 3, programs));
         let ib = d.index.as_ref().unwrap();
         assert_eq!((ib.address, ib.bytes_per_index, ib.first), (0x81_0000_2000, 2, 6));
+    }
+
+    #[test]
+    fn an_instanced_draw_numbers_its_instances() {
+        // BEGIN (triangles) with INSTANCE_ID FIRST, SUBSEQUENT twice, UNCHANGED, FIRST again.
+        let begin = |mode: u32| [header(1, 1, 0, BEGIN), 4 | mode << 26, header(1, 1, 0, DRAW_VERTEX_ARRAY), 3];
+        let words: Vec<u32> = [header(1, 1, 0, SET_OBJECT), 0xc797].into_iter().chain([0, 1, 1, 2, 0].into_iter().flat_map(begin)).collect();
+        let effects = Channel::default().run(&words);
+        let instances: Vec<u32> = effects.iter().filter_map(|e| if let Effect::Draw(d) = e { Some(d.instance) } else { None }).collect();
+        assert_eq!(instances, [0, 1, 2, 2, 0]);
     }
 
     #[test]

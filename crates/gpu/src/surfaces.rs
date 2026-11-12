@@ -229,6 +229,8 @@ pub struct Surfaces {
     bind_groups: Aged<(wgpu::BindGroupLayout, Vec<Bound>), wgpu::BindGroup>,
     /// The device's limit on uniform buffers bound at dynamic offsets.
     pub(crate) dynamic_max: u32,
+    /// Whether the device has Features::CLIP_DISTANCES (user clip planes).
+    pub(crate) clip_distances: bool,
 }
 
 /// A pipeline cache kept in a file between runs (`--pipeline-cache`): the
@@ -580,6 +582,7 @@ impl Surfaces {
             | wgpu::Features::SUBGROUP
             | wgpu::Features::PIPELINE_CACHE
             | wgpu::Features::TEXTURE_ATOMIC
+            | wgpu::Features::CLIP_DISTANCES
             | crate::timing::Timing::wanted();
         let info = adapter.get_info();
         check_adapter(adapter.features(), info.subgroup_min_size, info.subgroup_max_size).map_err(|e| format!("{} ({:?}): {e}", info.name, info.backend))?;
@@ -630,10 +633,11 @@ impl Surfaces {
         let fill = (fill_module, fill_layout, Default::default());
         let arena = (arena_buffer(&device, 16 << 20), Vec::new());
         let dynamic_max = device.limits().max_dynamic_uniform_buffers_per_pipeline_layout;
+        let clip_distances = device.features().contains(wgpu::Features::CLIP_DISTANCES);
         let window = window.map(|(surface, size)| Window::new(&adapter, &device, surface, size));
         let timing = crate::timing::Timing::new(&device, &queue);
         let renderable = (0..=0xff).filter_map(color_format).chain((0..=0xff).filter_map(depth_format)).map(|f| (f, renderable_on(&adapter, &device, f))).collect();
-        Ok(Surfaces { renderable, adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pass: None, pending: None, timing, clock: None, present: 0, readbacks: Default::default(), hasher: None, arena, staging: Staging::default(), staged: FxMap::default(), last_color: None, window, memo: Memo::default(), compile: Compile::default(), compile_total: Compile::default(), background: false, wait_left: PIPELINE_WAIT, workers: None, finished: Default::default(), disk_cache: None, views: Aged::default(), bind_groups: Aged::default(), dynamic_max })
+        Ok(Surfaces { renderable, adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pass: None, pending: None, timing, clock: None, present: 0, readbacks: Default::default(), hasher: None, arena, staging: Staging::default(), staged: FxMap::default(), last_color: None, window, memo: Memo::default(), compile: Compile::default(), compile_total: Compile::default(), background: false, wait_left: PIPELINE_WAIT, workers: None, finished: Default::default(), disk_cache: None, views: Aged::default(), bind_groups: Aged::default(), dynamic_max, clip_distances })
     }
 
     /// Shows the presented image (the color target written last, its top-left
