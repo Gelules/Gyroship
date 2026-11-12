@@ -163,7 +163,18 @@ fn hex(b: &[u8]) -> String {
 }
 
 /// The probe hook: the first pass is journaled; the oracle runs at `nn::init::Start`.
+/// Every pass of a `trace:` probe goes to the `--trace` file only.
 pub(crate) unsafe fn on_probe(cpu: *mut Cpu, pc: u64, name: &str) {
+    if name.starts_with("trace:") {
+        crate::with(|k| {
+            let stamp = (k.now(), k.sched.current.map_or(0, |t| k.sched.threads[t].id), k.gs.presents);
+            if let Some(t) = k.trace.as_mut() {
+                // SAFETY: the running thread's context, which this hook only reads.
+                t.pass(pc, name, unsafe { &*cpu }, &k.mem, stamp);
+            }
+        });
+        return;
+    }
     // SAFETY: the running thread's context, read before anything else runs.
     let (x, lr) = unsafe { ((*cpu).x, (*cpu).x[30]) };
     crate::with(|k| {
@@ -268,6 +279,7 @@ pub fn run(table: Vec<rt::Entry>, window: Option<HostWindow>) {
         perf: value("--perf").map(Into::into),
         hashes: value("--hashes").map(Into::into),
         record: value("--record").map(Into::into),
+        trace: value("--trace").map(Into::into),
         audio_dump: value("--dump-audio").map(Into::into),
         play: flag("--play"),
         pipeline_cache: value("--pipeline-cache").map(Into::into),
@@ -291,6 +303,12 @@ pub fn run(table: Vec<rt::Entry>, window: Option<HostWindow>) {
         std::process::exit(2);
     });
     k.log(&format!("{installed} recompiled functions installed"));
+    if let Some(path) = k.config.trace.clone() {
+        k.trace = Some(crate::trace::Trace::open(&path).unwrap_or_else(|e| {
+            eprintln!("gyroship: --trace {}: {e}", path.display());
+            std::process::exit(2);
+        }));
+    }
     // The host GPU runs the game's work when frames are dumped or measured, or with --gpu.
     if window.is_some() || k.config.frames_dump.is_some() || k.config.perf.is_some() || k.config.hashes.is_some() || flag("--gpu") {
         let backend = match value("--backend").as_deref() {

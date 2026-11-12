@@ -357,10 +357,13 @@ pub fn probe_counts() -> Vec<(u64, &'static str, u64)> {
     PROBES.get().map_or_else(Vec::new, |p| p.iter().map(|(a, n, c)| (*a, n.as_str(), c.load(Ordering::Relaxed))).collect())
 }
 
-/// How many passes of a probe are reported: every one up to 512 for
-/// `each:...`, four for `stack:...` and `dump:...`, otherwise the first.
+/// How many passes of a probe are reported: all of them for `trace:...`,
+/// every one up to 512 for `each:...`, four for `stack:...` and `dump:...`,
+/// otherwise the first.
 fn reported_passes(name: &str) -> u64 {
-    if name.starts_with("each:") {
+    if name.starts_with("trace:") {
+        u64::MAX
+    } else if name.starts_with("each:") {
         512
     } else if name.starts_with("stack:") || name.starts_with("dump:") {
         4

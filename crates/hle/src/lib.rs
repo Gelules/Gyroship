@@ -28,6 +28,7 @@ pub mod svc;
 pub mod sync;
 pub mod thread;
 pub mod time;
+pub mod trace;
 
 use gyroship_runtime::{Cpu, Hooks};
 use gyroship_runtime::mem::Memory;
@@ -131,6 +132,8 @@ pub struct Config {
     pub hashes: Option<std::path::PathBuf>,
     /// `--record FILE`: the controller's states, in `--replay`'s format.
     pub record: Option<std::path::PathBuf>,
+    /// `--trace FILE`: where the passes of `trace:` probes go (see [`trace`]).
+    pub trace: Option<std::path::PathBuf>,
     /// `--dump-audio FILE`: every frame the game plays, as a float WAV.
     pub audio_dump: Option<std::path::PathBuf>,
     /// `--play`: the play engine (D41). Each guest thread runs on a host thread
@@ -154,7 +157,7 @@ impl Config {
 
 impl Default for Config {
     fn default() -> Config {
-        Config { seed: 0x5EED, explore: false, non_system_memory: 0x2_6410_0000, time_limit: None, frames: None, save_dir: None, vsync: true, work_time: false, gpfifo_dump: None, frames_dump: None, dump_every: 1, dump_from: 0, dump_draws: None, shaders_dump: None, replay: None, profile: None, perf: None, hashes: None, record: None, audio_dump: None, play: false, pipeline_cache: None, late_frames: false }
+        Config { seed: 0x5EED, explore: false, non_system_memory: 0x2_6410_0000, time_limit: None, frames: None, save_dir: None, vsync: true, work_time: false, gpfifo_dump: None, frames_dump: None, dump_every: 1, dump_from: 0, dump_draws: None, shaders_dump: None, replay: None, profile: None, perf: None, hashes: None, record: None, trace: None, audio_dump: None, play: false, pipeline_cache: None, late_frames: false }
     }
 }
 
@@ -219,6 +222,8 @@ pub struct Kernel {
     /// The stream's gain (SetStreamGain), and its channels and rate.
     pub audio_gain: f32,
     pub audio_format: (u16, u32),
+    /// `--trace`: the file `trace:` probes write to.
+    pub trace: Option<trace::Trace>,
 }
 
 /// The host's sound output (`boot::HostWindow::audio`): interleaved f32 frames
@@ -285,7 +290,7 @@ impl Kernel {
         let audio_samples = config.audio_dump.as_ref().map(|_| Vec::new());
         let (mem, tally, gs) = (Arc::new(mem), Arc::new(Mutex::new(Tally::default())), gs::State::default());
         let gpu_side = Arc::new(Mutex::new(nvdrv::GpuSide::new(mem.clone(), journal.share(), tally.clone(), gs.syncpts.clone(), config.clone())));
-        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None, sessions: Vec::new(), objects: Vec::new(), domains: Vec::new(), allowed_services: Vec::new(), shared: Vec::new(), transfers: Vec::new(), time_shared: None, frame: (0, 0, 0), symbols: Vec::new(), romfs: None, deferred: None, gs, hid_shared: None, input: Default::default(), spin: Vec::new(), census: Census::default(), saves: Default::default(), timers: Vec::new(), gpu_side, tally, live_input: None, recorded, audio_out: None, audio_samples, opus: Default::default(), audio_gain: 1.0, audio_format: (2, 48_000) }
+        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None, sessions: Vec::new(), objects: Vec::new(), domains: Vec::new(), allowed_services: Vec::new(), shared: Vec::new(), transfers: Vec::new(), time_shared: None, frame: (0, 0, 0), symbols: Vec::new(), romfs: None, deferred: None, gs, hid_shared: None, input: Default::default(), spin: Vec::new(), census: Census::default(), saves: Default::default(), timers: Vec::new(), gpu_side, tally, live_input: None, recorded, audio_out: None, audio_samples, opus: Default::default(), audio_gain: 1.0, audio_format: (2, 48_000), trace: None }
     }
 
     /// The activity and anomaly counts.
@@ -350,9 +355,10 @@ impl Kernel {
                 self.log(&line);
             }
         }
-        // How many times guest code passed each probe (e.g. the engine stages' ticks).
+        // How many times guest code passed each probe (e.g. the engine stages' ticks);
+        // `trace:` probes stay out of the journal.
         for (addr, name, n) in gyroship_runtime::probe_counts() {
-            if n > 0 {
+            if n > 0 && !name.starts_with("trace:") {
                 self.log(&format!("  probe {name} at {addr:#x}: {n} passes"));
             }
         }
@@ -363,6 +369,9 @@ impl Kernel {
             self.log(&line);
         }
         self.journal.flush();
+        if let Some(t) = &self.trace {
+            t.flush();
+        }
         self.host_reports();
         eprintln!("gyroship: {why}");
         std::process::exit(code);
