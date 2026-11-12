@@ -209,9 +209,13 @@ pub struct Surfaces {
     /// in the whole run (the caller adds what it takes).
     pub compile: Compile,
     pub compile_total: Compile,
-    /// Play mode (D42): pipelines are made on worker threads, and a draw or a
-    /// dispatch whose pipeline is not made yet is skipped. Off: made at once.
+    /// Play mode (D42): pipelines are made on worker threads; a draw whose
+    /// pipeline is not made yet waits for it within the frame's budget, then is
+    /// skipped. Off: made at once.
     pub background: bool,
+    /// Play mode: how long this frame may still wait for pipelines being made
+    /// before it skips their draws ([`PIPELINE_WAIT`] at each present).
+    pub(crate) wait_left: std::time::Duration,
     /// The worker threads' queue, started at the first pipeline they make.
     pub(crate) workers: Option<std::sync::mpsc::Sender<crate::draw::Job>>,
     /// Pipelines the worker threads made since the caller took them: label, time.
@@ -241,6 +245,11 @@ pub(crate) struct DiskCache {
 
 /// How often a run writes its pipeline cache: a killed run loses at most that much.
 const CACHE_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Play mode: what a frame may spend waiting for its new pipelines. The driver
+/// makes one it has cached in 0 to 8 ms (43 at the first image of Corneria's
+/// opening scene, run 14): the frame comes later instead of without them.
+pub(crate) const PIPELINE_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Shader modules (translation and WGSL check) and pipelines made, and the
 /// host time they took: what a frame showing new materials spends before it
@@ -624,7 +633,7 @@ impl Surfaces {
         let window = window.map(|(surface, size)| Window::new(&adapter, &device, surface, size));
         let timing = crate::timing::Timing::new(&device, &queue);
         let renderable = (0..=0xff).filter_map(color_format).chain((0..=0xff).filter_map(depth_format)).map(|f| (f, renderable_on(&adapter, &device, f))).collect();
-        Ok(Surfaces { renderable, adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pass: None, pending: None, timing, clock: None, present: 0, readbacks: Default::default(), hasher: None, arena, staging: Staging::default(), staged: FxMap::default(), last_color: None, window, memo: Memo::default(), compile: Compile::default(), compile_total: Compile::default(), background: false, workers: None, finished: Default::default(), disk_cache: None, views: Aged::default(), bind_groups: Aged::default(), dynamic_max })
+        Ok(Surfaces { renderable, adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pass: None, pending: None, timing, clock: None, present: 0, readbacks: Default::default(), hasher: None, arena, staging: Staging::default(), staged: FxMap::default(), last_color: None, window, memo: Memo::default(), compile: Compile::default(), compile_total: Compile::default(), background: false, wait_left: PIPELINE_WAIT, workers: None, finished: Default::default(), disk_cache: None, views: Aged::default(), bind_groups: Aged::default(), dynamic_max })
     }
 
     /// Shows the presented image (the color target written last, its top-left
@@ -1051,6 +1060,7 @@ impl Surfaces {
     pub fn next_frame(&mut self) {
         self.views.age();
         self.bind_groups.age();
+        self.wait_left = PIPELINE_WAIT;
     }
 
     /// A color target was written.

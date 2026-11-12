@@ -131,6 +131,21 @@ impl<T: Clone> Made<T> {
             Made::Pending(..) => None,
         }
     }
+
+    /// The pipeline, waited for until `until` at most: one the driver has in
+    /// its cache is made in a few milliseconds, sooner than a frame without it.
+    /// ponytail: polls every 200 µs; a condition variable if that shows up.
+    pub(crate) fn wait(&mut self, until: std::time::Instant) -> Option<T> {
+        loop {
+            if let Some(p) = self.ready() {
+                return Some(p);
+            }
+            if std::time::Instant::now() >= until {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+    }
 }
 
 /// The worker threads and their queue. The SPIR-V of a program is written
@@ -673,7 +688,10 @@ impl Surfaces {
         let groups = group_layouts.iter().rposition(|e| !e.is_empty()).map_or(0, |g| g + 1);
         group_layouts.truncate(groups);
         let key: PipelineKey = ((vs.0.key, vs.0.wgsl.len()), ps.as_ref().map(|p| (p.0.key, p.0.wgsl.len())), layouts, primitive, color_states, depth_state, group_layouts);
-        let found = self.cache.pipelines.get_mut(&key).map(|(made, layouts)| (made.ready(), layouts.clone()));
+        // Play mode: a pending pipeline is waited for within the frame's budget.
+        let waiting = std::time::Instant::now();
+        let until = waiting + if self.background { self.wait_left } else { std::time::Duration::ZERO };
+        let found = self.cache.pipelines.get_mut(&key).map(|(made, layouts)| (made.wait(until), layouts.clone()));
         let (pipeline, bind_layouts) = match found {
             Some(found) => found,
             None => {
@@ -707,7 +725,7 @@ impl Surfaces {
                 };
                 let label = format!("p{:016x}+{}", vs.0.key, ps.as_ref().map_or("none".into(), |p| format!("{:016x}", p.0.key)));
                 let mut made = self.make(make, label.clone());
-                let ready = made.ready();
+                let ready = made.wait(until);
                 self.cache.pipelines.insert(key, (made, bind_layouts.clone()));
                 self.compile.pipelines += 1;
                 self.compile.pipeline_time += since.elapsed();
@@ -715,8 +733,12 @@ impl Surfaces {
                 (ready, bind_layouts)
             }
         };
+        if self.background {
+            self.wait_left = self.wait_left.saturating_sub(waiting.elapsed());
+        }
         let Some(pipeline) = pipeline else {
-            // Being made on a worker thread (play mode): the frame goes on without this draw.
+            // Still being made on a worker thread (play mode), the frame's wait spent:
+            // the frame goes on without this draw.
             self.compile.waited += 1;
             return Ok(());
         };
@@ -1703,6 +1725,12 @@ mod tests {
             assert!(since.elapsed() < std::time::Duration::from_secs(5), "a stuck worker held the others");
             std::thread::yield_now();
         }
+        // A wait gives up at its deadline, and returns a pipeline made in time.
+        let waited = std::time::Instant::now();
+        assert_eq!(slow.wait(waited + std::time::Duration::from_millis(20)), None);
+        assert!(waited.elapsed() >= std::time::Duration::from_millis(20));
+        let mut soon = s.make(|| 10u32, "soon".into());
+        assert_eq!(soon.wait(std::time::Instant::now() + std::time::Duration::from_secs(5)), Some(10));
         tx.send(()).unwrap();
         while slow.ready().is_none() {
             assert!(since.elapsed() < std::time::Duration::from_secs(5));
