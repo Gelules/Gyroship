@@ -160,8 +160,9 @@ fn check_text(text: &str) -> crate::Result<bool> {
                 r.last = Some((p.present, state, input.0, input.1, p.f32("s0")?));
                 r.hits.clear();
             }
-            "aw-damage" | "bm-damage" => {
-                let script = if p.label == "aw-damage" { "aw-update" } else { "bm-update" };
+            // The Arwing's hits go through arwing_shields (aw-hit) or vehicle_shields (aw-damage).
+            "aw-hit" | "aw-damage" | "bm-damage" => {
+                let script = if p.label.starts_with("aw-") { "aw-update" } else { "bm-update" };
                 if let Some((_, r)) = runs.iter_mut().find(|(k, _)| *k == script) {
                     r.hits.push(p.f32("s0")?);
                 }
