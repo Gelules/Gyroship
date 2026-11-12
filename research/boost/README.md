@@ -24,8 +24,8 @@ How much it matters (average boost speed over a full boost + cooldown cycle):
 
 | Vehicle | Best technique | 100% (hold until full) | 1/3 meter | 1/4 meter |
 |---|---|---|---|---|
-| Arwing | **450** (1/3 meter) | 350 | 450 | ~340 |
-| Landmaster | **124** (100%) | 124 | 78 | 69 |
+| Arwing | **450** (1/3 meter) | 352 | 450 | ~340 |
+| Landmaster | **125** (100%) | 125 | 78 | 69 |
 | Blue-Marine | **285 to 295** (hold + quick releases) | 140 | 230 | 247 |
 
 "Boost speed" here is the **extra** speed boosting adds on top of your normal speed. Its
@@ -102,6 +102,7 @@ you let go, so the rest of the cooldown is spent at zero. The average drops: 300
 | 45 | 50% | 400 |
 | 60 | 67% | 375 |
 | 90 (full) | 100% | 350 |
+| 91 (held until it locks) | 100% | 352 |
 
 **Timing tip.** Missing the mark is not symmetric: one frame early costs 3.3%, one frame
 late costs about 1%. Aim at **31 to 33 frames (34 to 37% of the meter)**: you lose only
@@ -132,7 +133,8 @@ restarts on its own when the meter is empty.
 | 90 | 50% | 97 |
 | 120 | 67% | 111 |
 | 150 | 83% | 119 |
-| **180 (full)** | **100%** | **124** |
+| 180 (full) | 100% | 124 |
+| **181 (held until it locks)** | **100%** | **125** |
 
 Careful: from the game code, the Landmaster's lean moves (tilting left or right) also use
 the boost meter, so leaning while boosting fills it twice as fast. That part has not been
@@ -213,18 +215,21 @@ def frame_arwing_or_bluemarine(v, s, boost_held):
         s.speed = max(s.speed - v.decel / 60, 0)
 
 # Landmaster
-def ease(s, target, share, cap):               # the game's easing function
-    step = max(-cap, min(cap, share * (target - s.speed)))
-    s.speed += 0.5 * step                      # 0.5 at 60 fps
+def add_calc(value, target, share, cap):       # the game's easing function
+    if value == target:
+        return 0
+    step = share * (target - value)
+    step = max(-cap, min(cap, step)) if abs(step) >= 0.001 else 0.001
+    return 30 * step
 
-def frame_landmaster(s, boost_held):
+def frame_landmaster(s, boost_held, dt=1 / 60):
     if boost_held and not s.locked:
-        ease(s, 300, 0.2, 6)
+        s.speed += dt * add_calc(s.speed, 300, 0.2, 6)
         s.meter += 0.5
         if s.meter > 90:
             s.meter, s.locked = 90, True
     else:
-        ease(s, 0, 0.1, 100)                   # = lose 5% per frame
+        s.speed += dt * add_calc(s.speed, 0, 0.1, 100)  # = lose 5% per frame
         if s.meter > 0:
             if not s.locked:
                 s.locked = True                # release frame: no drain yet

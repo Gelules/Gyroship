@@ -58,6 +58,17 @@ class Linear:
         return False
 
 
+def add_calc(value, target, rate, cap, minimum):
+    """The game's easing function: 30 times a step toward the target, `rate`
+    of the gap but at most `cap` either way; a step smaller than `minimum`
+    becomes +minimum (even when the target is below); 0 at the target."""
+    if value == target:
+        return 0.0
+    step = f32(rate * f32(target - value))
+    step = max(-cap, min(cap, step)) if abs(step) >= minimum else minimum
+    return f32(30 * step)
+
+
 class Landmaster:
     """The Landmaster's boost speed eases toward 300 (fast at first, capped
     at 3 per frame, then slower and slower) and fades by 5% per frame when not
@@ -67,16 +78,10 @@ class Landmaster:
     def __init__(self, v):
         self.v = v
         self.rate = f32(v["rate"] * DT)
-        self.k = f32(30 * DT)  # 0.5 at 60 fps
         self.meter, self.speed, self.locked = 0.0, 0.0, False
 
     def ease(self, target, share, cap):
-        step = f32(share * (target - self.speed))
-        if abs(step) >= 0.001:
-            step = max(-cap, min(cap, step))
-        else:
-            step = 0.001 if target != self.speed else 0.0
-        self.speed = f32(self.speed + f32(self.k * step))
+        self.speed = f32(self.speed + f32(DT * add_calc(self.speed, target, f32(share), cap, f32(0.001))))
 
     def frame(self, boost_held):
         boosting = boost_held and not self.locked

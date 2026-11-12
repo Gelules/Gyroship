@@ -282,21 +282,23 @@ mod tests {
         assert_eq!(&runs[..2], &[(false, 180), (true, 180)]);
     }
 
+    /// The averages also match, to the last bit, those of the write-up's
+    /// script (research/boost/boost_math.py), which follows the same rules.
     #[test]
     fn best_cycles() {
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
         // Arwing: let go when the boost speed peaks, after 30 frames.
         let (n, avg) = best_cycle(91, arwing);
-        assert_eq!(n, 30);
-        assert!((avg - 450.0).abs() < 0.01, "{avg}");
+        assert!(n == 30 && near(avg, 450.00001209047105), "{n} {avg}");
         // Held until it locks: 91 frames of boost (the frame that fills the
-        // meter still boosts), 180 of cooldown.
-        assert!((average(&simulate(3600, arwing, |_| true)) - 95_400.0 / 271.0).abs() < 0.01);
-        // Landmaster: hold until the meter is full.
+        // meter still boosts), 180 of cooldown: 95400 / 271.
+        assert!(near(average(&simulate(3600, arwing, |_| true)), 352.02952431048857));
+        // Landmaster: hold until the meter locks (181 frames).
         let (n, avg) = best_cycle(181, landmaster);
-        assert!(n >= 180, "{n}");
-        assert!((avg - 124.0).abs() < 1.0, "{avg}");
+        assert!(n == 181 && near(avg, 124.70180623397913), "{n} {avg}");
+        assert!(near(average(&simulate(3600, landmaster, boost_for(60))), 77.72157222968488));
         // Blue-Marine: shorter is better; held with quick releases is near the cap.
         let quick = average(&simulate(3600, blue_marine, hold_and_release(9, 2)));
-        assert!(quick > 290.0 && average(&simulate(3600, blue_marine, boost_for(45))) < quick, "{quick}");
+        assert!(near(quick, 295.27781168619794) && average(&simulate(3600, blue_marine, boost_for(45))) < quick, "{quick}");
     }
 }
