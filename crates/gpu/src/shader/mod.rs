@@ -70,6 +70,9 @@ pub struct Interface {
     pub cbuf_sizes: BTreeMap<u8, u32>,
     /// Texture slots, in binding order.
     pub textures: Vec<Texture>,
+    /// The constant banks the texture handles are read from (computed once:
+    /// every draw reads them).
+    pub handle_banks: BTreeSet<u8>,
     /// The swizzle codes are read (at `SWIZZLE_BINDING`).
     pub swizzles: bool,
     /// Compute: images written (SUST), in binding order (`IMAGE_BINDING` + i).
@@ -306,7 +309,17 @@ pub fn translate_with(code: &[u8], options: &Options) -> Result<Translation, Err
     cx.read_write = handles(true).intersection(&handles(false)).copied().collect();
     cx.atomic = ops.iter().filter_map(|o| if let Op::Memory(MemoryOp::Sured { handle, .. }) = o { Some((handle.bank, handle.offset)) } else { None }).collect();
     let body = cx.program(&words, &ops)?;
-    Ok(Translation { key, stage, wgsl: cx.module(&body, options), interface: cx.iface })
+    let wgsl = cx.module(&body, options);
+    for x in &cx.iface.textures {
+        match &x.handle {
+            Handle::CBuf { bank, .. } => {
+                cx.iface.handle_banks.insert(*bank);
+            }
+            Handle::Uniform(e) => e.banks(&mut cx.iface.handle_banks),
+            _ => {}
+        }
+    }
+    Ok(Translation { key, stage, wgsl, interface: cx.iface })
 }
 
 /// Whether integer image coordinates `at` (`coords` of them, and the layer of

@@ -299,9 +299,15 @@ fn hits(spans: &[(u64, u64)], s: u64, e: u64) -> bool {
     i > 0 && spans[i - 1].1 > s
 }
 
-/// The binding size of each bank a program reads (`Interface::cbuf_sizes`).
-pub(crate) fn windows(t: &Translation) -> BTreeMap<u8, u64> {
-    t.interface.cbufs.iter().map(|&b| (b, u64::from(t.interface.cbuf_sizes.get(&b).copied().unwrap_or(0x10000)))).collect()
+/// Which bind groups (0 vertex, 1 pixel) take their uniform buffers at dynamic
+/// offsets, given each group's uniform count and the device's limit for a pipeline:
+/// all when they fit; over the limit, the pixel group first (it holds the textures,
+/// dozens of entries made again otherwise), else the vertex group alone.
+fn dynamic_groups(uniforms: &[usize], limit: usize) -> Vec<bool> {
+    match uniforms {
+        [v, p] if v + p > limit => vec![*p > limit && *v <= limit, *p <= limit],
+        all => vec![all.iter().sum::<usize>() <= limit; all.len()],
+    }
 }
 
 /// Texels of `slices` slices of `from` (columns, rows) elements of `bpe` bytes,
@@ -376,17 +382,17 @@ type PipelineKey = (
 );
 
 /// A stage's bindings.
-pub(crate) struct Bindings {
+pub(crate) struct Bindings<'t> {
     /// Constant buffers by bank.
     pub(crate) cbufs: BTreeMap<u8, Bank>,
     pub(crate) textures: Vec<Slot>,
     /// Each slot's header swizzle, when the program reads them.
     pub(crate) swizzles: Option<Vec<u32>>,
-    /// The bytes of each bank the program may read (`Interface::cbuf_sizes`):
-    /// staged as bound, then zeros up to there, as the console reads past a
-    /// bank's size. The binding spans 64 KiB; what lies past these bytes is
-    /// never read.
-    pub(crate) windows: BTreeMap<u8, u64>,
+    /// The program's `Interface::cbuf_sizes`, the bytes of each bank it may
+    /// read (all 64 KiB of a bank it has no entry for): staged as bound, then
+    /// zeros up to there, as the console reads past a bank's size. The binding
+    /// spans 64 KiB; what lies past these bytes is never read.
+    pub(crate) sizes: &'t BTreeMap<u8, u32>,
 }
 
 /// A texture slot: its view, its sampler unless fetched, and whether it is
@@ -400,10 +406,10 @@ pub(crate) struct Slot {
     dimension: wgpu::TextureViewDimension,
 }
 
-impl Bindings {
+impl Bindings<'_> {
     /// The bytes of bank `bank` the program may read.
     pub(crate) fn window(&self, bank: u8) -> u64 {
-        self.windows.get(&bank).copied().unwrap_or(CBUF_BYTES as u64)
+        self.sizes.get(&bank).map_or(CBUF_BYTES as u64, |&s| u64::from(s))
     }
 
     /// The bank's bytes to stage (what the program may read of them) and the
@@ -704,14 +710,17 @@ impl Surfaces {
             ..Default::default()
         };
         // Bind groups: 0 vertex, 1 pixel; constant banks at their bank, textures at 32 + 2i, samplers at 33 + 2i.
-        // The uniform buffers take dynamic offsets when the device allows that many: a bind
-        // group then serves every draw with the same layout, textures and samplers.
-        let uniforms: usize = stages.iter().map(|b| b.cbufs.len() + usize::from(b.swizzles.is_some())).sum();
-        let dynamic = uniforms <= self.dynamic_max as usize;
+        // A group's uniform buffers take dynamic offsets when the device allows that many: the
+        // group then serves every draw with the same layout, textures and samplers, whatever the
+        // banks' place in the arena (which moves at every flush). Over the limit for the pair, the
+        // pixel group (the textures: dozens of entries) keeps them and the vertex group's are
+        // baked into it, so that only that small group is made again.
+        let uniforms: Vec<usize> = stages.iter().map(|b| b.cbufs.len() + usize::from(b.swizzles.is_some())).collect();
+        let dynamic = dynamic_groups(&uniforms, self.dynamic_max as usize);
         let visibility = [wgpu::ShaderStages::VERTEX, wgpu::ShaderStages::FRAGMENT];
         let mut group_layouts: Vec<Vec<wgpu::BindGroupLayoutEntry>> = stages.iter().zip(visibility).map(|(b, v)| b.layout(v)).collect();
-        if dynamic {
-            for e in group_layouts.iter_mut().flatten() {
+        for (entries, _) in group_layouts.iter_mut().zip(&dynamic).filter(|(_, d)| **d) {
+            for e in entries {
                 if let wgpu::BindingType::Buffer { has_dynamic_offset, .. } = &mut e.ty {
                     *has_dynamic_offset = true;
                 }
@@ -790,8 +799,8 @@ impl Surfaces {
                 buffers.push((shader::SWIZZLE_BINDING, self.stage(&bytes)));
             }
             // In binding order, as wgpu takes them: the banks', then the swizzles' (binding 999).
-            let offsets: Vec<u32> = if dynamic { buffers.iter().map(|(_, (_, at, _))| u32::try_from(*at).unwrap_or(u32::MAX)).collect() } else { Vec::new() };
-            bind_groups.push((self.bind_group(layout, &buffers, textures, dynamic), offsets));
+            let offsets: Vec<u32> = if dynamic[g] { buffers.iter().map(|(_, (_, at, _))| u32::try_from(*at).unwrap_or(u32::MAX)).collect() } else { Vec::new() };
+            bind_groups.push((self.bind_group(layout, &buffers, textures, dynamic[g]), offsets));
         }
         let index_buffer = indices;
 
@@ -956,33 +965,18 @@ impl Surfaces {
     }
 
     /// A stage's constant banks (64 KiB each, as bound) and textures.
-    fn stage_bindings(&mut self, d: &Draw, stage: usize, t: &Translation, attached: &[u64], mem: Mem) -> Result<Bindings, String> {
-        let handle_banks = Self::handle_banks(t);
+    fn stage_bindings<'t>(&mut self, d: &Draw, stage: usize, t: &'t Translation, attached: &[u64], mem: Mem) -> Result<Bindings<'t>, String> {
         let mut banks = BTreeMap::new();
-        for b in t.interface.cbufs.iter().copied().chain(handle_banks) {
+        for b in t.interface.cbufs.iter().chain(&t.interface.handle_banks).copied() {
             let (addr, size) = d.cbufs[stage].get(usize::from(b)).copied().flatten().ok_or_else(|| format!("constant bank {b} not bound"))?;
             // Its bound size only: binding it as 64 KiB is `stage_window`'s.
             let data = self.read_guest(crate::surfaces::Read::Bank, addr, (size as usize).min(CBUF_BYTES), mem).ok_or_else(|| format!("constant bank {b} at {addr:#x} not readable"))?;
             banks.insert(b, (addr, data));
         }
         let (textures, swizzles) = self.texture_slots(t, &banks, d.headers, d.samplers, d.sampler_binding, attached, mem)?;
-        let cbufs = banks.into_iter().filter(|(b, _)| t.interface.cbufs.contains(b)).collect();
-        Ok(Bindings { cbufs, textures, swizzles: t.interface.swizzles.then_some(swizzles), windows: windows(t) })
-    }
-
-    /// The constant banks a program's texture handles live in.
-    pub(crate) fn handle_banks(t: &Translation) -> BTreeSet<u8> {
-        let mut banks = BTreeSet::new();
-        for x in &t.interface.textures {
-            match &x.handle {
-                Handle::CBuf { bank, .. } => {
-                    banks.insert(*bank);
-                }
-                Handle::Uniform(e) => e.banks(&mut banks),
-                _ => {}
-            }
-        }
-        banks
+        // The handle banks were for the textures; the program reads the others.
+        banks.retain(|b, _| t.interface.cbufs.contains(b));
+        Ok(Bindings { cbufs: banks, textures, swizzles: t.interface.swizzles.then_some(swizzles), sizes: &t.interface.cbuf_sizes })
     }
 
     /// A program's texture slots (view, sampler) and swizzle codes, from its
@@ -1490,7 +1484,8 @@ mod tests {
         };
         let banks = BTreeMap::from([(0u8, (0, std::sync::Arc::new(vec![0u8; 16])))]);
         let (slots, _) = s.texture_slots(&t, &banks, resources::header_pool(&reg), resources::sampler_pool(&reg), resources::sampler_binding(&reg), &[], &mut mem).unwrap_or_else(|e| panic!("{e}"));
-        let bindings = Bindings { cbufs: BTreeMap::new(), textures: slots, swizzles: None, windows: BTreeMap::new() };
+        let none = BTreeMap::new();
+        let bindings = Bindings { cbufs: BTreeMap::new(), textures: slots, swizzles: None, sizes: &none };
         let mut entries = bindings.layout(wgpu::ShaderStages::COMPUTE);
         let storage = wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None };
         entries.push(wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::COMPUTE, ty: storage, count: None });
@@ -1572,6 +1567,16 @@ mod tests {
         }
         // The cached range covers the three layers, both levels of the last one.
         assert_eq!(s.texture_ranges(), vec![(TEX, TEX + 2 * 1024 + 1024)]);
+    }
+
+    #[test]
+    fn the_pixel_group_keeps_dynamic_offsets_over_the_limit() {
+        // Corneria's main pass: 3 vertex banks and 13 pixel banks plus swizzles, over 15.
+        assert_eq!(dynamic_groups(&[3, 14], 15), [false, true]);
+        assert_eq!(dynamic_groups(&[4, 11], 15), [true, true]);
+        assert_eq!(dynamic_groups(&[3, 16], 15), [true, false]);
+        assert_eq!(dynamic_groups(&[16, 16], 15), [false, false]);
+        assert_eq!(dynamic_groups(&[9], 15), [true]);
     }
 
     #[test]

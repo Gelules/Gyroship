@@ -124,7 +124,7 @@ impl Surfaces {
         }
         let compiled = self.compute_program(key, l, images.iter().map(|i| i.2.clone()).collect(), queried)?;
         let (t, module) = (&compiled.0, &compiled.1);
-        if let Some(b) = t.interface.cbufs.iter().chain(&Self::handle_banks(t)).find(|b| !banks.contains_key(b)) {
+        if let Some(b) = t.interface.cbufs.iter().chain(&t.interface.handle_banks).find(|b| !banks.contains_key(b)) {
             return Err(format!("compute constant bank {b} not bound"));
         }
 
@@ -209,8 +209,8 @@ impl Surfaces {
 
         // Bindings: constant banks, textures and swizzles as for draws, then the images.
         let (textures, swizzles) = self.texture_slots(t, &banks, pools.headers, pools.samplers, pools.sampler_binding, &[], mem)?;
-        let cbufs: BTreeMap<u8, Bank> = banks.into_iter().filter(|(b, _)| t.interface.cbufs.contains(b)).collect();
-        let bindings = Bindings { cbufs, textures, swizzles: t.interface.swizzles.then_some(swizzles), windows: crate::draw::windows(t) };
+        banks.retain(|b, _| t.interface.cbufs.contains(b));
+        let bindings = Bindings { cbufs: banks, textures, swizzles: t.interface.swizzles.then_some(swizzles), sizes: &t.interface.cbuf_sizes };
         let mut layout_entries = bindings.layout(wgpu::ShaderStages::COMPUTE);
         for (i, (img, (_, format, _, _))) in t.interface.images.iter().zip(&images).enumerate() {
             let view_dimension = match img.dim {
