@@ -67,6 +67,42 @@ impl<K: std::hash::Hash + Eq, V: Clone> Aged<K, V> {
     }
 }
 
+/// A bind group's layout and entries, as kept with it.
+type GroupKey = (wgpu::BindGroupLayout, Vec<Bound>);
+
+/// Values by a hash of their key, two presents' worth as [`Aged`] keeps them:
+/// the caller hashes and compares its key through references, and builds the
+/// owned key only for a value made (bind groups: layout and entries).
+pub(crate) struct Groups<K, V> {
+    now: FxMap<u64, Vec<(K, V)>>,
+    before: FxMap<u64, Vec<(K, V)>>,
+}
+
+impl<K, V> Default for Groups<K, V> {
+    fn default() -> Self {
+        Groups { now: FxMap::default(), before: FxMap::default() }
+    }
+}
+
+impl<K, V: Clone> Groups<K, V> {
+    /// The value of hash `hash` whose key `same` recognizes; else `make`'s (key, value).
+    fn get_or(&mut self, hash: u64, same: impl Fn(&K) -> bool, make: impl FnOnce() -> (K, V)) -> V {
+        if let Some((_, g)) = self.now.get(&hash).and_then(|b| b.iter().find(|(k, _)| same(k))) {
+            return g.clone();
+        }
+        let kept = self.before.get_mut(&hash).and_then(|b| b.iter().position(|(k, _)| same(k)).map(|i| b.swap_remove(i)));
+        let entry = kept.unwrap_or_else(make);
+        let g = entry.1.clone();
+        self.now.entry(hash).or_default().push(entry);
+        g
+    }
+
+    fn age(&mut self) {
+        std::mem::swap(&mut self.now, &mut self.before);
+        self.now.clear();
+    }
+}
+
 /// A texture view's texture and description (all of it but the label).
 type ViewKey = (wgpu::Texture, Option<wgpu::TextureFormat>, Option<wgpu::TextureViewDimension>, Option<wgpu::TextureUsages>, wgpu::TextureAspect, u32, Option<u32>, u32, Option<u32>);
 
@@ -226,7 +262,7 @@ pub struct Surfaces {
     /// view per texture slot and a bind group per draw cost wgpu and the
     /// driver more than the rest of the draw.
     views: Aged<ViewKey, wgpu::TextureView>,
-    bind_groups: Aged<(wgpu::BindGroupLayout, Vec<Bound>), wgpu::BindGroup>,
+    bind_groups: Groups<GroupKey, wgpu::BindGroup>,
     /// The device's limit on uniform buffers bound at dynamic offsets.
     pub(crate) dynamic_max: u32,
     /// Whether the device has Features::CLIP_DISTANCES (user clip planes).
@@ -637,7 +673,7 @@ impl Surfaces {
         let window = window.map(|(surface, size)| Window::new(&adapter, &device, surface, size));
         let timing = crate::timing::Timing::new(&device, &queue);
         let renderable = (0..=0xff).filter_map(color_format).chain((0..=0xff).filter_map(depth_format)).map(|f| (f, renderable_on(&adapter, &device, f))).collect();
-        Ok(Surfaces { renderable, adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pass: None, pending: None, timing, clock: None, present: 0, readbacks: Default::default(), hasher: None, arena, staging: Staging::default(), staged: FxMap::default(), last_color: None, window, memo: Memo::default(), compile: Compile::default(), compile_total: Compile::default(), background: false, wait_left: PIPELINE_WAIT, workers: None, finished: Default::default(), disk_cache: None, views: Aged::default(), bind_groups: Aged::default(), dynamic_max, clip_distances })
+        Ok(Surfaces { renderable, adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pass: None, pending: None, timing, clock: None, present: 0, readbacks: Default::default(), hasher: None, arena, staging: Staging::default(), staged: FxMap::default(), last_color: None, window, memo: Memo::default(), compile: Compile::default(), compile_total: Compile::default(), background: false, wait_left: PIPELINE_WAIT, workers: None, finished: Default::default(), disk_cache: None, views: Aged::default(), bind_groups: Groups::default(), dynamic_max, clip_distances })
     }
 
     /// Shows the presented image (the color target written last, its top-left
@@ -1033,20 +1069,44 @@ impl Surfaces {
     /// A bind group of `layout` with these buffer ranges (bound from 0 when
     /// their offsets are dynamic), then the slots' views and samplers.
     pub(crate) fn bind_group(&mut self, layout: &wgpu::BindGroupLayout, buffers: &[(u32, Slice)], textures: &[crate::draw::Slot], dynamic: bool) -> wgpu::BindGroup {
-        let mut bound = Vec::with_capacity(buffers.len() + 2 * textures.len());
-        for (binding, (buffer, at, size)) in buffers {
-            bound.push(Bound::Buffer(*binding, buffer.clone(), if dynamic { 0 } else { *at }, *size));
+        use std::hash::{Hash, Hasher};
+        // The entries, borrowed: a buffer at offset 0 when the offset is dynamic, then each
+        // texture slot's view and sampler. Hashed and compared as they are; cloned into a
+        // key only for a group made here.
+        let at = |a: u64| if dynamic { 0 } else { a };
+        let mut h = Fx::default();
+        layout.hash(&mut h);
+        for (binding, (buffer, a, size)) in buffers {
+            (binding, buffer, at(*a), size).hash(&mut h);
         }
-        for (slot, s) in textures.iter().enumerate() {
-            bound.push(Bound::View(32 + 2 * slot as u32, s.view.clone()));
-            if let Some(sampler) = &s.sampler {
-                bound.push(Bound::Sampler(33 + 2 * slot as u32, sampler.clone()));
-            }
+        for s in textures {
+            s.view.hash(&mut h);
+            s.sampler.hash(&mut h);
         }
+        let same = |(l, bound): &GroupKey| {
+            let mut it = bound.iter();
+            l == layout
+                && buffers.iter().all(|(binding, (buffer, a, size))| matches!(it.next(), Some(Bound::Buffer(b, f, o, z)) if b == binding && f == buffer && *o == at(*a) && z == size))
+                && textures.iter().enumerate().all(|(slot, s)| {
+                    matches!(it.next(), Some(Bound::View(b, v)) if *b == 32 + 2 * slot as u32 && *v == s.view)
+                        && s.sampler.as_ref().is_none_or(|sampler| matches!(it.next(), Some(Bound::Sampler(b, x)) if *b == 33 + 2 * slot as u32 && x == sampler))
+                })
+                && it.next().is_none()
+        };
         let (device, made) = (&self.device, &mut self.staging.bind_groups);
         made[1] += 1;
-        self.bind_groups.get_or((layout.clone(), bound), |(layout, bound)| {
+        self.bind_groups.get_or(h.finish(), same, || {
             made[0] += 1;
+            let mut bound = Vec::with_capacity(buffers.len() + 2 * textures.len());
+            for (binding, (buffer, a, size)) in buffers {
+                bound.push(Bound::Buffer(*binding, buffer.clone(), at(*a), *size));
+            }
+            for (slot, s) in textures.iter().enumerate() {
+                bound.push(Bound::View(32 + 2 * slot as u32, s.view.clone()));
+                if let Some(sampler) = &s.sampler {
+                    bound.push(Bound::Sampler(33 + 2 * slot as u32, sampler.clone()));
+                }
+            }
             let entries: Vec<wgpu::BindGroupEntry> = bound
                 .iter()
                 .map(|b| match b {
@@ -1055,7 +1115,8 @@ impl Surfaces {
                     Bound::Sampler(binding, sampler) => wgpu::BindGroupEntry { binding: *binding, resource: wgpu::BindingResource::Sampler(sampler) },
                 })
                 .collect();
-            device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout, entries: &entries })
+            let group = device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout, entries: &entries });
+            ((layout.clone(), bound), group)
         })
     }
 
@@ -1433,6 +1494,28 @@ mod tests {
         // Unused for two frames: made again.
         assert_eq!(get(&mut c, 1), 10);
         assert_eq!(made, 2);
+    }
+
+    #[test]
+    fn groups_are_found_by_key_within_a_hash_and_aged_like_aged() {
+        let mut g: Groups<u32, u32> = Groups::default();
+        let mut made = 0;
+        // Keys 1 and 2 share hash 7: each is told apart by `same`.
+        let mut get = |g: &mut Groups<u32, u32>, k: u32| {
+            g.get_or(7, |x| *x == k, || {
+                made += 1;
+                (k, k * 10)
+            })
+        };
+        assert_eq!((get(&mut g, 1), get(&mut g, 2), get(&mut g, 1)), (10, 20, 10));
+        g.age();
+        // Used the frame before: carried over, not made again.
+        assert_eq!(get(&mut g, 2), 20);
+        g.age();
+        g.age();
+        // Unused for two frames: made again.
+        assert_eq!(get(&mut g, 2), 20);
+        assert_eq!(made, 3);
     }
 
     /// Synthetic adapter descriptions: subgroups of 32 pass; none, or other
