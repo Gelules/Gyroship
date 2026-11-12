@@ -8,9 +8,10 @@ of each vehicle were datamined from the game files, then checked frame by frame 
 the game running its own code. From there, the best way to boost is plain math.
 
 > **Status.** The strategies below come from an exact frame-by-frame simulation of the
-> game's boost rules. What has not been done yet: checking the distance actually gained
-> in real levels with recorded runs. If that check changes anything, this post will be
-> updated.
+> game's boost rules, which matches the game itself on every one of 21,000 logged frames.
+> Recorded runs in Corneria, Aquas and Titania then measured the ground gained: each
+> recommended technique pulled ahead of the alternative by the distance the simulation
+> predicts (see "Checked in real levels").
 
 ## TL;DR
 
@@ -45,6 +46,9 @@ average over a whole cycle is what decides how much ground you gain.
    cost 2N frames of cooldown. You boost exactly 1/3 of the time, whatever you do. On the
    Landmaster, fill and drain go at the same speed: N frames of boost cost N frames of
    cooldown, plus one extra frame if you let go before the meter is full.
+6. **A big hit while you boost or brake forces the cooldown**, as if you had let go. It
+   takes a hit worth 40 or more (or exactly 38). In our runs, the hits worth 40 were not
+   projectiles (collisions, it seems) and did it; laser shots were worth 20 and didn't.
 
 So what does change with your release timing? **How fast you go during and after each
 boost:** how the boost speed builds up while you boost, and how it fades during the
@@ -107,6 +111,11 @@ you let go, so the rest of the cooldown is spent at zero. The average drops: 300
 **Timing tip.** Missing the mark is not symmetric: one frame early costs 3.3%, one frame
 late costs about 1%. Aim at **31 to 33 frames (34 to 37% of the meter)**: you lose only
 1 to 3% even with a sloppy release.
+
+**Don't play it on a fixed rhythm while holding boost.** If you hold boost through the
+cooldown, the next boost starts when the meter empties, and a boost one frame too long
+makes the next one two frames too short, then four too long, and so on. Time each release
+from the start of its own boost (or from the meter), or let go during the cooldown.
 
 ## Landmaster: hold it
 
@@ -237,6 +246,11 @@ def frame_landmaster(s, boost_held, dt=1 / 60):
                 s.meter -= 0.5
                 if s.meter <= 0:
                     s.meter, s.locked = 0, False
+
+# All three: a hit after the frame's update (boosting: boost or brake accepted this frame)
+def hit(s, damage, boosting):
+    if boosting and (damage >= 40 or damage == 38):
+        s.locked = True                        # the cooldown starts next frame
 ```
 
 The full script, `boost_math.py`, has all three vehicles' values, prints every table of
@@ -249,22 +263,46 @@ this post and draws the charts. Run `python boost_math.py`; the charts need
   player's vehicle setup overrides some of them (it does for the Arwing and the
   Blue-Marine). Reading the defaults alone would have given wrong answers: the Arwing's
   real boost build-up and meter rates are three to four times the script defaults.
-- **Checked in game, frame by frame.** The meter and the boost speed were logged every
-  frame while the game ran its own code (Corneria for the Arwing, Aquas for the
-  Blue-Marine, Titania for the Landmaster). Every value and every rule above matches those
-  logs, to the frame: for example, a 61-frame Arwing boost gives exactly 122 frames of
-  cooldown, and boost speed takes exactly 60 frames to fade from 900 to 0.
+- **Checked in game, frame by frame.** The meter, the boost speed, the buttons the boost
+  code read and every hit taken were logged every frame while the game ran its own code
+  (Corneria for the Arwing, Aquas for the Blue-Marine, Titania for the Landmaster). Every
+  value and every rule above matches those logs, to the frame and to the last bit, on
+  21,191 frames of six runs, three of them ending with half a minute of random inputs
+  (boost, brake, both or nothing, from a tap to a full meter): for example, a 61-frame
+  Arwing boost gives exactly 122 frames of cooldown, and boost speed takes exactly 60
+  frames to fade from 900 to 0.
 - **Then the math.** The tables are exact frame-by-frame simulations of those rules, over
   many cycles, once they settle.
 
+## Checked in real levels
+
+Two recorded runs per mission, identical up to a point where the vehicle can boost, then
+1,500 frames (25 s) with two different techniques. The position logs give the ground each
+run covered, and the boost speed logs predict the gap: the boost speed difference, added
+up frame by frame.
+
+| Mission | Technique A | Technique B | Average boost speed, A / B | Ground A gained | Predicted |
+|---|---|---|---|---|---|
+| Corneria (Arwing) | boost 30 frames, let go until the meter is empty | hold | 432 / 379 | 1,325.0 | 1,325.0 |
+| Aquas (Blue-Marine) | hold, release 2 frames every 9 | hold | 192 / 151 | 1,015.7 | 1,015.8 |
+| Titania (Landmaster) | hold | boost 60 frames (1/3 meter) | 118 / 90 | 684.5 | 709.1 |
+
+- **Boost speed turns into ground one for one.** On the Arwing to a thousandth of a unit
+  (1,325.0000 against 1,325.0006); on the Blue-Marine to 0.01%, which is the rounding of
+  the position itself. On Titania the gap is measured along the level's main axis, which
+  the road doesn't always follow (in places only 60% of the Landmaster's speed goes along
+  it), so the gap comes out 3.5% below the prediction.
+- **The averages are lower than in the tables above**: each window starts from zero boost
+  speed (the Blue-Marine takes about 15 s to stack it), hits cut some boosts short (four
+  in Titania's run A, three in run B), and in these runs the game read the controller one
+  or two frames late, so the Arwing's 30-frame boosts came out as 31 and 28 frames (432
+  instead of 450).
+
 ## Not covered yet
 
-- **Distance in real levels.** The averages above are boost speed, which adds to your
-  forward speed; checking the actual ground gained with recorded runs is next.
 - **Special cases.** Boost gates (they push the Arwing above its max boost speed, and
   boosting then snaps it back to max, so don't boost right after one), loops and U-turns
-  (the meter and boost speed freeze during them), getting hit while boosting (on the
-  Blue-Marine and the Landmaster, a big hit can force the cooldown).
+  (the meter and boost speed freeze during them).
 - **Other frame rates.** Everything here is at 60 fps. In seconds and in meter %, the
   Arwing and Landmaster answers don't depend on the frame rate; the Blue-Marine
   technique might.
@@ -289,4 +327,13 @@ repository.
 - **The missions.** Aquas and Titania were reached from the Challenge Mode menu, from a
   copy of the save with every mission's challenge unlocked, and replayed with scripted
   inputs (X boosts, B brakes).
+- **The frame-by-frame check.** `gyroship-tools boost-check <trace>...` runs every logged
+  frame through the Rust reimplementation of the rules (`crates/research/src/boost.rs`)
+  and compares each value bit for bit: meter, boost speed, lock and flags, and for the
+  Landmaster its easing steps and the buttons its boost code read. Probes on the four
+  shields scripts give it the hits.
+- **The distance.** More probes log the vehicle's position and the speeds its movement
+  code uses, every frame. The ground gained by run A over run B is the difference of their
+  positions; the prediction adds up `(boost speed A - boost speed B) * dt`, frame by
+  frame.
 - **The tables and charts.** `python boost_math.py`, in this folder.
