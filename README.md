@@ -60,6 +60,7 @@ The time step is fixed: frame N always renders the same image, on Vulkan and DX1
     crates/gyroship   the executable
     crates/tools      gyroship-tools
     tools/ghidra      headless Ghidra scripts
+    research          write-ups of the game's mechanics, with the code behind their numbers
 
 Generated code (`generated/`) and run outputs (`artifacts/`) are derived from the
 player's own game files and are never committed.
