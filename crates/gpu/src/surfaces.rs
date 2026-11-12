@@ -232,6 +232,10 @@ pub struct Surfaces {
     hasher: Option<Hasher>,
     /// This frame's vertex, index and constant data: one buffer, written at flush.
     arena: (wgpu::Buffer, Vec<u8>),
+    /// The arena's way to the GPU: mapped chunks that come back once the GPU is
+    /// done with them (`write_buffer` took fresh staging pages each frame in the
+    /// game: 10 MB in 6.6 ms, 1.8 ms into reused ones).
+    belt: wgpu::util::StagingBelt,
     /// Offsets of the arena's staged blocks by content hash: draws share identical
     /// constant banks (64 KiB each) instead of staging each copy.
     staged: FxMap<u64, Vec<(usize, usize)>>,
@@ -674,12 +678,13 @@ impl Surfaces {
         });
         let fill = (fill_module, fill_layout, Default::default());
         let arena = (arena_buffer(&device, 16 << 20), Vec::new());
+        let belt = wgpu::util::StagingBelt::new(device.clone(), 16 << 20);
         let dynamic_max = device.limits().max_dynamic_uniform_buffers_per_pipeline_layout;
         let clip_distances = device.features().contains(wgpu::Features::CLIP_DISTANCES);
         let window = window.map(|(surface, size)| Window::new(&adapter, &device, surface, size));
         let timing = crate::timing::Timing::new(&device, &queue);
         let renderable = (0..=0xff).filter_map(color_format).chain((0..=0xff).filter_map(depth_format)).map(|f| (f, renderable_on(&adapter, &device, f))).collect();
-        Ok(Surfaces { renderable, adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pass: None, pending: None, timing, clock: None, present: 0, readbacks: Default::default(), hasher: None, arena, staging: Staging::default(), staged: FxMap::default(), last_color: None, window, memo: Memo::default(), compile: Compile::default(), compile_total: Compile::default(), background: false, wait_left: PIPELINE_WAIT, workers: None, finished: Default::default(), disk_cache: None, views: Aged::default(), bind_groups: Groups::default(), dynamic_max, clip_distances })
+        Ok(Surfaces { renderable, adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pass: None, pending: None, timing, clock: None, present: 0, readbacks: Default::default(), hasher: None, arena, belt, staging: Staging::default(), staged: FxMap::default(), last_color: None, window, memo: Memo::default(), compile: Compile::default(), compile_total: Compile::default(), background: false, wait_left: PIPELINE_WAIT, workers: None, finished: Default::default(), disk_cache: None, views: Aged::default(), bind_groups: Groups::default(), dynamic_max, clip_distances })
     }
 
     /// Shows the presented image (the color target written last, its top-left
@@ -971,12 +976,19 @@ impl Surfaces {
     pub fn flush(&mut self) {
         self.pass = None;
         self.memo.clear();
-        // The arena's writes land before this submit's commands, and after the
-        // previous frame's, which read the same bytes: queue order.
-        if !self.arena.1.is_empty() {
-            self.staging.flushed += self.arena.1.len() as u64;
+        // The arena's copy runs before this submit's commands (its command buffer
+        // comes first), and after the previous frame's, which read the same
+        // bytes: queue order.
+        let mut buffers = Vec::with_capacity(2);
+        let whole = self.arena.1.len().next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT as usize);
+        self.arena.1.resize(whole, 0);
+        if let Some(size) = wgpu::BufferSize::new(whole as u64) {
+            self.staging.flushed += size.get();
             self.staging.flushes += 1;
-            self.queue.write_buffer(&self.arena.0, 0, &self.arena.1);
+            let mut upload = self.device.create_command_encoder(&Default::default());
+            self.belt.write_buffer(&mut upload, &self.arena.0, 0, size).copy_from_slice(&self.arena.1);
+            self.belt.finish();
+            buffers.push(upload.finish());
             self.arena.1.clear();
             self.staged.clear();
         }
@@ -987,14 +999,19 @@ impl Surfaces {
             if let Some(c) = &mut self.clock {
                 c.close(&self.device, &mut e);
             }
-            self.queue.submit([e.finish()]);
+            buffers.push(e.finish());
+            self.queue.submit(buffers);
             if let Some(t) = &mut self.timing {
                 t.collect(&self.device);
             }
             if let Some(c) = &mut self.clock {
                 c.submitted(&self.device, self.present);
             }
+        } else if !buffers.is_empty() {
+            self.queue.submit(buffers);
         }
+        // Chunks whose copies were submitted come back once the GPU is done.
+        self.belt.recall();
     }
 
     /// Copies `bytes` (padded to 4) into this frame's upload arena; returns
@@ -1482,6 +1499,55 @@ impl Surfaces {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// How fast the queue takes a heavy Corneria frame's arena (10 MiB), by
+    /// `write_buffer` and by `write_buffer_with`: `cargo test --release -p
+    /// gyroship-gpu upload_speed -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn upload_speed() {
+        let Ok(s) = Surfaces::headless(crate::Backend::Auto) else { return };
+        let data = vec![7u8; 10 << 20];
+        let buffer = arena_buffer(&s.device, 16 << 20);
+        let rate = |t: std::time::Duration| data.len() as f64 / t.as_secs_f64() / 1e9;
+        for round in 0..6 {
+            let t = std::time::Instant::now();
+            s.queue.write_buffer(&buffer, 0, &data);
+            let plain = t.elapsed();
+            let t = std::time::Instant::now();
+            if let Some(mut view) = s.queue.write_buffer_with(&buffer, 0, wgpu::BufferSize::new(data.len() as u64).unwrap()) {
+                view.copy_from_slice(&data);
+            }
+            let with = t.elapsed();
+            s.queue.submit([]);
+            let _ = s.device.poll(wgpu::PollType::wait_indefinitely());
+            eprintln!("round {round}: write_buffer {:.2} ms ({:.1} GB/s), write_buffer_with {:.2} ms ({:.1} GB/s)", plain.as_secs_f64() * 1e3, rate(plain), with.as_secs_f64() * 1e3, rate(with));
+        }
+        // Frames in flight: three uploads and submits before waiting, then the
+        // same through a staging belt whose chunks come back after each wait.
+        let mut belt = wgpu::util::StagingBelt::new(s.device.clone(), 16 << 20);
+        for round in 0..4 {
+            let mut plain = Vec::new();
+            let mut belted = Vec::new();
+            for _ in 0..3 {
+                let t = std::time::Instant::now();
+                s.queue.write_buffer(&buffer, 0, &data);
+                plain.push(t.elapsed().as_secs_f64() * 1e3);
+                s.queue.submit([]);
+            }
+            for _ in 0..3 {
+                let mut encoder = s.device.create_command_encoder(&Default::default());
+                let t = std::time::Instant::now();
+                belt.write_buffer(&mut encoder, &buffer, 0, wgpu::BufferSize::new(data.len() as u64).unwrap()).copy_from_slice(&data);
+                belt.finish();
+                belted.push(t.elapsed().as_secs_f64() * 1e3);
+                s.queue.submit([encoder.finish()]);
+                belt.recall();
+            }
+            let _ = s.device.poll(wgpu::PollType::wait_indefinitely());
+            eprintln!("in flight, round {round}: write_buffer {plain:.2?} ms, belt {belted:.2?} ms");
+        }
+    }
 
     #[test]
     fn an_aged_cache_forgets_what_two_frames_left_unused() {
