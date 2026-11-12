@@ -15,8 +15,9 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
-/// Samples by (guest thread, host instruction pointer, guest x30).
-type Samples = HashMap<(u64, u64, u64), u64>;
+/// Samples by (guest thread, host instruction pointer, guest x30, host caller:
+/// the first return address on the host stack, 0 if none).
+type Samples = HashMap<(u64, u64, u64, u64), u64>;
 
 struct Profiler {
     path: PathBuf,
@@ -218,6 +219,7 @@ pub fn count_interpreted(word: u32) {
 #[cfg(windows)]
 pub fn start(path: PathBuf) {
     use windows_sys::Win32::System::Diagnostics::Debug::{CONTEXT, CONTEXT_CONTROL_AMD64, GetThreadContext};
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
     use windows_sys::Win32::System::Threading::{GetCurrentThreadId, OpenThread, ResumeThread, SuspendThread, THREAD_GET_CONTEXT, THREAD_SUSPEND_RESUME};
     // SAFETY: opens a handle to this thread; it stays open for the process's life.
     let handle = unsafe { OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, 0, GetCurrentThreadId()) } as usize;
@@ -234,16 +236,31 @@ pub fn start(path: PathBuf) {
         // SAFETY: a zeroed CONTEXT is valid; only its control registers are asked for.
         let mut aligned: Aligned = unsafe { std::mem::zeroed() };
         let context = &mut aligned.0;
+        // The words at the top of the thread's stack, copied while it is suspended:
+        // a leaf function's caller, or the current function's, is the first return
+        // address among them (found after the thread resumes).
+        let mut top = [0u64; 16];
         while !stop.load(Ordering::Relaxed) {
             std::thread::sleep(std::time::Duration::from_millis(1));
             context.ContextFlags = CONTEXT_CONTROL_AMD64;
-            // SAFETY: the handle is valid; the thread resumes right after the read.
+            let mut words = 0;
+            // SAFETY: the handle is valid; the thread resumes right after the reads.
+            // The words copied lie between its stack pointer and the end of that
+            // committed region.
             let read = unsafe {
                 if SuspendThread(handle as _) == u32::MAX {
                     eprintln!("gyroship: --profile: SuspendThread: {}", std::io::Error::last_os_error());
                     break;
                 }
                 let ok = GetThreadContext(handle as _, context) != 0;
+                if ok {
+                    let rsp = context.Rsp as usize;
+                    let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+                    if VirtualQuery(rsp as *const _, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) != 0 {
+                        words = ((info.BaseAddress as usize + info.RegionSize).saturating_sub(rsp) / 8).min(top.len());
+                        std::ptr::copy_nonoverlapping(rsp as *const u64, top.as_mut_ptr(), words);
+                    }
+                }
                 ResumeThread(handle as _);
                 ok
             };
@@ -251,7 +268,8 @@ pub fn start(path: PathBuf) {
                 let cpu = GUEST_CPU.load(Ordering::Relaxed);
                 // SAFETY: the context outlives the run; its thread is suspended or parked.
                 let lr = if cpu.is_null() { 0 } else { unsafe { std::ptr::read_volatile(&raw const (*cpu).x[30]) } };
-                *samples.entry((GUEST_THREAD.load(Ordering::Relaxed), context.Rip, lr)).or_insert(0u64) += 1;
+                let caller = top[..words].iter().copied().find(|&w| after_call(w)).unwrap_or(0);
+                *samples.entry((GUEST_THREAD.load(Ordering::Relaxed), context.Rip, lr, caller)).or_insert(0u64) += 1;
             } else if samples.is_empty() {
                 eprintln!("gyroship: --profile: GetThreadContext: {}", std::io::Error::last_os_error());
                 break;
@@ -287,7 +305,8 @@ pub fn finish(guest: &dyn Fn(u64) -> String) {
     let mut by_module: HashMap<String, u64> = HashMap::new();
     let mut by_thread: HashMap<u64, HashMap<String, u64>> = HashMap::new();
     let mut callers: HashMap<String, HashMap<u64, u64>> = HashMap::new();
-    for ((thread, rip, lr), n) in samples {
+    let mut hosts: HashMap<String, HashMap<u64, u64>> = HashMap::new();
+    for ((thread, rip, lr, caller), n) in samples {
         let (module, name) = names
             .entry(rip)
             .or_insert_with(|| {
@@ -299,6 +318,7 @@ pub fn finish(guest: &dyn Fn(u64) -> String) {
         *by_module.entry(module).or_insert(0) += n;
         *by_symbol.entry(name.clone()).or_insert(0) += n;
         *by_thread.entry(thread).or_default().entry(name.clone()).or_insert(0) += n;
+        *hosts.entry(name.clone()).or_default().entry(caller).or_insert(0) += n;
         *callers.entry(name).or_default().entry(lr).or_insert(0) += n;
     }
     let mut out = format!("# gyroship profile: {total} samples of 1 ms of the guest's host thread\n# samples  percent  module\n");
@@ -343,6 +363,23 @@ pub fn finish(guest: &dyn Fn(u64) -> String) {
         sites.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         for (lr, k) in sites.into_iter().take(6) {
             out += &format!("{k:9} {:7.2}%  x30 {lr:#x}  {}\n", pct(k), guest(lr));
+        }
+    }
+    // Their host callers: the first return address on the host stack, the caller
+    // of a leaf function (memcpy, the allocator), or of the current function; a
+    // stale one may show up. By calling function, then its call sites.
+    out += "# host callers of the 25 hottest symbols (first return address on the stack)\n";
+    for (name, n) in rows.iter().take(25) {
+        out += &format!("# {name}: {n} samples\n");
+        let mut by_function: HashMap<String, u64> = HashMap::new();
+        for (&at, &k) in hosts.get(name).into_iter().flatten() {
+            let function = if at == 0 { "(none found)".to_string() } else { format!("[{}] {}", module(at), symbol(at)) };
+            *by_function.entry(function).or_insert(0) += k;
+        }
+        let mut sites: Vec<(String, u64)> = by_function.into_iter().collect();
+        sites.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        for (function, k) in sites.into_iter().take(8) {
+            out += &format!("{k:9} {:7.2}%  {function}\n", pct(k));
         }
     }
     // The interpreter's instructions, by opcode, then the most frequent words.
