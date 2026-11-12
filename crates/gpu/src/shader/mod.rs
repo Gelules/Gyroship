@@ -2125,7 +2125,9 @@ impl Cx {
         }
         let cs: Vec<String> = (0..coords).map(|c| get(Item::Coord(c))).collect::<R<_>>()?;
         let vec = |cast: &str, sc: &str| if coords == 1 { format!("{cast}({})", cs[0]) } else { format!("vec{coords}<{sc}>({})", cs.iter().map(|c| format!("{cast}({c})")).collect::<Vec<_>>().join(", ")) };
-        let arr = if array { format!(", i32({})", get(Item::Array)?) } else { String::new() };
+        // The hardware reads the array index from the register's low 16 bits (NAK
+        // clamps it to 16 bits and packs a min-lod or offsets above it).
+        let arr = if array { format!(", i32({} & 0xffffu)", get(Item::Array)?) } else { String::new() };
         let call = if fetch {
             let mut xy = vec("bitcast<i32>", "i32");
             if aoffi {
@@ -2144,7 +2146,7 @@ impl Cx {
                 let size = format!("textureDimensions(tex{slot}, {level})");
                 let mut inside = if coords == 1 { format!("(u32({xy}) < {size})") } else { format!("all(vec{coords}<u32>({xy}) < {size})") };
                 if array {
-                    inside = format!("({inside} && u32(i32({})) < textureNumLayers(tex{slot}))", get(Item::Array)?);
+                    inside = format!("({inside} && ({} & 0xffffu) < textureNumLayers(tex{slot}))", get(Item::Array)?);
                 }
                 format!("select(vec4<f32>(0.0), textureLoad(tex{slot}, {xy}{arr}, {level}), {inside})")
             } else {
@@ -2624,7 +2626,7 @@ mod tests {
         let tld4 = w(0xb63, &[(16, 28), (24, 32), (32, 43), (64, 22), (40, 0x28 / 4), (54, 0), (61, 5), (60, 1), (72, 0xf), (81, 7), (84, 1), (87, 1)]);
         let t = compute(&[tld4], &Options { workgroup: [8, 8, 1], ..Default::default() });
         assert_eq!(t.interface.textures, vec![Texture { handle: Handle::CBuf { bank: 0, offset: 0x28 }, dim: TexDim::Array2D, compare: false, fetch: false, query: false }]);
-        for want in ["texture_2d_array<f32>", "textureGather(0, tex0, smp0, vec2<f32>(f(r33), f(r43)), i32(r32))", "textureGather(3, tex0", "(swizzles[0][0] >> 3u) & 7u", "r28 =", "r29 =", "r22 =", "r23 ="] {
+        for want in ["texture_2d_array<f32>", "textureGather(0, tex0, smp0, vec2<f32>(f(r33), f(r43)), i32(r32 & 0xffffu))", "textureGather(3, tex0", "(swizzles[0][0] >> 3u) & 7u", "r28 =", "r29 =", "r22 =", "r23 ="] {
             assert!(t.wgsl.contains(want), "{want}\n{}", t.wgsl);
         }
         // .AOFFI: the offset follows y in b (R44), 6-bit fields one byte apart.
