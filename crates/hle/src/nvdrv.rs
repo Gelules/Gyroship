@@ -747,7 +747,7 @@ impl Gpu {
                 Effect::Ignored { class, method, value } => k.anomaly("gpu method ignored", &format!("class {class:#x} method {method:#x} = {value:#x} not executed"))?,
                 Effect::Clear(c) => {
                     // Journaled with the draws of a dumped frame: targets and raw values.
-                    if k.config.frames_dump.is_some() && (k.at.presents + 1).is_multiple_of(k.config.dump_every) {
+                    if k.config.dumps(k.at.presents + 1) {
                         k.log(&format!("gpu: clear {c:x?}"));
                     }
                     if let Some(s) = &mut k.surfaces {
@@ -759,7 +759,7 @@ impl Gpu {
                     // The programs first (a new one is journaled and dumped before the draw);
                     // the draw's line, and the strings it needs, only on the frames it is written.
                     let programs: Vec<(usize, u64, Option<u64>)> = d.programs.iter().enumerate().filter_map(|(stage, p)| Some((stage, (*p)?, self.program(k, space, (*p)?)))).collect();
-                    let dumped = k.config.frames_dump.is_some() && (k.at.presents + 1).is_multiple_of(k.config.dump_every);
+                    let dumped = k.config.dumps(k.at.presents + 1);
                     let logged = k.at.presents < 3 || draw <= 64 || dumped;
                     let mut outcome = String::new();
                     if let Some(mut s) = k.surfaces.take() {

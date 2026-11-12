@@ -255,6 +255,7 @@ pub fn run(table: Vec<rt::Entry>, window: Option<HostWindow>) {
         frames_dump: value("--dump-frames").map(std::path::PathBuf::from),
         dump_draws: value("--dump-draws").and_then(|s| s.parse().ok()),
         dump_every: value("--dump-every").and_then(|s| s.parse().ok()).filter(|&k| k > 0).unwrap_or(1),
+        dump_from: value("--dump-from").and_then(|s| s.parse().ok()).unwrap_or(0),
         shaders_dump: value("--dump-shaders").map(std::path::PathBuf::from),
         replay: value("--replay").map(|f| {
             let script = std::fs::read_to_string(&f).map_err(|e| e.to_string()).and_then(|t| crate::hid::parse_script(&t));

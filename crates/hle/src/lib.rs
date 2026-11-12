@@ -112,6 +112,8 @@ pub struct Config {
     pub frames_dump: Option<std::path::PathBuf>,
     /// `--dump-every K`: only every K-th frame is dumped (all are rendered).
     pub dump_every: u64,
+    /// `--dump-from N`: no frame before frame N is dumped.
+    pub dump_from: u64,
     /// `--dump-draws N`: in frame N, the targets of each draw are dumped after it.
     pub dump_draws: Option<u64>,
     /// `--dump-shaders DIR`: the code of every program a draw uses, once, as
@@ -141,9 +143,17 @@ pub struct Config {
     pub late_frames: bool,
 }
 
+impl Config {
+    /// Whether frame `n` (1 for the first present) is dumped: `--dump-frames`,
+    /// from `--dump-from`, every `--dump-every`.
+    pub fn dumps(&self, n: u64) -> bool {
+        self.frames_dump.is_some() && n >= self.dump_from && n.is_multiple_of(self.dump_every)
+    }
+}
+
 impl Default for Config {
     fn default() -> Config {
-        Config { seed: 0x5EED, explore: false, non_system_memory: 0x2_6410_0000, time_limit: None, frames: None, save_dir: None, vsync: true, work_time: false, gpfifo_dump: None, frames_dump: None, dump_every: 1, dump_draws: None, shaders_dump: None, replay: None, profile: None, perf: None, hashes: None, record: None, audio_dump: None, play: false, pipeline_cache: None, late_frames: false }
+        Config { seed: 0x5EED, explore: false, non_system_memory: 0x2_6410_0000, time_limit: None, frames: None, save_dir: None, vsync: true, work_time: false, gpfifo_dump: None, frames_dump: None, dump_every: 1, dump_from: 0, dump_draws: None, shaders_dump: None, replay: None, profile: None, perf: None, hashes: None, record: None, audio_dump: None, play: false, pipeline_cache: None, late_frames: false }
     }
 }
 

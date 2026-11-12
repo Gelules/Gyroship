@@ -669,9 +669,9 @@ impl GpuSide {
             }
         }
         // The render targets this frame touched, as PNG files (game output: never committed).
-        let every = self.config.dump_every;
+        let dumped = self.config.dumps(n);
         if let (Some(dir), Some(s)) = (self.config.frames_dump.clone(), self.surfaces.as_mut())
-            && n.is_multiple_of(every)
+            && dumped
         {
             let line = match s.dump(&dir, &format!("frame-{n:04}")) {
                 Ok(count) => format!("gpu: frame {n}: {count} render targets dumped; {} draws done", s.drawn),
