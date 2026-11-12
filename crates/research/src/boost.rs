@@ -87,7 +87,7 @@ impl State {
     /// One frame of the Arwing's or the Blue-Marine's `boost_brake_update`
     /// (main+0x8e5d8f0, main+0x94d1290): boost wins over brake; both fill the
     /// meter and are refused while it is locked; letting go drains it from
-    /// the same frame. Boost gates, loops, U-turns and damage are not modeled.
+    /// the same frame. Boost gates, loops and U-turns are not modeled; hits are [`State::hit`].
     pub fn linear(&mut self, p: &Linear, dt: f32, boost: bool, brake: bool) {
         self.boosting = boost && !self.locked;
         self.braking = brake && !self.locked && !self.boosting;
@@ -161,6 +161,19 @@ impl State {
     pub fn landmaster(&mut self, p: &Landmaster, dt: f32, boost: bool, brake: bool) {
         self.landmaster_speed(p, dt, boost, brake);
         self.landmaster_gauge(p, dt, self.boosting as u32 + self.braking as u32);
+    }
+
+    /// A hit taken after the frame's boost update, as the shields scripts
+    /// handle it (`arwing_shields` main+0x9234ad0, `vehicle_shields`
+    /// main+0x94668a0, `bluemarine_shields` main+0x9542d30,
+    /// `landmaster_shields` main+0x9c95b90): one of more than 40, or about 40
+    /// or 38 (the scripts' float equality), forces the cooldown while
+    /// boosting or braking.
+    pub fn hit(&mut self, damage: f32) {
+        let about = |v: f32| (damage - v).abs() <= 1.1920929e-4 || (damage - v).abs() <= damage.abs() * 4.7683716e-7;
+        if (self.boosting || self.braking) && (damage > 40.0 || about(40.0) || about(38.0)) {
+            self.locked = true;
+        }
     }
 }
 
@@ -280,6 +293,25 @@ mod tests {
         assert_eq!(&runs[..2], &[(false, 60), (true, 60)]);
         let runs = lock_runs(&simulate(1000, landmaster, |_| true));
         assert_eq!(&runs[..2], &[(false, 180), (true, 180)]);
+    }
+
+    #[test]
+    fn big_hits_force_the_cooldown() {
+        let boosting = State { gauge: 6.0, boosting: true, ..Default::default() };
+        let locks = |damage: f32, mut s: State| {
+            s.hit(damage);
+            s.locked
+        };
+        assert!(locks(40.0, boosting) && locks(41.0, boosting) && locks(38.00001, boosting));
+        assert!(!locks(20.0, boosting) && !locks(39.0, boosting) && !locks(37.0, boosting));
+        assert!(locks(40.0, State { braking: true, ..Default::default() }));
+        // Idle, or already in the cooldown: nothing changes.
+        assert!(!locks(40.0, State::default()));
+        // The Landmaster then drains from the next frame, like after a release.
+        let mut s = boosting;
+        s.hit(40.0);
+        s.landmaster(&LANDMASTER, DT, true, false);
+        assert!(!s.boosting && s.locked && s.gauge == 5.5);
     }
 
     /// The averages also match, to the last bit, those of the write-up's
