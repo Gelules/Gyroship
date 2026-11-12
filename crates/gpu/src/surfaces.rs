@@ -517,6 +517,11 @@ pub(crate) struct Memo {
     indices: FxMap<(u64, usize, u32, Option<u32>), Dated<Indices>>,
     /// Address -> a texture or sampler header (two guest reads per texture slot of every draw).
     descriptors: FxMap<u64, Dated<[u8; 32]>>,
+    /// Texture slots resolved this submit, by their inputs (`draw::SlotKey`): about
+    /// 17 a draw for a few hundred distinct ones. Also emptied when a texture is
+    /// dropped, a target made, or a dispatch starts; a target's slot is checked
+    /// against the target's last write at each use.
+    pub(crate) slots: FxMap<crate::draw::SlotKey, crate::draw::Resolved>,
     /// The epoch of each page written by the GPU in this submit, in page order:
     /// an entry's check visits only the written pages inside it.
     pages: BTreeMap<u64, u64>,
@@ -529,6 +534,7 @@ impl Memo {
         self.staged.clear();
         self.indices.clear();
         self.descriptors.clear();
+        self.slots.clear();
         self.pages.clear();
     }
 
@@ -1257,6 +1263,8 @@ impl Surfaces {
                 view_formats: if base == format { &[] } else { std::slice::from_ref(&format) },
             });
             self.map.insert(key, Entry { surface: *s, texture, written: 0 });
+            // A slot that read guest memory, or another target, at this address reads this one now.
+            self.memo.slots.clear();
         }
         let texture = self.map[&key].texture.clone();
         self.view_as(&texture, Some(format), wgpu::TextureUsages::RENDER_ATTACHMENT, wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2), array_layer_count: Some(1), ..Default::default() })

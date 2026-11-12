@@ -395,9 +395,27 @@ pub(crate) struct Bindings<'t> {
     pub(crate) sizes: &'t BTreeMap<u8, u32>,
 }
 
+/// A texture slot's inputs within a submit: its texture header, its sampler
+/// header (None when fetched), its view dimension, compare and fetch.
+pub(crate) type SlotKey = ([u8; 32], Option<[u8; 32]>, wgpu::TextureViewDimension, bool, bool);
+
+/// A texture slot resolved in this submit (`Memo::slots`), replayed while its
+/// inputs hold: the slot, its swizzle code, the address and source it read (for
+/// the journal), and when that was a render target, the target and its write
+/// stamp then (a later write makes the slot stale).
+#[derive(Clone)]
+pub(crate) struct Resolved {
+    slot: Slot,
+    swizzle: u32,
+    address: u64,
+    source: &'static str,
+    target: Option<((u64, u32), u64)>,
+}
+
 /// A texture slot: its view, its sampler unless fetched, and whether it is
 /// a depth target (read as unfilterable floats, with a non-filtering sampler)
 /// or a depth target sampled with a comparison (depth texture and sampler).
+#[derive(Clone)]
 pub(crate) struct Slot {
     pub(crate) view: wgpu::TextureView,
     pub(crate) sampler: Option<wgpu::Sampler>,
@@ -983,7 +1001,7 @@ impl Surfaces {
     /// handles in `banks` and the header and sampler pools.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn texture_slots(&mut self, t: &Translation, banks: &BTreeMap<u8, Bank>, headers: Pool, samplers: Pool, binding: SamplerBinding, attached: &[u64], mem: Mem) -> Result<(Vec<Slot>, Vec<u32>), String> {
-        let mut textures = Vec::new();
+        let mut textures = Vec::with_capacity(t.interface.textures.len());
         let mut swizzles = vec![0u32; t.interface.textures.len().next_multiple_of(4)];
         for (slot, x) in t.interface.textures.iter().enumerate() {
             let word = |bank: u8, offset: u16| -> Option<u32> {
@@ -1009,6 +1027,32 @@ impl Surfaces {
                 other => return Err(format!("texture {other:?} (compare {})", x.compare)),
             };
             let header = self.descriptor(headers.entry(handle.header).ok_or("texture index past the pool")?, mem).ok_or("texture header not readable")?;
+            // A slot already resolved in this submit with the same headers and use: replayed,
+            // unless it read a render target written since. The sampler header is read here
+            // for the key; when it cannot be, the full path below gives its error in order.
+            let sampler_index = match binding {
+                SamplerBinding::Independently => handle.sampler,
+                SamplerBinding::ViaHeaderBinding => handle.header,
+            };
+            let sampler_bytes = if x.fetch { None } else { samplers.entry(sampler_index).and_then(|at| self.descriptor(at, mem)) };
+            let key: Option<SlotKey> = (!x.query && (x.fetch || sampler_bytes.is_some())).then_some((header, sampler_bytes, dimension, x.compare, x.fetch));
+            if let Some(r) = key.as_ref().and_then(|k| self.memo.slots.get(k))
+                && r.target.is_none_or(|(target, stamp)| Self::latest_at(&self.map, r.address).is_some_and(|e| (e.surface.addr, e.surface.format) == target && e.written == stamp))
+            {
+                let r = r.clone();
+                if attached.contains(&r.address) {
+                    return Err("texture is a target of the same draw".into());
+                }
+                if let Some((target, _)) = r.target
+                    && !r.slot.depth
+                {
+                    self.touched.insert(target);
+                }
+                swizzles[slot] = r.swizzle;
+                self.textures_read.push((r.address, r.source));
+                textures.push(r.slot);
+                continue;
+            }
             let tic = textures::tic(&header).ok_or("texture header layout")?;
             if attached.contains(&tic.address) {
                 return Err("texture is a target of the same draw".into());
@@ -1046,7 +1090,7 @@ impl Surfaces {
                 continue;
             }
             // An image a compute program wrote, or a render target at that address: its host texture.
-            let (view, depth, source) = match Self::latest_at(&self.map, tic.address) {
+            let (view, depth, source, target) = match Self::latest_at(&self.map, tic.address) {
                 // With the header's format when the image allows it as a view (sRGB over linear storage).
                 _ if self.cache.images.contains_key(&tic.address) => {
                     let image = match self.cache.twins.get(&tic.address) {
@@ -1059,7 +1103,7 @@ impl Surfaces {
                     .clone();
                     fits(&image)?;
                     let view = self.view_as(&image, textures::wgpu_texture_format(&tic), wgpu::TextureUsages::TEXTURE_BINDING, view_desc(wgpu::TextureAspect::All));
-                    (view, false, "image")
+                    (view, false, "image", None)
                 }
                 Some(e) => {
                     fits(&e.texture)?;
@@ -1076,7 +1120,7 @@ impl Surfaces {
                     let (w, h) = (tic.width.min(texture.width()), tic.height.min(texture.height()));
                     let texture = if !depth && w > 0 && h > 0 && (w, h) != (texture.width(), texture.height()) { self.cropped(key, stamp, &texture, w, h) } else { texture };
                     let aspect = if depth { wgpu::TextureAspect::DepthOnly } else { wgpu::TextureAspect::All };
-                    (self.view_as(&texture, textures::wgpu_texture_format(&tic), wgpu::TextureUsages::TEXTURE_BINDING, view_desc(aspect)), depth, "target")
+                    (self.view_as(&texture, textures::wgpu_texture_format(&tic), wgpu::TextureUsages::TEXTURE_BINDING, view_desc(aspect)), depth, "target", Some((key, stamp)))
                 }
                 None => match self.upload(&tic, header, mem) {
                     // A color texture read with a compare (the 1x1 stand-in bound when
@@ -1090,11 +1134,11 @@ impl Surfaces {
                                 d
                             }
                         };
-                        (self.view(&depth, &view_desc(wgpu::TextureAspect::DepthOnly)), true, "memory")
+                        (self.view(&depth, &view_desc(wgpu::TextureAspect::DepthOnly)), true, "memory", None)
                     }
                     Ok(texture) => {
                         let depth = texture.format().is_depth_stencil_format();
-                        (self.view(&texture, &view_desc(if depth { wgpu::TextureAspect::DepthOnly } else { wgpu::TextureAspect::All })), depth, "memory")
+                        (self.view(&texture, &view_desc(if depth { wgpu::TextureAspect::DepthOnly } else { wgpu::TextureAspect::All })), depth, "memory", None)
                     }
                     Err(why) if x.compare => {
                         // Where the nearest depth targets are, to tell a missing shadow pass from an offset view.
@@ -1123,7 +1167,11 @@ impl Surfaces {
                     Some(self.sampler(bytes, !depth || x.compare, x.compare))
                 }
             };
-            textures.push(Slot { view, sampler, depth, compare: x.compare, dimension });
+            let resolved = Slot { view, sampler, depth, compare: x.compare, dimension };
+            if let Some(k) = key {
+                self.memo.slots.insert(k, Resolved { slot: resolved.clone(), swizzle: swizzles[slot], address: tic.address, source, target });
+            }
+            textures.push(resolved);
         }
         Ok((textures, swizzles))
     }
@@ -1399,6 +1447,8 @@ impl Surfaces {
             c.spans = None;
             let textures = &c.textures;
             c.compare_depths.retain(|k, _| textures.contains_key(k));
+            // Their slots upload them afresh.
+            self.memo.slots.clear();
         }
     }
 
@@ -1577,6 +1627,53 @@ mod tests {
         assert_eq!(dynamic_groups(&[3, 16], 15), [true, false]);
         assert_eq!(dynamic_groups(&[16, 16], 15), [false, false]);
         assert_eq!(dynamic_groups(&[9], 15), [true]);
+    }
+
+    #[test]
+    fn a_texture_slot_is_resolved_once_until_its_inputs_change() {
+        let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
+            eprintln!("no GPU adapter: test skipped");
+            return;
+        };
+        // An 8x8 RGBA8 block-linear texture (one GOB) at TEX, sampled through header 0 and sampler 0.
+        const TEX: u64 = 0x50_0000;
+        let mut tic = [0u8; 32];
+        put(&mut tic, &[(6, 0, 0x08), (9, 7, 2), (12, 10, 2), (15, 13, 2), (18, 16, 2), (21, 19, 2), (24, 22, 3), (27, 25, 4), (30, 28, 5)]);
+        put(&mut tic, &[(63, 41, (TEX >> 9) as u32), (87, 85, 3), (144, 128, 7), (175, 160, 7), (154, 151, 1), (191, 191, 1)]);
+        let x = Texture { handle: Handle::CBuf { bank: 0, offset: 0 }, dim: TexDim::D2, compare: false, fetch: false, query: false };
+        let t = Translation { key: 0, stage: Stage::Compute, wgsl: String::new(), interface: Interface { textures: vec![x], ..Default::default() } };
+        let regions = [(TEX, vec![7u8; 512]), (HEADERS, tic.to_vec()), (SAMPLERS, vec![0u8; 32])];
+        let reads = std::cell::Cell::new(0);
+        let mut mem = |addr: u64, out: &mut [u8]| {
+            reads.set(reads.get() + u32::from(addr == TEX));
+            regions.iter().any(|(at, data)| {
+                let Some(src) = addr.checked_sub(*at).and_then(|o| data.get(o as usize..o as usize + out.len())) else { return false };
+                out.copy_from_slice(src);
+                true
+            })
+        };
+        let reg = |m: u32| match m {
+            0x1578 => HEADERS as u32,
+            0x1560 => SAMPLERS as u32,
+            _ => 0,
+        };
+        let banks = BTreeMap::from([(0u8, (0, std::sync::Arc::new(vec![0u8; 16])))]);
+        let mut resolve = |s: &mut Surfaces| s.texture_slots(&t, &banks, resources::header_pool(&reg), resources::sampler_pool(&reg), resources::sampler_binding(&reg), &[], &mut mem).unwrap_or_else(|e| panic!("{e}")).0.remove(0).view;
+        let first = resolve(&mut s);
+        assert_eq!(reads.get(), 1);
+        // The same slot again in this submit: replayed, nothing read, and journaled as read.
+        let again = resolve(&mut s);
+        assert_eq!((again == first, reads.get()), (true, 1));
+        assert_eq!(s.textures_read, [(TEX, "memory"), (TEX, "memory")]);
+        // A GPU write over the texture: dropped, its slot resolved and uploaded afresh.
+        s.invalidate(TEX + 4, 4);
+        s.drain_invalidations();
+        let fresh = resolve(&mut s);
+        assert_eq!((fresh == first, reads.get()), (false, 2));
+        // A new submit forgets the slots, not the uploaded texture: same view, no read.
+        s.new_submit();
+        let next = resolve(&mut s);
+        assert_eq!((next == fresh, reads.get()), (true, 2));
     }
 
     #[test]

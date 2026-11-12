@@ -67,6 +67,8 @@ impl Surfaces {
         self.drain_invalidations();
         // A dispatch may write the images: their float twins are stale.
         self.cache.twins.clear();
+        // The dispatch may make, drop or write images: slots resolved to one are stale.
+        self.memo.slots.clear();
         if l.grid.contains(&0) || l.program == 0 {
             return Ok(());
         }
