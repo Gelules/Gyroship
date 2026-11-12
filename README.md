@@ -31,6 +31,7 @@ Requires a recent stable Rust toolchain (MSVC on Windows).
     generated/game/target/release/harness boot <exefs> --log FILE  # boot the recompiled game (--explore, --all-svcs)
     gyroship-tools experiment <exefs> -o generated/exp/x  # recompile a sample (--backend rust|clif)
     gyroship-tools measure <command> ...                  # wall time and peak memory of a process tree
+    gyroship-tools boost-check <trace>...                 # boost reimplementation vs --trace files, frame by frame
     gyroship-tools capture --title Gyroship -o shot.png   # capture a window (Windows)
 
 `tools/ghidra/analyze_modules.sh` imports the exported ELF files into a headless Ghidra

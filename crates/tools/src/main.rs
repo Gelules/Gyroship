@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
+mod boost;
 mod experiment;
 mod gpfifo;
 mod measure;
@@ -161,6 +162,14 @@ enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Check the boost reimplementation (gyroship-research) against --trace
+    /// files of the boost probes: every frame of every vehicle, bit for bit
+    /// (exit code 1 on any difference)
+    BoostCheck {
+        /// Trace files written with --trace
+        #[arg(required = true)]
+        traces: Vec<PathBuf>,
+    },
     /// Convert NSO executables to AArch64 ELF files for disassemblers
     Nso2elf {
         /// NSO files to convert
@@ -188,6 +197,7 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Command::Nso(NsoCommand::Info { nso, symbols }) => nso_info(&nso, symbols).map(|_| true),
         Command::Nso2elf { inputs, out } => nso2elf(&inputs, &out).map(|_| true),
+        Command::BoostCheck { traces } => boost::check(&traces),
         Command::Gpfifo { dir, first, last, methods, listing, bench, profile, repeat } => gpfifo::run(&dir, first, last, methods, listing, bench.then_some((profile, repeat))).map(|_| true),
         Command::Shaders { zip, samples } => shaders::run(&zip, samples.as_deref()),
         Command::DatazipFind { zips, patterns, out, context } => shaders::find(&zips, &patterns, out.as_deref(), context).map(|_| true),
