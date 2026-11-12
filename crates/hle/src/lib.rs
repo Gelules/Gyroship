@@ -105,7 +105,8 @@ pub struct Config {
     /// `--work-time`: guest instructions cost virtual time (D40), so that loads
     /// spread over frames; off, only switch points do (D19).
     pub work_time: bool,
-    /// `--dump-gpfifo DIR`: the first submits' pushbuffer segments go to DIR, raw.
+    /// `--dump-gpfifo DIR`: the first submits' pushbuffer segments go to DIR, raw,
+    /// and with `--dump-from N` those of presents N to N + 9.
     pub gpfifo_dump: Option<std::path::PathBuf>,
     /// `--dump-frames DIR`: at each present, the render targets the frame
     /// touched go to DIR as PNG files.
@@ -447,9 +448,10 @@ impl Kernel {
             }
             let m = g.as_ref().map(|g| g.gpu.mme_stats()).unwrap_or_default();
             eprintln!(
-                "gyroship: macros over {} presents: {} calls, {:.1}% repeating their macro's last parameters without reading registers or memory; {} zero-count LOOPs; {} taken branches with bit 14 ({} with an END pending)",
+                "gyroship: macros over {} presents: {} calls of {:.1} groups on average, {:.1}% repeating their macro's last parameters without reading registers or memory; {} zero-count LOOPs; {} taken branches with bit 14 ({} with an END pending)",
                 self.gs.presents,
                 m.calls,
+                m.groups as f64 / m.calls.max(1) as f64,
                 100.0 * m.repeats as f64 / m.calls.max(1) as f64,
                 m.zero_loops,
                 m.bit14,

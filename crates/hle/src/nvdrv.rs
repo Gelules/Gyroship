@@ -515,10 +515,11 @@ fn run_gpfifo(k: &mut GpuSide, fd: u32, space: u32, entries: &[u8]) -> Result<()
                 continue;
             }
             let words: Vec<u32> = raw.as_chunks::<4>().0.iter().map(|w| u32::from_le_bytes(*w)).collect();
-            // Raw segments of the first submits in GPFIFO order, for study (never committed: game data).
-            let submits = k.at.submits;
+            // Raw segments of the first submits in GPFIFO order (they load the macros) and, with
+            // --dump-from N, those of presents N to N + 9, for study (never committed: game data).
+            let (submits, from) = (k.at.submits, k.config.dump_from);
             if let Some(dir) = &k.config.gpfifo_dump
-                && submits <= 300
+                && (submits <= 300 || (from > 0 && (from..from + 10).contains(&k.at.presents)))
             {
                 let _ = std::fs::create_dir_all(dir);
                 let _ = std::fs::write(dir.join(format!("submit-{submits:04}-{rank:04}-{at:010x}.bin")), &raw);

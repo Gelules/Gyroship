@@ -107,6 +107,15 @@ enum Command {
         /// After the replay, list this macro's code, decoded
         #[arg(long = "macro")]
         listing: Option<usize>,
+        /// Time the reported submits without tracing them, and give the macros' figures
+        #[arg(long)]
+        bench: bool,
+        /// With --bench: sample the reported submits, report to this file
+        #[arg(long)]
+        profile: Option<PathBuf>,
+        /// With --bench: run the reported submits this many times
+        #[arg(long, default_value_t = 1)]
+        repeat: u32,
     },
     /// Inventory of the game's shaders: every nvn_gen2.raw blob of data.zip,
     /// its program and its instructions by opcode and stage (exit code 1 if a
@@ -161,7 +170,7 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Command::Nso(NsoCommand::Info { nso, symbols }) => nso_info(&nso, symbols).map(|_| true),
         Command::Nso2elf { inputs, out } => nso2elf(&inputs, &out).map(|_| true),
-        Command::Gpfifo { dir, first, last, methods, listing } => gpfifo::run(&dir, first, last, methods, listing).map(|_| true),
+        Command::Gpfifo { dir, first, last, methods, listing, bench, profile, repeat } => gpfifo::run(&dir, first, last, methods, listing, bench.then_some((profile, repeat))).map(|_| true),
         Command::Shaders { zip, samples } => shaders::run(&zip, samples.as_deref()),
         Command::Sass { file } => shaders::list(&file).map(|_| true),
         Command::Translate { files, out } => shaders::translate(&files, out.as_deref()),

@@ -111,10 +111,122 @@ impl Group {
     }
 }
 
-/// A group decoded, with whether it takes a parameter into LOAD0 and LOAD1.
-fn decoded(words: [u32; 3]) -> (Group, bool, bool) {
-    let g = Group::decode(words);
-    (g, g.reads(LOAD0, OUT_LOAD0), g.reads(LOAD1, OUT_LOAD1))
+// The interpreter's register file (`Run::r`): R0..R23, ZERO (never written),
+// LOAD0 and LOAD1 at their own numbers, the slot that takes the writes to ZERO
+// at IMMED's number (immediates are constants), and the two ALU results at the
+// numbers no source may name.
+const R_DISCARD: u8 = IMMED;
+const R_ALU: [usize; 2] = [30, 31];
+
+/// A value the interpreter reads: `r[idx] | konst` (`idx` ZERO for a constant).
+#[derive(Debug, Clone, Copy)]
+struct Src {
+    idx: u8,
+    konst: u32,
+}
+
+impl Src {
+    const ZERO: Src = Src { idx: ZERO, konst: 0 };
+
+    const fn reg(idx: u8) -> Src {
+        Src { idx, konst: 0 }
+    }
+
+    const fn konst(konst: u32) -> Src {
+        Src { idx: ZERO, konst }
+    }
+}
+
+/// One ALU of a [`Fast`] group.
+#[derive(Debug, Clone, Copy)]
+struct FastAlu {
+    op: u8,
+    /// The register written: R0..R23, or R_DISCARD for ZERO and bad numbers.
+    dst: u8,
+    /// A bad destination number: the fault once the ALU has run.
+    bad_dst: Option<u8>,
+    imm: u16,
+    x: Src,
+    y: Src,
+}
+
+/// A group decoded for the interpreter: its sources resolved to the register
+/// file or constants, its predicate mode to the parts that run.
+#[derive(Debug, Clone, Copy)]
+struct Fast {
+    /// Parts that run (bit 0: ALU 0, 1: ALU 1, 2: output 0, 3: output 1) when the
+    /// predicate reads zero, and when it does not (all without a predicate mode).
+    if_zero: u8,
+    if_set: u8,
+    pred: Src,
+    /// Parameters taken into LOAD0 (bit 0) and LOAD1 (bit 1) first.
+    loads: u8,
+    end_next: bool,
+    /// Bad source numbers: the predicate's (read with a predicate mode only), then
+    /// each ALU's first, checked in the order the unit reads them (`bad`: any).
+    bad: bool,
+    bad_pred: Option<u8>,
+    bad_src: [Option<u8>; 2],
+    alu: [FastAlu; 2],
+    /// Each output's method and emit sources; whether they are not OUT_NONE in
+    /// `outs`, bits 0 (method) and 1 (emit) for output 0, 2 and 3 for output 1.
+    out: [(Src, Src); 2],
+    outs: u8,
+}
+
+impl Fast {
+    fn new(g: &Group) -> Fast {
+        let imm = |k: usize| g.alu[k].imm as i16 as u32;
+        // What ALU `i` (0 for the predicate) reads for a source number; ZERO and bad
+        // numbers read 0 (a bad one faults before its value counts).
+        let src = |i: usize, reg: u8| match reg {
+            0..=23 | LOAD0 | LOAD1 => Src::reg(reg),
+            IMMED => Src::konst(imm(i)),
+            IMMED_PAIR => Src::konst(imm(i ^ 1)),
+            IMMED32 => Src::konst((u32::from(g.alu[0].imm) << 16) | u32::from(g.alu[1].imm)),
+            _ => Src::ZERO,
+        };
+        let out = |s: u8| {
+            let (i0, i1) = (u32::from(g.alu[0].imm), u32::from(g.alu[1].imm));
+            match s {
+                1 => Src::reg(R_ALU[0] as u8),
+                2 => Src::reg(R_ALU[1] as u8),
+                OUT_LOAD0 => Src::reg(LOAD0),
+                OUT_LOAD1 => Src::reg(LOAD1),
+                5 => Src::konst(i0),
+                6 => Src::konst(i1),
+                8 => Src::konst(i0 >> 12),
+                9 => Src::konst(i1 >> 12),
+                10 => Src::konst((i0 << 16) | i1),
+                _ => Src::ZERO,
+            }
+        };
+        let bad = |reg: u8| (reg > LOAD1).then_some(reg);
+        // A part runs when its letter is not the predicate's state; an output with
+        // neither source would do nothing.
+        let letters = PRED_MODES[usize::from(g.pred_mode)];
+        let outs = g.out.iter().enumerate().fold(0, |m, (k, &(method, emit))| m | u8::from(method != OUT_NONE) << (2 * k) | u8::from(emit != OUT_NONE) << (2 * k + 1));
+        let quiet = (0..2).fold(0, |m, k| m | u8::from(outs >> (2 * k) & 3 == 0) << (2 + k));
+        let runs = |state: u8| letters.iter().enumerate().fold(0, |m, (k, &c)| m | u8::from(c != state) << k) & !quiet;
+        let bad_pred = if g.pred_mode == 0 { None } else { bad(g.pred) };
+        let bad_src = g.alu.map(|a| a.src.into_iter().find_map(bad));
+        Fast {
+            if_zero: runs(b'F'),
+            if_set: runs(b'T'),
+            pred: if g.pred_mode == 0 { Src::ZERO } else { src(0, g.pred) },
+            loads: u8::from(g.reads(LOAD0, OUT_LOAD0)) | u8::from(g.reads(LOAD1, OUT_LOAD1)) << 1,
+            end_next: g.end_next,
+            bad: bad_pred.is_some() || bad_src.iter().any(Option::is_some),
+            bad_pred,
+            bad_src,
+            alu: std::array::from_fn(|i| {
+                let a = g.alu[i];
+                FastAlu { op: a.op, dst: if a.dst < ZERO { a.dst } else { R_DISCARD }, bad_dst: (a.dst > ZERO).then_some(a.dst), imm: a.imm, x: src(i, a.src[0]), y: src(i, a.src[1]) }
+            }),
+            out: g.out.map(|(method, emit)| (out(method), out(emit))),
+            outs,
+        }
+    }
 }
 
 /// The macro unit of one 3D class: its RAMs and the pointers that load them.
@@ -125,14 +237,16 @@ pub struct Mme {
     pub data: Vec<u32>,
     code_ptr: usize,
     start_ptr: usize,
-    /// `code` decoded group by group, with whether each group takes a parameter
-    /// into LOAD0 and LOAD1: derived, kept in step by `load_code`, so that a
-    /// call decodes nothing (rebuild it if `code` is ever set another way).
-    groups: Vec<(Group, bool, bool)>,
+    /// `code` decoded group by group for the interpreter: derived, kept in step
+    /// by `load_code`, so that a call decodes nothing (rebuild it if `code` is
+    /// ever set another way).
+    groups: Vec<Fast>,
     /// What the calls did, for `--perf` (host statistics, not GPU state).
     pub stats: Stats,
     /// Each macro's last call: a hash of the parameters it took.
     last: Vec<Option<u64>>,
+    /// A call running more groups than this is a runaway (STEP_LIMIT).
+    limit: u64,
 }
 
 /// What macro calls did, for the speed work: the calls; those a memo could
@@ -140,41 +254,42 @@ pub struct Mme {
 /// read); LOOPs with a zero count (run once here; Lichii skips them); taken
 /// branches with immediate bit 14 (Lichii cancels a pending END with them), in
 /// all and with an END pending.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Stats {
     pub calls: u64,
     pub repeats: u64,
     pub zero_loops: u64,
     pub bit14: u64,
     pub bit14_end: u64,
+    /// Groups the calls that ended ran.
+    pub groups: u64,
 }
 
 impl std::ops::AddAssign for Stats {
     fn add_assign(&mut self, o: Stats) {
-        (self.calls, self.repeats, self.zero_loops, self.bit14, self.bit14_end) = (self.calls + o.calls, self.repeats + o.repeats, self.zero_loops + o.zero_loops, self.bit14 + o.bit14, self.bit14_end + o.bit14_end);
+        (self.calls, self.repeats, self.zero_loops, self.bit14, self.bit14_end, self.groups) = (self.calls + o.calls, self.repeats + o.repeats, self.zero_loops + o.zero_loops, self.bit14 + o.bit14, self.bit14_end + o.bit14_end, self.groups + o.groups);
     }
 }
 
 impl Default for Mme {
     fn default() -> Mme {
-        Mme { code: vec![0; CODE_WORDS], starts: vec![u32::MAX; MACROS], data: vec![0; DATA_WORDS], code_ptr: 0, start_ptr: 0, groups: vec![decoded([0; 3]); CODE_WORDS / 3], stats: Stats::default(), last: vec![None; MACROS] }
+        Mme { code: vec![0; CODE_WORDS], starts: vec![u32::MAX; MACROS], data: vec![0; DATA_WORDS], code_ptr: 0, start_ptr: 0, groups: vec![Fast::new(&Group::decode([0; 3])); CODE_WORDS / 3], stats: Stats::default(), last: vec![None; MACROS], limit: STEP_LIMIT }
     }
 }
 
 /// The state of one macro call.
 struct Run<'a, H: Host> {
     host: &'a mut H,
-    regs: [u32; 24],
-    load: [u32; 2],
-    alu_res: [u32; 2],
+    data: &'a mut [u32],
+    stats: &'a mut Stats,
+    /// The register file: R0..R23, ZERO, LOAD0/1, the ALU results (`R_ALU`).
+    r: [u32; 32],
     carry: u32,
     method: u32,
     inc: u32,
     stop: bool,
     /// Words MME_DMA_READ_FIFOED queued after the call's parameters.
     fifo: std::collections::VecDeque<u32>,
-    /// Each ALU's (x, y), read before either ALU of the group writes.
-    sources: [(u32, u32); 2],
     /// For [`Stats`]: a hash of the parameters taken, whether the call read
     /// registers or memory, and whether a taken branch had immediate bit 14.
     params: u64,
@@ -195,7 +310,7 @@ impl Mme {
             *w = word;
             let g = self.code_ptr / 3;
             if let Some(&[a, b, c]) = self.code.get(g * 3..g * 3 + 3) {
-                self.groups[g] = decoded([a, b, c]);
+                self.groups[g] = Fast::new(&Group::decode([a, b, c]));
             }
         }
         self.code_ptr += 1;
@@ -236,49 +351,51 @@ impl Mme {
         if start == u32::MAX as usize {
             return Err(Fault::NoMacro(index));
         }
-        let mut run = Run { host, regs: [0; 24], load: [0; 2], alu_res: [0; 2], carry: 0, method: 0, inc: 0, stop: false, fifo: Default::default(), sources: [(0, 0); 2], params: 0, reads: false, bit14: false };
+        let Mme { groups, data, stats, last, limit, .. } = self;
+        let mut run = Run { host, data, stats, r: [0; 32], carry: 0, method: 0, inc: 0, stop: false, fifo: Default::default(), params: 0, reads: false, bit14: false };
         let (mut ip, mut end_next) = (start, false);
         let mut lp = None::<(usize, usize, u32)>; // (start, end, remaining)
-        for _ in 0..STEP_LIMIT {
-            let &(g, load0, load1) = self.groups.get(ip).ok_or(Fault::OutOfCode(ip))?;
+        for step in 1..=*limit {
+            let g = groups.get(ip).ok_or(Fault::OutOfCode(ip))?;
             let mut next = ip + 1;
-            if load0 {
-                run.load[0] = run.param();
+            if g.loads & 1 != 0 {
+                run.r[usize::from(LOAD0)] = run.param();
             }
-            if load1 {
-                run.load[1] = run.param();
+            if g.loads & 2 != 0 {
+                run.r[usize::from(LOAD1)] = run.param();
             }
-            let mask = match g.pred_mode {
-                0 => [true; 4],
-                m => {
-                    let v = run.read(&g, 0, g.pred)? != 0;
-                    PRED_MODES[usize::from(m)].map(|c| c != if v { b'T' } else { b'F' })
-                }
-            };
+            if let Some(r) = g.bad_pred {
+                return Err(Fault::BadRegister(r));
+            }
+            let mask = if run.get(g.pred) != 0 { g.if_set } else { g.if_zero };
+            if g.bad
+                && let Some(r) = (0..2).filter(|i| mask >> i & 1 != 0).find_map(|i| g.bad_src[i])
+            {
+                return Err(Fault::BadRegister(r));
+            }
             // Both ALUs read the registers before either writes its destination (the
             // game's macros rely on it: macro code computes a value in one ALU while the
             // other still reads the register's old value); only the carry chains.
-            run.sources = [(0, 0); 2];
-            for (i, _) in mask[..2].iter().enumerate().filter(|m| *m.1) {
-                let a = g.alu[i];
-                run.sources[i] = (run.read(&g, i, a.src[0])?, run.read(&g, i, a.src[1])?);
-            }
-            for (i, _) in mask[..2].iter().enumerate().filter(|m| *m.1) {
-                run.alu(self, &g, i, ip, &mut next, &mut lp)?;
+            let xy = g.alu.map(|a| (run.get(a.x), run.get(a.y)));
+            for (i, a) in g.alu.iter().enumerate() {
+                if mask >> i & 1 != 0 {
+                    run.alu(a, i, xy[i], ip, &mut next, &mut lp)?;
+                }
             }
             if std::mem::take(&mut run.bit14) {
-                self.stats.bit14 += 1;
-                self.stats.bit14_end += u64::from(end_next);
+                run.stats.bit14 += 1;
+                run.stats.bit14_end += u64::from(end_next);
             }
-            for i in 0..2 {
-                if mask[2 + i] {
-                    run.out(self, &g, i);
+            for (i, &out) in g.out.iter().enumerate() {
+                if mask >> (2 + i) & 1 != 0 {
+                    run.out(out, g.outs >> (2 * i));
                 }
             }
             if end_next || run.stop {
-                self.stats.calls += 1;
-                let last = self.last.get_mut(index).and_then(|l| l.replace(run.params));
-                self.stats.repeats += u64::from(!run.reads && last == Some(run.params));
+                run.stats.calls += 1;
+                run.stats.groups += step;
+                let last = last.get_mut(index).and_then(|l| l.replace(run.params));
+                run.stats.repeats += u64::from(!run.reads && last == Some(run.params));
                 return Ok(());
             }
             end_next = g.end_next;
@@ -296,23 +413,11 @@ impl Mme {
 }
 
 impl<H: Host> Run<'_, H> {
-    fn read(&self, g: &Group, i: usize, reg: u8) -> Result<u32, Fault> {
-        Ok(match reg {
-            0..=23 => self.regs[usize::from(reg)],
-            ZERO => 0,
-            // Immediates are signed for the ALUs.
-            IMMED => g.alu[i & 1].imm as i16 as u32,
-            IMMED_PAIR => g.alu[(i & 1) ^ 1].imm as i16 as u32,
-            IMMED32 => (u32::from(g.alu[0].imm) << 16) | u32::from(g.alu[1].imm),
-            LOAD0 => self.load[0],
-            LOAD1 => self.load[1],
-            r => return Err(Fault::BadRegister(r)),
-        })
+    fn get(&self, s: Src) -> u32 {
+        self.r[usize::from(s.idx & 31)] | s.konst
     }
 
-    fn alu(&mut self, mme: &mut Mme, g: &Group, i: usize, ip: usize, next: &mut usize, lp: &mut Option<(usize, usize, u32)>) -> Result<(), Fault> {
-        let (x, y) = self.sources[i];
-        let a = g.alu[i];
+    fn alu(&mut self, a: &FastAlu, i: usize, (x, y): (u32, u32), ip: usize, next: &mut usize, lp: &mut Option<(usize, usize, u32)>) -> Result<(), Fault> {
         let wide = |p: u64| (p as u32, (p >> 32) as u32);
         let branch = |taken: bool| taken == (a.imm & 0x8000 != 0);
         let res = match a.op {
@@ -370,7 +475,7 @@ impl<H: Host> Run<'_, H> {
             // simulator runs them once, but NVK skips padding words with a LOOP of
             // parameter loads whose count is 0 for packed draws (D37).
             23 => {
-                mme.stats.zero_loops += u64::from(x == 0);
+                self.stats.zero_loops += u64::from(x == 0);
                 match x {
                     0 => *next = ip + usize::from(a.imm),
                     _ => *lp = Some((ip, ip + usize::from(a.imm) - 1, x - 1)),
@@ -394,21 +499,17 @@ impl<H: Host> Run<'_, H> {
                 }
                 0
             }
-            30 => mme.data.get(x as usize).copied().unwrap_or(0),
+            30 => self.data.get(x as usize).copied().unwrap_or(0),
             _ => {
-                if let Some(d) = mme.data.get_mut(x as usize) {
+                if let Some(d) = self.data.get_mut(x as usize) {
                     *d = y;
                 }
                 0
             }
         };
-        self.alu_res[i] = res;
-        match a.dst {
-            0..=23 => self.regs[usize::from(a.dst)] = res,
-            ZERO => {}
-            r => return Err(Fault::BadRegister(r)),
-        }
-        Ok(())
+        self.r[R_ALU[i & 1]] = res;
+        self.r[usize::from(a.dst & 31)] = res;
+        a.bad_dst.map_or(Ok(()), |r| Err(Fault::BadRegister(r)))
     }
 
     /// The call's parameters, then what DMA reads queued; 0 once both run out.
@@ -424,7 +525,7 @@ impl<H: Host> Run<'_, H> {
 
     /// MME_DMA_READ(_FIFOED): `count` words at SET_MME_MEM_ADDRESS_A/B go to
     /// data RAM from SET_MME_DATA_RAM_ADDRESS, or after the parameters.
-    fn dma(&mut self, mme: &mut Mme, method: u32, count: u32) {
+    fn dma(&mut self, method: u32, count: u32) {
         self.reads = true;
         let addr = u64::from(self.host.reg(SET_MME_MEM_ADDRESS_A) & 0x1_ffff) << 32 | u64::from(self.host.reg(SET_MME_MEM_ADDRESS_B));
         let mut words = vec![0; count.min(DMA_LIMIT) as usize];
@@ -433,39 +534,25 @@ impl<H: Host> Run<'_, H> {
             self.fifo.extend(words);
         } else {
             let at = self.host.reg(SET_MME_DATA_RAM_ADDRESS) as usize;
-            for (d, w) in mme.data.iter_mut().skip(at).zip(words) {
+            for (d, w) in self.data.iter_mut().skip(at).zip(words) {
                 *d = w;
             }
         }
     }
 
-    fn out(&mut self, mme: &mut Mme, g: &Group, i: usize) {
-        let (method, emit) = g.out[i];
-        let value = |src: u8| {
-            let (i0, i1) = (u32::from(g.alu[0].imm), u32::from(g.alu[1].imm));
-            match src {
-                1 => self.alu_res[0],
-                2 => self.alu_res[1],
-                OUT_LOAD0 => self.load[0],
-                OUT_LOAD1 => self.load[1],
-                5 => i0,
-                6 => i1,
-                8 => i0 >> 12,
-                9 => i1 >> 12,
-                10 => (i0 << 16) | i1,
-                _ => 0,
-            }
-        };
-        if method != OUT_NONE {
-            let d = value(method);
+    /// An output: its method source (`outs` bit 0) sets the method and the
+    /// increment, its emit source (bit 1) emits a value.
+    fn out(&mut self, (method, emit): (Src, Src), outs: u8) {
+        if outs & 1 != 0 {
+            let d = self.get(method);
             self.method = (d & 0xfff) << 2;
             self.inc = (d >> 12) & 0xf;
         }
-        if emit != OUT_NONE {
-            let d = value(emit);
+        if outs & 2 != 0 {
+            let d = self.get(emit);
             self.host.method(self.method, d);
             if matches!(self.method, MME_DMA_READ | MME_DMA_READ_FIFOED) {
-                self.dma(mme, self.method, d);
+                self.dma(self.method, d);
             }
             self.method += self.inc * 4;
         }
@@ -480,6 +567,268 @@ fn compare(op: u8, x: u32, y: u32) -> bool {
         27 => (x as i32) <= (y as i32),
         28 => x <= y,
         _ => x == y,
+    }
+}
+
+/// The interpreter as it was before [`Fast`]: each group decoded as it runs,
+/// each register read checked. A test runs both on random programs.
+#[cfg(test)]
+mod reference {
+    use super::*;
+
+    pub(super) struct Old<'a, H: Host> {
+        host: &'a mut H,
+        regs: [u32; 24],
+        load: [u32; 2],
+        alu_res: [u32; 2],
+        carry: u32,
+        method: u32,
+        inc: u32,
+        stop: bool,
+        fifo: std::collections::VecDeque<u32>,
+        sources: [(u32, u32); 2],
+        params: u64,
+        reads: bool,
+        bit14: bool,
+    }
+
+    pub(super) fn call<H: Host>(mme: &mut Mme, index: usize, host: &mut H) -> Result<(), Fault> {
+        let start = *mme.starts.get(index).ok_or(Fault::NoMacro(index))? as usize;
+        if start == u32::MAX as usize {
+            return Err(Fault::NoMacro(index));
+        }
+        let mut run = Old { host, regs: [0; 24], load: [0; 2], alu_res: [0; 2], carry: 0, method: 0, inc: 0, stop: false, fifo: Default::default(), sources: [(0, 0); 2], params: 0, reads: false, bit14: false };
+        let (mut ip, mut end_next) = (start, false);
+        let mut lp = None::<(usize, usize, u32)>; // (start, end, remaining)
+        for step in 1..=mme.limit {
+            let w = (ip < CODE_WORDS / 3).then(|| &mme.code[ip * 3..ip * 3 + 3]).ok_or(Fault::OutOfCode(ip))?;
+            let g = Group::decode([w[0], w[1], w[2]]);
+            let mut next = ip + 1;
+            if g.reads(LOAD0, OUT_LOAD0) {
+                run.load[0] = run.param();
+            }
+            if g.reads(LOAD1, OUT_LOAD1) {
+                run.load[1] = run.param();
+            }
+            let mask = match g.pred_mode {
+                0 => [true; 4],
+                m => {
+                    let v = run.read(&g, 0, g.pred)? != 0;
+                    PRED_MODES[usize::from(m)].map(|c| c != if v { b'T' } else { b'F' })
+                }
+            };
+            run.sources = [(0, 0); 2];
+            for (i, _) in mask[..2].iter().enumerate().filter(|m| *m.1) {
+                let a = g.alu[i];
+                run.sources[i] = (run.read(&g, i, a.src[0])?, run.read(&g, i, a.src[1])?);
+            }
+            for (i, _) in mask[..2].iter().enumerate().filter(|m| *m.1) {
+                run.alu(mme, &g, i, ip, &mut next, &mut lp)?;
+            }
+            if std::mem::take(&mut run.bit14) {
+                mme.stats.bit14 += 1;
+                mme.stats.bit14_end += u64::from(end_next);
+            }
+            for i in 0..2 {
+                if mask[2 + i] {
+                    run.out(mme, &g, i);
+                }
+            }
+            if end_next || run.stop {
+                mme.stats.calls += 1;
+                mme.stats.groups += step;
+                let last = mme.last.get_mut(index).and_then(|l| l.replace(run.params));
+                mme.stats.repeats += u64::from(!run.reads && last == Some(run.params));
+                return Ok(());
+            }
+            end_next = g.end_next;
+            if let Some((s, e, n)) = lp
+                && ip == e
+                && n > 0
+            {
+                lp = Some((s, e, n - 1));
+                next = s + 1;
+            }
+            ip = next;
+        }
+        Err(Fault::Runaway)
+    }
+
+    impl<H: Host> Old<'_, H> {
+        fn read(&self, g: &Group, i: usize, reg: u8) -> Result<u32, Fault> {
+            Ok(match reg {
+                0..=23 => self.regs[usize::from(reg)],
+                ZERO => 0,
+                // Immediates are signed for the ALUs.
+                IMMED => g.alu[i & 1].imm as i16 as u32,
+                IMMED_PAIR => g.alu[(i & 1) ^ 1].imm as i16 as u32,
+                IMMED32 => (u32::from(g.alu[0].imm) << 16) | u32::from(g.alu[1].imm),
+                LOAD0 => self.load[0],
+                LOAD1 => self.load[1],
+                r => return Err(Fault::BadRegister(r)),
+            })
+        }
+
+        fn alu(&mut self, mme: &mut Mme, g: &Group, i: usize, ip: usize, next: &mut usize, lp: &mut Option<(usize, usize, u32)>) -> Result<(), Fault> {
+            let (x, y) = self.sources[i];
+            let a = g.alu[i];
+            let wide = |p: u64| (p as u32, (p >> 32) as u32);
+            let branch = |taken: bool| taken == (a.imm & 0x8000 != 0);
+            let res = match a.op {
+                0 => {
+                    let r = x.wrapping_add(y);
+                    self.carry = u32::from(r < x);
+                    r
+                }
+                1 => x.wrapping_add(y).wrapping_add(self.carry),
+                2 => {
+                    let r = x.wrapping_sub(y);
+                    self.carry = u32::from(r > x);
+                    r
+                }
+                3 => x.wrapping_sub(y).wrapping_sub(self.carry),
+                4 => {
+                    let (lo, hi) = wide((i64::from(x as i32) * i64::from(y as i32)) as u64);
+                    self.carry = hi;
+                    lo
+                }
+                5 => self.carry,
+                6 => {
+                    let (lo, hi) = wide(u64::from(x) * u64::from(y));
+                    self.carry = hi;
+                    lo
+                }
+                // EXTENDED: a barrier for MME_DMA_READ_FIFOED, which nothing here needs.
+                7 => 0,
+                8 => x.leading_zeros(),
+                9 => x << (y & 31),
+                10 => x >> (y & 31),
+                11 => ((x as i32) >> (y & 31)) as u32,
+                12 => x & y,
+                13 => !(x & y),
+                14 => x | y,
+                15 => x ^ y,
+                // MERGE: `bits` bits of y from `src` replace those of x at `dst`.
+                16 => {
+                    let (dst, bits, src) = (u32::from(a.imm >> 10) & 0x3f, u32::from(a.imm >> 5) & 0x1f, u32::from(a.imm) & 0x1f);
+                    let mask = ((1u64 << bits) - 1) << dst;
+                    ((u64::from(x) & !mask) | ((u64::from(y >> src) << dst) & mask)) as u32
+                }
+                17..=21 => {
+                    if compare(a.op - 17 + 25, x, y) {
+                        u32::MAX
+                    } else {
+                        0
+                    }
+                }
+                22 => {
+                    self.reads = true;
+                    self.host.state(u32::from(x.wrapping_add(y) as u16) * 4)
+                }
+                // LOOP: the next `imm - 1` groups run x times; none when x is 0. Mesa's
+                // simulator runs them once, but NVK skips padding words with a LOOP of
+                // parameter loads whose count is 0 for packed draws (D37).
+                23 => {
+                    mme.stats.zero_loops += u64::from(x == 0);
+                    match x {
+                        0 => *next = ip + usize::from(a.imm),
+                        _ => *lp = Some((ip, ip + usize::from(a.imm) - 1, x - 1)),
+                    }
+                    0
+                }
+                24 => {
+                    *next = ip + usize::from(a.imm & 0x7fff);
+                    0
+                }
+                25..=29 => {
+                    if branch(compare(a.op, x, y)) {
+                        self.bit14 |= a.imm & 0x4000 != 0;
+                        // A 13-bit signed offset; its most negative value means "stop".
+                        let offset = i32::from(((a.imm as i16) << 3) >> 3);
+                        if offset == -0x1000 {
+                            self.stop = true;
+                        } else {
+                            *next = (ip as i64 + i64::from(offset)) as usize;
+                        }
+                    }
+                    0
+                }
+                30 => mme.data.get(x as usize).copied().unwrap_or(0),
+                _ => {
+                    if let Some(d) = mme.data.get_mut(x as usize) {
+                        *d = y;
+                    }
+                    0
+                }
+            };
+            self.alu_res[i] = res;
+            match a.dst {
+                0..=23 => self.regs[usize::from(a.dst)] = res,
+                ZERO => {}
+                r => return Err(Fault::BadRegister(r)),
+            }
+            Ok(())
+        }
+
+        /// The call's parameters, then what DMA reads queued; 0 once both run out.
+        fn param(&mut self) -> u32 {
+            match self.host.param() {
+                Some(v) => {
+                    self.params = (self.params.rotate_left(5) ^ u64::from(v)).wrapping_mul(0x517c_c1b7_2722_0a95);
+                    v
+                }
+                None => self.fifo.pop_front().unwrap_or(0),
+            }
+        }
+
+        /// MME_DMA_READ(_FIFOED): `count` words at SET_MME_MEM_ADDRESS_A/B go to
+        /// data RAM from SET_MME_DATA_RAM_ADDRESS, or after the parameters.
+        fn dma(&mut self, mme: &mut Mme, method: u32, count: u32) {
+            self.reads = true;
+            let addr = u64::from(self.host.reg(SET_MME_MEM_ADDRESS_A) & 0x1_ffff) << 32 | u64::from(self.host.reg(SET_MME_MEM_ADDRESS_B));
+            let mut words = vec![0; count.min(DMA_LIMIT) as usize];
+            self.host.read(addr, &mut words);
+            if method == MME_DMA_READ_FIFOED {
+                self.fifo.extend(words);
+            } else {
+                let at = self.host.reg(SET_MME_DATA_RAM_ADDRESS) as usize;
+                for (d, w) in mme.data.iter_mut().skip(at).zip(words) {
+                    *d = w;
+                }
+            }
+        }
+
+        fn out(&mut self, mme: &mut Mme, g: &Group, i: usize) {
+            let (method, emit) = g.out[i];
+            let value = |src: u8| {
+                let (i0, i1) = (u32::from(g.alu[0].imm), u32::from(g.alu[1].imm));
+                match src {
+                    1 => self.alu_res[0],
+                    2 => self.alu_res[1],
+                    OUT_LOAD0 => self.load[0],
+                    OUT_LOAD1 => self.load[1],
+                    5 => i0,
+                    6 => i1,
+                    8 => i0 >> 12,
+                    9 => i1 >> 12,
+                    10 => (i0 << 16) | i1,
+                    _ => 0,
+                }
+            };
+            if method != OUT_NONE {
+                let d = value(method);
+                self.method = (d & 0xfff) << 2;
+                self.inc = (d >> 12) & 0xf;
+            }
+            if emit != OUT_NONE {
+                let d = value(emit);
+                self.host.method(self.method, d);
+                if matches!(self.method, MME_DMA_READ | MME_DMA_READ_FIFOED) {
+                    self.dma(mme, self.method, d);
+                }
+                self.method += self.inc * 4;
+            }
+        }
     }
 }
 
@@ -699,6 +1048,102 @@ mod tests {
         let end = last(group(NOP, NOP, [(OUT_NONE, OUT_NONE); 2]));
         let host = run(&[w, r, m, c, end, group(NOP, NOP, [(OUT_NONE, OUT_NONE); 2])], &[0xabcd, 0xffff_ffff]);
         assert_eq!(host.emitted, vec![(0, 0xbc_0000), (0, 0), (0, 1)]);
+    }
+
+    /// A host answering from fixed functions, logging each call in order:
+    /// (0 param, 1 state, 2 method, 3 reg, 4 read; then two values).
+    #[derive(Default)]
+    struct Logged {
+        params: std::collections::VecDeque<u32>,
+        log: Vec<(u8, u32, u32)>,
+    }
+
+    impl Host for Logged {
+        fn param(&mut self) -> Option<u32> {
+            let p = self.params.pop_front();
+            self.log.push((0, p.unwrap_or(0), u32::from(p.is_some())));
+            p
+        }
+        fn state(&mut self, method: u32) -> u32 {
+            self.log.push((1, method, 0));
+            method.wrapping_mul(0x9e37_79b9) >> 7
+        }
+        fn method(&mut self, method: u32, data: u32) {
+            self.log.push((2, method, data));
+        }
+        fn reg(&mut self, method: u32) -> u32 {
+            self.log.push((3, method, 0));
+            self.log.iter().rev().find(|e| e.0 == 2 && e.1 == method).map_or(0, |e| e.2)
+        }
+        fn read(&mut self, addr: u64, words: &mut [u32]) {
+            self.log.push((4, addr as u32, words.len() as u32));
+            for (i, w) in words.iter_mut().enumerate() {
+                *w = (addr as u32).wrapping_add(7 * i as u32);
+            }
+        }
+    }
+
+    /// xorshift64, for random programs.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        /// A register number below `valid`, or one in 7 times any of the 32.
+        fn reg(&mut self, valid: u64) -> u8 {
+            let v = self.next();
+            (if v.is_multiple_of(7) { (v >> 3) % 32 } else { (v >> 3) % valid }) as u8
+        }
+    }
+
+    #[test]
+    fn the_interpreter_matches_the_reference_on_random_programs() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let mut faults = 0;
+        for case in 0..5000 {
+            // 1 to 12 random groups at a random start: mostly valid register numbers,
+            // some predicates and ENDs, now and then a method aimed at the DMA reads.
+            let mut mme = Mme { limit: 3000, ..Mme::default() };
+            let at = 1 + rng.next() % 64;
+            mme.set_code_pointer(at as u32);
+            for _ in 0..1 + rng.next() % 12 {
+                let mut alu = [NOP; 2];
+                for a in &mut alu {
+                    *a = Alu { op: (rng.next() % 32) as u8, dst: rng.reg(25), src: [rng.reg(30), rng.reg(30)], imm: rng.next() as u16 };
+                }
+                let pred_mode = if rng.next().is_multiple_of(2) { 0 } else { (rng.next() % 16) as u8 };
+                let out = [0; 2].map(|_| ((rng.next() % 8) as u8, (rng.next() % 16) as u8));
+                let mut g = Group { end_next: rng.next().is_multiple_of(6), pred_mode, pred: rng.reg(30), alu, out };
+                if rng.next().is_multiple_of(12) {
+                    let dma = if rng.next().is_multiple_of(2) { MME_DMA_READ } else { MME_DMA_READ_FIFOED };
+                    g.out[0].0 = 5;
+                    g.alu[0].imm = (dma / 4) as u16 | ((rng.next() % 2) << 12) as u16;
+                }
+                for w in enc(&g) {
+                    mme.load_code(w);
+                }
+            }
+            mme.set_start_pointer(0);
+            mme.load_start(at as u32);
+            for _ in 0..8 {
+                mme.data[(rng.next() % 16) as usize] = rng.next() as u32;
+            }
+            let params: std::collections::VecDeque<u32> = (0..rng.next() % 8).map(|_| (rng.next() % 64) as u32).collect();
+            let (mut a, mut b) = (mme.clone(), mme);
+            let (mut ha, mut hb) = (Logged { params: params.clone(), ..Logged::default() }, Logged { params, ..Logged::default() });
+            let (ra, rb) = (a.call(0, &mut ha), reference::call(&mut b, 0, &mut hb));
+            assert_eq!(ra, rb, "case {case}");
+            assert_eq!(ha.log, hb.log, "case {case}");
+            assert_eq!((a.data, a.stats), (b.data, b.stats), "case {case}");
+            faults += usize::from(ra.is_err());
+        }
+        // Both endings, and every fault kind's path, are well covered.
+        assert!((500..4500).contains(&faults), "{faults} faults");
     }
 
     #[test]

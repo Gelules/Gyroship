@@ -522,6 +522,10 @@ impl Channel {
         }
     }
 
+    // Out of line: inlined into the macro interpreter (through `MacroHost::method`),
+    // it made the interpreter's loop slower; heavy Corneria frames, offline: command
+    // processing 210 -> 174 ms over 10 frames.
+    #[inline(never)]
     fn write(&mut self, subchannel: usize, method: u32, value: u32, effects: &mut Vec<Effect>, read: Mem) {
         let three_d = self.classes[subchannel] & 0xff == 0x97;
         // The macro unit is the channel's: the 3D and compute classes both load and call it
