@@ -12,6 +12,7 @@ gyroship-analysis = { version = "0.1.0", path = "../analysis" }
 gyroship-recomp = { version = "0.1.0", path = "../recomp" }
 gyroship-gpu = { version = "0.1.0", path = "../gpu" }
 gyroship-runtime = { version = "0.1.0", path = "../runtime" }
+memchr = "2"
 
 [target."cfg(windows)".dependencies]
 windows-capture = "2"

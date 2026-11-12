@@ -1058,6 +1058,7 @@ dependencies = [
  "gyroship-loader",
  "gyroship-recomp",
  "gyroship-runtime",
+ "memchr",
  "windows",
  "windows-capture",
 ]

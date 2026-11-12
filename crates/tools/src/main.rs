@@ -127,6 +127,24 @@ enum Command {
         #[arg(long)]
         samples: Option<PathBuf>,
     },
+    /// Search every entry of data.zip archives for byte patterns: text, or hex
+    /// with a 0x prefix (bytes in file order); print each match's entry, offset
+    /// and surrounding bytes, and copy the matching entries to a folder (game
+    /// data: keep it out of the repository)
+    DatazipFind {
+        /// The romfs data.zip files, searched in order
+        #[arg(long = "zip", required = true)]
+        zips: Vec<PathBuf>,
+        /// Patterns: text, or 0x followed by hex bytes
+        #[arg(required = true)]
+        patterns: Vec<String>,
+        /// Copy the entries that match into this folder
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Bytes shown around each match
+        #[arg(long, default_value_t = 48)]
+        context: usize,
+    },
     /// List a dumped graphics program (--dump-shaders): its SPH and each
     /// decoded instruction
     Sass {
@@ -172,6 +190,7 @@ fn main() -> ExitCode {
         Command::Nso2elf { inputs, out } => nso2elf(&inputs, &out).map(|_| true),
         Command::Gpfifo { dir, first, last, methods, listing, bench, profile, repeat } => gpfifo::run(&dir, first, last, methods, listing, bench.then_some((profile, repeat))).map(|_| true),
         Command::Shaders { zip, samples } => shaders::run(&zip, samples.as_deref()),
+        Command::DatazipFind { zips, patterns, out, context } => shaders::find(&zips, &patterns, out.as_deref(), context).map(|_| true),
         Command::Sass { file } => shaders::list(&file).map(|_| true),
         Command::Translate { files, out } => shaders::translate(&files, out.as_deref()),
         Command::Link { exefs, verbose } => link(&exefs, verbose),

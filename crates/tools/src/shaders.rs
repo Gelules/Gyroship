@@ -168,3 +168,55 @@ pub fn translate(files: &[std::path::PathBuf], out: Option<&Path>) -> super::Res
 fn hex(w: Word) -> String {
     format!("{:032x}", w.0)
 }
+
+/// `datazip-find`: the entries of `zips` that hold one of `patterns` (text, or
+/// `0x` then hex bytes in file order), each match with its offset and `context`
+/// bytes around it; with `out`, the matching entries are copied there, named
+/// after their hash.
+pub fn find(zips: &[std::path::PathBuf], patterns: &[String], out: Option<&Path>, context: usize) -> super::Result<()> {
+    let mut needles = Vec::new();
+    for p in patterns {
+        let bytes = match p.strip_prefix("0x") {
+            Some(h) if h.len().is_multiple_of(2) => (0..h.len() / 2).map(|i| u8::from_str_radix(&h[2 * i..2 * i + 2], 16)).collect::<Result<Vec<u8>, _>>().map_err(|e| format!("{p}: {e}"))?,
+            Some(_) => return Err(format!("{p}: an odd number of hex digits").into()),
+            None => p.as_bytes().to_vec(),
+        };
+        needles.push((p.as_str(), memchr::memmem::Finder::new(&bytes).into_owned(), bytes.len()));
+    }
+    if let Some(dir) = out {
+        std::fs::create_dir_all(dir)?;
+    }
+    let show = |b: &[u8]| -> String { b.iter().map(|&c| if (0x20..0x7f).contains(&c) { (c as char).to_string() } else { format!("\\x{c:02x}") }).collect() };
+    for zip in zips {
+        let mut z = DataZip::open(zip)?;
+        let entries = z.entries.clone();
+        let (mut scanned, mut bytes, mut hits) = (0usize, 0u64, 0usize);
+        for e in &entries {
+            let data = match z.read(e) {
+                Ok(d) => d,
+                Err(err) => {
+                    eprintln!("{}: {}: {err}", zip.display(), e.name);
+                    continue;
+                }
+            };
+            scanned += 1;
+            bytes += data.len() as u64;
+            let mut hit = false;
+            for (name, finder, len) in &needles {
+                for at in finder.find_iter(&data).take(16) {
+                    hit = true;
+                    let (a, b) = (at.saturating_sub(context), (at + len + context).min(data.len()));
+                    println!("{} {} +{at:#x} {name}: {}", zip.display(), e.name, show(&data[a..b]));
+                }
+            }
+            if hit {
+                hits += 1;
+                if let Some(dir) = out {
+                    std::fs::write(dir.join(&e.name), &data)?;
+                }
+            }
+        }
+        eprintln!("{}: {scanned} entries ({:.1} GiB) searched, {hits} with a match", zip.display(), bytes as f64 / f64::from(1u32 << 30));
+    }
+    Ok(())
+}
