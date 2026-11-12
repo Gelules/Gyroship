@@ -304,6 +304,24 @@ pub(crate) fn windows(t: &Translation) -> BTreeMap<u8, u64> {
     t.interface.cbufs.iter().map(|&b| (b, u64::from(t.interface.cbuf_sizes.get(&b).copied().unwrap_or(0x10000)))).collect()
 }
 
+/// Texels of `slices` slices of `from` (columns, rows) elements of `bpe` bytes,
+/// laid out as `to` (columns, rows): what fits is copied, the rest is zero.
+fn repack(src: &[u8], from: (u32, u32), to: (u32, u32), slices: u32, bpe: u32) -> Vec<u8> {
+    let (fc, fr, tc, tr, bpe) = (from.0 as usize, from.1 as usize, to.0 as usize, to.1 as usize, bpe as usize);
+    let mut out = vec![0u8; tc * tr * slices as usize * bpe];
+    let n = fc.min(tc) * bpe;
+    for s in 0..slices as usize {
+        for r in 0..fr.min(tr) {
+            let at = ((s * fr + r) * fc) * bpe;
+            if let Some(row) = src.get(at..at + n) {
+                let to = ((s * tr + r) * tc) * bpe;
+                out[to..to + n].copy_from_slice(row);
+            }
+        }
+    }
+    out
+}
+
 /// An index of `size` little-endian bytes.
 fn index_value(c: &[u8]) -> u32 {
     c.iter().rev().fold(0, |v, b| v << 8 | u32::from(*b))
@@ -1016,7 +1034,8 @@ impl Surfaces {
                 }
                 Ok(())
             };
-            let view_desc = |aspect| wgpu::TextureViewDescriptor { dimension: Some(dimension), aspect, array_layer_count: Some(layers), mip_level_count: Some(1), ..Default::default() };
+            // Every level of the host texture (a texture from memory holds the view's).
+            let view_desc = |aspect| wgpu::TextureViewDescriptor { dimension: Some(dimension), aspect, array_layer_count: Some(layers), ..Default::default() };
             // Only queried (TXQ): a stand-in of its size and levels, as the texture itself
             // may be an image the same dispatch writes, which wgpu cannot also bind for reading.
             if x.query {
@@ -1135,7 +1154,12 @@ impl Surfaces {
         }
         let format = if zf32 { wgpu::TextureFormat::R32Float } else { float_format(format).unwrap_or(format) };
         let (bpe, bw, bh) = tic.components.element().ok_or("texture element size")?;
-        let level = tic.view_levels.map_or(0, |v| v.0);
+        // The view's levels (RES_VIEW_MIN/MAX_MIP_LEVEL); the first is the host texture's
+        // level 0. MIN_LOD_CLAMP (from the view's first level, as NIL packs it) hides the
+        // levels below it, which a streamed texture may not hold yet: its whole part
+        // moves the first level, as an integer clamp would.
+        let (view_first, view_last) = tic.view_levels.unwrap_or((0, tic.max_mip_level));
+        let level = (view_first + tic.min_lod_clamp.map_or(0, |c| c as u32)).min(tic.max_mip_level);
         let (width, height) = ((tic.width >> level).max(1), (tic.height >> level).max(1));
         let (columns, rows) = (width.div_ceil(bw), height.div_ceil(bh));
         let layers = textures::layers(tic);
@@ -1143,29 +1167,43 @@ impl Surfaces {
             return Err(format!("texture of {layers} layers"));
         }
         let depth = if three_d { (tic.depth >> level).max(1) } else { layers };
+        let dimension = if three_d { wgpu::TextureDimension::D3 } else { wgpu::TextureDimension::D2 };
+        // Compressed formats need whole blocks: the host texture covers them.
+        let size = wgpu::Extent3d { width: columns * bw, height: rows * bh, depth_or_array_layers: depth };
+        // Block linear: every level the view reaches, a mip chain wgpu can hold (pitch
+        // textures have one level; a ZF32 shadow map's depth copy takes level 0 only).
+        let last = if tic.texture_type == TextureType::TwoDNoMipmap { level } else { view_last.min(tic.max_mip_level).max(level) };
+        let levels = if tic.layout == Layout::BlockLinear && !zf32 { (last - level + 1).min(size.max_mips(dimension)) } else { 1 };
+        // Each level's texels (linear, layer after layer) and its size in elements.
+        let mut data: Vec<(Vec<u8>, u32, u32)> = Vec::new();
         let end;
-        let data = match tic.layout {
+        match tic.layout {
             Layout::BlockLinear => {
-                let l = textures::tic_level(tic, level).ok_or("texture level")?;
-                let offset = *textures::level_offsets(tic).get(level as usize).ok_or("texture level")?;
+                let offsets = textures::level_offsets(tic);
                 let stride = textures::layer_stride(tic).ok_or("texture layer stride")?;
-                let mut raw = vec![0u8; l.size() as usize];
-                let mut data = Vec::new();
-                for layer in 0..u64::from(layers) {
-                    if !mem(tic.address + layer * stride + offset, &mut raw) {
-                        return Err("texture not readable".into());
+                let mut reach = 0;
+                for l in level..level + levels {
+                    let bl = textures::tic_level(tic, l).ok_or("texture level")?;
+                    let offset = *offsets.get(l as usize).ok_or("texture level")?;
+                    let mut raw = vec![0u8; bl.size() as usize];
+                    let mut texels = Vec::new();
+                    for layer in 0..u64::from(layers) {
+                        if !mem(tic.address + layer * stride + offset, &mut raw) {
+                            return Err("texture not readable".into());
+                        }
+                        // Every layer's room at once (an 85 MiB pool would otherwise regrow ~10 times).
+                        let t = bl.deswizzle(&raw);
+                        if texels.is_empty() {
+                            texels = t;
+                            texels.reserve_exact(texels.len() * (layers as usize - 1));
+                        } else {
+                            texels.extend_from_slice(&t);
+                        }
                     }
-                    // Every layer's room at once (an 85 MiB pool would otherwise regrow ~10 times).
-                    let texels = l.deswizzle(&raw);
-                    if data.is_empty() {
-                        data = texels;
-                        data.reserve_exact(data.len() * (layers as usize - 1));
-                    } else {
-                        data.extend_from_slice(&texels);
-                    }
+                    reach = reach.max(offset + raw.len() as u64);
+                    data.push((texels, bl.width, bl.height));
                 }
-                end = tic.address + u64::from(layers - 1) * stride + offset + raw.len() as u64;
-                data
+                end = tic.address + u64::from(layers - 1) * stride + reach;
             }
             Layout::Pitch if level == 0 && !three_d && layers == 1 => {
                 let row = (columns * bpe) as usize;
@@ -1174,38 +1212,54 @@ impl Surfaces {
                     return Err("texture not readable".into());
                 }
                 end = tic.address + raw.len() as u64;
-                raw.chunks(tic.pitch as usize).flat_map(|r| &r[..row]).copied().collect()
+                data.push((raw.chunks(tic.pitch as usize).flat_map(|r| &r[..row]).copied().collect(), columns, rows));
             }
             other => return Err(format!("texture layout {other:?}")),
-        };
-        // Compressed formats need whole blocks: the host texture covers them.
+        }
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: None,
-            size: wgpu::Extent3d { width: columns * bw, height: rows * bh, depth_or_array_layers: depth },
-            mip_level_count: 1,
+            size,
+            mip_level_count: levels,
             sample_count: 1,
-            dimension: if three_d { wgpu::TextureDimension::D3 } else { wgpu::TextureDimension::D2 },
+            dimension,
             format,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        self.queue.write_texture(
-            texture.as_image_copy(),
-            &data,
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(columns * bpe), rows_per_image: Some(rows) },
-            texture.size(),
-        );
+        let mut bytes = 0;
+        for (i, (texels, guest_columns, guest_rows)) in data.iter().enumerate() {
+            let i = i as u32;
+            // wgpu halves the block-rounded level 0; the guest halves the real size: on
+            // a size that is not a power of two they may differ by a block, then the
+            // guest's texels are copied into wgpu's (the rest stays zero).
+            let extent = size.mip_level_size(i, dimension).physical_size(format);
+            let (host_columns, host_rows) = (extent.width / bw, extent.height / bh);
+            let packed;
+            let texels = if (host_columns, host_rows) == (*guest_columns, *guest_rows) {
+                texels
+            } else {
+                packed = repack(texels, (*guest_columns, *guest_rows), (host_columns, host_rows), extent.depth_or_array_layers, bpe);
+                &packed
+            };
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: i, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                texels,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(host_columns * bpe), rows_per_image: Some(host_rows) },
+                extent,
+            );
+            bytes += texels.len() as u64;
+        }
         let texture = if zf32 { self.as_depth(&texture) } else { texture };
         // A large upload's staging memory is freed once the GPU is past it: at once, so
         // that two such uploads in a frame (a 128 MiB shadow atlas and a 128 MiB light
         // probe texture in the tutorial) do not exhaust it.
-        if data.len() >= 32 << 20 {
+        if bytes >= 32 << 20 {
             self.flush();
             let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         }
         self.cache.textures.insert((tic.address, header), (texture.clone(), end));
         self.cache.spans = None;
-        self.staging.uploads[0] += data.len() as u64;
+        self.staging.uploads[0] += bytes;
         self.staging.uploads[1] += started.elapsed().as_nanos() as u64;
         Ok(texture)
     }
@@ -1478,19 +1532,23 @@ mod tests {
             return;
         };
         // 3 layers of 8x8 RGBA8 with 2 levels: level 0 one GOB, level 1 (4x4) another, so
-        // layers are 1024 bytes apart. Texel (x, y) of layer l is (40 l + x, y, l, 255).
+        // layers are 1024 bytes apart. Texel (x, y) of layer l is (40 l + x, y, l, 255) at
+        // level 0, (40 l + x, y, 100 + l, 255) at level 1.
         const TEX: u64 = 0x50_0000;
         let mut tic = [0u8; 32];
         put(&mut tic, &[(6, 0, 0x08), (9, 7, 2), (12, 10, 2), (15, 13, 2), (18, 16, 2), (21, 19, 2), (24, 22, 3), (27, 25, 4), (30, 28, 5)]);
-        put(&mut tic, &[(63, 41, (TEX >> 9) as u32), (87, 85, 3), (127, 124, 1), (144, 128, 7), (175, 160, 7), (189, 176, 2), (154, 151, 5), (191, 191, 1)]);
+        put(&mut tic, &[(63, 41, (TEX >> 9) as u32), (87, 85, 3), (127, 124, 1), (144, 128, 7), (175, 160, 7), (189, 176, 2), (154, 151, 5), (191, 191, 1), (231, 228, 1)]);
         let t = textures::tic(&tic).unwrap();
         assert_eq!(textures::layer_stride(&t), Some(1024));
-        let level = textures::tic_level(&t, 0).unwrap();
+        let offsets = textures::level_offsets(&t);
         let mut memory = vec![0u8; 3 * 1024];
         for l in 0..3u32 {
-            for (x, y) in (0..8).flat_map(|x| (0..8).map(move |y| (x, y))) {
-                let at = 1024 * l as usize + level.offset(4 * x, y, 0) as usize;
-                memory[at..at + 4].copy_from_slice(&[(40 * l + x) as u8, y as u8, l as u8, 255]);
+            for level in 0..2u32 {
+                let bl = textures::tic_level(&t, level).unwrap();
+                for (x, y) in (0..8 >> level).flat_map(|x| (0..8 >> level).map(move |y| (x, y))) {
+                    let at = (1024 * u64::from(l) + offsets[level as usize] + bl.offset(4 * x, y, 0)) as usize;
+                    memory[at..at + 4].copy_from_slice(&[(40 * l + x) as u8, y as u8, (100 * level + l) as u8, 255]);
+                }
             }
         }
         let x = Texture { handle: Handle::CBuf { bank: 0, offset: 0 }, dim: TexDim::Array2D, compare: false, fetch: true, query: false };
@@ -1499,17 +1557,30 @@ mod tests {
             @compute @workgroup_size(1) fn main() {
                 for (var l = 0u; l < 3u; l++) {
                     let c = textureLoad(tex0, vec2<i32>(3, 5), l, 0);
-                    out[4u * l] = c.r; out[4u * l + 1u] = c.g; out[4u * l + 2u] = c.b; out[4u * l + 3u] = f32(textureNumLayers(tex0));
+                    let m = textureLoad(tex0, vec2<i32>(2, 1), l, 1);
+                    out[6u * l] = c.r; out[6u * l + 1u] = c.g; out[6u * l + 2u] = c.b; out[6u * l + 3u] = f32(textureNumLayers(tex0));
+                    out[6u * l + 4u] = m.b; out[6u * l + 5u] = f32(textureNumLevels(tex0));
                 }
             }";
-        let got = run(&mut s, x, tic, [0; 32], vec![(TEX, memory)], wgsl, 12);
+        let got = run(&mut s, x, tic, [0; 32], vec![(TEX, memory)], wgsl, 18);
         for l in 0..3 {
-            let texel: Vec<u32> = got[4 * l..4 * l + 3].iter().map(|v| (v * 255.0).round() as u32).collect();
+            let texel: Vec<u32> = got[6 * l..6 * l + 3].iter().map(|v| (v * 255.0).round() as u32).collect();
             assert_eq!(texel, vec![40 * l as u32 + 3, 5, l as u32], "layer {l}");
-            assert_eq!(got[4 * l + 3], 3.0);
+            assert_eq!(got[6 * l + 3], 3.0);
+            // Level 1 is uploaded too: the view holds both levels.
+            assert_eq!(((got[6 * l + 4] * 255.0).round() as u32, got[6 * l + 5]), (100 + l as u32, 2.0), "layer {l} level 1");
         }
-        // The cached range covers the three layers (level 0 of the last one).
-        assert_eq!(s.texture_ranges(), vec![(TEX, TEX + 2 * 1024 + 512)]);
+        // The cached range covers the three layers, both levels of the last one.
+        assert_eq!(s.texture_ranges(), vec![(TEX, TEX + 2 * 1024 + 1024)]);
+    }
+
+    #[test]
+    fn repack_copies_what_fits_and_zeroes_the_rest() {
+        // Two slices of 3x2 two-byte elements into 2x3: each row's first two elements,
+        // both rows, then a zero row.
+        let src: Vec<u8> = (0..24).collect();
+        let out = repack(&src, (3, 2), (2, 3), 2, 2);
+        assert_eq!(out, [vec![0, 1, 2, 3, 6, 7, 8, 9, 0, 0, 0, 0], vec![12, 13, 14, 15, 18, 19, 20, 21, 0, 0, 0, 0]].concat());
     }
 
     #[test]
