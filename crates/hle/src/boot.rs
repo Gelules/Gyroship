@@ -106,8 +106,13 @@ pub fn boot(exefs: &Path, journal: Journal, config: Config) -> Result<Kernel, St
     let services = format!("npdm: {} services granted: {}", k.allowed_services.len(), k.allowed_services.join(" "));
     k.log(&services);
     let romfs = exefs.parent().map(|p| p.join("romfs")).filter(|p| p.is_dir()).ok_or("no romfs folder next to the exefs")?;
-    let image = crate::fs::RomFs::build(&romfs).map_err(|e| format!("{}: {e}", romfs.display()))?;
+    let layer = k.config.romfs_layer.clone();
+    let (image, replaced) = crate::fs::RomFs::layered(&romfs, layer.as_deref()).map_err(|e| format!("{}: {e}", romfs.display()))?;
     k.log(&format!("romfs: an image of {} bytes", image.size()));
+    if let Some(dir) = layer {
+        // A run with a layer is never a reference run: the journal says what changed.
+        k.log(&format!("romfs: layer {} replaces {}", dir.display(), if replaced.is_empty() { "nothing".to_string() } else { replaced.join(", ") }));
+    }
     k.romfs = Some(std::sync::Arc::new(image));
     let rtld = link::base_of("rtld").expect("rtld's base");
     k.create_main(rtld, MAIN_STACK.0 + MAIN_STACK.1);
@@ -237,7 +242,7 @@ pub struct HostWindow {
 }
 
 /// [`main`], showing the frames in a host window when one is given.
-pub fn run(table: Vec<rt::Entry>, window: Option<HostWindow>) {
+pub fn run(mut table: Vec<rt::Entry>, window: Option<HostWindow>) {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) != Some("boot") {
         return rt::harness::main(table);
@@ -284,6 +289,8 @@ pub fn run(table: Vec<rt::Entry>, window: Option<HostWindow>) {
         play: flag("--play"),
         pipeline_cache: value("--pipeline-cache").map(Into::into),
         late_frames: flag("--late-frames"),
+        romfs_layer: value("--romfs-layer").map(Into::into),
+        hooks: value("--hooks").map(Into::into),
         ..Config::default()
     };
     if config.play {
@@ -295,6 +302,12 @@ pub fn run(table: Vec<rt::Entry>, window: Option<HostWindow>) {
             eprintln!("gyroship: --record in play mode: the file will not replay this run exactly");
         }
     }
+    let hooked = config.hooks.as_ref().map(|f| {
+        std::fs::read_to_string(f).map_err(|e| e.to_string()).and_then(|t| crate::hooks::apply(&mut table, &t)).unwrap_or_else(|e| {
+            eprintln!("gyroship: --hooks {}: {e}", f.display());
+            std::process::exit(2);
+        })
+    });
     let installed = table.len();
     rt::install(table);
     mem::install_fault_handler();
@@ -303,6 +316,10 @@ pub fn run(table: Vec<rt::Entry>, window: Option<HostWindow>) {
         std::process::exit(2);
     });
     k.log(&format!("{installed} recompiled functions installed"));
+    // A run with hooks is never a reference run: the journal says what changed.
+    for h in hooked.unwrap_or_default() {
+        k.log(&format!("hook: {h}"));
+    }
     if let Some(path) = k.config.trace.clone() {
         k.trace = Some(crate::trace::Trace::open(&path).unwrap_or_else(|e| {
             eprintln!("gyroship: --trace {}: {e}", path.display());

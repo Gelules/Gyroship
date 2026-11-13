@@ -16,6 +16,7 @@ pub mod bsd;
 pub mod fs;
 pub mod gs;
 pub mod hid;
+pub mod hooks;
 pub mod ipc;
 pub mod journal;
 pub mod nvdrv;
@@ -145,6 +146,12 @@ pub struct Config {
     /// `--late-frames` (play mode): a frame later than its vsync is shown at once
     /// instead of at the next vsync: more frames, an uneven cadence (D48).
     pub late_frames: bool,
+    /// `--romfs-layer DIR`: a file of DIR replaces the dump's file at the same
+    /// RomFS path (game settings, debug tools); never a reference run.
+    pub romfs_layer: Option<std::path::PathBuf>,
+    /// `--hooks FILE`: game functions replaced by ours, `<hex address> <hook>`
+    /// per line (see [`hooks`]); the addresses stay in data files (D21).
+    pub hooks: Option<std::path::PathBuf>,
 }
 
 impl Config {
@@ -157,7 +164,7 @@ impl Config {
 
 impl Default for Config {
     fn default() -> Config {
-        Config { seed: 0x5EED, explore: false, non_system_memory: 0x2_6410_0000, time_limit: None, frames: None, save_dir: None, vsync: true, work_time: false, gpfifo_dump: None, frames_dump: None, dump_every: 1, dump_from: 0, dump_draws: None, shaders_dump: None, replay: None, profile: None, perf: None, hashes: None, record: None, trace: None, audio_dump: None, play: false, pipeline_cache: None, late_frames: false }
+        Config { seed: 0x5EED, explore: false, non_system_memory: 0x2_6410_0000, time_limit: None, frames: None, save_dir: None, vsync: true, work_time: false, gpfifo_dump: None, frames_dump: None, dump_every: 1, dump_from: 0, dump_draws: None, shaders_dump: None, replay: None, profile: None, perf: None, hashes: None, record: None, trace: None, audio_dump: None, play: false, pipeline_cache: None, late_frames: false, romfs_layer: None, hooks: None }
     }
 }
 

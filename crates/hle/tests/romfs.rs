@@ -99,6 +99,34 @@ fn files_are_found_and_read_back() {
     assert_eq!(h1, h2);
 }
 
+/// A layer file takes the dump file's place, bytes and size; the other files,
+/// and the dump itself, stay as they are.
+#[test]
+fn a_layer_file_replaces_the_dumps() {
+    let (root, layer) = (folder("romfs-layer-dump"), folder("romfs-layer"));
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    std::fs::create_dir_all(layer.join("sub")).unwrap();
+    std::fs::write(root.join("data.zip"), b"zip").unwrap();
+    std::fs::write(root.join("x_build.cvar"), b"{\"a\": true}").unwrap();
+    std::fs::write(root.join("sub").join("c"), b"xyz").unwrap();
+    std::fs::write(layer.join("x_build.cvar"), b"{\"a\": false, \"b\": 1.0}").unwrap();
+    std::fs::write(layer.join("sub").join("c"), b"longer than xyz").unwrap();
+    std::fs::write(layer.join("not_in_the_dump"), b"ignored").unwrap();
+    let (r, replaced) = RomFs::layered(&root, Some(&layer)).unwrap();
+    assert_eq!(replaced, ["sub/c", "x_build.cvar"]);
+    let read = |path: &str| {
+        let (at, len) = lookup(&r, path).expect(path);
+        let mut buf = vec![0; len as usize];
+        r.read(at, &mut buf).unwrap();
+        buf
+    };
+    assert_eq!(read("x_build.cvar"), b"{\"a\": false, \"b\": 1.0}");
+    assert_eq!(read("sub/c"), b"longer than xyz");
+    assert_eq!(read("data.zip"), b"zip");
+    assert!(lookup(&r, "not_in_the_dump").is_none());
+    assert_eq!(std::fs::read(root.join("x_build.cvar")).unwrap(), b"{\"a\": true}", "the dump is untouched");
+}
+
 /// An empty folder of the test's own.
 fn folder(name: &str) -> std::path::PathBuf {
     let root = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);

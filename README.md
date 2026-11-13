@@ -48,6 +48,23 @@ verification loop:
 
 The time step is fixed: frame N always renders the same image, on Vulkan and DX12 alike.
 
+## The game's own debug tools
+
+The game ships its developers' debug tools (an in-game debug menu, a development
+mission select, a debug console), locked on retail consoles by a build setting. A run
+of the recompiled game can open them; such a run is never a reference run:
+
+    harness boot <exefs> --romfs-layer DIR   # DIR's files replace the dump's files at the same RomFS paths
+    harness boot <exefs> --hooks FILE        # game functions replaced by Gyroship's: "<hex address> <hook>" per line
+
+A layer with the game's build settings file switched to a development build opens every
+tool: Minus in the pause menu and in the main menu, and the console (hold L+R+ZL+ZR then
+click a stick, or the backquote key and F1 to F12 on the keyboard). The same file can set
+the game's cheat settings at boot without leaving the retail build. The hook
+`requirement-met` opens the menus' debug buttons while the build setting stays retail.
+The dump itself is only ever read. In a `--replay` script, `K=35,3a` adds keyboard keys
+(USB HID usages, hex) to a line.
+
 ## Layout
 
     crates/loader     NSO executables, relocations, ELF export

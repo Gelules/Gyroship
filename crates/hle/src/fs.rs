@@ -77,18 +77,33 @@ struct Dir {
 impl RomFs {
     /// The image of the files under `root`.
     pub fn build(root: &Path) -> std::io::Result<RomFs> {
+        RomFs::layered(root, None).map(|(r, _)| r)
+    }
+
+    /// The image of the files under `root`, where a file at the same path
+    /// under `layer` takes the dump file's place, bytes and size (the dump is
+    /// only read, rule 4). Also returns the paths the layer replaced.
+    // ponytail: a layer only replaces files; one the dump lacks is ignored, and
+    // the caller logs what was replaced so a misplaced file shows.
+    pub fn layered(root: &Path, layer: Option<&Path>) -> std::io::Result<(RomFs, Vec<String>)> {
         let mut dirs = vec![Dir { name: Vec::new(), parent: 0, dirs: Vec::new(), files: Vec::new() }];
-        let mut todo = vec![(0, root.to_path_buf())];
-        while let Some((d, path)) = todo.pop() {
+        let mut replaced = Vec::new();
+        let mut todo = vec![(0, root.to_path_buf(), PathBuf::new())];
+        while let Some((d, path, rel)) = todo.pop() {
             let mut entries: Vec<_> = std::fs::read_dir(&path)?.collect::<Result<_, _>>()?;
             entries.sort_by_key(|e| e.file_name());
             for e in entries {
                 let name = e.file_name().to_string_lossy().into_owned().into_bytes();
+                let rel = rel.join(e.file_name());
                 if e.file_type()?.is_dir() {
                     let i = dirs.len();
                     dirs.push(Dir { name, parent: d, dirs: Vec::new(), files: Vec::new() });
                     dirs[d].dirs.push(i);
-                    todo.push((i, e.path()));
+                    todo.push((i, e.path(), rel));
+                } else if let Some(over) = layer.map(|l| l.join(&rel)).filter(|p| p.is_file()) {
+                    let size = std::fs::metadata(&over)?.len();
+                    replaced.push(rel.to_string_lossy().replace('\\', "/"));
+                    dirs[d].files.push((name, over, size));
                 } else {
                     dirs[d].files.push((name, e.path(), e.metadata()?.len()));
                 }
@@ -163,7 +178,8 @@ impl RomFs {
         header.extend(DATA.to_le_bytes());
         let size = tables_at + tables.len() as u64;
         let open = files.iter().map(|_| OnceLock::new()).collect();
-        Ok(RomFs { header, tables, tables_at, files, size, open })
+        replaced.sort();
+        Ok((RomFs { header, tables, tables_at, files, size, open }, replaced))
     }
 
     pub fn size(&self) -> u64 {
