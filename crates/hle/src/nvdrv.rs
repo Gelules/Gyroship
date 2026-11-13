@@ -549,6 +549,11 @@ fn forget_written_textures(k: &mut GpuSide, space: u32) {
     cpu.sort_unstable_by_key(|c| c.2);
     let (written, pages) = written_textures(&k.mem, &cpu);
     k.watched += pages;
+    rewritten(k, written);
+}
+
+/// Drops the textures (GPU start, GPU end) the CPU wrote.
+fn rewritten(k: &mut GpuSide, written: Vec<(u64, u64)>) {
     if let Some(s) = k.surfaces.as_mut() {
         for (start, end) in written {
             s.invalidate(start, end - start);
@@ -559,6 +564,23 @@ fn forget_written_textures(k: &mut GpuSide, space: u32) {
             }
         }
     }
+}
+
+/// After a copy engine write of `len` bytes at GPU address `start` (whose
+/// textures `Surfaces::invalidate` already drops): its pages' write watch is
+/// reset, or the next submit's take would see our own write as the CPU's and
+/// drop the textures uploaded afresh from it (a streaming pool, uploaded twice
+/// per write). Any other texture on a reset page (sharing one, or the same
+/// memory at another GPU address) is dropped as that take would drop it.
+fn forget_copied(k: &mut GpuSide, space: u32, start: u64, len: u64) {
+    let pages = k.mem.reset_written(k.gpu_to_cpu(space, start), len);
+    if pages.is_empty() {
+        return;
+    }
+    // Leaves out the textures the copy drops (pending invalidations).
+    let Some(ranges) = k.surfaces.as_ref().map(|s| s.texture_ranges()) else { return };
+    let written = ranges.into_iter().filter(|&(a, b)| touches(&pages, k.gpu_to_cpu(space, a), b - a)).collect();
+    rewritten(k, written);
 }
 
 /// The textures of `cpu` (GPU start, GPU end, CPU address; sorted by CPU
@@ -838,6 +860,7 @@ impl Gpu {
                     if let Some(s) = &mut k.surfaces {
                         s.invalidate(c.dst, span);
                     }
+                    forget_copied(k, space, c.dst, span);
                 }
                 // A PCAS action: the QMDs it lets run, each then its releases and its dependent QMD.
                 Effect::Dispatch(first, action, pools) => {
@@ -972,6 +995,28 @@ mod tests {
         let mut c = [0u8; 4];
         k.mem.read_object(page + 0x1000, &mut c).unwrap();
         assert_eq!(c, 3u32.to_le_bytes());
+    }
+
+    /// The copy engine's writes are the GPU's: the next submit's take does not
+    /// report them (it would upload again the textures they fed), a CPU write
+    /// after them still shows.
+    #[test]
+    fn a_copy_is_not_taken_for_a_cpu_write() {
+        use gyroship_runtime::mem::{Block, Memory, perm, state};
+        let page = crate::layout::ALIAS.0;
+        let k = Kernel::new(Memory::new().unwrap(), crate::journal::Journal::memory(), crate::Config::default());
+        k.mem.map(page, 0x3000, Block::new(state::NORMAL, perm::RW)).unwrap();
+        k.mem.write(page, &[7; 0x100]).unwrap();
+        k.mem.take_written(page, 0x3000);
+        // 0x20 lines of the same 0x100 bytes into pages 1 and 2.
+        let copy = gyroship_gpu::pushbuf::Copy { src: page, dst: page + 0x1000, pitch_in: 0, pitch_out: 0x100, line_length: 0x100, line_count: 0x20, dst_block: None };
+        Gpu::default().effects(&mut k.gpu_side(), 0, vec![Effect::Copy(copy)]).unwrap();
+        let mut b = [0u8; 0x100];
+        k.mem.read(page + 0x2f00, &mut b).unwrap();
+        assert_eq!(b, [7; 0x100], "copied");
+        assert!(k.mem.take_written(page, 0x3000).is_empty());
+        k.mem.write(page + 0x1010, &[1]).unwrap();
+        assert_eq!(k.mem.take_written(page, 0x3000), [page + 0x1000]);
     }
 
     /// In strict mode GPU work ends at its first anomaly: the kernel stops the

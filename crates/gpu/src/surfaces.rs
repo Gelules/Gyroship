@@ -236,6 +236,9 @@ pub struct Surfaces {
     /// done with them (`write_buffer` took fresh staging pages each frame in the
     /// game: 10 MB in 6.6 ms, 1.8 ms into reused ones).
     belt: wgpu::util::StagingBelt,
+    /// An upload of 32 MiB or more was made since the last flush (see
+    /// `Surfaces::flush_big_uploads`).
+    pub(crate) big_upload: bool,
     /// Offsets of the arena's staged blocks by content hash: draws share identical
     /// constant banks (64 KiB each) instead of staging each copy.
     staged: FxMap<u64, Vec<(usize, usize)>>,
@@ -684,7 +687,7 @@ impl Surfaces {
         let window = window.map(|(surface, size)| Window::new(&adapter, &device, surface, size));
         let timing = crate::timing::Timing::new(&device, &queue);
         let renderable = (0..=0xff).filter_map(color_format).chain((0..=0xff).filter_map(depth_format)).map(|f| (f, renderable_on(&adapter, &device, f))).collect();
-        Ok(Surfaces { renderable, adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pass: None, pending: None, timing, clock: None, present: 0, readbacks: Default::default(), hasher: None, arena, belt, staging: Staging::default(), staged: FxMap::default(), last_color: None, window, memo: Memo::default(), compile: Compile::default(), compile_total: Compile::default(), background: false, wait_left: PIPELINE_WAIT, workers: None, finished: Default::default(), disk_cache: None, views: Aged::default(), bind_groups: Groups::default(), dynamic_max, clip_distances })
+        Ok(Surfaces { renderable, adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pass: None, pending: None, timing, clock: None, present: 0, readbacks: Default::default(), hasher: None, arena, belt, big_upload: false, staging: Staging::default(), staged: FxMap::default(), last_color: None, window, memo: Memo::default(), compile: Compile::default(), compile_total: Compile::default(), background: false, wait_left: PIPELINE_WAIT, workers: None, finished: Default::default(), disk_cache: None, views: Aged::default(), bind_groups: Groups::default(), dynamic_max, clip_distances })
     }
 
     /// Shows the presented image (the color target written last, its top-left
@@ -1012,6 +1015,16 @@ impl Surfaces {
         }
         // Chunks whose copies were submitted come back once the GPU is done.
         self.belt.recall();
+    }
+
+    /// After an upload of 32 MiB or more (`big_upload`), at the start of the next
+    /// draw or dispatch: the work so far submitted and waited for, so that the
+    /// upload's staging memory comes back before another such upload.
+    pub(crate) fn flush_big_uploads(&mut self) {
+        if std::mem::take(&mut self.big_upload) {
+            self.flush();
+            let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        }
     }
 
     /// Copies `bytes` (padded to 4) into this frame's upload arena; returns

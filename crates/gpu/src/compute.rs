@@ -63,6 +63,7 @@ pub(crate) type Compiled = Result<std::sync::Arc<(Translation, wgpu::ShaderModul
 impl Surfaces {
     /// Runs a dispatch; an empty grid does nothing.
     pub fn dispatch(&mut self, l: &Launch, pools: Pools, mem: Mem) -> Result<(), String> {
+        self.flush_big_uploads();
         self.textures_read.clear();
         self.drain_invalidations();
         // A dispatch may write the images: their float twins are stale.

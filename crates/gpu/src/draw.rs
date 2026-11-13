@@ -532,6 +532,7 @@ impl Surfaces {
     /// Runs a draw; one that cannot be done is counted in `skipped` by
     /// reason, and the reason returned.
     pub fn draw(&mut self, d: &Draw, mem: Mem) -> Result<(), String> {
+        self.flush_big_uploads();
         self.textures_read.clear();
         self.drain_invalidations();
         let result = self.try_draw(d, mem);
@@ -1292,12 +1293,13 @@ impl Surfaces {
             bytes += texels.len() as u64;
         }
         let texture = if zf32 { self.as_depth(&texture) } else { texture };
-        // A large upload's staging memory is freed once the GPU is past it: at once, so
-        // that two such uploads in a frame (a 128 MiB shadow atlas and a 128 MiB light
-        // probe texture in the tutorial) do not exhaust it.
+        // A large upload's staging memory is freed once the GPU is past it, before the
+        // next draw or dispatch (`flush_big_uploads`), so that two such uploads in a frame
+        // (a 128 MiB shadow atlas and a 128 MiB light probe texture in the tutorial) do not
+        // exhaust it. Not here: a flush inside the draw would submit the index and vertex
+        // data it staged already, and the arena's next blocks would overwrite them.
         if bytes >= 32 << 20 {
-            self.flush();
-            let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+            self.big_upload = true;
         }
         self.cache.textures.insert((tic.address, header), (texture.clone(), end));
         self.cache.spans = None;
@@ -1627,6 +1629,32 @@ mod tests {
         assert_eq!(dynamic_groups(&[3, 16], 15), [true, false]);
         assert_eq!(dynamic_groups(&[16, 16], 15), [false, false]);
         assert_eq!(dynamic_groups(&[9], 15), [true]);
+    }
+
+    /// A texture of 32 MiB or more uploaded while a draw resolves its slots no
+    /// longer flushes there: what the draw staged before (index and vertex data)
+    /// stays in this frame's arena, where a flush gave its place to later blocks
+    /// (a black sky in Corneria). The flush and its wait come before the next draw.
+    #[test]
+    fn a_big_upload_keeps_the_arena_until_the_next_draw() {
+        let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
+            eprintln!("no GPU adapter: test skipped");
+            return;
+        };
+        const TEX: u64 = 0x50_0000;
+        let mut h = [0u8; 32];
+        put(&mut h, &[(6, 0, 0x08), (9, 7, 2), (12, 10, 2), (15, 13, 2), (18, 16, 2), (21, 19, 2), (24, 22, 3), (27, 25, 4), (30, 28, 5)]);
+        put(&mut h, &[(63, 41, (TEX >> 9) as u32), (87, 85, 3), (144, 128, 7), (175, 160, 7), (154, 151, 1), (191, 191, 1)]);
+        // RGBA8 4096x2048, one level: 32 MiB.
+        let tic = textures::Tic { width: 4096, height: 2048, max_mip_level: 0, view_levels: Some((0, 0)), ..textures::tic(&h).unwrap() };
+        let staged = s.stage(&[1, 2, 3, 4]);
+        let guest = vec![7u8; textures::layer_stride(&tic).unwrap() as usize];
+        let mut mem = |addr: u64, out: &mut [u8]| guest.get((addr - TEX) as usize..(addr - TEX) as usize + out.len()).map(|src| out.copy_from_slice(src)).is_some();
+        s.upload(&tic, h, &mut mem).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(s.arena_bytes(&staged, 4), [1, 2, 3, 4], "still in this frame's arena");
+        assert!(s.big_upload);
+        s.flush_big_uploads();
+        assert!(!s.big_upload);
     }
 
     #[test]

@@ -340,6 +340,15 @@ impl Memory {
         out
     }
 
+    /// The pages of `[addr, addr + len)` written since they were last taken,
+    /// reset as `take_written` resets them but left unarmed: for memory the
+    /// host has just written itself (the GPU's copies), which may hold no
+    /// texture and be rewritten by the guest at once.
+    pub fn reset_written(&self, addr: u64, len: u64) -> Vec<u64> {
+        let Some(end) = addr.checked_add(len).filter(|&e| e <= SPACE && len > 0) else { return Vec::new() };
+        self.watched(addr, end)
+    }
+
     /// The OS write watch's pages of `[addr, end)`, reset as they are reported.
     fn watched(&self, addr: u64, end: u64) -> Vec<u64> {
         let len = end - addr;
