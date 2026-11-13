@@ -861,23 +861,50 @@ impl BlockLinear {
     /// Linear rows (width * bytes_per_texel bytes each, height rows per
     /// slice, depth slices). Parts of `src` that are missing stay zero.
     pub fn deswizzle(&self, src: &[u8]) -> Vec<u8> {
-        let g = self.geom();
         let row = (self.width * self.bytes_per_texel) as usize;
         let mut out = vec![0; row * self.height as usize * self.depth as usize];
+        self.deswizzle_into(src, wgpu::WriteOnly::from_mut(&mut out[..]), row, row * self.height as usize);
+        out
+    }
+
+    /// The rows [`BlockLinear::deswizzle`] makes, written into `out` (a mapped
+    /// staging buffer): row `y` of slice `z` at `z * slice_pitch + y * pitch`.
+    /// Bytes between rows, and those of missing parts of `src`, are not written.
+    pub fn deswizzle_into(&self, src: &[u8], mut out: wgpu::WriteOnly<'_, [u8]>, pitch: usize, slice_pitch: usize) {
+        let g = self.geom();
+        let row = (self.width * self.bytes_per_texel) as usize;
+        // A tile is `across` GOBs wide (a power of two) and `tile` bytes long.
+        let (across, tile) = ((g.tw / 64) as usize, (g.tw * g.th * g.td) as usize);
+        let shift = across.trailing_zeros();
         for z in 0..self.depth as usize {
             for y in 0..self.height as usize {
-                let dst = (z * self.height as usize + y) * row;
+                // The row's first GOB, and where its four 16-byte lines sit in a GOB:
                 // 16 aligned bytes stay contiguous in both GOB layouts.
-                for x in (0..row).step_by(16) {
-                    let n = 16.min(row - x);
-                    let s = g.offset(x as u64, y as u64, z as u64) as usize;
-                    if let Some(chunk) = src.get(s..s + n) {
-                        out[dst + x..dst + x + n].copy_from_slice(chunk);
+                let gy = (y % 8) as u32;
+                let first = g.offset(0, y as u64, z as u64) as usize - self.gob.offset(0, gy) as usize;
+                let lines = [0, 16, 32, 48].map(|x| self.gob.offset(x, gy) as usize);
+                let at = z * slice_pitch + y * pitch;
+                let mut dst = out.slice(at..at + row);
+                let line = |x: usize| {
+                    let k = x / 64;
+                    first + (k >> shift) * tile + (k & (across - 1)) * 512 + lines[x / 16 % 4]
+                };
+                // Whole lines (fixed-size moves), then the row's last bytes.
+                let whole = row / 16 * 16;
+                for x in (0..whole).step_by(16) {
+                    let s = line(x);
+                    if let Some(chunk) = src.get(s..s + 16) {
+                        dst.slice(x..x + 16).copy_from_slice(chunk);
+                    }
+                }
+                if whole < row {
+                    let s = line(whole);
+                    if let Some(chunk) = src.get(s..s + row - whole) {
+                        dst.slice(whole..).copy_from_slice(chunk);
                     }
                 }
             }
         }
-        out
     }
 }
 
@@ -1211,6 +1238,71 @@ mod tests {
         assert_eq!(deswizzle(&tiled, 4, 16, 16, 1, 5, 0), linear);
         assert_eq!(level_size(4, 16, 16, 1, 5, 0), 1024);
         assert_eq!(level_size(4, 1, 1, 1, 5, 0), 512); // one GOB at least
+    }
+
+    /// The loop `deswizzle` was before `deswizzle_into`: 16 bytes at a time
+    /// through `Geom::offset`.
+    fn deswizzle_reference(bl: &BlockLinear, src: &[u8]) -> Vec<u8> {
+        let g = bl.geom();
+        let row = (bl.width * bl.bytes_per_texel) as usize;
+        let mut out = vec![0; row * bl.height as usize * bl.depth as usize];
+        for z in 0..bl.depth as usize {
+            for y in 0..bl.height as usize {
+                let dst = (z * bl.height as usize + y) * row;
+                for x in (0..row).step_by(16) {
+                    let n = 16.min(row - x);
+                    let s = g.offset(x as u64, y as u64, z as u64) as usize;
+                    if let Some(chunk) = src.get(s..s + n) {
+                        out[dst + x..dst + x + n].copy_from_slice(chunk);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// `deswizzle_into` writes the rows the 16-bytes-at-a-time loop wrote, at
+    /// any pitch, over random shapes, tiles, both GOB layouts and short
+    /// sources, and nothing between or after them.
+    #[test]
+    fn deswizzle_into_matches_the_reference_loop() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |n: u32| {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            ((seed >> 33) % u64::from(n)) as u32
+        };
+        for case in 0..600u64 {
+            let gob = if case % 2 == 0 { GobLayout::Tegra } else { GobLayout::Turing2D };
+            let bl = BlockLinear { bytes_per_texel: 1 << next(5), width: 1 + next(200), height: 1 + next(40), depth: 1 + next(4), tile_width_log2: next(3), gob_height_log2: next(6), gob_depth_log2: next(4), gob };
+            let mut src: Vec<u8> = (0..bl.size()).map(|i| (i * 131 + case) as u8).collect();
+            if case % 4 == 3 {
+                src.truncate(next(src.len() as u32) as usize);
+            }
+            let row = (bl.width * bl.bytes_per_texel) as usize;
+            let (h, d) = (bl.height as usize, bl.depth as usize);
+            let (pitch, rows) = (row + next(3) as usize * 16, h + next(2) as usize);
+            // Rows zeroed (missing source bytes read as zeros in both), the rest marked.
+            let mut out = vec![0xa5; pitch * rows * d];
+            for z in 0..d {
+                for y in 0..h {
+                    out[z * pitch * rows + y * pitch..][..row].fill(0);
+                }
+            }
+            bl.deswizzle_into(&src, wgpu::WriteOnly::from_mut(&mut out[..]), pitch, pitch * rows);
+            let want = deswizzle_reference(&bl, &src);
+            for z in 0..d {
+                for y in 0..rows {
+                    let got = &out[z * pitch * rows + y * pitch..][..pitch];
+                    let rest = if y < h {
+                        assert_eq!(got[..row], want[(z * h + y) * row..][..row], "case {case}: {bl:?}, row {y} of slice {z}");
+                        &got[row..]
+                    } else {
+                        got
+                    };
+                    assert!(rest.iter().all(|&b| b == 0xa5), "case {case}: {bl:?}, written past row {y} of slice {z}");
+                }
+            }
+        }
     }
 
     #[test]

@@ -239,6 +239,11 @@ pub struct Surfaces {
     /// An upload of 32 MiB or more was made since the last flush (see
     /// `Surfaces::flush_big_uploads`).
     pub(crate) big_upload: bool,
+    /// Uploaded texels on their way to their textures (`Surfaces::upload`): a
+    /// belt of their own (its chunks as large as the largest level uploaded),
+    /// and the copies out of it, which `flush` submits before the frame.
+    pub(crate) texture_belt: wgpu::util::StagingBelt,
+    pub(crate) uploads: Option<wgpu::CommandEncoder>,
     /// Offsets of the arena's staged blocks by content hash: draws share identical
     /// constant banks (64 KiB each) instead of staging each copy.
     staged: FxMap<u64, Vec<(usize, usize)>>,
@@ -682,12 +687,13 @@ impl Surfaces {
         let fill = (fill_module, fill_layout, Default::default());
         let arena = (arena_buffer(&device, 16 << 20), Vec::new());
         let belt = wgpu::util::StagingBelt::new(device.clone(), 16 << 20);
+        let texture_belt = wgpu::util::StagingBelt::new(device.clone(), 16 << 20);
         let dynamic_max = device.limits().max_dynamic_uniform_buffers_per_pipeline_layout;
         let clip_distances = device.features().contains(wgpu::Features::CLIP_DISTANCES);
         let window = window.map(|(surface, size)| Window::new(&adapter, &device, surface, size));
         let timing = crate::timing::Timing::new(&device, &queue);
         let renderable = (0..=0xff).filter_map(color_format).chain((0..=0xff).filter_map(depth_format)).map(|f| (f, renderable_on(&adapter, &device, f))).collect();
-        Ok(Surfaces { renderable, adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pass: None, pending: None, timing, clock: None, present: 0, readbacks: Default::default(), hasher: None, arena, belt, big_upload: false, staging: Staging::default(), staged: FxMap::default(), last_color: None, window, memo: Memo::default(), compile: Compile::default(), compile_total: Compile::default(), background: false, wait_left: PIPELINE_WAIT, workers: None, finished: Default::default(), disk_cache: None, views: Aged::default(), bind_groups: Groups::default(), dynamic_max, clip_distances })
+        Ok(Surfaces { renderable, adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pass: None, pending: None, timing, clock: None, present: 0, readbacks: Default::default(), hasher: None, arena, belt, big_upload: false, texture_belt, uploads: None, staging: Staging::default(), staged: FxMap::default(), last_color: None, window, memo: Memo::default(), compile: Compile::default(), compile_total: Compile::default(), background: false, wait_left: PIPELINE_WAIT, workers: None, finished: Default::default(), disk_cache: None, views: Aged::default(), bind_groups: Groups::default(), dynamic_max, clip_distances })
     }
 
     /// Shows the presented image (the color target written last, its top-left
@@ -841,9 +847,6 @@ impl Surfaces {
         self.pending = Some(encoder);
     }
 
-    /// Submits the work recorded so far (at each present, and before any
-    /// readback). Uploads (`write_texture`) only ever go to new textures,
-    /// which nothing recorded before can use, so they need no flush.
     /// Counts a guest read for the GPU, `memo` if the memo served it (host
     /// statistics, see [`Staging`]).
     pub(crate) fn note_read(&mut self, kind: Read, len: usize, memo: bool) {
@@ -976,13 +979,20 @@ impl Surfaces {
         self.memo.indices.insert((addr, size, count, restart), (staged, self.memo.epoch));
     }
 
+    /// Submits the work recorded so far (at each present, and before any
+    /// readback). Uploads only ever go to new textures, which nothing
+    /// recorded before can use: their copies need no flush of their own.
     pub fn flush(&mut self) {
         self.pass = None;
         self.memo.clear();
-        // The arena's copy runs before this submit's commands (its command buffer
-        // comes first), and after the previous frame's, which read the same
-        // bytes: queue order.
-        let mut buffers = Vec::with_capacity(2);
+        // The texture uploads' and the arena's copies run before this submit's
+        // commands (their command buffers come first), and after the previous
+        // frame's, which read the same arena bytes: queue order.
+        let mut buffers = Vec::with_capacity(3);
+        if let Some(uploads) = self.uploads.take() {
+            self.texture_belt.finish();
+            buffers.push(uploads.finish());
+        }
         let whole = self.arena.1.len().next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT as usize);
         self.arena.1.resize(whole, 0);
         if let Some(size) = wgpu::BufferSize::new(whole as u64) {
@@ -1015,15 +1025,19 @@ impl Surfaces {
         }
         // Chunks whose copies were submitted come back once the GPU is done.
         self.belt.recall();
+        self.texture_belt.recall();
     }
 
     /// After an upload of 32 MiB or more (`big_upload`), at the start of the next
-    /// draw or dispatch: the work so far submitted and waited for, so that the
-    /// upload's staging memory comes back before another such upload.
+    /// draw or dispatch: the work so far submitted and waited for, then the
+    /// texture belt made anew, which frees its chunks: the largest kept the
+    /// largest level uploaded (64 MiB for a streaming pool), and RAM runs short
+    /// in Corneria (1.3 GB free, the write watch then over-reports, D44).
     pub(crate) fn flush_big_uploads(&mut self) {
         if std::mem::take(&mut self.big_upload) {
             self.flush();
             let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+            self.texture_belt = wgpu::util::StagingBelt::new(self.device.clone(), 16 << 20);
         }
     }
 

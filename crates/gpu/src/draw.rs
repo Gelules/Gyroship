@@ -310,24 +310,6 @@ fn dynamic_groups(uniforms: &[usize], limit: usize) -> Vec<bool> {
     }
 }
 
-/// Texels of `slices` slices of `from` (columns, rows) elements of `bpe` bytes,
-/// laid out as `to` (columns, rows): what fits is copied, the rest is zero.
-fn repack(src: &[u8], from: (u32, u32), to: (u32, u32), slices: u32, bpe: u32) -> Vec<u8> {
-    let (fc, fr, tc, tr, bpe) = (from.0 as usize, from.1 as usize, to.0 as usize, to.1 as usize, bpe as usize);
-    let mut out = vec![0u8; tc * tr * slices as usize * bpe];
-    let n = fc.min(tc) * bpe;
-    for s in 0..slices as usize {
-        for r in 0..fr.min(tr) {
-            let at = ((s * fr + r) * fc) * bpe;
-            if let Some(row) = src.get(at..at + n) {
-                let to = ((s * tr + r) * tc) * bpe;
-                out[to..to + n].copy_from_slice(row);
-            }
-        }
-    }
-    out
-}
-
 /// An index of `size` little-endian bytes.
 fn index_value(c: &[u8]) -> u32 {
     c.iter().rev().fold(0, |v, b| v << 8 | u32::from(*b))
@@ -1217,34 +1199,61 @@ impl Surfaces {
         // textures have one level; a ZF32 shadow map's depth copy takes level 0 only).
         let last = if tic.texture_type == TextureType::TwoDNoMipmap { level } else { view_last.min(tic.max_mip_level).max(level) };
         let levels = if tic.layout == Layout::BlockLinear && !zf32 { (last - level + 1).min(size.max_mips(dimension)) } else { 1 };
-        // Each level's texels (linear, layer after layer) and its size in elements.
-        let mut data: Vec<(Vec<u8>, u32, u32)> = Vec::new();
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size,
+            mip_level_count: levels,
+            sample_count: 1,
+            dimension,
+            format,
+            // Tests read uploads back.
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | if cfg!(test) { wgpu::TextureUsages::COPY_SRC } else { wgpu::TextureUsages::empty() },
+            view_formats: &[],
+        });
+        // Each level's texels go from guest memory straight into mapped staging
+        // (`stage_level`), layer after layer, rows at the pitch a buffer copy needs.
+        let pitch = |columns: u32| (columns * bpe).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let mut bytes = 0;
         let end;
         match tic.layout {
             Layout::BlockLinear => {
                 let offsets = textures::level_offsets(tic);
                 let stride = textures::layer_stride(tic).ok_or("texture layer stride")?;
                 let mut reach = 0;
-                for l in level..level + levels {
-                    let bl = textures::tic_level(tic, l).ok_or("texture level")?;
-                    let offset = *offsets.get(l as usize).ok_or("texture level")?;
+                for i in 0..levels {
+                    let bl = textures::tic_level(tic, level + i).ok_or("texture level")?;
+                    let offset = *offsets.get((level + i) as usize).ok_or("texture level")?;
+                    // wgpu halves the block-rounded level 0; the guest halves the real size:
+                    // on a size that is not a power of two wgpu's level may be a block
+                    // larger, its extra texels zero.
+                    let extent = size.mip_level_size(i, dimension).physical_size(format);
+                    let (host_columns, host_rows) = (extent.width / bw, extent.height / bh);
+                    if bl.width > host_columns || bl.height > host_rows {
+                        return Err(format!("texture level {i} larger than wgpu's"));
+                    }
+                    let (pitch, row) = (pitch(host_columns) as usize, (bl.width * bpe) as usize);
+                    let image = pitch * host_rows as usize;
+                    let mut view = self.stage_level(&texture, i, extent, pitch as u32, host_rows);
                     let mut raw = vec![0u8; bl.size() as usize];
-                    let mut texels = Vec::new();
-                    for layer in 0..u64::from(layers) {
-                        if !mem(tic.address + layer * stride + offset, &mut raw) {
+                    for layer in 0..layers as usize {
+                        if !mem(tic.address + layer as u64 * stride + offset, &mut raw) {
                             return Err("texture not readable".into());
                         }
-                        // Every layer's room at once (an 85 MiB pool would otherwise regrow ~10 times).
-                        let t = bl.deswizzle(&raw);
-                        if texels.is_empty() {
-                            texels = t;
-                            texels.reserve_exact(texels.len() * (layers as usize - 1));
-                        } else {
-                            texels.extend_from_slice(&t);
+                        // A layer is a slice, or a 3D level's `bl.depth` slices.
+                        let at = layer * bl.depth as usize * image;
+                        bl.deswizzle_into(&raw, view.slice(at..at + bl.depth as usize * image), pitch, image);
+                    }
+                    if (bl.width, bl.height) != (host_columns, host_rows) {
+                        for z in 0..extent.depth_or_array_layers as usize {
+                            for y in 0..host_rows as usize {
+                                let at = z * image + y * pitch;
+                                let from = if y < bl.height as usize { row } else { 0 };
+                                view.slice(at + from..at + (host_columns * bpe) as usize).fill(0);
+                            }
                         }
                     }
                     reach = reach.max(offset + raw.len() as u64);
-                    data.push((texels, bl.width, bl.height));
+                    bytes += (row * bl.height as usize * bl.depth as usize * layers as usize) as u64;
                 }
                 end = tic.address + u64::from(layers - 1) * stride + reach;
             }
@@ -1255,42 +1264,14 @@ impl Surfaces {
                     return Err("texture not readable".into());
                 }
                 end = tic.address + raw.len() as u64;
-                data.push((raw.chunks(tic.pitch as usize).flat_map(|r| &r[..row]).copied().collect(), columns, rows));
+                let pitch = pitch(columns) as usize;
+                let mut view = self.stage_level(&texture, 0, size, pitch as u32, rows);
+                for (y, r) in raw.chunks(tic.pitch as usize).enumerate() {
+                    view.slice(y * pitch..y * pitch + row).copy_from_slice(&r[..row]);
+                }
+                bytes += (row * rows as usize) as u64;
             }
             other => return Err(format!("texture layout {other:?}")),
-        }
-        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: None,
-            size,
-            mip_level_count: levels,
-            sample_count: 1,
-            dimension,
-            format,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let mut bytes = 0;
-        for (i, (texels, guest_columns, guest_rows)) in data.iter().enumerate() {
-            let i = i as u32;
-            // wgpu halves the block-rounded level 0; the guest halves the real size: on
-            // a size that is not a power of two they may differ by a block, then the
-            // guest's texels are copied into wgpu's (the rest stays zero).
-            let extent = size.mip_level_size(i, dimension).physical_size(format);
-            let (host_columns, host_rows) = (extent.width / bw, extent.height / bh);
-            let packed;
-            let texels = if (host_columns, host_rows) == (*guest_columns, *guest_rows) {
-                texels
-            } else {
-                packed = repack(texels, (*guest_columns, *guest_rows), (host_columns, host_rows), extent.depth_or_array_layers, bpe);
-                &packed
-            };
-            self.queue.write_texture(
-                wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: i, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-                texels,
-                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(host_columns * bpe), rows_per_image: Some(host_rows) },
-                extent,
-            );
-            bytes += texels.len() as u64;
         }
         let texture = if zf32 { self.as_depth(&texture) } else { texture };
         // A large upload's staging memory is freed once the GPU is past it, before the
@@ -1306,6 +1287,23 @@ impl Surfaces {
         self.staging.uploads[0] += bytes;
         self.staging.uploads[1] += started.elapsed().as_nanos() as u64;
         Ok(texture)
+    }
+
+    /// Staging for level `level` of `texture`: `rows` rows of `pitch` bytes per
+    /// slice, copied into the texture before this frame's commands (`flush`
+    /// submits `uploads` first). The view to fill, dropped before the flush.
+    fn stage_level(&mut self, texture: &wgpu::Texture, level: u32, extent: wgpu::Extent3d, pitch: u32, rows: u32) -> wgpu::BufferViewMut {
+        let size = u64::from(pitch) * u64::from(rows) * u64::from(extent.depth_or_array_layers);
+        let room = self.texture_belt.allocate(wgpu::BufferSize::new(size).expect("a texture level has texels"), wgpu::BufferSize::new(256).unwrap());
+        let (buffer, offset) = (room.buffer().clone(), room.offset());
+        let view = room.get_mapped_range_mut().expect("staging belt chunks are mapped");
+        let layout = wgpu::TexelCopyBufferLayout { offset, bytes_per_row: Some(pitch), rows_per_image: Some(rows) };
+        self.uploads.get_or_insert_with(|| self.device.create_command_encoder(&Default::default())).copy_buffer_to_texture(
+            wgpu::TexelCopyBufferInfo { buffer: &buffer, layout },
+            wgpu::TexelCopyTextureInfo { texture, mip_level: level, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            extent,
+        );
+        view
     }
 
     /// A texture with 32-bit integer channels as a float one with the same bits, level 0:
@@ -1704,13 +1702,74 @@ mod tests {
         assert_eq!((next == fresh, reads.get()), (true, 2));
     }
 
+    /// Level `level` of `t`, every slice, as rows of `pitch` bytes (`t` needs COPY_SRC).
+    fn read_level(s: &Surfaces, t: &wgpu::Texture, level: u32) -> (Vec<u8>, usize, u32) {
+        let extent = t.size().mip_level_size(level, t.dimension()).physical_size(t.format());
+        let (bw, bh) = t.format().block_dimensions();
+        let pitch = (extent.width / bw * t.format().block_copy_size(None).unwrap()).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let rows = extent.height / bh;
+        let buffer = s.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: u64::from(pitch * rows * extent.depth_or_array_layers), usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+        let mut encoder = s.device.create_command_encoder(&Default::default());
+        let image = wgpu::TexelCopyTextureInfo { texture: t, mip_level: level, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All };
+        encoder.copy_texture_to_buffer(image, wgpu::TexelCopyBufferInfo { buffer: &buffer, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(pitch), rows_per_image: Some(rows) } }, extent);
+        s.queue.submit([encoder.finish()]);
+        buffer.slice(..).map_async(wgpu::MapMode::Read, |r| r.expect("readback mapping failed"));
+        s.device.poll(wgpu::PollType::wait_indefinitely()).expect("GPU poll");
+        let bytes = buffer.slice(..).get_mapped_range().expect("mapped").to_vec();
+        (bytes, pitch as usize, rows)
+    }
+
+    /// Uploads go through staging at a buffer copy's row pitch: every layer and
+    /// level of a block-linear array reads back as its deswizzled guest bytes;
+    /// where wgpu's level is a block larger than the guest's (a compressed size
+    /// not a multiple of four), the extra blocks read back zero, though the
+    /// staging chunk they come from held the first texture's bytes.
     #[test]
-    fn repack_copies_what_fits_and_zeroes_the_rest() {
-        // Two slices of 3x2 two-byte elements into 2x3: each row's first two elements,
-        // both rows, then a zero row.
-        let src: Vec<u8> = (0..24).collect();
-        let out = repack(&src, (3, 2), (2, 3), 2, 2);
-        assert_eq!(out, [vec![0, 1, 2, 3, 6, 7, 8, 9, 0, 0, 0, 0], vec![12, 13, 14, 15, 18, 19, 20, 21, 0, 0, 0, 0]].concat());
+    fn uploads_read_back_as_the_guest_texels() {
+        let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
+            eprintln!("no GPU adapter: test skipped");
+            return;
+        };
+        const TEX: u64 = 0x50_0000;
+        let mut h = [0u8; 32];
+        put(&mut h, &[(6, 0, 0x08), (9, 7, 2), (12, 10, 2), (15, 13, 2), (18, 16, 2), (21, 19, 2), (24, 22, 3), (27, 25, 4), (30, 28, 5)]);
+        put(&mut h, &[(63, 41, (TEX >> 9) as u32), (87, 85, 3), (144, 128, 7), (175, 160, 7), (154, 151, 1), (191, 191, 1)]);
+        // RGBA8 40x24, 3 layers, 2 levels; then DXT1 18x18 (5x5 blocks), 3 levels.
+        let array = textures::Tic { texture_type: TextureType::TwoDArray, width: 40, height: 24, depth: 3, max_mip_level: 1, view_levels: Some((0, 1)), ..textures::tic(&h).unwrap() };
+        let dxt1 = textures::Tic { components: textures::Components(0x24), width: 18, height: 18, depth: 1, max_mip_level: 2, view_levels: Some((0, 2)), ..textures::tic(&h).unwrap() };
+        for (case, tic) in [array, dxt1].iter().enumerate() {
+            let layers = textures::layers(tic) as usize;
+            let stride = textures::layer_stride(tic).unwrap() as usize;
+            let guest: Vec<u8> = (0..stride * layers).map(|i| (i * 7 + i / 251 + 1) as u8).collect();
+            let mut mem = |addr: u64, out: &mut [u8]| match guest.get((addr - TEX) as usize..(addr - TEX) as usize + out.len()) {
+                Some(src) => {
+                    out.copy_from_slice(src);
+                    true
+                }
+                None => false,
+            };
+            let mut key = h;
+            key[0] ^= case as u8 + 1;
+            let t = s.upload(tic, key, &mut mem).unwrap_or_else(|e| panic!("{e}"));
+            s.flush();
+            for level in 0..=tic.max_mip_level {
+                let bl = textures::tic_level(tic, level).unwrap();
+                let offset = textures::level_offsets(tic)[level as usize] as usize;
+                let (bytes, pitch, rows) = read_level(&s, &t, level);
+                let extent = t.size().mip_level_size(level, t.dimension()).physical_size(t.format());
+                let host_row = (extent.width / t.format().block_dimensions().0 * bl.bytes_per_texel) as usize;
+                let row = (bl.width * bl.bytes_per_texel) as usize;
+                for layer in 0..layers {
+                    let want = bl.deswizzle(&guest[layer * stride + offset..][..bl.size() as usize]);
+                    for y in 0..rows as usize {
+                        let got = &bytes[(layer * rows as usize + y) * pitch..][..host_row];
+                        let texels = if y < bl.height as usize { &want[y * row..][..row] } else { &[][..] };
+                        assert_eq!(&got[..texels.len()], texels, "case {case}, level {level}, layer {layer}, row {y}");
+                        assert!(got[texels.len()..].iter().all(|&b| b == 0), "case {case}, level {level}, layer {layer}, row {y}: wgpu's extra texels");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
