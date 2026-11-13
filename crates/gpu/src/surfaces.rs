@@ -859,8 +859,9 @@ impl Surfaces {
 
     /// Guest code may have run since the last GPU work (a new submit, or a
     /// wait that ended): what was read from guest memory may have changed.
-    pub fn new_submit(&mut self) {
+    pub fn new_submit(&mut self, verified: bool) {
         self.memo.clear();
+        self.begin_job(verified);
     }
 
     /// `len` bytes of guest memory at `addr`, read through `mem` unless this
@@ -981,16 +982,18 @@ impl Surfaces {
 
     /// Submits the work recorded so far (at each present, and before any
     /// readback). Uploads only ever go to new textures, which nothing
-    /// recorded before can use: their copies need no flush of their own.
+    /// recorded before can use: their copies need no flush of their own. A
+    /// refresh in place copies among the frame's commands instead.
     pub fn flush(&mut self) {
         self.pass = None;
         self.memo.clear();
         // The texture uploads' and the arena's copies run before this submit's
         // commands (their command buffers come first), and after the previous
-        // frame's, which read the same arena bytes: queue order.
+        // frame's, which read the same arena bytes: queue order. The texture
+        // staging is closed even with no upload: a refresh may have used it.
         let mut buffers = Vec::with_capacity(3);
+        self.texture_belt.finish();
         if let Some(uploads) = self.uploads.take() {
-            self.texture_belt.finish();
             buffers.push(uploads.finish());
         }
         let whole = self.arena.1.len().next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT as usize);
@@ -1729,7 +1732,7 @@ mod tests {
         s.invalidate(0x1ff0, 0x20);
         read(&mut s);
         assert_eq!(reads.get(), 2);
-        s.new_submit();
+        s.new_submit(true);
         read(&mut s);
         assert_eq!(reads.get(), 3);
         // Texture and sampler headers alike.

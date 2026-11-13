@@ -213,12 +213,28 @@ pub struct Cache {
     /// GPU writes to guest memory not yet applied to `textures`, as (start, end):
     /// applied once before the next read of the cache (`drain_invalidations`).
     pending: Vec<(u64, u64)>,
+    /// Bytes GPU writes reached past their `pending` range (`mark_dirty`):
+    /// refreshes take them, drops do not.
+    marked: Vec<(u64, u64)>,
+    /// Textures a GPU write of this job reached in part, out of `textures` until
+    /// their next upload refreshes them in place (see `drain_invalidations`).
+    aside: FxMap<(u64, [u8; 32]), Aside>,
+    /// Whether this job may set textures aside, and the ranges its write-watch
+    /// take did not check (see `begin_job`).
+    partial: bool,
+    unverified: Vec<(u64, u64)>,
+    /// Refreshes in place so far (host statistics).
+    refreshed: u64,
     /// `textures`' ranges as [`spans`] indexes them; None once `textures` changed.
     spans: Option<Vec<(u64, u64)>>,
     /// Color targets read through a smaller texture header, cropped to it, by
     /// (address, format, width, height), with the target's write stamp when copied.
     crops: FxMap<(u64, u32, u32, u32), (u64, wgpu::Texture)>,
 }
+
+/// A texture set aside: the texture, the end of its memory and the ranges
+/// written since its upload.
+type Aside = (wgpu::Texture, u64, Vec<(u64, u64)>);
 
 /// How far a jump table of unknown length is read: 256 entries.
 const TABLE_MAX: usize = 1024;
@@ -280,6 +296,32 @@ fn merged(ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
 fn overlaps(ranges: &[(u64, u64)], a: u64, b: u64) -> bool {
     let i = ranges.partition_point(|r| r.1 <= a);
     ranges.get(i).is_some_and(|r| r.0 < b)
+}
+
+/// The layers of one level, its slices `size` bytes at `base` then one every
+/// `stride`, that a range of `dirty` reaches (the test of `overlaps`), as runs
+/// of consecutive layers.
+fn dirty_layers(dirty: &[(u64, u64)], layers: u32, base: u64, stride: u64, size: u64) -> Vec<std::ops::Range<u32>> {
+    let mut hit = vec![false; layers as usize];
+    for &(s, e) in dirty {
+        if e <= base {
+            continue;
+        }
+        // The first slice ending past s, the last starting before e.
+        let first = if s < base + size { 0 } else { (s - base - size) / stride + 1 };
+        let last = ((e - base - 1) / stride).min(u64::from(layers) - 1);
+        for l in first..=last {
+            hit[l as usize] = true;
+        }
+    }
+    let mut runs: Vec<std::ops::Range<u32>> = Vec::new();
+    for l in (0..layers).filter(|&l| hit[l as usize]) {
+        match runs.last_mut() {
+            Some(r) if r.end == l => r.end += 1,
+            _ => runs.push(l..l + 1),
+        }
+    }
+    runs
 }
 
 /// Ranges [a, b) sorted by start, each end replaced by the furthest end so far.
@@ -499,7 +541,7 @@ impl Surfaces {
         let c = &self.cache;
         let written = merged(&c.pending);
         format!(
-            "targets {}, textures {}, samplers {}, programs {}, modules {}, pipelines {}, compute pipelines {}, images {}",
+            "targets {}, textures {}, samplers {}, programs {}, modules {}, pipelines {}, compute pipelines {}, images {}, textures refreshed in place {}",
             self.map.len(),
             c.textures.keys().filter(|(addr, header)| !overlaps(&written, *addr, c.textures[&(*addr, *header)].1)).count(),
             c.samplers.len(),
@@ -507,7 +549,8 @@ impl Surfaces {
             c.modules.len(),
             c.pipelines.len(),
             c.compute_pipelines.len(),
-            c.images.len()
+            c.images.len(),
+            c.refreshed
         )
     }
 
@@ -1164,7 +1207,8 @@ impl Surfaces {
     /// uploaded as R32Float then written as depth by a pass (WebGPU copies no
     /// buffer into Depth32Float): a shadow map the game samples but never renders.
     fn upload(&mut self, tic: &textures::Tic, header: [u8; 32], mem: Mem) -> Result<wgpu::Texture, String> {
-        if let Some((t, _)) = self.cache.textures.get(&(tic.address, header)) {
+        let key = (tic.address, header);
+        if let Some((t, _)) = self.cache.textures.get(&key) {
             return Ok(t.clone());
         }
         let started = std::time::Instant::now();
@@ -1199,17 +1243,23 @@ impl Surfaces {
         // textures have one level; a ZF32 shadow map's depth copy takes level 0 only).
         let last = if tic.texture_type == TextureType::TwoDNoMipmap { level } else { view_last.min(tic.max_mip_level).max(level) };
         let levels = if tic.layout == Layout::BlockLinear && !zf32 { (last - level + 1).min(size.max_mips(dimension)) } else { 1 };
-        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: None,
-            size,
-            mip_level_count: levels,
-            sample_count: 1,
-            dimension,
-            format,
-            // Tests read uploads back.
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | if cfg!(test) { wgpu::TextureUsages::COPY_SRC } else { wgpu::TextureUsages::empty() },
-            view_formats: &[],
-        });
+        // A texture a GPU write of this job reached in part (`drain_invalidations`):
+        // the same one again, only the layers the write reached staged into it.
+        let aside = self.cache.aside.remove(&key).filter(|_| tic.layout == Layout::BlockLinear && !three_d && !zf32);
+        let texture = match &aside {
+            Some((t, ..)) => t.clone(),
+            None => self.device.create_texture(&wgpu::TextureDescriptor {
+                label: None,
+                size,
+                mip_level_count: levels,
+                sample_count: 1,
+                dimension,
+                format,
+                // Tests read uploads back.
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | if cfg!(test) { wgpu::TextureUsages::COPY_SRC } else { wgpu::TextureUsages::empty() },
+                view_formats: &[],
+            }),
+        };
         // Each level's texels go from guest memory straight into mapped staging
         // (`stage_level`), layer after layer, rows at the pitch a buffer copy needs.
         let pitch = |columns: u32| (columns * bpe).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
@@ -1231,29 +1281,38 @@ impl Surfaces {
                     if bl.width > host_columns || bl.height > host_rows {
                         return Err(format!("texture level {i} larger than wgpu's"));
                     }
+                    reach = reach.max(offset + bl.size());
                     let (pitch, row) = (pitch(host_columns) as usize, (bl.width * bpe) as usize);
                     let image = pitch * host_rows as usize;
-                    let mut view = self.stage_level(&texture, i, extent, pitch as u32, host_rows);
+                    // Every layer; in a refresh, the runs of layers a write reached.
+                    let runs = match &aside {
+                        Some((_, _, dirty)) => dirty_layers(dirty, layers, tic.address + offset, stride, bl.size()),
+                        None => vec![std::ops::Range { start: 0, end: layers }],
+                    };
                     let mut raw = vec![0u8; bl.size() as usize];
-                    for layer in 0..layers as usize {
-                        if !mem(tic.address + layer as u64 * stride + offset, &mut raw) {
-                            return Err("texture not readable".into());
-                        }
+                    for run in runs {
                         // A layer is a slice, or a 3D level's `bl.depth` slices.
-                        let at = layer * bl.depth as usize * image;
-                        bl.deswizzle_into(&raw, view.slice(at..at + bl.depth as usize * image), pitch, image);
-                    }
-                    if (bl.width, bl.height) != (host_columns, host_rows) {
-                        for z in 0..extent.depth_or_array_layers as usize {
-                            for y in 0..host_rows as usize {
-                                let at = z * image + y * pitch;
-                                let from = if y < bl.height as usize { row } else { 0 };
-                                view.slice(at + from..at + (host_columns * bpe) as usize).fill(0);
+                        let staged = wgpu::Extent3d { depth_or_array_layers: if three_d { extent.depth_or_array_layers } else { run.len() as u32 }, ..extent };
+                        let target = wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: i, origin: wgpu::Origin3d { z: run.start, ..wgpu::Origin3d::ZERO }, aspect: wgpu::TextureAspect::All };
+                        let mut view = self.stage_level(target, staged, pitch as u32, host_rows, aside.is_some());
+                        for layer in run.clone() {
+                            if !mem(tic.address + u64::from(layer) * stride + offset, &mut raw) {
+                                return Err("texture not readable".into());
+                            }
+                            let at = (layer - run.start) as usize * bl.depth as usize * image;
+                            bl.deswizzle_into(&raw, view.slice(at..at + bl.depth as usize * image), pitch, image);
+                        }
+                        if (bl.width, bl.height) != (host_columns, host_rows) {
+                            for z in 0..staged.depth_or_array_layers as usize {
+                                for y in 0..host_rows as usize {
+                                    let at = z * image + y * pitch;
+                                    let from = if y < bl.height as usize { row } else { 0 };
+                                    view.slice(at + from..at + (host_columns * bpe) as usize).fill(0);
+                                }
                             }
                         }
+                        bytes += (row * bl.height as usize * bl.depth as usize * run.len()) as u64;
                     }
-                    reach = reach.max(offset + raw.len() as u64);
-                    bytes += (row * bl.height as usize * bl.depth as usize * layers as usize) as u64;
                 }
                 end = tic.address + u64::from(layers - 1) * stride + reach;
             }
@@ -1265,7 +1324,8 @@ impl Surfaces {
                 }
                 end = tic.address + raw.len() as u64;
                 let pitch = pitch(columns) as usize;
-                let mut view = self.stage_level(&texture, 0, size, pitch as u32, rows);
+                let target = wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All };
+                let mut view = self.stage_level(target, size, pitch as u32, rows, false);
                 for (y, r) in raw.chunks(tic.pitch as usize).enumerate() {
                     view.slice(y * pitch..y * pitch + row).copy_from_slice(&r[..row]);
                 }
@@ -1282,27 +1342,32 @@ impl Surfaces {
         if bytes >= 32 << 20 {
             self.big_upload = true;
         }
-        self.cache.textures.insert((tic.address, header), (texture.clone(), end));
+        self.cache.refreshed += u64::from(aside.is_some());
+        self.cache.textures.insert(key, (texture.clone(), end));
         self.cache.spans = None;
         self.staging.uploads[0] += bytes;
         self.staging.uploads[1] += started.elapsed().as_nanos() as u64;
         Ok(texture)
     }
 
-    /// Staging for level `level` of `texture`: `rows` rows of `pitch` bytes per
-    /// slice, copied into the texture before this frame's commands (`flush`
-    /// submits `uploads` first). The view to fill, dropped before the flush.
-    fn stage_level(&mut self, texture: &wgpu::Texture, level: u32, extent: wgpu::Extent3d, pitch: u32, rows: u32) -> wgpu::BufferViewMut {
+    /// Staging for `extent` texels of a level at `target`: `rows` rows of
+    /// `pitch` bytes per slice. A new texture's copy runs before this frame's
+    /// commands (`flush` submits `uploads` first); a refresh's, `in_place`,
+    /// among them: the commands recorded before it read the old texels. The
+    /// view to fill, dropped before the flush.
+    fn stage_level(&mut self, target: wgpu::TexelCopyTextureInfo, extent: wgpu::Extent3d, pitch: u32, rows: u32, in_place: bool) -> wgpu::BufferViewMut {
         let size = u64::from(pitch) * u64::from(rows) * u64::from(extent.depth_or_array_layers);
         let room = self.texture_belt.allocate(wgpu::BufferSize::new(size).expect("a texture level has texels"), wgpu::BufferSize::new(256).unwrap());
         let (buffer, offset) = (room.buffer().clone(), room.offset());
         let view = room.get_mapped_range_mut().expect("staging belt chunks are mapped");
-        let layout = wgpu::TexelCopyBufferLayout { offset, bytes_per_row: Some(pitch), rows_per_image: Some(rows) };
-        self.uploads.get_or_insert_with(|| self.device.create_command_encoder(&Default::default())).copy_buffer_to_texture(
-            wgpu::TexelCopyBufferInfo { buffer: &buffer, layout },
-            wgpu::TexelCopyTextureInfo { texture, mip_level: level, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            extent,
-        );
+        let source = wgpu::TexelCopyBufferInfo { buffer: &buffer, layout: wgpu::TexelCopyBufferLayout { offset, bytes_per_row: Some(pitch), rows_per_image: Some(rows) } };
+        if in_place {
+            let mut encoder = self.encoder();
+            encoder.copy_buffer_to_texture(source, target, extent);
+            self.record(encoder);
+        } else {
+            self.uploads.get_or_insert_with(|| self.device.create_command_encoder(&Default::default())).copy_buffer_to_texture(source, target, extent);
+        }
         view
     }
 
@@ -1426,15 +1491,47 @@ impl Surfaces {
         }
     }
 
+    /// A GPU write reached `[start, start + len)` past the range it invalidated
+    /// (a copy whose declared span falls short): refreshes take those bytes,
+    /// drops do not (the next write-watch take reports them, as before). Always
+    /// with a write of its own to `invalidate`.
+    pub fn mark_dirty(&mut self, start: u64, len: u64) {
+        self.cache.marked.push((start, start.saturating_add(len)));
+    }
+
+    /// A GPU job starts (`Surfaces::new_submit`), `verified` after the HLE's
+    /// write-watch take: the textures the take found clean, and those uploaded
+    /// during the job, hold memory as it is, but for the GPU's own writes, which
+    /// `invalidate` records. Such a texture written in part can be refreshed in
+    /// place, its written layers only. Not those the take skipped (GPU writes
+    /// still pending), nor in a job without a take (`poll`).
+    pub(crate) fn begin_job(&mut self, verified: bool) {
+        let c = &mut self.cache;
+        c.aside.clear();
+        c.partial = verified;
+        c.unverified = if verified { merged(&c.pending) } else { Vec::new() };
+    }
+
     /// Applies the recorded GPU writes: one pass over the uploaded textures drops
-    /// those they overlap, then the depth copies made from them.
+    /// those they overlap, then the depth copies made from them. In a verified
+    /// job a dropped texture waits aside, with the ranges written, for its next
+    /// upload to refresh it in place (`begin_job`).
     pub(crate) fn drain_invalidations(&mut self) {
         if self.cache.pending.is_empty() {
             return;
         }
         let c = &mut self.cache;
         let written = merged(&c.pending);
+        c.marked.extend_from_slice(&c.pending);
+        let dirty = merged(&c.marked);
         c.pending.clear();
+        c.marked.clear();
+        let reaching = |a: u64, b: u64| dirty.iter().filter(move |r| r.0 < b && r.1 > a).copied();
+        for (&(addr, _), (_, end, ranges)) in &mut c.aside {
+            ranges.extend(reaching(addr, *end));
+        }
+        // The first drain drops every texture the take skipped: unverified no more.
+        let unverified = std::mem::take(&mut c.unverified);
         // Most writes (constant-buffer loads, before nearly every draw) overlap no
         // texture: checked against the spans index before passing over them all.
         let spans = c.spans.get_or_insert_with(|| spans(c.textures.iter().map(|((a, _), (_, b))| (*a, *b))));
@@ -1442,7 +1539,14 @@ impl Surfaces {
             return;
         }
         let before = c.textures.len();
-        c.textures.retain(|(addr, _), (_, last)| !overlaps(&written, *addr, *last));
+        let (partial, aside) = (c.partial, &mut c.aside);
+        c.textures.retain(|&key, (texture, last)| {
+            let dropped = overlaps(&written, key.0, *last);
+            if dropped && partial && !overlaps(&unverified, key.0, *last) {
+                aside.insert(key, (texture.clone(), *last, reaching(key.0, *last).collect()));
+            }
+            !dropped
+        });
         if c.textures.len() != before {
             c.spans = None;
             let textures = &c.textures;
@@ -1697,7 +1801,7 @@ mod tests {
         let fresh = resolve(&mut s);
         assert_eq!((fresh == first, reads.get()), (false, 2));
         // A new submit forgets the slots, not the uploaded texture: same view, no read.
-        s.new_submit();
+        s.new_submit(true);
         let next = resolve(&mut s);
         assert_eq!((next == fresh, reads.get()), (true, 2));
     }
@@ -1770,6 +1874,133 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The layers whose bytes a write reached, as `upload` reads a level's slices.
+    #[test]
+    fn dirty_layers_follow_the_slices() {
+        // Slices of 0x100 bytes at 0x1000, one every 0x400, 8 layers; runs as (first, end).
+        let at = |r: &[(u64, u64)]| dirty_layers(r, 8, 0x1000, 0x400, 0x100).into_iter().map(|r| (r.start, r.end)).collect::<Vec<_>>();
+        assert_eq!(at(&[(0x1c00, 0x1d00)]), [(3, 4)], "one slice");
+        assert_eq!(at(&[(0x1cff, 0x1d00)]), [(3, 4)], "its last byte");
+        assert!(at(&[(0x1d00, 0x2000)]).is_empty(), "the gap after it");
+        assert_eq!(at(&[(0x1c80, 0x1c80)]), [(3, 4)], "an empty write inside it");
+        assert!(at(&[(0x1c00, 0x1c00)]).is_empty(), "an empty write at its first byte");
+        assert_eq!(at(&[(0, 0x1001)]), [(0, 1)], "a write ending in the first slice");
+        assert_eq!(at(&[(0x1400, 0x1c01), (0x2c00, 0x9000)]), [(1, 4), (7, 8)], "runs; past the last layer");
+        assert_eq!(at(&[(0x1800, 0x1900), (0x1400, 0x1500)]), [(1, 3)], "neighbours in any order: one run");
+    }
+
+    /// A DXT1 18x18 array of 3 layers and 3 levels at TEX (5x5 blocks; wgpu's
+    /// level 2 is a block larger than the guest's), its header, and the guest
+    /// bytes of a layer's level.
+    fn dxt1_array() -> (textures::Tic, [u8; 32], impl Fn(usize, u32) -> std::ops::Range<usize>) {
+        const TEX: u64 = 0x50_0000;
+        let mut h = [0u8; 32];
+        put(&mut h, &[(6, 0, 0x08), (9, 7, 2), (12, 10, 2), (15, 13, 2), (18, 16, 2), (21, 19, 2), (24, 22, 3), (27, 25, 4), (30, 28, 5)]);
+        put(&mut h, &[(63, 41, (TEX >> 9) as u32), (87, 85, 3), (144, 128, 7), (175, 160, 7), (154, 151, 1), (191, 191, 1)]);
+        let tic = textures::Tic { components: textures::Components(0x24), texture_type: TextureType::TwoDArray, width: 18, height: 18, depth: 3, max_mip_level: 2, view_levels: Some((0, 2)), ..textures::tic(&h).unwrap() };
+        let (stride, offsets) = (textures::layer_stride(&tic).unwrap() as usize, textures::level_offsets(&tic));
+        let sizes: Vec<usize> = (0..3).map(|l| textures::tic_level(&tic, l).unwrap().size() as usize).collect();
+        let slice = move |layer: usize, level: u32| {
+            let at = layer * stride + offsets[level as usize] as usize;
+            at..at + sizes[level as usize]
+        };
+        (tic, h, slice)
+    }
+
+    /// `guest` read at TEX.
+    fn guest_at(guest: &[u8], addr: u64, out: &mut [u8]) -> bool {
+        guest.get((addr - 0x50_0000) as usize..).and_then(|g| g.get(..out.len())).map(|src| out.copy_from_slice(src)).is_some()
+    }
+
+    /// A texture a GPU write reached in part, in a job after a write-watch take,
+    /// is refreshed in place: only the layers reached are staged (the bytes
+    /// counted), and every level reads back as a full upload of the new bytes,
+    /// wgpu's extra texels zero although the staging held the first upload's.
+    /// A texture the take skipped, or any in a job without a take, is uploaded
+    /// whole into a new texture, as before.
+    #[test]
+    fn a_refresh_in_place_reads_back_as_a_full_upload() {
+        let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
+            eprintln!("no GPU adapter: test skipped");
+            return;
+        };
+        let (tic, h, slice) = dxt1_array();
+        let mut guest: Vec<u8> = (0..slice(2, 2).end).map(|i| (i * 7 + i / 251 + 1) as u8).collect();
+        s.begin_job(true);
+        let t = s.upload(&tic, h, &mut |a, o| guest_at(&guest, a, o)).unwrap_or_else(|e| panic!("{e}"));
+        s.flush();
+        let whole = s.staging.uploads[0];
+        assert_eq!(whole, 3 * (200 + 72 + 8), "every layer of every level");
+        // The GPU writes layer 1's level 2 (invalidated) and layer 2's level 0 (past a copy's span: marked).
+        let (a, b) = (slice(1, 2), slice(2, 0));
+        for i in a.clone().chain(b.clone()) {
+            guest[i] ^= 0x5a;
+        }
+        s.invalidate(0x50_0000 + a.start as u64, a.len() as u64);
+        s.mark_dirty(0x50_0000 + b.start as u64, b.len() as u64);
+        s.drain_invalidations();
+        let again = s.upload(&tic, h, &mut |a, o| guest_at(&guest, a, o)).unwrap_or_else(|e| panic!("{e}"));
+        assert!(again == t, "refreshed in place");
+        // Layer 1's level 2 is one block (8 bytes), layer 2's level 0 25 blocks.
+        assert_eq!(s.staging.uploads[0] - whole, 8 + 200);
+        s.flush();
+        let mut other = h;
+        other[0] ^= 1;
+        let fresh = s.upload(&tic, other, &mut |a, o| guest_at(&guest, a, o)).unwrap_or_else(|e| panic!("{e}"));
+        s.flush();
+        for level in 0..3 {
+            assert!(read_level(&s, &t, level) == read_level(&s, &fresh, level), "level {level}");
+        }
+        // A write the take skipped (pending when the job starts), then a job without a take.
+        for verified in [true, false] {
+            let cached = s.upload(&tic, h, &mut |a, o| guest_at(&guest, a, o)).unwrap_or_else(|e| panic!("{e}"));
+            s.invalidate(0x50_0000 + a.start as u64, 1);
+            s.begin_job(verified);
+            s.drain_invalidations();
+            let before = s.staging.uploads[0];
+            let new = s.upload(&tic, h, &mut |a, o| guest_at(&guest, a, o)).unwrap_or_else(|e| panic!("{e}"));
+            assert!(new != cached, "verified {verified}: a new texture");
+            assert_eq!(s.staging.uploads[0] - before, whole, "verified {verified}: uploaded whole");
+            s.flush();
+        }
+    }
+
+    /// Commands recorded before a refresh in place read the old texels: the
+    /// refresh copies among the frame's commands, not before them.
+    #[test]
+    fn commands_recorded_before_a_refresh_read_the_old_texels() {
+        let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
+            eprintln!("no GPU adapter: test skipped");
+            return;
+        };
+        let (tic, h, slice) = dxt1_array();
+        let mut guest: Vec<u8> = (0..slice(2, 2).end).map(|i| (i * 3 + 1) as u8).collect();
+        s.begin_job(true);
+        let t = s.upload(&tic, h, &mut |a, o| guest_at(&guest, a, o)).unwrap_or_else(|e| panic!("{e}"));
+        s.flush();
+        let (old, pitch, rows) = read_level(&s, &t, 0);
+        // Level 0 copied into a buffer, recorded with the frame's commands.
+        let buffer = s.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: old.len() as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+        let mut e = s.encoder();
+        let image = wgpu::TexelCopyTextureInfo { texture: &t, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All };
+        let layout = wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(pitch as u32), rows_per_image: Some(rows) };
+        e.copy_texture_to_buffer(image, wgpu::TexelCopyBufferInfo { buffer: &buffer, layout }, t.size().mip_level_size(0, t.dimension()).physical_size(t.format()));
+        s.record(e);
+        // Then the GPU writes layer 0's level 0, and the texture is refreshed in place.
+        for i in slice(0, 0) {
+            guest[i] ^= 0xff;
+        }
+        s.invalidate(0x50_0000 + slice(0, 0).start as u64, 4);
+        s.drain_invalidations();
+        let again = s.upload(&tic, h, &mut |a, o| guest_at(&guest, a, o)).unwrap_or_else(|e| panic!("{e}"));
+        assert!(again == t, "refreshed in place");
+        s.flush();
+        buffer.slice(..).map_async(wgpu::MapMode::Read, |r| r.expect("readback mapping failed"));
+        s.device.poll(wgpu::PollType::wait_indefinitely()).expect("GPU poll");
+        assert!(*buffer.slice(..).get_mapped_range().expect("mapped") == old[..], "the copy recorded before read the old texels");
+        assert!(read_level(&s, &t, 0).0 != old, "the texture holds the new ones");
     }
 
     #[test]

@@ -504,7 +504,8 @@ impl Nvdrv {
 fn run_gpfifo(k: &mut GpuSide, fd: u32, space: u32, entries: &[u8]) -> Result<(), Stop> {
     forget_written_textures(k, space);
     if let Some(s) = k.surfaces.as_mut() {
-        s.new_submit();
+        // After the take: textures written in part may be refreshed in place.
+        s.new_submit(true);
     }
     let mut gpu = std::mem::take(&mut k.gpu);
     let done = (|| {
@@ -630,7 +631,8 @@ fn page_spans(ranges: &[(u64, u64, u64)]) -> Vec<&[(u64, u64, u64)]> {
 /// released it (called at each present; a submit resumes its own channel).
 pub fn poll(k: &mut GpuSide) -> Result<(), Stop> {
     if let Some(s) = k.surfaces.as_mut() {
-        s.new_submit();
+        // No take here: no refresh in place.
+        s.new_submit(false);
     }
     let mut gpu = std::mem::take(&mut k.gpu);
     let waiting: Vec<u32> = gpu.channels.iter().filter(|(_, (c, _))| c.waiting().is_some()).map(|(fd, _)| *fd).collect();
@@ -828,6 +830,9 @@ impl Gpu {
                         let l = BlockLinear { bytes_per_texel: 1, width: b.width, height: b.height, depth: b.depth.max(1), tile_width_log2: 0, gob_height_log2: b.gob_height_log2, gob_depth_log2: b.gob_depth_log2, gob: GobLayout::DEFAULT };
                         (b, l)
                     });
+                    // How far past dst the lines go: past the span below when PITCH_OUT is
+                    // stale or zero (a 1D copy), or the region leaves the surface.
+                    let mut reach = 0;
                     for i in 0..c.line_count {
                         if !ok {
                             break;
@@ -835,16 +840,20 @@ impl Gpu {
                         ok = k.read_gpu(space, c.src + u64::from(i) * u64::from(c.pitch_in), &mut line);
                         match &block {
                             None => {
-                                let at = k.gpu_to_cpu(space, c.dst + u64::from(i) * u64::from(c.pitch_out));
+                                let off = u64::from(i) * u64::from(c.pitch_out);
+                                let at = k.gpu_to_cpu(space, c.dst + off);
                                 ok = ok && k.mem.write_object(at, &line).is_ok();
+                                reach = reach.max(off + line.len() as u64);
                             }
                             Some((b, l)) => {
                                 let mut j = 0;
                                 while ok && j < line.len() {
                                     let x = b.x + j as u32;
                                     let n = ((16 - x % 16) as usize).min(line.len() - j);
-                                    let at = k.gpu_to_cpu(space, c.dst + l.offset(x, b.y + i, b.layer));
+                                    let off = l.offset(x, b.y + i, b.layer);
+                                    let at = k.gpu_to_cpu(space, c.dst + off);
                                     ok = k.mem.write_object(at, &line[j..j + n]).is_ok();
+                                    reach = reach.max(off + n as u64);
                                     j += n;
                                 }
                             }
@@ -859,6 +868,11 @@ impl Gpu {
                     };
                     if let Some(s) = &mut k.surfaces {
                         s.invalidate(c.dst, span);
+                        // A refresh in place takes every byte written (the rest of the
+                        // cache sees the span alone, as before: same drops, same takes).
+                        if reach > span {
+                            s.mark_dirty(c.dst, reach);
+                        }
                     }
                     forget_copied(k, space, c.dst, span);
                 }
