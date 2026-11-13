@@ -64,6 +64,9 @@ struct Shared {
     /// between two samples still counts once), as `key_bit` bits.
     held: AtomicU64,
     pressed: AtomicU64,
+    /// The same for the game's keyboard: one bit per USB HID usage.
+    keys_held: [AtomicU64; 4],
+    keys_pressed: [AtomicU64; 4],
     /// The gamepads' state, from SDL.
     pads: pads::Shared,
 }
@@ -147,23 +150,25 @@ impl ApplicationHandler for App {
                 });
             }
             WindowEvent::Resized(s) => self.shared.size.store(u64::from(s.width) << 32 | u64::from(s.height), Ordering::Relaxed),
+            // A key drives the controller (`key_bit`) and, for the game's debug
+            // tools, the keyboard (`hid_usage`), which the game only reads when
+            // its keyboard setting is on.
             WindowEvent::KeyboardInput { event, .. } if !event.repeat => {
-                if let PhysicalKey::Code(code) = event.physical_key
-                    && let Some(bit) = key_bit(code)
-                {
-                    match event.state {
-                        ElementState::Pressed => {
-                            self.shared.held.fetch_or(1 << bit, Ordering::Relaxed);
-                            self.shared.pressed.fetch_or(1 << bit, Ordering::Relaxed);
-                        }
-                        ElementState::Released => {
-                            self.shared.held.fetch_and(!(1 << bit), Ordering::Relaxed);
-                        }
-                    }
+                let PhysicalKey::Code(code) = event.physical_key else { return };
+                let (s, down) = (&self.shared, event.state == ElementState::Pressed);
+                if let Some(bit) = key_bit(code) {
+                    set(&s.held, &s.pressed, bit, down);
+                }
+                if let Some(u) = hid_usage(code) {
+                    let w = usize::from(u / 64);
+                    set(&s.keys_held[w], &s.keys_pressed[w], u32::from(u % 64), down);
                 }
             }
             // Keys released while another window has the focus never come: let go of all.
-            WindowEvent::Focused(false) => self.shared.held.store(0, Ordering::Relaxed),
+            WindowEvent::Focused(false) => {
+                self.shared.held.store(0, Ordering::Relaxed);
+                self.shared.keys_held.iter().for_each(|w| w.store(0, Ordering::Relaxed));
+            }
             _ => {}
         }
     }
@@ -198,6 +203,71 @@ fn pace(shared: Arc<Shared>) -> gyroship_hle::Pace {
             _ => origin = Some((now, ticks)),
         }
         Some(shared.size())
+    })
+}
+
+/// A key going down (held, and pressed since the last sample) or up.
+fn set(held: &AtomicU64, pressed: &AtomicU64, bit: u32, down: bool) {
+    if down {
+        held.fetch_or(1 << bit, Ordering::Relaxed);
+        pressed.fetch_or(1 << bit, Ordering::Relaxed);
+    } else {
+        held.fetch_and(!(1 << bit), Ordering::Relaxed);
+    }
+}
+
+/// The USB HID usage of a key (keyboard page), for the game's keyboard,
+/// which only its debug tools read: the console (backquote, F1 to F12, Ctrl,
+/// Shift) and its text fields.
+// ponytail: no numpad nor rare keys; add them if a debug window needs them.
+fn hid_usage(code: KeyCode) -> Option<u8> {
+    use KeyCode::*;
+    const LETTERS: [KeyCode; 26] = [KeyA, KeyB, KeyC, KeyD, KeyE, KeyF, KeyG, KeyH, KeyI, KeyJ, KeyK, KeyL, KeyM, KeyN, KeyO, KeyP, KeyQ, KeyR, KeyS, KeyT, KeyU, KeyV, KeyW, KeyX, KeyY, KeyZ];
+    const DIGITS: [KeyCode; 10] = [Digit1, Digit2, Digit3, Digit4, Digit5, Digit6, Digit7, Digit8, Digit9, Digit0];
+    const FUNCTIONS: [KeyCode; 12] = [F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12];
+    for (keys, first) in [(&LETTERS[..], 0x04), (&DIGITS[..], 0x1e), (&FUNCTIONS[..], 0x3a)] {
+        if let Some(i) = keys.iter().position(|&k| k == code) {
+            return Some(first + i as u8);
+        }
+    }
+    Some(match code {
+        Enter => 0x28,
+        Escape => 0x29,
+        Backspace => 0x2a,
+        Tab => 0x2b,
+        Space => 0x2c,
+        Minus => 0x2d,
+        Equal => 0x2e,
+        BracketLeft => 0x2f,
+        BracketRight => 0x30,
+        Backslash => 0x31,
+        Semicolon => 0x33,
+        Quote => 0x34,
+        Backquote => 0x35,
+        Comma => 0x36,
+        Period => 0x37,
+        Slash => 0x38,
+        CapsLock => 0x39,
+        Insert => 0x49,
+        Home => 0x4a,
+        PageUp => 0x4b,
+        Delete => 0x4c,
+        End => 0x4d,
+        PageDown => 0x4e,
+        ArrowRight => 0x4f,
+        ArrowLeft => 0x50,
+        ArrowDown => 0x51,
+        ArrowUp => 0x52,
+        IntlBackslash => 0x64,
+        ControlLeft => 0xe0,
+        ShiftLeft => 0xe1,
+        AltLeft => 0xe2,
+        SuperLeft => 0xe3,
+        ControlRight => 0xe4,
+        ShiftRight => 0xe5,
+        AltRight => 0xe6,
+        SuperRight => 0xe7,
+        _ => return None,
     })
 }
 
@@ -244,14 +314,17 @@ fn pad_of(bits: u64) -> gyroship_hle::hid::Pad {
             buttons |= 1 << bit;
         }
     }
-    gyroship_hle::hid::Pad { buttons, l: [x, y], r: [0, 0] }
+    gyroship_hle::hid::Pad { buttons, l: [x, y], ..Default::default() }
 }
 
 /// The live state for each hid sample: what is held, plus what was pressed
 /// since the last sample.
 fn input(shared: Arc<Shared>) -> gyroship_hle::LiveInput {
     Box::new(move || {
-        let keys = pad_of(shared.held.load(Ordering::Relaxed) | shared.pressed.swap(0, Ordering::Relaxed));
+        let mut keys = pad_of(shared.held.load(Ordering::Relaxed) | shared.pressed.swap(0, Ordering::Relaxed));
+        for (w, (held, pressed)) in shared.keys_held.iter().zip(&shared.keys_pressed).enumerate() {
+            keys.keys[w] = held.load(Ordering::Relaxed) | pressed.swap(0, Ordering::Relaxed);
+        }
         let p = &shared.pads;
         let (l, r) = p.sticks();
         pads::merge(keys, p.held.load(Ordering::Relaxed) | p.pressed.swap(0, Ordering::Relaxed), l, r)
@@ -277,10 +350,23 @@ mod tests {
     fn a_short_press_between_samples_counts_once() {
         let shared = Arc::new(Shared::default());
         let mut sample = input(shared.clone());
-        shared.held.fetch_or(1, Ordering::Relaxed);
-        shared.pressed.fetch_or(1, Ordering::Relaxed);
-        shared.held.fetch_and(!1, Ordering::Relaxed);
-        assert_eq!(sample().buttons, 1);
-        assert_eq!(sample().buttons, 0);
+        set(&shared.held, &shared.pressed, 0, true);
+        set(&shared.held, &shared.pressed, 0, false);
+        set(&shared.keys_held[0], &shared.keys_pressed[0], 0x35, true);
+        set(&shared.keys_held[0], &shared.keys_pressed[0], 0x35, false);
+        let p = sample();
+        assert_eq!((p.buttons, p.keys), (1, [1 << 0x35, 0, 0, 0]));
+        let p = sample();
+        assert_eq!((p.buttons, p.keys), (0, [0; 4]));
+    }
+
+    /// The debug console's keys, and a few others, by their USB HID usages.
+    #[test]
+    fn keys_have_their_usb_usages() {
+        let u = |c| hid_usage(c).unwrap();
+        assert_eq!([u(KeyCode::Backquote), u(KeyCode::F1), u(KeyCode::F11), u(KeyCode::F12)], [0x35, 0x3a, 0x44, 0x45]);
+        assert_eq!([u(KeyCode::ControlLeft), u(KeyCode::ShiftLeft), u(KeyCode::ControlRight), u(KeyCode::ShiftRight)], [0xe0, 0xe1, 0xe4, 0xe5]);
+        assert_eq!([u(KeyCode::KeyA), u(KeyCode::KeyZ), u(KeyCode::Digit1), u(KeyCode::Digit0), u(KeyCode::Enter)], [0x04, 0x1d, 0x1e, 0x27, 0x28]);
+        assert_eq!(hid_usage(KeyCode::Numpad5), None);
     }
 }
