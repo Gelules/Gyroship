@@ -406,9 +406,11 @@ up frame by frame.
   it), so the gap comes out 3.5% below the prediction.
 - **The averages are lower than in the tables above**: each window starts from zero boost
   speed (the Blue-Marine takes about 15 s to stack it), hits cut some boosts short (four
-  in Titania's run A, three in run B), and in these runs the game read the controller one
-  or two frames late, so the Arwing's 30-frame boosts came out as 31 and 28 frames (432
-  instead of 450).
+  in Titania's run A, three in run B), and every scripted press reached the game one frame
+  early (it reads each frame's buttons from two consecutive samples of the script, and
+  either one held counts): the Arwing's first 30-frame boost came out as 31 frames, its
+  62-frame cooldown ate the first 3 frames of the next press, and boosts of 31 and 28
+  frames then alternated (432 instead of 450).
 
 **The Blue-Marine's frame-perfect schedule, over the whole of Aquas.** The game played it
 with scripted inputs, from the first boost to the boss arena, with no steering and the
@@ -464,7 +466,8 @@ repository.
 - **The tables and charts.** `python boost_math.py`, in this folder.
 - **The Aquas run of the frame-perfect schedule.** The script holds X and lets it go for one
   frame each time the schedule does. The game reads X at present p from the replay's
-  samples p + 777 and p + 778 (either one held counts as held), so a one-frame release is
-  two released samples; the update of present 7103 is the first that can boost. A
+  samples p + 777 and p + 778 (either one held counts as held, as on every frame of the six
+  runs above), so a one-frame release is two released samples; the update of present 7103
+  is the first that can boost. A
   `--romfs-layer` folder serves a build settings file that keeps the retail build and turns
   the game's Unkillable mode on, and `--video` films the run.
