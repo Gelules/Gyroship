@@ -1,6 +1,6 @@
 # Boost management in Star Fox (2026): when to let go, and why
 
-*First draft — November 2026. 60 fps.*
+*First draft — November 2026. 60 fps. Updated on 13 November: a new Blue-Marine technique, from a brute force over Aquas (see "The best you can do by hand").*
 
 This follows up on the earlier boost management guide, which compared 25%, 33%, 50% and
 100% boosts on video. This time the numbers come from the game itself: the boost values
@@ -10,8 +10,9 @@ the game running its own code. From there, the best way to boost is plain math.
 > **Status.** The strategies below come from an exact frame-by-frame simulation of the
 > game's boost rules, which matches the game itself on every one of 21,000 logged frames.
 > Recorded runs in Corneria, Aquas and Titania then measured the ground gained: each
-> recommended technique pulled ahead of the alternative by the distance the simulation
-> predicts (see "Checked in real levels").
+> technique we recorded pulled ahead of the alternative by the distance the simulation
+> predicts (see "Checked in real levels"). The Blue-Marine's by-hand technique also rests
+> on a model of human timing, and nobody has recorded it in a level yet.
 
 ## TL;DR
 
@@ -19,7 +20,7 @@ the game running its own code. From there, the best way to boost is plain math.
 |---|---|---|
 | **Arwing** | Let go of boost when the meter is **1/3 full** (30 frames = 0.5 s of boost). When in doubt, a little late beats early. | That is the exact moment your boost speed maxes out. |
 | **Landmaster** | **Hold boost all the time** (100% every cycle). | Its boost speed builds slowly and fades fast, and every early release wastes a frame. |
-| **Blue-Marine** | **Hold boost and release it very briefly, about 5 to 7 times a second.** | Its boost speed stacks up from one boost to the next; short boosts keep it near max. |
+| **Blue-Marine** | **Start with three long boosts** (let go when the meter is 1/2 full, then 1/3, then 1/4), **then hold boost and flick it off about 0.1 s after each boost restarts.** Never before: a little late beats early. | Long boosts get boost speed up fastest from zero; once it has stacked up, short boosts keep it near max. |
 
 How much it matters (average boost speed over a full boost + cooldown cycle):
 
@@ -27,7 +28,7 @@ How much it matters (average boost speed over a full boost + cooldown cycle):
 |---|---|---|---|---|
 | Arwing | **450** (1/3 meter) | 352 | 450 | ~340 |
 | Landmaster | **125** (100%) | 125 | 78 | 69 |
-| Blue-Marine | **285 to 295** (hold + quick releases) | 140 | 230 | 247 |
+| Blue-Marine | **about 285** by hand (long start, then quick flicks; 298 frame-perfect) | 140 | 230 | 247 |
 
 "Boost speed" here is the **extra** speed boosting adds on top of your cruise speed, in
 the game's distance units per second (see "Units"). Its average over a whole cycle is
@@ -43,10 +44,12 @@ what decides how much ground you gain.
 4. **Holding boost during the cooldown costs nothing.** The boost restarts on its own the
    frame right after the meter is empty.
 5. **Releasing early does not give you more boost time.** On the Arwing and the
-   Blue-Marine, the meter drains half as fast as it fills, so N frames of boost always
-   cost 2N frames of cooldown. You boost exactly 1/3 of the time, whatever you do. On the
-   Landmaster, fill and drain go at the same speed: N frames of boost cost N frames of
-   cooldown, plus one extra frame if you let go before the meter is full.
+   Blue-Marine, the meter drains half as fast as it fills, so N frames of boost cost
+   2N frames of cooldown: you boost 1/3 of the time, whatever you do. (On the Blue-Marine,
+   the game's 32-bit rounding leaves a sliver in the meter after a boost of 4 to 7, 15 to 28
+   or 59 to 115 frames, and the cooldown lasts one frame more.) On the Landmaster, fill and
+   drain go at the same speed: N frames of boost cost N frames of cooldown, plus one extra
+   frame if you let go before the meter is full.
 6. **A big hit while you boost or brake forces the cooldown**, as if you had let go. It
    takes a hit worth 40 or more (or exactly 38). In our runs, the hits worth 40 were not
    projectiles (collisions, it seems) and did it; laser shots were worth 20 and didn't.
@@ -200,25 +203,107 @@ That's why 25% looked better than 33% in the video comparisons: shorter is bette
 way down.
 
 **The technique.** Don't tap boost: a tap that lands during the cooldown does nothing, and
-with even ±1 frame of timing error most taps get wasted (the average falls below 5!).
-Instead:
+with even ±1 frame of timing error most taps get wasted (the average falls below 5!). A
+console video of Aquas shows it: tapping about 3.4 times a second, with presses of about
+5 frames, the player stayed at cruise speed the whole level (boost speed under 15). From the
+first boost to the boss arena, that run took 253.7 s: 89 s more than a 3:53 speedrun that
+boosts about 39 frames at a time (164.6 s). Instead:
 
-> **Hold boost, and release it very briefly (a quick flick, 2 to 4 frames) about 5 to 7
-> times a second.**
+> **Start with three long boosts: let go when the meter is 1/2 full, then 1/3, then 1/4.
+> Then hold boost, and flick it off (a quick release, 2 to 4 frames) about 0.1 s after
+> each boost restarts. Never before it: a little late beats early.**
 
-The boost restarts by itself the moment each cooldown ends, and each quick release just
-ends the current boost. It forgives sloppy timing:
+The boost restarts by itself the moment each cooldown ends, and each flick just ends the
+current boost. Once settled, that's about 7 frames of boost and 14 of cooldown: close to
+3 flicks a second, each just after the boost comes back. Can't watch for it? After the same
+start, short flicks 4 to 5 times a second, without looking, cost about 1 s (see "The best
+you can do by hand" below).
+
+With perfect timing, a fixed rhythm gives these averages once stacked:
 
 | Technique | Average boost speed |
 |---|---|
 | Hold, release 2 frames every 9 frames (6.7 per second) | 295 |
 | Hold, release 3 frames every 12 frames (5 per second) | 284 |
 | Hold, release 3 frames every 15 frames (4 per second) | 280 |
-| Hold, release 2 frames every 6 frames (10 per second) | 102 (too fast: cycles can't fit) |
+| Hold, release 2 frames every 6 frames (10 per second) | 101 (too fast: cycles can't fit) |
 | Hold the whole time | 140 |
+
+By hand, the timing is never perfect: see "The best you can do by hand" below.
 
 Don't stop: if you stop boosting, the stacked boost speed fades at 100 per second
 (3 seconds to lose it all).
+
+### The best you can do by hand (Aquas)
+
+![Blue-Marine on Aquas: time from the first boost to the boss arena for every boost length, frame-perfect and by hand](bluemarine-aquas.png)
+
+To put seconds on each technique, we raced them over a real course: Aquas, from the first
+boost to the boss arena. That's about 102,200 units, estimated from the 3:53 speedrun's
+video. Each race starts with no boost speed, at cruise speed 400 plus boost speed.
+
+**Every boost length, frame-perfect** (black curve): from 1 frame to the full meter, the
+same length every time. Shorter is faster, all the way down to 1-frame boosts: 150.1 s. The
+bump at 4 to 7 frames and the step at 15 come from the extra cooldown frame of rule 5.
+
+**Long boosts first is better still.** While you boost, boost speed climbs at 250 per
+second; in the cooldown it falls at only 100 per second. Below the max, a longer boost rides
+higher through its whole cycle; at the max, it only adds cooldown. So each boost should end
+as boost speed tops out: let go as soon as it is 296 or more (the max is 300). From zero,
+that gives boosts of 72, 58, 46, 37, 29, 24... frames, down to 1 frame after 19 s, and
+148.2 s: a search over boost sequences found nothing faster. Over the first 20 s, boost
+speed averages 233 that way, against 167 with 1-frame boosts. Waiting for exactly 300 gives
+150.0 s: the boosts get stuck at 6 frames.
+
+**By hand.** Nobody can play that: it ends with a flick every 3 frames, each on the right
+frame. So we simulated players: reactions of 0.2 s (give or take 0.03 s), timing off by
+about 2 frames either way, 3-frame flicks, and the game reading each button change 1 or
+2 frames late; 16 players per technique. It's a model, not a measurement, but it agrees
+with both console videos: given their measured rhythms, it gives 163 to 164 s for the
+speedrun (164.6 s on the video) and 249 s for the tapping run (253.7 s). A player who aims
+at the same length every time (red curve) can't let go sooner than a reaction after the
+boost restarts: about 13 frames with the input lag, 10% of the meter. Aiming shorter still
+gives 153.8 s.
+
+| Aquas, first boost to the boss arena | Time |
+|---|---|
+| Frame-perfect: let go once boost speed is 296 or more | 148.2 s |
+| Frame-perfect: 1-frame boosts all along | 150.1 s |
+| **By hand: long start, then flick 0.1 s after each boost restarts** | **151.5 s** |
+| By hand: long start, then flick 4 to 5 times a second without looking | 152.4 to 152.8 s |
+| By hand: long start, then flick when you see the boost restart | 152.8 s |
+| By hand: no long start, flick 2 frames every 9 (6.7 a second) | 154.3 s |
+| Frame-perfect: 39-frame boosts (29% of the meter) | 161.1 s |
+| The 3:53 speedrun (about 39-frame boosts), measured on its video | 164.6 s |
+| Hold boost the whole time | 189.0 s |
+| The tapping run, measured on its video | 253.7 s |
+
+The rule is 1.4 s behind frame-perfect 1-frame boosts and 3.3 s behind the best
+frame-perfect play, and 12 to 13 s ahead of the speedrun's boosting. The long start alone is
+worth 1.4 s (152.9 s without it).
+
+**It doesn't need precision.** Starting from the rule (151.5 s):
+
+| What goes wrong | Time |
+|---|---|
+| Each flick 4 frames (0.07 s) too early | 153.8 s |
+| Each flick 4 frames too late | 152.2 s |
+| Timing errors of 4 frames instead of 2 | 152.7 s |
+| Each long boost 8 frames too short | 151.9 s |
+| First long boost at 2/3 of the meter instead of 1/2 | 153.1 s |
+| Reacting to the restart, in 0.28 s (slow reactions, or a TV's lag) | 154.4 s |
+| Without looking: 6-frame flicks 4 times a second | 154.0 s |
+| Without looking: 6-frame flicks 5 times a second | 191.5 s |
+
+- **Too early costs more than too late**, as on the Arwing. A flick that lands while the
+  meter is still emptying does nothing, so that boost runs on until you react; one that
+  overlaps the restart delays it.
+- **Anticipate the restart rather than react to it.** It comes back at a steady beat, about
+  every third of a second: flick just after each one. Reacting works (152.8 s with 0.2 s
+  reactions), but each frame of reaction time costs about 0.3 s.
+- **Without looking, keep the flicks short.** About 40% of them land in the cooldown and do
+  nothing, which is fine. But long flicks at a fast rate are tapping: at 5 a second,
+  6-frame flicks are slower than holding boost.
 
 ## The rules, as code
 
@@ -272,9 +357,9 @@ def hit(s, damage, boosting):
         s.locked = True                        # the cooldown starts next frame
 ```
 
-The full script, `boost_math.py`, has all three vehicles' values, prints every table of
-this post and draws the charts. Run `python boost_math.py`; the charts need
-`pip install matplotlib`.
+The full script, `boost_math.py`, has all three vehicles' values and the simulated players
+of the Blue-Marine section; it prints every table of this post and draws the charts. Run
+`python boost_math.py`; the charts need `pip install matplotlib`.
 
 ## How the numbers were found
 
@@ -325,6 +410,15 @@ up frame by frame.
   or two frames late, so the Arwing's 30-frame boosts came out as 31 and 28 frames (432
   instead of 450).
 
+**The Blue-Marine's frame-perfect schedule, over the whole of Aquas.** The game played it
+with scripted inputs, from the first boost to the boss arena, with no steering and the
+game's own Unkillable mode on (the sub takes its hits but can't die). The boosts came out
+exactly as simulated: 72, 58, 46, 37, 29, 24... frames, then 1-frame boosts. Boost speed
+averaged 232.7 over the first 20 s and 298.3 after that, through 8 hits. The arena came
+148.7 s after the first boost (148.2 s predicted for the estimated 102,200 units); the
+same run with 2-frame boosts all along took 150.8 s. The 3:53 speedrun took 164.6 s over
+that stretch.
+
 ## Not covered yet
 
 - **Special cases.** Boost gates (they push the Arwing above its max boost speed, and
@@ -333,6 +427,9 @@ up frame by frame.
 - **Other frame rates.** Everything here is at 60 fps. In seconds and in meter %, the
   Arwing and Landmaster answers don't depend on the frame rate; the Blue-Marine
   technique might.
+- **The Blue-Marine by hand, in a real level.** The by-hand numbers come from a model of
+  human timing, not from recorded play. The race leaves out steering and hits: a hit that
+  forces the cooldown (rule 6) cuts a long boost short.
 
 ## How we checked it with Gyroship
 
@@ -365,3 +462,9 @@ repository.
   their positions; the prediction adds up `(boost speed A - boost speed B) * dt`, frame by
   frame.
 - **The tables and charts.** `python boost_math.py`, in this folder.
+- **The Aquas run of the frame-perfect schedule.** The script holds X and lets it go for one
+  frame each time the schedule does. The game reads X at present p from the replay's
+  samples p + 777 and p + 778 (either one held counts as held), so a one-frame release is
+  two released samples; the update of present 7103 is the first that can boost. A
+  `--romfs-layer` folder serves a build settings file that keeps the retail build and turns
+  the game's Unkillable mode on, and `--video` films the run.
