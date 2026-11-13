@@ -30,6 +30,7 @@ pub mod sync;
 pub mod thread;
 pub mod time;
 pub mod trace;
+pub mod video;
 
 use gyroship_runtime::{Cpu, Hooks};
 use gyroship_runtime::mem::Memory;
@@ -152,19 +153,27 @@ pub struct Config {
     /// `--hooks FILE`: game functions replaced by ours, `<hex address> <hook>`
     /// per line (see [`hooks`]); the addresses stay in data files (D21).
     pub hooks: Option<std::path::PathBuf>,
+    /// `--video FILE`: the presented images (as `--dump-frames` chooses
+    /// frames) as an H.264 video, through ffmpeg (see [`video`]).
+    pub video: Option<std::path::PathBuf>,
 }
 
 impl Config {
     /// Whether frame `n` (1 for the first present) is dumped: `--dump-frames`,
     /// from `--dump-from`, every `--dump-every`.
     pub fn dumps(&self, n: u64) -> bool {
-        self.frames_dump.is_some() && n >= self.dump_from && n.is_multiple_of(self.dump_every)
+        self.frames_dump.is_some() && self.picks(n)
+    }
+
+    /// Whether frame `n` is one `--dump-from` and `--dump-every` pick.
+    pub fn picks(&self, n: u64) -> bool {
+        n >= self.dump_from && n.is_multiple_of(self.dump_every)
     }
 }
 
 impl Default for Config {
     fn default() -> Config {
-        Config { seed: 0x5EED, explore: false, non_system_memory: 0x2_6410_0000, time_limit: None, frames: None, save_dir: None, vsync: true, work_time: false, gpfifo_dump: None, frames_dump: None, dump_every: 1, dump_from: 0, dump_draws: None, shaders_dump: None, replay: None, profile: None, perf: None, hashes: None, record: None, trace: None, audio_dump: None, play: false, pipeline_cache: None, late_frames: false, romfs_layer: None, hooks: None }
+        Config { seed: 0x5EED, explore: false, non_system_memory: 0x2_6410_0000, time_limit: None, frames: None, save_dir: None, vsync: true, work_time: false, gpfifo_dump: None, frames_dump: None, dump_every: 1, dump_from: 0, dump_draws: None, shaders_dump: None, replay: None, profile: None, perf: None, hashes: None, record: None, trace: None, audio_dump: None, play: false, pipeline_cache: None, late_frames: false, romfs_layer: None, hooks: None, video: None }
     }
 }
 
@@ -396,6 +405,13 @@ impl Kernel {
         let mut g = g.as_deref_mut();
         if let Some(s) = g.as_mut().and_then(|g| g.surfaces.as_mut()) {
             s.finish_pipeline_cache(std::time::Duration::from_secs(3));
+        }
+        if let Some(v) = g.as_mut().and_then(|g| g.video.take()) {
+            let (skipped, path) = (v.skipped, self.config.video.clone().unwrap_or_default());
+            match v.finish() {
+                Ok(()) => eprintln!("gyroship: --video {}: written{}", path.display(), if skipped > 0 { format!(", {skipped} images of another size left out") } else { String::new() }),
+                Err(e) => eprintln!("gyroship: --video {}: {e}", path.display()),
+            }
         }
         if let Some(path) = &self.config.perf {
             let (gpu, stalls) = g.as_mut().and_then(|g| g.surfaces.as_mut()).map_or((Vec::new(), 0), |s| s.frame_times());

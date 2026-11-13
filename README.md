@@ -56,6 +56,7 @@ of the recompiled game can open them; such a run is never a reference run:
 
     harness boot <exefs> --romfs-layer DIR   # DIR's files replace the dump's files at the same RomFS paths
     harness boot <exefs> --hooks FILE        # game functions replaced by Gyroship's: "<hex address> <hook>" per line
+    harness boot <exefs> --video FILE        # the frames --dump-from/--dump-every pick, as H.264 (needs ffmpeg)
 
 A layer with the game's build settings file switched to a development build opens every
 tool: Minus in the pause menu and in the main menu, and the console (hold L+R+ZL+ZR then

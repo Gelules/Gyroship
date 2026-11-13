@@ -1203,6 +1203,20 @@ impl Surfaces {
         true
     }
 
+    /// The image a present shows (the color target written last, its top-left
+    /// `width` × `height` texels) as RGBA rows, waiting for the GPU; None if
+    /// nothing was written, the target is smaller, or the copy failed.
+    pub fn presented_rgba(&mut self, width: u32, height: u32) -> Option<Vec<u8>> {
+        self.flush();
+        let e = self.last_color.and_then(|k| self.map.get(&k))?;
+        if width == 0 || height == 0 || width > e.surface.width || height > e.surface.height {
+            return None;
+        }
+        let full = self.rgba(e).ok()?;
+        let stride = e.surface.width.max(1) as usize * 4;
+        Some(full.chunks(stride).take(height as usize).flat_map(|row| &row[..width as usize * 4]).copied().collect())
+    }
+
     /// Hands the images back from the GPU to the hasher, oldest first; with
     /// `wait`, waits for the GPU first.
     fn collect_hashes(&mut self, wait: bool) {

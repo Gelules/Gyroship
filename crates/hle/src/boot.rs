@@ -291,6 +291,7 @@ pub fn run(mut table: Vec<rt::Entry>, window: Option<HostWindow>) {
         late_frames: flag("--late-frames"),
         romfs_layer: value("--romfs-layer").map(Into::into),
         hooks: value("--hooks").map(Into::into),
+        video: value("--video").map(Into::into),
         ..Config::default()
     };
     if config.play {
@@ -326,8 +327,8 @@ pub fn run(mut table: Vec<rt::Entry>, window: Option<HostWindow>) {
             std::process::exit(2);
         }));
     }
-    // The host GPU runs the game's work when frames are dumped or measured, or with --gpu.
-    if window.is_some() || k.config.frames_dump.is_some() || k.config.perf.is_some() || k.config.hashes.is_some() || flag("--gpu") {
+    // The host GPU runs the game's work when frames are dumped, filmed or measured, or with --gpu.
+    if window.is_some() || k.config.frames_dump.is_some() || k.config.video.is_some() || k.config.perf.is_some() || k.config.hashes.is_some() || flag("--gpu") {
         let backend = match value("--backend").as_deref() {
             None | Some("auto") => gyroship_gpu::Backend::Auto,
             Some("vulkan") => gyroship_gpu::Backend::Vulkan,

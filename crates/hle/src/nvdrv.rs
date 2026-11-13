@@ -148,6 +148,8 @@ pub struct GpuSide {
     pub gpu: Gpu,
     /// `--hashes`: the presents with no image to hash (the others come back from the GPU).
     pub frame_hashes: Vec<(u64, Option<(u64, u64)>)>,
+    /// `--video`: ffmpeg, once the first image came.
+    pub video: Option<crate::video::Video>,
     /// The host window's pace hook and its last size (`boot::HostWindow`).
     pub window: Option<(crate::Pace, (u32, u32))>,
     /// Textures found rewritten by the CPU: (present, GPU address, size), for `--perf`.
@@ -188,7 +190,7 @@ pub enum GpuJob {
 
 impl GpuSide {
     pub fn new(mem: Arc<Memory>, journal: crate::journal::Journal, tally: Arc<Mutex<crate::Tally>>, syncpts: Arc<[AtomicU32; 32]>, config: crate::Config) -> GpuSide {
-        GpuSide { surfaces: None, gpu: Gpu::default(), frame_hashes: Vec::new(), window: None, rewrites: Vec::new(), frames: String::new(), watched: 0, mem, journal, tally, syncpts, config, at: Phase::default() }
+        GpuSide { surfaces: None, gpu: Gpu::default(), frame_hashes: Vec::new(), video: None, window: None, rewrites: Vec::new(), frames: String::new(), watched: 0, mem, journal, tally, syncpts, config, at: Phase::default() }
     }
 
     /// The kernel time the work was handed over at.

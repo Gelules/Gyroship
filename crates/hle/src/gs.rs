@@ -658,6 +658,28 @@ impl GpuSide {
                 self.frame_hashes.push((n, None));
             }
         }
+        // `--video`: the presented image to ffmpeg (host output, not journaled).
+        if let (Some(path), Some(s)) = (self.config.video.clone(), self.surfaces.as_mut())
+            && self.config.picks(n)
+        {
+            let (w, h) = ((area & 0xffff) + 1, (area >> 16) + 1);
+            if let Some(rgba) = s.presented_rgba(w, h) {
+                if self.video.is_none() {
+                    let fps = 60.0 / self.config.dump_every as f64;
+                    match crate::video::Video::start(&path, (w, h), fps) {
+                        Ok(v) => self.video = Some(v),
+                        Err(e) => return Err((2, format!("--video {}: {e}", path.display()))),
+                    }
+                }
+                if let Some(v) = self.video.as_mut() {
+                    if v.size != (w, h) {
+                        v.skipped += 1;
+                    } else if !v.frame(&rgba) {
+                        return Err((2, format!("--video {}: ffmpeg stopped reading", path.display())));
+                    }
+                }
+            }
+        }
         // The host window: show the frame, then wait for its time on the wall clock.
         let now = self.now();
         let shown = ((area & 0xffff) + 1, (area >> 16) + 1);
