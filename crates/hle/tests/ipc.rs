@@ -269,6 +269,29 @@ fn the_nfc_reader_is_listed_and_finds_no_tag() {
     assert_eq!(state(&mut k, &mut cpu), 1);
 }
 
+/// Offline (rule 9): a connection request fails, and nifm has no applet to show
+/// for it (GetAppletInfo fails too). The SDK's HandleNetworkRequestErrorResult
+/// then reports the network as still unavailable instead of launching a
+/// library applet, which aborted the game in run 16.
+#[test]
+fn nifm_fails_requests_and_offers_no_applet() {
+    let (mut k, mut cpu) = kernel();
+    k.allowed_services.push("nifm:u".to_string());
+    let sm = connect_sm(&mut k, &mut cpu);
+    let (_, nifm) = get_service(&mut k, &mut cpu, sm, "nifm:u");
+    let (_, w) = send(&mut k, &mut cpu, nifm, &cmif(&[4], 5, &[0, 0], None));
+    let general = moved(&w);
+    let (_, w) = send(&mut k, &mut cpu, general, &cmif(&[4], 4, &[2], None));
+    let request = moved(&w);
+    let no_network = gyroship_hle::account::NIFM_NO_NETWORK;
+    // Submit, then GetResult and GetAppletInfo.
+    send(&mut k, &mut cpu, request, &cmif(&[4], 4, &[], None));
+    let (_, w) = send(&mut k, &mut cpu, request, &cmif(&[4], 1, &[], None));
+    assert_eq!(cmif_result(&w, 2), no_network);
+    let (_, w) = send(&mut k, &mut cpu, request, &cmif(&[4], 21, &[0], None));
+    assert_eq!(cmif_result(&w, 2), no_network);
+}
+
 /// IStorage Read: the destination is checked and the read counted at once, the
 /// bytes come with the deferred work, and a read over the message is an anomaly.
 #[test]

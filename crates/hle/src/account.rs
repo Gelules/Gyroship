@@ -126,7 +126,10 @@ impl Nifm {
                 Reply::ok()
             }
             // SetRequirementPreset, SetConnectionConfirmationOption, and other settings.
-            (Nifm::Request { .. }, 6 | 8 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21) => Reply::ok(),
+            (Nifm::Request { .. }, 6 | 8 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20) => Reply::ok(),
+            // GetAppletInfo: no applet to show. The SDK then launches none, and
+            // HandleNetworkRequestErrorResult reports the network as unavailable.
+            (Nifm::Request { .. }, 21) => Reply::error(NIFM_NO_NETWORK),
             _ => return None,
         })
     }
