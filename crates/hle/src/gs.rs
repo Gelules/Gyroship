@@ -594,13 +594,16 @@ impl GpuSide {
         // ponytail: checked once per frame; per operation if a stop needs the guest stack.
         if let Some(s) = self.surfaces.as_mut() {
             s.flush();
+            if s.submit_ended {
+                return Err((crate::STOP_EXIT, "the GPU submit thread ended: frames were lost".into()));
+            }
             s.next_frame();
             let skipped = std::mem::take(&mut s.skipped);
             if self.config.perf.is_some() {
                 let cpu = gyroship_runtime::profile::own_cpu_time().unwrap_or_default().as_secs_f64() * 1e3;
                 let (st, calls) = (&s.staging, self.gpu.mme_stats().calls);
                 let row = format!(
-                    "{n},{cpu:.1},{},{},{},{},{},{},{:.1},{calls},{},{:.1}\n",
+                    "{n},{cpu:.1},{},{},{},{},{},{},{:.1},{calls},{},{:.1},{:.1}\n",
                     s.drawn,
                     skipped.values().sum::<u64>(),
                     st.views[0],
@@ -609,7 +612,8 @@ impl GpuSide {
                     st.uploads[0],
                     st.uploads[1] as f64 / 1e6,
                     self.watched,
-                    st.flush_ns as f64 / 1e6
+                    st.flush_ns as f64 / 1e6,
+                    st.submit_ns as f64 / 1e6
                 );
                 self.frames += &row;
             }

@@ -1827,13 +1827,22 @@ mod tests {
     /// level of a block-linear array reads back as its deswizzled guest bytes;
     /// where wgpu's level is a block larger than the guest's (a compressed size
     /// not a multiple of four), the extra blocks read back zero, though the
-    /// staging chunk they come from held the first texture's bytes.
+    /// staging chunk they come from held the first texture's bytes. Inline,
+    /// then on the submit thread, where the staging comes back on submit.
     #[test]
     fn uploads_read_back_as_the_guest_texels() {
+        uploads_read_back(false);
+        uploads_read_back(true);
+    }
+
+    fn uploads_read_back(threaded: bool) {
         let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
             eprintln!("no GPU adapter: test skipped");
             return;
         };
+        if threaded {
+            s.start_submit_thread().unwrap();
+        }
         const TEX: u64 = 0x50_0000;
         let mut h = [0u8; 32];
         put(&mut h, &[(6, 0, 0x08), (9, 7, 2), (12, 10, 2), (15, 13, 2), (18, 16, 2), (21, 19, 2), (24, 22, 3), (27, 25, 4), (30, 28, 5)]);
@@ -1856,6 +1865,7 @@ mod tests {
             key[0] ^= case as u8 + 1;
             let t = s.upload(tic, key, &mut mem).unwrap_or_else(|e| panic!("{e}"));
             s.flush();
+            s.sync();
             for level in 0..=tic.max_mip_level {
                 let bl = textures::tic_level(tic, level).unwrap();
                 let offset = textures::level_offsets(tic)[level as usize] as usize;
@@ -1874,6 +1884,9 @@ mod tests {
                 }
             }
         }
+        assert!(s.errors.lock().unwrap().is_empty(), "threaded {threaded}: {:?}", s.errors.lock().unwrap());
+        // Every staging chunk was handed back for reuse (its re-map asked for).
+        assert!(format!("{:?}", s.texture_belt).contains("closed_chunks: 0"), "threaded {threaded}: {:?}", s.texture_belt);
     }
 
     /// The layers whose bytes a write reached, as `upload` reads a level's slices.
@@ -1968,18 +1981,28 @@ mod tests {
     }
 
     /// Commands recorded before a refresh in place read the old texels: the
-    /// refresh copies among the frame's commands, not before them.
+    /// refresh copies among the frame's commands, not before them. Inline,
+    /// then on the submit thread.
     #[test]
     fn commands_recorded_before_a_refresh_read_the_old_texels() {
+        refresh_after_commands(false);
+        refresh_after_commands(true);
+    }
+
+    fn refresh_after_commands(threaded: bool) {
         let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
             eprintln!("no GPU adapter: test skipped");
             return;
         };
+        if threaded {
+            s.start_submit_thread().unwrap();
+        }
         let (tic, h, slice) = dxt1_array();
         let mut guest: Vec<u8> = (0..slice(2, 2).end).map(|i| (i * 3 + 1) as u8).collect();
         s.begin_job(true);
         let t = s.upload(&tic, h, &mut |a, o| guest_at(&guest, a, o)).unwrap_or_else(|e| panic!("{e}"));
         s.flush();
+        s.sync();
         let (old, pitch, rows) = read_level(&s, &t, 0);
         // Level 0 copied into a buffer, recorded with the frame's commands.
         let buffer = s.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: old.len() as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
@@ -1997,10 +2020,12 @@ mod tests {
         let again = s.upload(&tic, h, &mut |a, o| guest_at(&guest, a, o)).unwrap_or_else(|e| panic!("{e}"));
         assert!(again == t, "refreshed in place");
         s.flush();
+        s.sync();
         buffer.slice(..).map_async(wgpu::MapMode::Read, |r| r.expect("readback mapping failed"));
         s.device.poll(wgpu::PollType::wait_indefinitely()).expect("GPU poll");
         assert!(*buffer.slice(..).get_mapped_range().expect("mapped") == old[..], "the copy recorded before read the old texels");
         assert!(read_level(&s, &t, 0).0 != old, "the texture holds the new ones");
+        assert!(s.errors.lock().unwrap().is_empty(), "threaded {threaded}: {:?}", s.errors.lock().unwrap());
     }
 
     #[test]

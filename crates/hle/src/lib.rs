@@ -402,6 +402,12 @@ impl Kernel {
         if g.is_none() {
             eprintln!("gyroship: GPU work kept the GPU side past {} s: no GPU reports", GPU_WAIT.as_secs());
         }
+        // Play mode: the frames the submit thread holds reach the GPU first, within the same
+        // bound; the reports that wait for the GPU (frame times, hashes) are left out past it.
+        let drained = g.as_ref().and_then(|g| g.surfaces.as_ref()).is_none_or(|s| s.drain(GPU_WAIT));
+        if !drained {
+            eprintln!("gyroship: the GPU submit thread kept its frames past {} s: no GPU frame times or hashes", GPU_WAIT.as_secs());
+        }
         let mut g = g.as_deref_mut();
         if let Some(s) = g.as_mut().and_then(|g| g.surfaces.as_mut()) {
             s.finish_pipeline_cache(std::time::Duration::from_secs(3));
@@ -414,7 +420,7 @@ impl Kernel {
             }
         }
         if let Some(path) = &self.config.perf {
-            let (gpu, stalls) = g.as_mut().and_then(|g| g.surfaces.as_mut()).map_or((Vec::new(), 0), |s| s.frame_times());
+            let (gpu, stalls) = g.as_mut().and_then(|g| g.surfaces.as_mut()).filter(|_| drained).map_or((Vec::new(), 0), |s| s.frame_times());
             gyroship_runtime::profile::write_perf(path, self.config.profile.as_ref().map_or(600, |p| p.1 as usize), &gpu);
             if stalls > 0 {
                 eprintln!("gyroship: GPU frame times: {stalls} flushes waited for the GPU to free a timing slot");
@@ -504,7 +510,10 @@ impl Kernel {
                 eprintln!("gyroship: --record {}: {e}", path.display());
             }
         }
-        if let Some(path) = &self.config.hashes {
+        // No file rather than one without its images.
+        if let Some(path) = &self.config.hashes
+            && drained
+        {
             let mut rows = g.as_mut().map(|g| std::mem::take(&mut g.frame_hashes)).unwrap_or_default();
             if let Some(s) = g.as_mut().and_then(|g| g.surfaces.as_mut()) {
                 rows.extend(s.presented_hashes().into_iter().map(|(n, target, hash)| (n, Some((target, hash)))));
@@ -849,8 +858,9 @@ pub struct Census {
 
 /// The `--perf` frames file: per present, counters so far (cpu_ms: the
 /// presenting host thread's CPU time; watched_pages: pages the textures' write
-/// watch went over); only `skipped` is the present's own.
-pub(crate) const FRAME_COLUMNS: &str = "present,cpu_ms,draws,skipped,views_made,bind_groups_made,flushed_bytes,upload_bytes,upload_ms,macro_calls,watched_pages,flush_ms\n";
+/// watch went over; submit_ms: play mode, the GPU submit thread's busy time,
+/// as of the present's flush); only `skipped` is the present's own.
+pub(crate) const FRAME_COLUMNS: &str = "present,cpu_ms,draws,skipped,views_made,bind_groups_made,flushed_bytes,upload_bytes,upload_ms,macro_calls,watched_pages,flush_ms,submit_ms\n";
 
 const COUNTER: u32 = 0x100;
 const WAIT: u32 = 0x200;

@@ -362,6 +362,13 @@ pub fn run(mut table: Vec<rt::Entry>, window: Option<HostWindow>) {
                 if k.config.perf.is_some() && !s.measure_frames() {
                     eprintln!("gyroship: --perf: this GPU has no timestamps inside command encoders: no GPU frame times");
                 }
+                // D65: in play mode each frame is submitted on a thread of its own (the frame clock goes with it).
+                if k.config.play
+                    && let Err(e) = s.start_submit_thread()
+                {
+                    eprintln!("gyroship: cannot start the GPU submit thread: {e}");
+                    std::process::exit(2);
+                }
                 k.gpu_side().surfaces = Some(s);
             }
             Err(e) => {

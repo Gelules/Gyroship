@@ -251,6 +251,12 @@ pub struct Surfaces {
     last_color: Option<(u64, u32)>,
     /// The window the presented images go to, if any.
     window: Option<Window>,
+    /// Play mode: the thread that finishes, submits and shows each frame
+    /// ([`Surfaces::start_submit_thread`]).
+    submit: Option<Submit>,
+    /// Play mode: the submit thread ended (its panic is on stderr), losing the
+    /// frames it held and their uploads: the run must stop.
+    pub submit_ended: bool,
     /// This submit's guest reads and staged blocks, for the reads that repeat.
     pub(crate) memo: Memo,
     /// Shader modules and pipelines made since the caller last took them, and
@@ -481,9 +487,14 @@ struct Frame {
 /// arena bytes copied through `belt`. The texture uploads' and the arena's
 /// copies run before the frame's commands (their command buffers come first),
 /// and after the previous frame's, which read the same arena bytes: queue
-/// order. Returns the arena bytes, emptied.
-fn submit_frame(device: &wgpu::Device, queue: &wgpu::Queue, belt: &mut wgpu::util::StagingBelt, mut clock: Option<&mut crate::timing::FrameClock>, timing: Option<&mut crate::timing::Timing>, f: Frame) -> Vec<u8> {
-    let mut buffers = Vec::with_capacity(3);
+/// order. `stamp`: the frame clock's first timestamp is written here, just
+/// before the frame's commands (the submit thread's; inline, `encoder` wrote
+/// it, so the span then leaves out the barriers and first-use clears wgpu puts
+/// at the head of the frame's commands: microseconds). Returns the arena
+/// bytes, emptied.
+#[allow(clippy::too_many_arguments)]
+fn submit_frame(device: &wgpu::Device, queue: &wgpu::Queue, belt: &mut wgpu::util::StagingBelt, mut clock: Option<&mut crate::timing::FrameClock>, timing: Option<&mut crate::timing::Timing>, stamp: bool, f: Frame) -> Vec<u8> {
+    let mut buffers = Vec::with_capacity(4);
     if let Some(uploads) = f.uploads {
         buffers.push(uploads.finish());
     }
@@ -500,6 +511,11 @@ fn submit_frame(device: &wgpu::Device, queue: &wgpu::Queue, belt: &mut wgpu::uti
             t.resolve(&mut e);
         }
         if let Some(c) = clock.as_deref_mut() {
+            if stamp {
+                let mut s = device.create_command_encoder(&Default::default());
+                c.open(&mut s);
+                buffers.push(s.finish());
+            }
             c.close(device, &mut e);
         }
         buffers.push(e.finish());
@@ -516,6 +532,28 @@ fn submit_frame(device: &wgpu::Device, queue: &wgpu::Queue, belt: &mut wgpu::uti
     // Chunks whose copies were submitted come back once the GPU is done.
     belt.recall();
     bytes
+}
+
+/// A job for the submit thread.
+type SubmitJob = Box<dyn FnOnce(&mut Submitter) + Send>;
+
+/// What the submit thread owns: the arena's staging, the frame clock and the window.
+struct Submitter {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    belt: wgpu::util::StagingBelt,
+    clock: Option<crate::timing::FrameClock>,
+    window: Option<Window>,
+    /// Each frame's arena bytes, emptied, back to the recording thread.
+    spare: std::sync::mpsc::Sender<Vec<u8>>,
+}
+
+/// The way to the submit thread: its jobs (one running and one waiting at
+/// most), the arena bytes it gives back, and the nanoseconds its jobs took.
+struct Submit {
+    jobs: std::sync::mpsc::SyncSender<SubmitJob>,
+    spare: std::sync::mpsc::Receiver<Vec<u8>>,
+    busy: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// What the upload arena carried since the start: staged blocks (and those an
@@ -543,8 +581,12 @@ pub struct Staging {
     /// deswizzle, copy, and the wait after a large one).
     pub uploads: [u64; 2],
     /// Host nanoseconds in `flush`: the arena's copy, the command buffers
-    /// finished, the submit.
+    /// finished, the submit (in play mode, handing the frame to the submit
+    /// thread instead).
     pub flush_ns: u64,
+    /// Play mode: host nanoseconds the submit thread's jobs took (each
+    /// flush's GPU half, each frame shown), as of the last flush.
+    pub submit_ns: u64,
 }
 
 /// What a guest read for the GPU was for, an index into [`Staging`]'s arrays.
@@ -791,7 +833,7 @@ impl Surfaces {
         let window = window.map(|(surface, size)| Window::new(&adapter, &device, surface, size));
         let timing = crate::timing::Timing::new(&device, &queue);
         let renderable = (0..=0xff).filter_map(color_format).chain((0..=0xff).filter_map(depth_format)).map(|f| (f, renderable_on(&adapter, &device, f))).collect();
-        Ok(Surfaces { renderable, adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pass: None, pending: None, timing, clock: None, present: 0, readbacks: Default::default(), hasher: None, arena, belt, big_upload: false, texture_belt, uploads: None, staging: Staging::default(), staged: FxMap::default(), last_color: None, window, memo: Memo::default(), compile: Compile::default(), compile_total: Compile::default(), background: false, wait_left: PIPELINE_WAIT, workers: None, finished: Default::default(), disk_cache: None, views: Aged::default(), bind_groups: Groups::default(), dynamic_max, clip_distances })
+        Ok(Surfaces { renderable, adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pass: None, pending: None, timing, clock: None, present: 0, readbacks: Default::default(), hasher: None, arena, belt, big_upload: false, texture_belt, uploads: None, staging: Staging::default(), staged: FxMap::default(), last_color: None, window, submit: None, submit_ended: false, memo: Memo::default(), compile: Compile::default(), compile_total: Compile::default(), background: false, wait_left: PIPELINE_WAIT, workers: None, finished: Default::default(), disk_cache: None, views: Aged::default(), bind_groups: Groups::default(), dynamic_max, clip_distances })
     }
 
     /// Shows the presented image (the color target written last, its top-left
@@ -799,9 +841,19 @@ impl Surfaces {
     /// happens without a window, with nothing written, or while minimized.
     pub fn show(&mut self, area: (u32, u32), size: (u32, u32)) {
         self.flush();
-        let (Some(w), Some(key)) = (self.window.as_mut(), self.last_color) else { return };
-        let Some(e) = self.map.get(&key) else { return };
-        w.show(&self.device, &self.queue, &e.texture, (e.surface.width, e.surface.height), area, size);
+        let Some(e) = self.last_color.and_then(|k| self.map.get(&k)) else { return };
+        let (texture, target) = (e.texture.clone(), (e.surface.width, e.surface.height));
+        if self.submit.is_some() {
+            // Play mode: the submit thread shows it, after the frame it was just given.
+            return self.send(Box::new(move |s: &mut Submitter| {
+                if let Some(w) = &mut s.window {
+                    w.show(&s.device, &s.queue, &texture, target, area, size);
+                }
+            }));
+        }
+        if let Some(w) = &mut self.window {
+            w.show(&self.device, &self.queue, &texture, target, area, size);
+        }
     }
 
     /// The encoder that collects a frame's passes: one submit per frame
@@ -826,9 +878,18 @@ impl Surfaces {
     }
 
     /// Waits for the GPU; each present's GPU milliseconds (index: present) and
-    /// how many flushes had to wait for the GPU to free a timing slot.
+    /// how many flushes had to wait for the GPU to free a timing slot. At the
+    /// end of a run: in play mode the clock comes back from the submit thread
+    /// once it has submitted every frame (none if it is stuck past 3 s).
     pub fn frame_times(&mut self) -> (Vec<f64>, u64) {
         self.flush();
+        if self.submit.is_some() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.send(Box::new(move |s: &mut Submitter| {
+                let _ = tx.send(s.clock.take());
+            }));
+            self.clock = rx.recv_timeout(std::time::Duration::from_secs(3)).ok().flatten();
+        }
         self.clock.as_mut().map_or((Vec::new(), 0), |c| (c.finish(&self.device), c.stalls))
     }
 
@@ -1056,12 +1117,112 @@ impl Surfaces {
             self.staging.flushes += 1;
             self.staged.clear();
         }
-        // The texture staging is closed even with no upload: a refresh may have used it.
-        self.texture_belt.finish();
-        let f = Frame { uploads: self.uploads.take(), arena: (self.arena.0.clone(), std::mem::take(&mut self.arena.1)), pending: self.pending.take(), present: self.present };
-        self.arena.1 = submit_frame(&self.device, &self.queue, &mut self.belt, self.clock.as_mut(), self.timing.as_mut(), f);
-        self.texture_belt.recall();
+        if self.submit.is_some() {
+            self.hand_over();
+        } else {
+            // The texture staging is closed even with no upload: a refresh may have used it.
+            self.texture_belt.finish();
+            let f = Frame { uploads: self.uploads.take(), arena: (self.arena.0.clone(), std::mem::take(&mut self.arena.1)), pending: self.pending.take(), present: self.present };
+            self.arena.1 = submit_frame(&self.device, &self.queue, &mut self.belt, self.clock.as_mut(), self.timing.as_mut(), false, f);
+            self.texture_belt.recall();
+        }
+        if let Some(t) = &self.submit {
+            self.staging.submit_ns = t.busy.load(std::sync::atomic::Ordering::Relaxed);
+        }
         self.staging.flush_ns += started.elapsed().as_nanos() as u64;
+    }
+
+    /// Play mode: the work recorded so far goes to the submit thread, which
+    /// finishes and submits it while this thread records the next frame.
+    fn hand_over(&mut self) {
+        if self.uploads.is_none() && self.pending.is_none() && self.arena.1.is_empty() {
+            return;
+        }
+        // The texture staging is mapped again right after the submit that carries its
+        // copies (each staging allocation records its copy at once: `stage_level`).
+        match self.pending.as_ref().or(self.uploads.as_ref()) {
+            Some(e) => self.texture_belt.finish_and_recall_on_submit(e),
+            None => self.texture_belt.finish(),
+        }
+        let len = self.arena.1.len();
+        let spare = self.submit.as_ref().and_then(|t| t.spare.try_recv().ok()).unwrap_or_else(|| Vec::with_capacity(len));
+        let f = Frame { uploads: self.uploads.take(), arena: (self.arena.0.clone(), std::mem::replace(&mut self.arena.1, spare)), pending: self.pending.take(), present: self.present };
+        self.send(Box::new(move |s: &mut Submitter| {
+            let bytes = submit_frame(&s.device, &s.queue, &mut s.belt, s.clock.as_mut(), None, true, f);
+            let _ = s.spare.send(bytes);
+        }));
+    }
+
+    /// Play mode (D65): from now on each frame is finished, submitted and
+    /// shown on a thread of its own while this one records the next; the
+    /// frame clock and the window go with it. Not with GYROSHIP_GPU_TIMES,
+    /// which waits for the GPU at each flush anyway.
+    pub fn start_submit_thread(&mut self) -> std::io::Result<()> {
+        if self.timing.is_some() {
+            return Ok(());
+        }
+        let (jobs, rx) = std::sync::mpsc::sync_channel::<SubmitJob>(1);
+        let (back, spare) = std::sync::mpsc::channel();
+        let busy = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // The arena's staging is the thread's now; this one serves only if the thread ends.
+        let belt = std::mem::replace(&mut self.belt, wgpu::util::StagingBelt::new(self.device.clone(), 16 << 20));
+        let mut s = Submitter { device: self.device.clone(), queue: self.queue.clone(), belt, clock: self.clock.take(), window: self.window.take(), spare: back };
+        let took = busy.clone();
+        std::thread::Builder::new().name("gpu submit".into()).spawn(move || {
+            for job in rx {
+                let started = std::time::Instant::now();
+                job(&mut s);
+                took.fetch_add(started.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+        })?;
+        self.submit = Some(Submit { jobs, spare, busy });
+        Ok(())
+    }
+
+    /// Play mode: queues a job for the submit thread, waiting while another
+    /// one waits. If the thread ended, frames are submitted here until the
+    /// run stops (`submit_ended`).
+    fn send(&mut self, job: SubmitJob) {
+        if let Some(t) = &self.submit
+            && t.jobs.send(job).is_err()
+        {
+            self.submit = None;
+            self.submit_ended = true;
+        }
+    }
+
+    /// Play mode: returns once the submit thread has run every job sent so
+    /// far, for work submitted here, or a wait for the GPU, that must follow them.
+    pub(crate) fn sync(&mut self) {
+        if self.submit.is_some() {
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            self.send(Box::new(move |_: &mut Submitter| {
+                let _ = tx.send(());
+            }));
+            let _ = rx.recv(); // at once if the thread ended: the job was dropped
+        }
+    }
+
+    /// As [`Surfaces::sync`], `patience` at most, even with the submit thread
+    /// stuck in the driver (the end of a run); false if it is still busy then.
+    /// A thread that ended holds nothing more.
+    pub fn drain(&self, patience: std::time::Duration) -> bool {
+        use std::sync::mpsc::{RecvTimeoutError, TrySendError};
+        let Some(t) = &self.submit else { return true };
+        let since = std::time::Instant::now();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut job: SubmitJob = Box::new(move |_: &mut Submitter| {
+            let _ = tx.send(());
+        });
+        loop {
+            match t.jobs.try_send(job) {
+                Ok(()) => return !matches!(rx.recv_timeout(patience.saturating_sub(since.elapsed())), Err(RecvTimeoutError::Timeout)),
+                Err(TrySendError::Full(j)) if since.elapsed() < patience => job = j,
+                Err(TrySendError::Full(_)) => return false,
+                Err(TrySendError::Disconnected(_)) => return true,
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     /// After an upload of 32 MiB or more (`big_upload`), at the start of the next
@@ -1072,6 +1233,7 @@ impl Surfaces {
     pub(crate) fn flush_big_uploads(&mut self) {
         if std::mem::take(&mut self.big_upload) {
             self.flush();
+            self.sync();
             let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
             self.texture_belt = wgpu::util::StagingBelt::new(self.device.clone(), 16 << 20);
         }
@@ -1123,6 +1285,9 @@ impl Surfaces {
     /// and a buffer twice as large, with room for `range`, takes over; recorded
     /// work keeps the old one alive.
     fn grow_arena(&mut self, range: usize) {
+        // Play mode: no frame may wait in the submit thread's queue, or this write
+        // (sent with the next submit) would land before that frame's own arena copy.
+        self.sync();
         self.staging.flushed += self.arena.1.len() as u64;
         self.queue.write_buffer(&self.arena.0, 0, &self.arena.1);
         let capacity = (self.arena.0.size() * 2).max((range as u64).next_power_of_two());
@@ -1240,7 +1405,9 @@ impl Surfaces {
     /// thread: the frame never waits ([`Surfaces::presented_hashes`]). False if
     /// nothing was written or the target is smaller.
     pub fn hash_presented(&mut self, present: u64, width: u32, height: u32) -> bool {
+        // The copy is submitted here: after the frame (in play mode, once the submit thread has).
         self.flush();
+        self.sync();
         let Some(e) = self.last_color.and_then(|k| self.map.get(&k)) else { return false };
         let Some(bpp) = e.texture.format().block_copy_size(None) else { return false };
         if width == 0 || height == 0 || width > e.surface.width || height > e.surface.height {
@@ -1271,6 +1438,7 @@ impl Surfaces {
     /// nothing was written, the target is smaller, or the copy failed.
     pub fn presented_rgba(&mut self, width: u32, height: u32) -> Option<Vec<u8>> {
         self.flush();
+        self.sync();
         let e = self.last_color.and_then(|k| self.map.get(&k))?;
         if width == 0 || height == 0 || width > e.surface.width || height > e.surface.height {
             return None;
@@ -1500,6 +1668,7 @@ impl Surfaces {
     pub fn dump(&mut self, dir: &Path, prefix: &str) -> Result<usize, String> {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         self.flush();
+        self.sync();
         let mut keys = std::mem::take(&mut self.touched);
         // GYROSHIP_DUMP_ONLY=<hex address>: that target alone (dumps every few frames).
         if let Some(only) = std::env::var("GYROSHIP_DUMP_ONLY").ok().and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()) {
@@ -1816,5 +1985,74 @@ mod tests {
         assert!(!s.hash_presented(3, 5, 1));
         let blue = |texels: usize| fnv(&[0u8, 0, 255, 255].repeat(texels));
         assert_eq!(s.presented_hashes(), vec![(1, target.addr, blue(8)), (2, target.addr, blue(4))]);
+    }
+
+    /// Frames handed to the submit thread draw what inline frames draw. Five
+    /// presents of masked clears (fills whose colour is staged in the arena).
+    /// On the thread, a job holds it at presents 2 and 4: frame 2 still waits
+    /// in its queue while the third grows the arena (fills before and after
+    /// the growth on other channels), and frame 4 while the fifth is recorded
+    /// and handed over (red only, over frame 4's green). Each image reads back
+    /// as its colours, the frame clock timed every present, no wgpu error
+    /// came, and a drain gives up on a held thread. Needs a GPU adapter.
+    #[test]
+    fn the_submit_thread_draws_the_inline_frames() {
+        let target = Surface { addr: 0x81_0000_8000, width: 4, height: 2, format: 0xd5, layers: 1 };
+        let fill = |s: &mut Surfaces, mask: u8, v: [u8; 4]| s.clear(&Clear { layer: 0, color: Some((target, v.map(|c| (f32::from(c) / 255.0).to_bits()), mask)), depth: None, scissor: None });
+        // A job holding the submit thread until the sender it returns is dropped.
+        let hold = |s: &mut Surfaces| {
+            let (open, gate) = std::sync::mpsc::channel::<()>();
+            s.send(Box::new(move |_: &mut Submitter| {
+                let _ = gate.recv();
+            }));
+            open
+        };
+        for threaded in [false, true] {
+            let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
+                eprintln!("no GPU adapter: test skipped");
+                return;
+            };
+            let timed = s.measure_frames();
+            if threaded {
+                s.start_submit_thread().unwrap();
+                assert!(s.submit.is_some(), "no submit thread (GYROSHIP_GPU_TIMES set?)");
+            }
+            for n in 1..=5u8 {
+                s.present = u64::from(n);
+                fill(&mut s, if n == 5 { 0x1 } else { 0x3 }, [17 * n, 255 - 17 * n, 0, 0]);
+                if n == 3 {
+                    s.stage(&vec![1; 17 << 20]);
+                    fill(&mut s, 0x4, [0, 0, 64, 0]);
+                }
+                if threaded && n % 2 == 0 {
+                    let open = hold(&mut s);
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                        drop(open);
+                    });
+                }
+                s.flush();
+                if n % 2 == 1 {
+                    assert!(s.hash_presented(u64::from(n), 4, 2));
+                }
+            }
+            assert!(s.arena.0.size() > 16 << 20, "the arena grew");
+            let (ms, _) = s.frame_times();
+            let rgba = |n: u8| {
+                let green = if n == 5 { 4 } else { n };
+                [17 * n, 255 - 17 * green, if n < 3 { 0 } else { 64 }, 0]
+            };
+            let want: Vec<_> = [1u8, 3, 5].iter().map(|&n| (u64::from(n), target.addr, fnv(&rgba(n).repeat(8)))).collect();
+            assert_eq!(s.presented_hashes(), want, "threaded {threaded}");
+            // Microseconds of work: a slot without its first timestamp would give the GPU clock's value.
+            assert!(!timed || (1..=5).all(|n| ms.get(n).is_some_and(|&t| t > 0.0 && t < 100.0)), "threaded {threaded}: GPU times {ms:?}");
+            assert!(s.errors.lock().unwrap().is_empty(), "threaded {threaded}: {:?}", s.errors.lock().unwrap());
+            if threaded {
+                let open = hold(&mut s);
+                assert!(!s.drain(std::time::Duration::from_millis(100)), "a drain waits for a held thread");
+                drop(open);
+                assert!(s.drain(std::time::Duration::from_secs(3)));
+            }
+        }
     }
 }
