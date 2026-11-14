@@ -146,13 +146,83 @@ pub struct Decoder {
     /// Presents each waiting channel has waited through.
     stalls: BTreeMap<u32, u32>,
     /// Host nanoseconds so far reading and decoding pushbuffers (the command
-    /// processor, macros included), for `--perf`.
+    /// processor, macros included), and, apart, waiting for the GPU thread
+    /// (its barriers and the end of each submit), for `--perf`.
     pub decode_ns: u64,
+    pub gpu_wait_ns: u64,
     mem: Arc<Memory>,
     journal: crate::journal::Journal,
     tally: Arc<Mutex<crate::Tally>>,
     config: crate::Config,
     at: Phase,
+    /// Play mode: the GPU thread, which applies the ops while this decodes.
+    pub gpu: Option<GpuThread>,
+    /// With the GPU thread, the pushbuffers this submit decoded: the ops
+    /// already applied when each was read, the number of the op it made, and
+    /// its CPU range: (applied, op, start, end).
+    ahead: Vec<(u64, u64, u64, u64)>,
+    /// With the GPU thread, the guest memory each op of this submit may write
+    /// once applied, by its number: CPU ranges, or None for anywhere.
+    writes: Vec<(u64, Option<Ranges>)>,
+}
+
+/// The GPU thread (play mode): it applies the decoded ops in order while the
+/// submitting thread decodes the next GPFIFO entries. A submit returns once
+/// they are all applied (joined): the guest sees what it saw without it.
+pub struct GpuThread {
+    ops: std::sync::mpsc::SyncSender<(Phase, GpuOp)>,
+    progress: Arc<Progress>,
+    /// Ops sent so far.
+    sent: u64,
+    thread: std::thread::JoinHandle<()>,
+}
+
+/// How far the GPU thread got; its waiters wake at each op.
+#[derive(Default)]
+struct Progress {
+    state: Mutex<Applied>,
+    changed: std::sync::Condvar,
+}
+
+/// Ops applied so far (those after a stop are skipped, and counted), the
+/// stop the GPU thread met, and whether it ended.
+#[derive(Default)]
+struct Applied {
+    ops: u64,
+    stop: Option<Stop>,
+    ended: bool,
+}
+
+/// Ops in flight at most: about two heavy frames' GPFIFO entries.
+const IN_FLIGHT: usize = 256;
+
+/// CPU ranges of guest memory: (start, end).
+type Ranges = Vec<(u64, u64)>;
+
+/// The stop of a run whose GPU thread ended (a panic).
+fn gpu_thread_ended() -> Stop {
+    (crate::STOP_EXIT, "the GPU thread ended: GPU work was lost".into())
+}
+
+/// The guest memory `effects` may write once applied, as CPU ranges through
+/// `maps`; None when that cannot be told before (a compute dispatch's QMD
+/// releases, a block-linear copy). Releases and semaphores count 16 bytes.
+fn writes_of(maps: &crate::gs::Mappings, space: u32, effects: &[Effect]) -> Option<Ranges> {
+    let mut out = Vec::new();
+    for e in effects {
+        let (gpu, len) = match e {
+            // A release of 1 at address 0 increments the channel's syncpoint: no memory.
+            Effect::Release(r) if r.addr == 0 && r.value == 1 && !r.timestamp => continue,
+            Effect::Release(r) => (r.addr, 16),
+            Effect::Semaphore(r) => (r.addr, 16),
+            Effect::Write(w) => (w.address, w.data.len() as u64),
+            Effect::Copy(c) if c.dst_block.is_none() => (c.dst, u64::from(c.line_count.max(1) - 1) * u64::from(c.pitch_out) + u64::from(c.line_length)),
+            Effect::Copy(_) | Effect::Dispatch(..) => return None,
+            _ => continue,
+        };
+        out.extend(crate::gs::cpu_ranges(maps, space, gpu, len));
+    }
+    Some(out)
 }
 
 /// GPU work decoded, for the GPU side to perform in order ([`GpuSide::apply`]).
@@ -202,6 +272,10 @@ pub struct GpuSide {
     /// Host nanoseconds so far performing GPU ops (the take of written
     /// textures, guest writes, and translating and recording draws), for `--perf`.
     pub effects_ns: u64,
+    /// With the GPU thread: the number of the op it applies, and the guest
+    /// memory its ops wrote since the submit began: (op, start, end).
+    pub applying: u64,
+    pub wrote: Option<Vec<(u64, u64, u64)>>,
     pub mem: Arc<Memory>,
     pub journal: crate::journal::Journal,
     pub tally: Arc<Mutex<crate::Tally>>,
@@ -234,7 +308,7 @@ pub enum GpuJob {
 
 impl GpuSide {
     pub fn new(mem: Arc<Memory>, journal: crate::journal::Journal, tally: Arc<Mutex<crate::Tally>>, syncpts: Arc<[AtomicU32; 32]>, config: crate::Config) -> GpuSide {
-        GpuSide { surfaces: None, gpu: Gpu::default(), frame_hashes: Vec::new(), video: None, window: None, rewrites: Vec::new(), frames: String::new(), watched: 0, effects_ns: 0, mem, journal, tally, syncpts, config, at: Phase::default() }
+        GpuSide { surfaces: None, gpu: Gpu::default(), frame_hashes: Vec::new(), video: None, window: None, rewrites: Vec::new(), frames: String::new(), watched: 0, effects_ns: 0, applying: 0, wrote: None, mem, journal, tally, syncpts, config, at: Phase::default() }
     }
 
     /// The kernel time the work was handed over at.
@@ -261,6 +335,9 @@ impl GpuSide {
         let started = Instant::now();
         let done = match op {
             GpuOp::Begin { space } => {
+                if let Some(w) = &mut self.wrote {
+                    w.clear();
+                }
                 forget_written_textures(self, space);
                 if let Some(s) = self.surfaces.as_mut() {
                     // After the take: textures written in part may be refreshed in place.
@@ -278,11 +355,19 @@ impl GpuSide {
         self.effects_ns += started.elapsed().as_nanos() as u64;
         done
     }
+
+    /// With the GPU thread: the op being applied writes `len` bytes of guest
+    /// memory at `at` (checked against the pushbuffers decoded ahead).
+    fn note_write(&mut self, at: u64, len: usize) {
+        if let Some(w) = &mut self.wrote {
+            w.push((self.applying, at, at + len as u64));
+        }
+    }
 }
 
 impl Decoder {
     pub fn new(mem: Arc<Memory>, journal: crate::journal::Journal, tally: Arc<Mutex<crate::Tally>>, config: crate::Config) -> Decoder {
-        Decoder { channels: BTreeMap::new(), stalls: BTreeMap::new(), decode_ns: 0, mem, journal, tally, config, at: Phase::default() }
+        Decoder { channels: BTreeMap::new(), stalls: BTreeMap::new(), decode_ns: 0, gpu_wait_ns: 0, mem, journal, tally, config, at: Phase::default(), gpu: None, ahead: Vec::new(), writes: Vec::new() }
     }
 
     /// Logs a line, stamped as the hand-over.
@@ -304,6 +389,12 @@ impl Decoder {
         let (at, len) = (e & 0xffff_fffc | (e >> 32 & 0xff) << 32, (e >> 42 & 0x1f_ffff) as usize);
         let mut raw = vec![0u8; 4 * len.min(0x10_0000)];
         let addr = crate::gs::gpu_to_cpu(&self.at.maps, space, at);
+        // With the GPU thread, the earlier ops may not be applied yet: what they write here would be
+        // missed. Those it applied are seen (their count is read under the lock they set it under).
+        if let Some(t) = &self.gpu {
+            let applied = crate::lock(&t.progress.state).ops;
+            self.ahead.push((applied, t.sent, addr, addr + raw.len() as u64));
+        }
         if self.mem.read(addr, &mut raw).is_err() {
             self.anomaly("gpfifo unreadable", &format!("channel fd {fd}: pushbuffer {at:#x} ({len} words) is not readable at {addr:#x}"))?;
             return Ok(None);
@@ -318,14 +409,30 @@ impl Decoder {
             let _ = std::fs::create_dir_all(dir);
             let _ = std::fs::write(dir.join(format!("submit-{submits:04}-{rank:04}-{at:010x}.bin")), &raw);
         }
-        let Decoder { channels, mem, at: phase, .. } = self;
+        let Decoder { channels, mem, at: phase, gpu, writes, .. } = self;
         let (channel, channel_space) = channels.entry(fd).or_insert_with(|| (Channel::default(), space));
         *channel_space = space;
         let before = channel.waiting();
-        let effects = channel.run_with(&words, &mut |a, buf| crate::gs::read_gpu(mem, &phase.maps, space, a, buf));
+        // The acquires and macro DMA reads see the earlier entries' effects, as
+        // without the GPU thread: a read waits until the last op sent that may
+        // write its bytes is applied. A stop then ends the submit after decoding.
+        let mut waited = std::time::Duration::ZERO;
+        let effects = channel.run_with(&words, &mut |a, buf| {
+            if let Some(t) = gpu.as_ref() {
+                let read = crate::gs::cpu_ranges(&phase.maps, space, a, buf.len() as u64);
+                let writer = writes.iter().rev().find(|(_, w)| w.as_ref().is_none_or(|w| w.iter().any(|&(s, e)| read.iter().any(|&(a, b)| s < b && a < e))));
+                if let Some(&(op, _)) = writer {
+                    let since = Instant::now();
+                    let _ = t.wait_for(op + 1);
+                    waited += since.elapsed();
+                }
+            }
+            crate::gs::read_gpu(mem, &phase.maps, space, a, buf)
+        });
         let after = channel.waiting();
         self.note_wait(fd, space, before, after);
-        self.decode_ns += decoding.elapsed().as_nanos() as u64;
+        self.decode_ns += decoding.elapsed().saturating_sub(waited).as_nanos() as u64;
+        self.gpu_wait_ns += waited.as_nanos() as u64;
         Ok(Some(effects))
     }
 
@@ -372,9 +479,135 @@ impl Decoder {
         }
         all
     }
+
+    /// Play mode: a submit decoded here while the GPU thread applies its ops;
+    /// it returns once they are all applied. The first stop in stream order
+    /// wins: the GPU thread's comes from an earlier op than the decoder's.
+    fn run_threaded(&mut self, side: &Mutex<GpuSide>, phase: &Phase, fd: u32, space: u32, entries: &[u8]) -> Result<(), Stop> {
+        let Some(t) = self.gpu.as_mut() else { return Err(gpu_thread_ended()) };
+        self.ahead.clear();
+        self.writes.clear();
+        let sent = t.send(phase, GpuOp::Begin { space }).and_then(|()| {
+            for (rank, e) in entries.as_chunks::<8>().0.iter().map(|e| u64::from_le_bytes(*e)).enumerate() {
+                if let Some(effects) = self.decode(fd, space, rank, e)?
+                    && let Some(t) = self.gpu.as_mut()
+                {
+                    self.writes.push((t.sent, writes_of(&self.at.maps, space, &effects)));
+                    t.send(phase, GpuOp::Effects { space, effects })?;
+                }
+            }
+            Ok(())
+        });
+        let since = Instant::now();
+        let joined = self.gpu.as_ref().map_or(Err(gpu_thread_ended()), GpuThread::join);
+        self.gpu_wait_ns += since.elapsed().as_nanos() as u64;
+        joined.and(sent)?;
+        // An op that wrote a pushbuffer decoded before it ran: that decode missed the write.
+        let wrote = crate::lock(side).wrote.as_mut().map(std::mem::take).unwrap_or_default();
+        if let Some((op, start, end)) = wrote.into_iter().find(|&(op, start, end)| self.ahead.iter().any(|&(applied, read, a, b)| applied <= op && op < read && start < b && a < end)) {
+            self.anomaly("gpu wrote a pushbuffer read ahead", &format!("op {op} wrote {start:#x}..{end:#x}, in a pushbuffer decoded before it ran"))?;
+        }
+        Ok(())
+    }
+}
+
+impl GpuThread {
+    /// Starts the GPU thread, with the guest threads' stack reservation:
+    /// shader translation and validation run on it.
+    pub fn start(side: Arc<Mutex<GpuSide>>) -> std::io::Result<GpuThread> {
+        let (ops, rx) = std::sync::mpsc::sync_channel::<(Phase, GpuOp)>(IN_FLIGHT);
+        let progress = Arc::new(Progress::default());
+        let p = progress.clone();
+        let thread = std::thread::Builder::new().name("gpu".into()).stack_size(gyroship_runtime::fiber::STACK_RESERVE).spawn(move || {
+            /// However the thread ends (a panic too), its waiters wake and see it.
+            struct Ended(Arc<Progress>);
+            impl Drop for Ended {
+                fn drop(&mut self) {
+                    crate::lock(&self.0.state).ended = true;
+                    self.0.changed.notify_all();
+                }
+            }
+            let _ended = Ended(p.clone());
+            for (n, (phase, op)) in (0u64..).zip(rx) {
+                let stopped = crate::lock(&p.state).stop.is_some();
+                let done = if stopped { Ok(()) } else { apply_op(&side, phase, op, n) };
+                let mut state = crate::lock(&p.state);
+                state.ops += 1;
+                if let Err(e) = done {
+                    state.stop.get_or_insert(e);
+                }
+                drop(state);
+                p.changed.notify_all();
+            }
+        })?;
+        Ok(GpuThread { ops, progress, sent: 0, thread })
+    }
+
+    /// Sends an op; the stop the thread met, if any, instead.
+    fn send(&mut self, phase: &Phase, op: GpuOp) -> Result<(), Stop> {
+        if let Some(e) = crate::lock(&self.progress.state).stop.clone() {
+            return Err(e);
+        }
+        self.ops.send((phase.clone(), op)).map_err(|_| gpu_thread_ended())?;
+        self.sent += 1;
+        Ok(())
+    }
+
+    /// Waits until every op sent so far is applied; the stop the thread met, if any.
+    fn join(&self) -> Result<(), Stop> {
+        self.wait_for(self.sent)
+    }
+
+    /// Waits until `n` ops are applied; the stop the thread met, if any.
+    fn wait_for(&self, n: u64) -> Result<(), Stop> {
+        let mut state = crate::lock(&self.progress.state);
+        while state.ops < n && state.stop.is_none() && !state.ended {
+            state = self.progress.changed.wait(state).unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        match &state.stop {
+            Some(e) => Err(e.clone()),
+            None if state.ops < n => Err(gpu_thread_ended()),
+            None => Ok(()),
+        }
+    }
+
+    /// The thread's CPU time so far (`--perf`; Windows only).
+    pub fn cpu_time(&self) -> Option<std::time::Duration> {
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            gyroship_runtime::profile::cpu_time(self.thread.as_raw_handle() as usize)
+        }
+        #[cfg(not(windows))]
+        None
+    }
+}
+
+/// On the GPU thread: op number `n`, handed over at `phase`, under the GPU
+/// side's lock, which the play engine's watchdog sees held.
+fn apply_op(side: &Mutex<GpuSide>, phase: Phase, op: GpuOp, n: u64) -> Result<(), Stop> {
+    let mut g = crate::lock(side);
+    crate::GPU_SINCE.store(crate::play::real_ticks(), Ordering::Relaxed);
+    crate::GPU_GUEST.store(phase.thread, Ordering::Relaxed);
+    crate::GPU_HOLDER.store(gyroship_runtime::profile::thread_id(), Ordering::Relaxed);
+    g.at = phase;
+    g.applying = n;
+    let done = g.apply(op);
+    // The mappings' snapshot goes: a change to them need not copy them.
+    g.at = Phase::default();
+    crate::GPU_HOLDER.store(0, Ordering::Relaxed);
+    done
 }
 
 impl Kernel {
+    /// Play mode: from now on the GPU thread applies the submits' ops.
+    pub fn start_gpu_thread(&self) -> std::io::Result<()> {
+        let t = GpuThread::start(self.gpu_side.clone())?;
+        self.gpu_side().wrote = Some(Vec::new());
+        crate::lock(&self.decoder).gpu = Some(t);
+        Ok(())
+    }
+
     /// Hands GPU work over to the GPU side, where it runs under the GPU lock
     /// alone; then what it leaves (`After`) runs under the kernel lock. The
     /// deterministic engine runs it at once. The play engine queues it
@@ -397,6 +630,15 @@ impl Kernel {
 /// kernel lock.
 pub fn run(side: &Mutex<GpuSide>, decoder: &Mutex<Decoder>, phase: Phase, job: GpuJob) -> Result<After, Stop> {
     let mut d = crate::lock(decoder);
+    // Play mode: the GPU thread applies a submit's ops while this thread decodes.
+    if d.gpu.is_some()
+        && let GpuJob::Submit { fd, space, entries } = &job
+    {
+        d.at = phase.clone();
+        let done = d.run_threaded(side, &phase, *fd, *space, entries);
+        d.at = Phase::default();
+        return done.map(|()| After::Nothing);
+    }
     let mut g = crate::lock(side);
     // The play engine's watchdog sees who holds the GPU side, and since when.
     let play = g.config.play;
@@ -788,8 +1030,11 @@ fn semaphore(k: &mut GpuSide, space: u32, r: &gyroship_gpu::state::qmd::Release)
     let cpu = k.gpu_to_cpu(space, r.addr);
     if k.mem.publish_object(cpu, n, &bytes[n..], |old| r.apply(if readable { old } else { 0 })).is_err() {
         k.anomaly("gpu semaphore not writable", &format!("semaphore at {:#x}", r.addr))?;
-    } else if let Some(s) = k.surfaces.as_mut() {
-        s.invalidate(r.addr, bytes.len() as u64);
+    } else {
+        k.note_write(cpu, bytes.len());
+        if let Some(s) = k.surfaces.as_mut() {
+            s.invalidate(r.addr, bytes.len() as u64);
+        }
     }
     if k.journal.few("gpu semaphore release", 8) {
         k.log(&format!("gpu: semaphore {r:x?}"));
@@ -861,6 +1106,7 @@ impl Gpu {
                     } else if k.mem.publish_object(at, width, &bytes[width..], |_| r.value).is_err() {
                         k.anomaly(if r.addr == 0 { "gpu release at 0" } else { "gpu release not writable" }, &what)?;
                     } else {
+                        k.note_write(at, bytes.len());
                         // Read again by later GPU work, as any GPU write.
                         if let Some(s) = k.surfaces.as_mut() {
                             s.invalidate(r.addr, bytes.len() as u64);
@@ -965,6 +1211,7 @@ impl Gpu {
                         Some((_, l)) => l.size(),
                         None => u64::from(c.pitch_out) * u64::from(c.line_count.max(1)),
                     };
+                    k.note_write(k.gpu_to_cpu(space, c.dst), reach as usize);
                     if let Some(s) = &mut k.surfaces {
                         s.invalidate(c.dst, span);
                         // A refresh in place takes every byte written (the rest of the
@@ -1033,6 +1280,7 @@ impl Gpu {
                     if let Err(at) = k.write_gpu(space, w.address, &w.data) {
                         k.anomaly("gpu write not done", &format!("{} bytes at {:#x} (cpu {at:#x}) not writable", w.data.len(), w.address))?;
                     }
+                    k.note_write(k.gpu_to_cpu(space, w.address), w.data.len());
                 }
                 Effect::Unsupported(u) => k.anomaly("gpu unsupported", &format!("not applied: {u:x?}"))?,
                 Effect::MacroFault { index, fault } => k.anomaly("gpu macro fault", &format!("macro {index} stopped: {fault:?}"))?,
@@ -1170,6 +1418,133 @@ mod tests {
             assert!(k.deferred.is_none());
             assert_eq!(ran(&k), Some(1));
         }
+    }
+
+    /// A method header: operation, count, subchannel, byte offset.
+    fn header(op: u32, count: u32, subchannel: u32, method: u32) -> u32 {
+        op << 29 | count << 16 | subchannel << 13 | (method / 4)
+    }
+
+    /// A host semaphore (SEMAPHOREA..D): `value` released at `addr` (one
+    /// word), or acquired (until the word is at least `value`).
+    fn semaphore(addr: u64, value: u32, release: bool) -> Vec<u32> {
+        vec![header(1, 4, 0, 0x10), (addr >> 32) as u32, addr as u32, value, if release { 0x0110_0002 } else { 4 }]
+    }
+
+    /// Where `play_submit` puts its two semaphore words and its pushbuffers.
+    const WORDS: u64 = crate::layout::ALIAS.0;
+    const PUSHBUFFERS: u64 = WORDS + 0x100;
+
+    /// One submit of `segments` (a GPFIFO entry each), queued in play mode,
+    /// strict unless `explore`, with the GPU thread if `threaded`: the
+    /// kernel, and the job to run.
+    fn play_submit(threaded: bool, explore: bool, segments: &[Vec<u32>]) -> (Kernel, crate::Deferred) {
+        use gyroship_runtime::mem::{Block, Memory, perm, state};
+        let config = crate::Config { play: true, explore, vsync: false, ..crate::Config::default() };
+        let mut k = Kernel::new(Memory::new().unwrap(), crate::journal::Journal::memory(), config);
+        k.mem.map(WORDS, 0x1000, Block::new(state::NORMAL, perm::RW)).unwrap();
+        let mut entries = Vec::new();
+        let mut at = PUSHBUFFERS;
+        for words in segments {
+            let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            k.mem.write(at, &bytes).unwrap();
+            entries.extend((at | (words.len() as u64) << 42).to_le_bytes());
+            at += bytes.len() as u64;
+        }
+        if threaded {
+            k.start_gpu_thread().unwrap();
+        }
+        k.gpu_work(GpuJob::Submit { fd: 1, space: 0, entries });
+        let job = k.deferred.take().expect("a deferred job");
+        (k, job)
+    }
+
+    fn word(k: &Kernel, at: u64) -> u32 {
+        let mut b = [0u8; 4];
+        k.mem.read(at, &mut b).unwrap();
+        u32::from_le_bytes(b)
+    }
+
+    /// The GPU thread applies what the submitting thread decodes, in order:
+    /// guest memory and the tally end as when one thread does both.
+    #[test]
+    fn the_gpu_thread_leaves_what_one_thread_leaves() {
+        let segments = [semaphore(WORDS, 1, true), [semaphore(WORDS, 1, false), semaphore(WORDS + 8, 2, true)].concat()];
+        for threaded in [false, true] {
+            let (k, job) = play_submit(threaded, false, &segments);
+            assert!(matches!(job.run(), Ok(After::Nothing)));
+            assert_eq!((word(&k, WORDS), word(&k, WORDS + 8)), (1, 2), "threaded: {threaded}");
+            assert!(k.tally().anomalies.is_empty());
+        }
+    }
+
+    /// An acquire reads what the entries before it released, as with one
+    /// thread: decoding it waits until the GPU thread has applied them.
+    #[test]
+    fn an_acquire_waits_for_the_ops_sent_before_it() {
+        let segments = [semaphore(WORDS, 1, true), [semaphore(WORDS, 1, false), semaphore(WORDS + 8, 2, true)].concat()];
+        let (k, job) = play_submit(true, false, &segments);
+        // The GPU thread cannot apply anything while the test holds the GPU side.
+        let side = k.gpu_side.clone();
+        let held = crate::lock(&side);
+        let running = std::thread::spawn(move || job.run());
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!running.is_finished());
+        drop(held);
+        assert!(matches!(running.join().unwrap(), Ok(After::Nothing)));
+        assert_eq!(word(&k, WORDS + 8), 2, "the acquire was met: the release after it ran");
+        assert!(crate::lock(&k.decoder).waiting().is_empty());
+    }
+
+    /// In strict mode an anomaly on the GPU thread ends the submit there: the
+    /// ops after it are not applied, and the submit returns its stop.
+    #[test]
+    fn a_strict_anomaly_on_the_gpu_thread_ends_the_submit() {
+        // SEMAPHORED with an operation no one implements: an ignored method.
+        let segments = [vec![header(1, 1, 0, 0x1c), 0x10], semaphore(WORDS + 8, 2, true)];
+        let (k, job) = play_submit(true, false, &segments);
+        assert!(matches!(job.run(), Err((crate::STOP_EXIT, line)) if line.contains("gpu method ignored")));
+        assert_eq!(word(&k, WORDS + 8), 0, "the release after the anomaly is not applied");
+        assert_eq!(k.tally().anomalies["gpu method ignored"], 1);
+    }
+
+    /// A GPU write into a pushbuffer decoded before the write was applied
+    /// (the GPU thread's read-ahead) is an anomaly; one thread sees the write.
+    #[test]
+    fn a_gpu_write_into_a_pushbuffer_read_ahead_is_an_anomaly() {
+        // The first entry releases 7 over the second one's payload word (its 4th).
+        let second = PUSHBUFFERS + 5 * 4;
+        let segments = [semaphore(second + 3 * 4, 7, true), semaphore(WORDS + 8, 2, true)];
+        for threaded in [false, true] {
+            let (k, job) = play_submit(threaded, true, &segments);
+            // The GPU thread applies nothing before the second pushbuffer is read.
+            let side = k.gpu_side.clone();
+            let held = threaded.then(|| crate::lock(&side));
+            let running = std::thread::spawn(move || job.run());
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(held);
+            assert!(matches!(running.join().unwrap(), Ok(After::Nothing)));
+            let hits = k.tally().anomalies.get("gpu wrote a pushbuffer read ahead").copied();
+            if threaded {
+                assert_eq!(hits, Some(1));
+            } else {
+                assert_eq!((hits, word(&k, WORDS + 8)), (None, 7));
+            }
+        }
+    }
+
+    /// A write that a barrier waited for before the pushbuffer it lands in
+    /// was read is seen by that read: no anomaly.
+    #[test]
+    fn a_gpu_write_seen_by_the_decoder_is_no_anomaly() {
+        // The second entry acquires what the first releases (into the third's
+        // payload word): decoding it waits for the first's op.
+        let third = PUSHBUFFERS + 5 * 4 + 10 * 4;
+        let segments = [semaphore(third + 3 * 4, 7, true), [semaphore(third + 3 * 4, 7, false), semaphore(WORDS, 1, true)].concat(), semaphore(WORDS + 8, 2, true)];
+        let (k, job) = play_submit(true, false, &segments);
+        assert!(matches!(job.run(), Ok(After::Nothing)));
+        assert!(k.tally().anomalies.is_empty());
+        assert_eq!(word(&k, WORDS + 8), 7, "the third entry decoded the released payload");
     }
 }
 

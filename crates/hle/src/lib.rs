@@ -875,9 +875,11 @@ pub struct Census {
 /// watch went over; submit_ms: play mode, the GPU submit thread's busy time,
 /// as of the present's flush; decode_ms: host time decoding pushbuffers,
 /// `Decoder::decode_ns`; effects_ms: host time performing their effects,
-/// `GpuSide::effects_ns`; submit_cpu_ms: the submit thread's CPU time); only
-/// `skipped` is the present's own.
-pub(crate) const FRAME_COLUMNS: &str = "present,cpu_ms,draws,skipped,views_made,bind_groups_made,flushed_bytes,upload_bytes,upload_ms,macro_calls,watched_pages,flush_ms,submit_ms,decode_ms,effects_ms,submit_cpu_ms\n";
+/// `GpuSide::effects_ns`, on the GPU thread in play mode; submit_cpu_ms and
+/// gpu_cpu_ms: the submit thread's and the GPU thread's CPU time;
+/// gpu_wait_ms: the submitting thread's waits for the GPU thread,
+/// `Decoder::gpu_wait_ns`); only `skipped` is the present's own.
+pub(crate) const FRAME_COLUMNS: &str = "present,cpu_ms,draws,skipped,views_made,bind_groups_made,flushed_bytes,upload_bytes,upload_ms,macro_calls,watched_pages,flush_ms,submit_ms,decode_ms,effects_ms,submit_cpu_ms,gpu_cpu_ms,gpu_wait_ms\n";
 
 const COUNTER: u32 = 0x100;
 const WAIT: u32 = 0x200;

@@ -380,6 +380,11 @@ pub fn run(mut table: Vec<rt::Entry>, window: Option<HostWindow>) {
         }
     }
     let play = k.config.play;
+    // In play mode a thread of its own applies the GPU ops while the submitting thread decodes.
+    if play && let Err(e) = k.start_gpu_thread() {
+        eprintln!("gyroship: cannot start the GPU thread: {e}");
+        std::process::exit(2);
+    }
     crate::install(k);
     let outcome = if play { crate::play::run_play() } else { thread::run() };
     crate::with(|k| match &outcome {

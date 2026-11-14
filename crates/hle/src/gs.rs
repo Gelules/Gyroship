@@ -152,6 +152,19 @@ pub fn read_gpu(mem: &Memory, maps: &Mappings, space: u32, mut gpu: u64, mut out
     word.map(|v| out.copy_from_slice(&v.to_le_bytes()[..out.len()])).is_ok()
 }
 
+/// The CPU ranges (start, end) that `len` bytes at GPU address `gpu` of
+/// `space` cover through `maps`, mapping by mapping.
+pub fn cpu_ranges(maps: &Mappings, space: u32, mut gpu: u64, mut len: u64) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    while len > 0 {
+        let (at, room) = span(&maps.table, space, gpu);
+        let n = len.min(room.max(1));
+        out.push((at, at + n));
+        (gpu, len) = (gpu + n, len - n);
+    }
+    out
+}
+
 impl GpuSide {
     /// [`gpu_to_cpu`] through the mappings of the work's hand-over.
     pub fn gpu_to_cpu(&self, space: u32, gpu: u64) -> u64 {
@@ -630,9 +643,10 @@ impl GpuSide {
                 });
                 #[cfg(not(windows))]
                 let submit_cpu: Option<std::time::Duration> = None;
+                let gpu_cpu = d.gpu.as_ref().and_then(crate::nvdrv::GpuThread::cpu_time);
                 let (st, calls) = (&s.staging, d.mme_stats().calls);
                 let row = format!(
-                    "{n},{cpu:.1},{},{},{},{},{},{},{:.1},{calls},{},{:.1},{:.1},{:.1},{:.1},{:.1}\n",
+                    "{n},{cpu:.1},{},{},{},{},{},{},{:.1},{calls},{},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1}\n",
                     s.drawn,
                     skipped.values().sum::<u64>(),
                     st.views[0],
@@ -645,7 +659,9 @@ impl GpuSide {
                     st.submit_ns as f64 / 1e6,
                     d.decode_ns as f64 / 1e6,
                     self.effects_ns as f64 / 1e6,
-                    submit_cpu.unwrap_or_default().as_secs_f64() * 1e3
+                    submit_cpu.unwrap_or_default().as_secs_f64() * 1e3,
+                    gpu_cpu.unwrap_or_default().as_secs_f64() * 1e3,
+                    d.gpu_wait_ns as f64 / 1e6
                 );
                 self.frames += &row;
             }
