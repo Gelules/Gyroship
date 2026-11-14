@@ -447,6 +447,9 @@ pub struct Staging {
     /// Textures uploaded from guest memory: bytes, and host nanoseconds (read,
     /// deswizzle, copy, and the wait after a large one).
     pub uploads: [u64; 2],
+    /// Host nanoseconds in `flush`: the arena's copy, the command buffers
+    /// finished, the submit.
+    pub flush_ns: u64,
 }
 
 /// What a guest read for the GPU was for, an index into [`Staging`]'s arrays.
@@ -985,6 +988,7 @@ impl Surfaces {
     /// recorded before can use: their copies need no flush of their own. A
     /// refresh in place copies among the frame's commands instead.
     pub fn flush(&mut self) {
+        let started = std::time::Instant::now();
         self.pass = None;
         self.memo.clear();
         // The texture uploads' and the arena's copies run before this submit's
@@ -1029,6 +1033,7 @@ impl Surfaces {
         // Chunks whose copies were submitted come back once the GPU is done.
         self.belt.recall();
         self.texture_belt.recall();
+        self.staging.flush_ns += started.elapsed().as_nanos() as u64;
     }
 
     /// After an upload of 32 MiB or more (`big_upload`), at the start of the next

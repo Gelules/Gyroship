@@ -600,7 +600,7 @@ impl GpuSide {
                 let cpu = gyroship_runtime::profile::own_cpu_time().unwrap_or_default().as_secs_f64() * 1e3;
                 let (st, calls) = (&s.staging, self.gpu.mme_stats().calls);
                 let row = format!(
-                    "{n},{cpu:.1},{},{},{},{},{},{},{:.1},{calls},{}\n",
+                    "{n},{cpu:.1},{},{},{},{},{},{},{:.1},{calls},{},{:.1}\n",
                     s.drawn,
                     skipped.values().sum::<u64>(),
                     st.views[0],
@@ -608,7 +608,8 @@ impl GpuSide {
                     st.flushed,
                     st.uploads[0],
                     st.uploads[1] as f64 / 1e6,
-                    self.watched
+                    self.watched,
+                    st.flush_ns as f64 / 1e6
                 );
                 self.frames += &row;
             }

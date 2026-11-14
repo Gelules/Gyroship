@@ -850,7 +850,7 @@ pub struct Census {
 /// The `--perf` frames file: per present, counters so far (cpu_ms: the
 /// presenting host thread's CPU time; watched_pages: pages the textures' write
 /// watch went over); only `skipped` is the present's own.
-pub(crate) const FRAME_COLUMNS: &str = "present,cpu_ms,draws,skipped,views_made,bind_groups_made,flushed_bytes,upload_bytes,upload_ms,macro_calls,watched_pages\n";
+pub(crate) const FRAME_COLUMNS: &str = "present,cpu_ms,draws,skipped,views_made,bind_groups_made,flushed_bytes,upload_bytes,upload_ms,macro_calls,watched_pages,flush_ms\n";
 
 const COUNTER: u32 = 0x100;
 const WAIT: u32 = 0x200;
