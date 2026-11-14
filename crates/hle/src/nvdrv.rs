@@ -13,6 +13,7 @@ use gyroship_gpu::pushbuf::{Channel, Effect};
 use gyroship_runtime::mem::{Memory, PAGE};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use crate::ipc::{Reply, Request};
 use crate::{After, Kernel, Stop};
@@ -158,6 +159,11 @@ pub struct GpuSide {
     /// textures' write watch went over so far.
     pub frames: String,
     pub watched: u64,
+    /// Host nanoseconds so far reading and decoding pushbuffers (the command
+    /// processor, macros included), then performing their effects (the take of
+    /// written textures, guest writes, and translating and recording draws).
+    pub decode_ns: u64,
+    pub effects_ns: u64,
     pub mem: Arc<Memory>,
     pub journal: crate::journal::Journal,
     pub tally: Arc<Mutex<crate::Tally>>,
@@ -190,7 +196,7 @@ pub enum GpuJob {
 
 impl GpuSide {
     pub fn new(mem: Arc<Memory>, journal: crate::journal::Journal, tally: Arc<Mutex<crate::Tally>>, syncpts: Arc<[AtomicU32; 32]>, config: crate::Config) -> GpuSide {
-        GpuSide { surfaces: None, gpu: Gpu::default(), frame_hashes: Vec::new(), video: None, window: None, rewrites: Vec::new(), frames: String::new(), watched: 0, mem, journal, tally, syncpts, config, at: Phase::default() }
+        GpuSide { surfaces: None, gpu: Gpu::default(), frame_hashes: Vec::new(), video: None, window: None, rewrites: Vec::new(), frames: String::new(), watched: 0, decode_ns: 0, effects_ns: 0, mem, journal, tally, syncpts, config, at: Phase::default() }
     }
 
     /// The kernel time the work was handed over at.
@@ -342,6 +348,7 @@ impl Nvdrv {
         let mut extra = vec![0; extra_buf.size.min(0x10000) as usize];
 
         let label = dev.label();
+        k.census_ipc(|| format!("nvdrv {label} {code:#x}"));
         if k.journal.first(&format!("nvsrv ioctl {label} {code:#x}")) {
             k.log(&format!("nvsrv: fd {fd} ({label}) ioctl {code:#x}"));
         }
@@ -455,7 +462,6 @@ impl Nvdrv {
                 let flags = u32_at(&input, 0xc);
                 put32(&mut out, 0xc, 0);
                 let n = k.count("submits");
-                k.census_ipc("nvdrv submit");
                 let mut fence = String::new();
                 if flags & 2 != 0 {
                     let v = k.gs.syncpts[CHANNEL_SYNCPT as usize].fetch_add(1, Ordering::AcqRel).wrapping_add(1);
@@ -502,14 +508,17 @@ impl Nvdrv {
 /// words at bits 42..63) through the channel's command processor, as far as
 /// its semaphore acquires allow, and performs what they did.
 fn run_gpfifo(k: &mut GpuSide, fd: u32, space: u32, entries: &[u8]) -> Result<(), Stop> {
+    let took = Instant::now();
     forget_written_textures(k, space);
     if let Some(s) = k.surfaces.as_mut() {
         // After the take: textures written in part may be refreshed in place.
         s.new_submit(true);
     }
+    k.effects_ns += took.elapsed().as_nanos() as u64;
     let mut gpu = std::mem::take(&mut k.gpu);
     let done = (|| {
         for (rank, e) in entries.as_chunks::<8>().0.iter().map(|e| u64::from_le_bytes(*e)).enumerate() {
+            let decoding = Instant::now();
             let (at, len) = (e & 0xffff_fffc | (e >> 32 & 0xff) << 32, (e >> 42 & 0x1f_ffff) as usize);
             let mut raw = vec![0u8; 4 * len.min(0x10_0000)];
             let addr = k.gpu_to_cpu(space, at);
@@ -532,6 +541,7 @@ fn run_gpfifo(k: &mut GpuSide, fd: u32, space: u32, entries: &[u8]) -> Result<()
             let before = channel.waiting();
             let effects = channel.run_with(&words, &mut |a, buf| k.read_gpu(space, a, buf));
             note_wait(k, fd, space, before, channel.waiting());
+            k.decode_ns += decoding.elapsed().as_nanos() as u64;
             gpu.effects(k, space, effects)?;
         }
         Ok(())
@@ -640,6 +650,7 @@ pub fn poll(k: &mut GpuSide) -> Result<(), Stop> {
         for fd in waiting {
             let Some((channel, space)) = gpu.channels.get_mut(&fd) else { continue };
             let space = *space;
+            let decoding = Instant::now();
             let before = channel.waiting();
             let mut effects = channel.resume(&mut |a, buf| k.read_gpu(space, a, buf));
             // ponytail: a watchdog. A semaphore no one we model releases would hang
@@ -655,6 +666,7 @@ pub fn poll(k: &mut GpuSide) -> Result<(), Stop> {
                 effects.extend(channel.resume(&mut |a, buf| k.read_gpu(space, a, buf)));
             }
             note_wait(k, fd, space, before, channel.waiting());
+            k.decode_ns += decoding.elapsed().as_nanos() as u64;
             gpu.effects(k, space, effects)?;
         }
         Ok(())
@@ -739,8 +751,16 @@ impl Gpu {
         Some(key)
     }
 
-    /// Performs a channel's effects in guest memory and on the host GPU, in order.
+    /// Performs a channel's effects in guest memory and on the host GPU, in
+    /// order; their host time goes to `GpuSide::effects_ns`.
     fn effects(&mut self, k: &mut GpuSide, space: u32, effects: Vec<Effect>) -> Result<(), Stop> {
+        let started = Instant::now();
+        let done = self.apply(k, space, effects);
+        k.effects_ns += started.elapsed().as_nanos() as u64;
+        done
+    }
+
+    fn apply(&mut self, k: &mut GpuSide, space: u32, effects: Vec<Effect>) -> Result<(), Stop> {
         for effect in effects {
             match effect {
                 Effect::Release(r) => {

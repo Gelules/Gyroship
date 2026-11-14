@@ -549,11 +549,13 @@ struct Submitter {
 }
 
 /// The way to the submit thread: its jobs (one running and one waiting at
-/// most), the arena bytes it gives back, and the nanoseconds its jobs took.
+/// most), the arena bytes it gives back, the nanoseconds its jobs took, and
+/// the thread itself (its CPU time, `--perf`).
 struct Submit {
     jobs: std::sync::mpsc::SyncSender<SubmitJob>,
     spare: std::sync::mpsc::Receiver<Vec<u8>>,
     busy: Arc<std::sync::atomic::AtomicU64>,
+    thread: std::thread::JoinHandle<()>,
 }
 
 /// What the upload arena carried since the start: staged blocks (and those an
@@ -1168,15 +1170,20 @@ impl Surfaces {
         let belt = std::mem::replace(&mut self.belt, wgpu::util::StagingBelt::new(self.device.clone(), 16 << 20));
         let mut s = Submitter { device: self.device.clone(), queue: self.queue.clone(), belt, clock: self.clock.take(), window: self.window.take(), spare: back };
         let took = busy.clone();
-        std::thread::Builder::new().name("gpu submit".into()).spawn(move || {
+        let thread = std::thread::Builder::new().name("gpu submit".into()).spawn(move || {
             for job in rx {
                 let started = std::time::Instant::now();
                 job(&mut s);
                 took.fetch_add(started.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             }
         })?;
-        self.submit = Some(Submit { jobs, spare, busy });
+        self.submit = Some(Submit { jobs, spare, busy, thread });
         Ok(())
+    }
+
+    /// Play mode: the submit thread, while it runs (its CPU time, `--perf`).
+    pub fn submit_thread(&self) -> Option<&std::thread::JoinHandle<()>> {
+        self.submit.as_ref().map(|t| &t.thread)
     }
 
     /// Play mode: queues a job for the submit thread, waiting while another

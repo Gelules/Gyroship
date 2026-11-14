@@ -218,6 +218,11 @@ impl Trace {
         }
     }
 
+    /// A line of the HLE's own, stamped as a pass.
+    pub(crate) fn note(&mut self, (time, thread, present): (u64, u64, u64), text: &str) {
+        self.journal.line(time, thread, &format!("p{present} {text}"));
+    }
+
     pub fn flush(&self) {
         self.journal.flush();
     }

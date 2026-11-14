@@ -30,9 +30,11 @@ pub struct State {
     /// gsv 204: the syncpoint memory (read-only page for the guest) and its two events.
     pub syncpt_page: Option<u64>,
     pub syncpt_events: Option<(usize, usize)>,
-    /// vi2 229: frames presented, and the vsync the last one waited for.
+    /// vi2 229: frames presented, the vsync the last one waited for, and the
+    /// guest thread that presented it (its waits go to `--trace`).
     pub presents: u64,
     pub vsync: u64,
+    pub presenter: u64,
     /// Syncpoint values (syncpt GetCount says 32), shared with the GPU side.
     pub syncpts: Arc<[AtomicU32; 32]>,
     /// syncpt 22: the event of each wait index.
@@ -208,6 +210,7 @@ impl Gs {
     }
 
     pub fn request(&mut self, k: &mut Kernel, req: &Request) -> Option<Reply> {
+        k.census_ipc(|| format!("{} {}", self.label(), req.command));
         let gs = |g: Gs| Some(Reply::object(Service::Gs(g)));
         Some(match (self, req.command) {
             // Boot: the process (pseudo-handle), its aruid, flags.
@@ -268,7 +271,6 @@ impl Gs {
             // change kind answer the fallback kind (no compression).
             // Unmap: the mapping goes; then its event.
             (Gs::GpuMemory, 213) => {
-                k.census_ipc("gpu memory 213");
                 let (space, first, last) = (req.u32_at(0)?, req.u64_at(4)?, req.u64_at(0xc)?);
                 let maps = Arc::make_mut(&mut k.gs.maps);
                 maps.list.retain(|m| m.0 != space || m.2 < first || m.1 > last);
@@ -289,7 +291,6 @@ impl Gs {
                         Reply::ok()
                     }
                     211 => {
-                        k.census_ipc("gpu memory 211");
                         if k.journal.few("gpu memory 211", 4) {
                             let d = &req.data;
                             k.log(&format!(
@@ -314,13 +315,11 @@ impl Gs {
             }
             // syncpt: the value of a syncpoint (on the wire, its id inverted), mode 0.
             (Gs::Syncpt, 103) => {
-                k.census_ipc("syncpt 103");
                 let v = k.gs.syncpts.get(!req.u32_at(0)? as usize).map_or(0, |s| s.load(Ordering::Acquire));
                 Reply::with(&[&u64::from(v).to_le_bytes()[..], &[0]].concat())
             }
             // The event of a wait index.
             (Gs::Syncpt, 22) => {
-                k.census_ipc("syncpt 22");
                 let n = req.u32_at(0)? as usize;
                 let (r, e) = k.numbered_event()?;
                 put(&mut k.gs.syncpt_waits, n, e);
@@ -332,7 +331,6 @@ impl Gs {
             // Arm a wait: the fake GPU has always got there (the syncpoint is raised to the
             // threshold, 32-bit wrapping compare), so the event is signaled at once.
             (Gs::Syncpt, 201) => {
-                k.census_ipc("syncpt 201");
                 let (n, id, threshold) = (req.u32_at(0)? as usize, !req.u32_at(4)? as usize, req.u64_at(8)? as u32);
                 if k.journal.few("syncpt 201", 4) {
                     let armed = k.gs.syncpt_waits.get(n).copied().flatten().is_some();
@@ -427,7 +425,6 @@ impl Gs {
             // release fence that is already reached ({0, 0, 0}).
             (Gs::Vi2, c @ (228 | 229)) => {
                 if c == 229 {
-                    k.census_ipc("vi2 present");
                     k.present(req);
                 }
                 Reply::with(&[&FREE_SLOTS.to_le_bytes()[..], &[0u8; 16]].concat())
@@ -511,7 +508,15 @@ impl Kernel {
     /// vi2 229: one more frame. The first three and every 60th are journaled.
     fn present(&mut self, req: &Request) {
         self.gs.presents += 1;
+        self.gs.presenter = self.sched.current.map_or(0, |t| self.sched.threads[t].id);
         let n = self.gs.presents;
+        // In --trace, the presents bracket the presenting thread's waits and probe passes.
+        if self.trace.is_some() {
+            let stamp = (self.now(), self.gs.presenter, n);
+            if let Some(t) = self.trace.as_mut() {
+                t.note(stamp, "present");
+            }
+        }
         if let Some((path, from)) = &self.config.profile
             && n == (*from).max(1)
         {
@@ -526,6 +531,12 @@ impl Kernel {
                     if let Some(cpu) = t.host_thread.as_ref().and_then(|h| gyroship_runtime::profile::cpu_time(h.as_raw_handle() as usize)) {
                         self.census.threads_cpu += &format!("{n},{},{:.1}\n", t.id, cpu.as_secs_f64() * 1e3);
                     }
+                }
+            }
+            if self.config.play && n.is_multiple_of(60) {
+                let c = &mut self.census;
+                for (&(id, kind), (parked, _)) in &c.parked {
+                    c.waits_csv += &format!("{n},{id},{kind},{:.1}\n", parked.as_secs_f64() * 1e3);
                 }
             }
         }
@@ -601,9 +612,16 @@ impl GpuSide {
             let skipped = std::mem::take(&mut s.skipped);
             if self.config.perf.is_some() {
                 let cpu = gyroship_runtime::profile::own_cpu_time().unwrap_or_default().as_secs_f64() * 1e3;
+                #[cfg(windows)]
+                let submit_cpu = s.submit_thread().and_then(|h| {
+                    use std::os::windows::io::AsRawHandle;
+                    gyroship_runtime::profile::cpu_time(h.as_raw_handle() as usize)
+                });
+                #[cfg(not(windows))]
+                let submit_cpu: Option<std::time::Duration> = None;
                 let (st, calls) = (&s.staging, self.gpu.mme_stats().calls);
                 let row = format!(
-                    "{n},{cpu:.1},{},{},{},{},{},{},{:.1},{calls},{},{:.1},{:.1}\n",
+                    "{n},{cpu:.1},{},{},{},{},{},{},{:.1},{calls},{},{:.1},{:.1},{:.1},{:.1},{:.1}\n",
                     s.drawn,
                     skipped.values().sum::<u64>(),
                     st.views[0],
@@ -613,7 +631,10 @@ impl GpuSide {
                     st.uploads[1] as f64 / 1e6,
                     self.watched,
                     st.flush_ns as f64 / 1e6,
-                    st.submit_ns as f64 / 1e6
+                    st.submit_ns as f64 / 1e6,
+                    self.decode_ns as f64 / 1e6,
+                    self.effects_ns as f64 / 1e6,
+                    submit_cpu.unwrap_or_default().as_secs_f64() * 1e3
                 );
                 self.frames += &row;
             }

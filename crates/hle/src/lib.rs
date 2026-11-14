@@ -470,7 +470,7 @@ impl Kernel {
                 eprintln!("gyroship: --perf {}: {e}", census.display());
             }
             let frames = g.as_ref().map_or("", |g| &g.frames[..]);
-            for (name, header, rows) in [("frames.csv", FRAME_COLUMNS, frames), ("threads.csv", "present,thread,cpu_ms\n", &self.census.threads_cpu[..])] {
+            for (name, header, rows) in [("frames.csv", FRAME_COLUMNS, frames), ("threads.csv", "present,thread,cpu_ms\n", &self.census.threads_cpu[..]), ("waits.csv", "present,thread,kind,ms\n", &self.census.waits_csv[..])] {
                 let file = path.with_extension(name);
                 if let Err(e) = std::fs::write(&file, format!("{header}{rows}")) {
                     eprintln!("gyroship: --perf {}: {e}", file.display());
@@ -845,9 +845,15 @@ pub struct Census {
     first: std::collections::BTreeMap<u64, Vec<String>>,
     /// RomFS reads: (present, offset, size).
     romfs: Vec<(u64, u64, u64)>,
-    /// (command, thread id) -> count, for the IPC commands the multi-core plan
-    /// needs counted (syncpt 22, 103 and 201; GPU maps, submits, presents).
-    ipc: std::collections::BTreeMap<(&'static str, u64), u64>,
+    /// (command, thread id) -> count: every gsv command and nvdrv ioctl.
+    ipc: std::collections::BTreeMap<(String, u64), u64>,
+    /// Play mode: the time guest threads spent parked in `play::wait`, by
+    /// (thread id, wait kind), and by (thread id, address) for WaitForAddress:
+    /// total and waits.
+    parked: std::collections::BTreeMap<(u64, &'static str), (std::time::Duration, u64)>,
+    parked_at: std::collections::HashMap<(u64, u64), (std::time::Duration, u64)>,
+    /// Play mode: every 60 presents, `parked` so far as CSV rows (present, thread, kind, ms).
+    waits_csv: String,
     /// Play mode: the waits for the kernel lock, by guest thread (by host thread
     /// name for the others): total, longest, waits of 1 ms or more, scopes.
     lock_waits: std::collections::BTreeMap<String, (std::time::Duration, std::time::Duration, u64, u64)>,
@@ -859,8 +865,11 @@ pub struct Census {
 /// The `--perf` frames file: per present, counters so far (cpu_ms: the
 /// presenting host thread's CPU time; watched_pages: pages the textures' write
 /// watch went over; submit_ms: play mode, the GPU submit thread's busy time,
-/// as of the present's flush); only `skipped` is the present's own.
-pub(crate) const FRAME_COLUMNS: &str = "present,cpu_ms,draws,skipped,views_made,bind_groups_made,flushed_bytes,upload_bytes,upload_ms,macro_calls,watched_pages,flush_ms,submit_ms\n";
+/// as of the present's flush; decode_ms and effects_ms: host time decoding
+/// pushbuffers and performing their effects, `GpuSide::decode_ns`;
+/// submit_cpu_ms: the submit thread's CPU time); only `skipped` is the
+/// present's own.
+pub(crate) const FRAME_COLUMNS: &str = "present,cpu_ms,draws,skipped,views_made,bind_groups_made,flushed_bytes,upload_bytes,upload_ms,macro_calls,watched_pages,flush_ms,submit_ms,decode_ms,effects_ms,submit_cpu_ms\n";
 
 const COUNTER: u32 = 0x100;
 const WAIT: u32 = 0x200;
@@ -903,10 +912,33 @@ impl Kernel {
     }
 
     /// Counts an IPC command of the running thread for `--perf`.
-    pub(crate) fn census_ipc(&mut self, command: &'static str) {
+    pub(crate) fn census_ipc(&mut self, command: impl FnOnce() -> String) {
         let (Some(_), Some(t)) = (&self.config.perf, self.sched.current) else { return };
         let id = self.sched.threads[t].id;
-        *self.census.ipc.entry((command, id)).or_insert(0) += 1;
+        *self.census.ipc.entry((command(), id)).or_insert(0) += 1;
+    }
+
+    /// Play mode: guest thread `me` spent `parked` in a wait of `kind`, at
+    /// `addr` for WaitForAddress (`play::wait`): to the census (`--perf`), and
+    /// to `--trace` for the presenting thread, where it orders its waits
+    /// against the probes' passes.
+    pub(crate) fn parked(&mut self, me: usize, (kind, addr): (&'static str, Option<u64>), parked: std::time::Duration) {
+        let id = self.sched.threads[me].id;
+        if id == self.gs.presenter && self.trace.is_some() {
+            let stamp = (self.now(), id, self.gs.presents);
+            if let Some(t) = self.trace.as_mut() {
+                t.note(stamp, &format!("park kind={kind} addr={:#x} ms={:.3}", addr.unwrap_or(0), parked.as_secs_f64() * 1e3));
+            }
+        }
+        if self.config.perf.is_none() {
+            return;
+        }
+        let w = self.census.parked.entry((id, kind)).or_default();
+        *w = (w.0 + parked, w.1 + 1);
+        if let Some(a) = addr {
+            let w = self.census.parked_at.entry((id, a)).or_default();
+            *w = (w.0 + parked, w.1 + 1);
+        }
     }
 
     /// The census as text: switch points per present by thread and kind, the
@@ -937,9 +969,19 @@ impl Kernel {
         for (&(id, pc), &n) in sites.into_iter().take(30) {
             let _ = writeln!(out, "{:8.1}  thread {id}  {pc:#x} {}", n as f64 / presents, self.symbolize(pc));
         }
-        out += "# counted IPC commands, by command and guest thread\n";
-        for (&(command, id), &n) in &self.census.ipc {
+        out += "# IPC commands (every gsv command and nvdrv ioctl), by command and guest thread\n";
+        for ((command, id), &n) in &self.census.ipc {
             let _ = writeln!(out, "{command}  thread {id}: {n} ({:.2} per present)", n as f64 / presents);
+        }
+        out += "# parked time (play mode), by guest thread and wait kind (a sleep of the presenting thread includes its vsync wait): total, per present, waits\n";
+        for (&(id, kind), &(parked, n)) in &self.census.parked {
+            let _ = writeln!(out, "thread {id} {kind}: {:.2} s, {:.2} ms per present, {n} waits", parked.as_secs_f64(), parked.as_secs_f64() * 1e3 / presents);
+        }
+        out += "# WaitForAddress parked time (play mode), the 30 longest by thread and address: total, per present, waits\n";
+        let mut at: Vec<_> = self.census.parked_at.iter().collect();
+        at.sort_by(|a, b| b.1.0.cmp(&a.1.0).then(a.0.cmp(b.0)));
+        for (&(id, addr), &(parked, n)) in at.into_iter().take(30) {
+            let _ = writeln!(out, "thread {id} {addr:#x}: {:.2} s, {:.2} ms per present, {n} waits", parked.as_secs_f64(), parked.as_secs_f64() * 1e3 / presents);
         }
         out += "# kernel lock waits (play mode): total, per present, longest, waits of 1 ms or more, scopes\n";
         let mut waits: Vec<_> = self.census.lock_waits.iter().collect();

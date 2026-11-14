@@ -140,6 +140,9 @@ pub(crate) unsafe fn svc(cpu: *mut Cpu, pc: u64, imm: u32, me: usize) {
 /// Wakers queue the unpark, and `with` issues it once the lock is free; std
 /// keeps an unpark that comes before the park, so no wake-up is lost, and a
 /// spurious return just goes round again.
+///
+/// With `--perf`, the time from the first round to the return goes to the
+/// census, by the kind of wait the first round found (`Kernel::parked`).
 fn wait(me: usize) {
     enum Then {
         Run,
@@ -147,12 +150,23 @@ fn wait(me: usize) {
         ParkFor(Duration),
         Sleep(Duration),
     }
+    let since = Instant::now();
+    let mut kind = None;
     loop {
         let then = crate::with(|k| {
             let now = k.now();
             let th = &k.sched.threads[me];
+            let kind = *kind.get_or_insert(match th.wait {
+                Wait::None => ("none", None),
+                Wait::Sleep => ("sleep", None),
+                Wait::Sync(_) => ("sync", None),
+                Wait::Lock { .. } => ("lock", None),
+                Wait::CondVar { .. } => ("condvar", None),
+                Wait::Address(a) => ("address", Some(a)),
+            });
             let (state, sleep, deadline, cpu, on_timeout) = (th.state, th.wait == Wait::Sleep, th.deadline, th.cpu, th.on_timeout);
             if state != State::Waiting {
+                k.parked(me, kind, since.elapsed());
                 return Then::Run;
             }
             match deadline {
@@ -170,6 +184,7 @@ fn wait(me: usize) {
                     if now - d > 31_250 {
                         k.count(if sleep { "play sleeps over 1 ms late" } else { "play timed waits over 1 ms late" });
                     }
+                    k.parked(me, kind, since.elapsed());
                     Then::Run
                 }
             }
