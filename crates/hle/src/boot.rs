@@ -381,6 +381,7 @@ pub fn run(mut table: Vec<rt::Entry>, window: Option<HostWindow>) {
     }
     let play = k.config.play;
     // In play mode a thread of its own applies the GPU ops while the submitting thread decodes.
+    // `run_play` must run on this thread: the GPU thread wakes it.
     if play && let Err(e) = k.start_gpu_thread() {
         eprintln!("gyroship: cannot start the GPU thread: {e}");
         std::process::exit(2);

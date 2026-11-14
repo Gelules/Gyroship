@@ -18,7 +18,8 @@ thread_local! {
     static PREEMPTED: Cell<u64> = const { Cell::new(0) };
 }
 
-/// How often the boot thread looks at the run's end and its time limit.
+/// How often the boot thread looks at the run's end, its time limit and the
+/// guests' waits on GPU work (the GPU thread also wakes it for those).
 const CHECK: Duration = Duration::from_millis(250);
 
 /// The play engine's boot thread: starts the ready threads (the main thread)
@@ -46,7 +47,14 @@ pub fn run_play() -> Outcome {
     let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let watchdog = spawn_watchdog(done.clone());
     loop {
-        if let Some(outcome) = crate::with(|k| k.sched.outcome.clone()) {
+        let outcome = crate::with(|k| {
+            let outcome = k.sched.outcome.clone();
+            if outcome.is_none() {
+                k.check_gpu_waits();
+            }
+            outcome
+        });
+        if let Some(outcome) = outcome {
             done.store(true, std::sync::atomic::Ordering::Relaxed);
             // They see the outcome too, and leave the kernel before it is uninstalled.
             for t in timers.into_iter().chain([watchdog]) {

@@ -225,6 +225,8 @@ pub struct Kernel {
     /// behind another one, always taken first.
     pub gpu_side: Arc<Mutex<nvdrv::GpuSide>>,
     pub decoder: Arc<Mutex<nvdrv::Decoder>>,
+    /// Play mode: how far the GPU thread got (`start_gpu_thread`).
+    pub(crate) gpu_progress: Option<Arc<nvdrv::Progress>>,
     /// Activity and anomaly counts, shared with the GPU side and the decoder.
     pub tally: Arc<Mutex<Tally>>,
     /// The host's live controller state, read at each hid sample.
@@ -309,7 +311,7 @@ impl Kernel {
         let (mem, tally, gs) = (Arc::new(mem), Arc::new(Mutex::new(Tally::default())), gs::State::default());
         let gpu_side = Arc::new(Mutex::new(nvdrv::GpuSide::new(mem.clone(), journal.share(), tally.clone(), gs.syncpts.clone(), config.clone())));
         let decoder = Arc::new(Mutex::new(nvdrv::Decoder::new(mem.clone(), journal.share(), tally.clone(), config.clone())));
-        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None, sessions: Vec::new(), objects: Vec::new(), domains: Vec::new(), allowed_services: Vec::new(), shared: Vec::new(), transfers: Vec::new(), time_shared: None, frame: (0, 0, 0), symbols: Vec::new(), romfs: None, deferred: None, gs, hid_shared: None, input: Default::default(), spin: Vec::new(), census: Census::default(), saves: Default::default(), timers: Vec::new(), gpu_side, decoder, tally, live_input: None, recorded, audio_out: None, audio_samples, opus: Default::default(), audio_gain: 1.0, audio_format: (2, 48_000), trace: None }
+        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None, sessions: Vec::new(), objects: Vec::new(), domains: Vec::new(), allowed_services: Vec::new(), shared: Vec::new(), transfers: Vec::new(), time_shared: None, frame: (0, 0, 0), symbols: Vec::new(), romfs: None, deferred: None, gs, hid_shared: None, input: Default::default(), spin: Vec::new(), census: Census::default(), saves: Default::default(), timers: Vec::new(), gpu_side, decoder, gpu_progress: None, tally, live_input: None, recorded, audio_out: None, audio_samples, opus: Default::default(), audio_gain: 1.0, audio_format: (2, 48_000), trace: None }
     }
 
     /// The activity and anomaly counts.

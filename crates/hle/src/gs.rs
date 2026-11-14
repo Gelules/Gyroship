@@ -5,7 +5,9 @@
 //! build `a7730d0f`).
 //!
 //! The fake GPU is complaisant: every fence it hands out is already
-//! reached, and every wait it is asked about succeeds at once.
+//! reached, and every wait it is asked about succeeds at once. In play mode,
+//! with the GPU thread, a wait on GPU progress (syncpt 201, gpu memory 213
+//! and 102) ends when the GPU thread gets there instead.
 
 use crate::ipc::{Reply, Request};
 use crate::nvdrv::{Decoder, GpuSide};
@@ -57,6 +59,39 @@ pub struct State {
     /// GPU mappings (gpu 211). GPU work takes them as they stand when it is
     /// handed over (`Phase`); a change copies them only while it holds them.
     pub maps: Arc<Mappings>,
+    /// Play mode, with the GPU thread: the guests' waits on GPU work, which
+    /// the boot thread signals once the work gets there (`signal_reached`).
+    pub armed: Vec<Armed>,
+}
+
+/// A guest's wait on GPU work: its event, what it waits for, the kernel time
+/// it was first armed at, and whether syncpt 202 gave it up.
+#[derive(Debug, Clone, Copy)]
+pub struct Armed {
+    pub event: usize,
+    pub until: Until,
+    pub since: u64,
+    pub cancelled: bool,
+}
+
+/// What a wait on GPU work waits for: the ops of every submit up to this
+/// number applied (gpu memory 213 and 102: queued work still reads through
+/// the old mapping), or a syncpoint at a threshold (syncpt 201, a 32-bit
+/// wrapping compare).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Until {
+    Jobs(u64),
+    Syncpt(usize, u32),
+}
+
+/// How long a syncpoint wait may stay unreached, every submit applied,
+/// before the boot thread raises the syncpoint (an increment we do not model).
+const STUCK: u64 = 2 * TICKS_PER_SECOND;
+
+/// Raises syncpoint `id` to `threshold` if it is behind (32-bit wrapping
+/// compare); whether it moved.
+fn raise(syncpts: &[AtomicU32], id: usize, threshold: u32) -> bool {
+    syncpts.get(id).is_some_and(|s| s.try_update(Ordering::AcqRel, Ordering::Acquire, |v| ((threshold.wrapping_sub(v) as i32) > 0).then_some(threshold)).is_ok())
 }
 
 #[derive(Debug, Default, Clone)]
@@ -299,7 +334,7 @@ impl Gs {
                 let maps = Arc::make_mut(&mut k.gs.maps);
                 maps.list.retain(|m| m.0 != space || m.2 < first || m.1 > last);
                 maps.table = flatten(&maps.list);
-                k.signal_gpu(req.u32_at(0x18)? as usize);
+                k.signal_gpu_when_done(req.u32_at(0x18)? as usize);
                 Reply::ok()
             }
             (Gs::GpuMemory, c @ (101 | 102 | 211 | 212)) => {
@@ -311,7 +346,7 @@ impl Gs {
                         Reply::with(&k.gs.gpu_memories.to_le_bytes())
                     }
                     102 => {
-                        k.signal_gpu(req.u32_at(4)? as usize);
+                        k.signal_gpu_when_done(req.u32_at(4)? as usize);
                         Reply::ok()
                     }
                     211 => {
@@ -352,8 +387,9 @@ impl Gs {
                 }
                 Reply { move_handles: vec![r], ..Reply::ok() }
             }
-            // Arm a wait: the fake GPU has always got there (the syncpoint is raised to the
-            // threshold, 32-bit wrapping compare), so the event is signaled at once.
+            // Arm a wait. Without the GPU thread the fake GPU has always got there (the
+            // syncpoint is raised to the threshold, 32-bit wrapping compare), so the event is
+            // signaled at once; with it, the event is signaled when the GPU thread gets there.
             (Gs::Syncpt, 201) => {
                 let (n, id, threshold) = (req.u32_at(0)? as usize, !req.u32_at(4)? as usize, req.u64_at(8)? as u32);
                 if k.journal.few("syncpt 201", 4) {
@@ -361,15 +397,24 @@ impl Gs {
                     let now = k.gs.syncpts.get(id).map(|s| s.load(Ordering::Acquire));
                     k.log(&format!("gsv syncpt 201: wait index {n} syncpoint {id} threshold {threshold} mode {} value {now:?} event {armed}", req.data.get(0x10).copied().unwrap_or(0)));
                 }
-                if k.gs.syncpts.get(id).is_some_and(|s| s.try_update(Ordering::AcqRel, Ordering::Acquire, |v| ((threshold.wrapping_sub(v) as i32) > 0).then_some(threshold)).is_ok()) {
-                    k.count("syncpoint waits raised");
+                if k.gpu_progress.is_none() {
+                    if raise(&k.gs.syncpts[..], id, threshold) {
+                        k.count("syncpoint waits raised");
+                    }
+                    k.signal_wait(n);
+                } else if let Some(Some(e)) = k.gs.syncpt_waits.get(n).copied() {
+                    k.arm(e, Until::Syncpt(id, threshold));
                 }
-                k.signal_wait(n);
                 Reply::ok()
             }
-            // Cancel a wait: the client then waits for the event without a timeout.
+            // Cancel a wait: the client then waits for the event without a timeout. A wait
+            // armed on it stays listed (a later 201 keeps its age), but is never raised.
             (Gs::Syncpt, 202) => {
-                k.signal_wait(req.u32_at(0)? as usize);
+                let n = req.u32_at(0)? as usize;
+                if let Some(Some(e)) = k.gs.syncpt_waits.get(n).copied() {
+                    k.gs.armed.iter_mut().filter(|a| a.event == e).for_each(|a| a.cancelled = true);
+                }
+                k.signal_wait(n);
                 Reply::ok()
             }
             // Chat (Lichii's answers): register (1201) and unregister (1203), the session
@@ -586,6 +631,8 @@ impl Kernel {
     /// the frame limit, the summary line, and the display's cadence, from
     /// kernel time `at`, when the present was handed over.
     pub(crate) fn present_end(&mut self, n: u64, interval: u64, at: u64) {
+        // The present resumed channels on this thread: their increments wake no one else.
+        self.signal_reached();
         if self.config.frames.is_some_and(|f| n >= f) {
             self.stop(0, &format!("{n} frames presented"));
         }
@@ -764,6 +811,100 @@ impl GpuSide {
 }
 
 impl Kernel {
+
+    /// gpu memory 213 and 102: signals the event of GPU event id `n` once the
+    /// GPU work handed over so far is applied (it may still read through the
+    /// old mapping); at once without the GPU thread.
+    fn signal_gpu_when_done(&mut self, n: usize) {
+        match (self.gpu_progress.is_some(), self.gs.gpu_events.get(n).copied().flatten()) {
+            (true, Some(e)) => {
+                let submits = self.tally().counts.get("submits").copied().unwrap_or(0);
+                self.arm(e, Until::Jobs(submits));
+            }
+            _ => self.signal_gpu(n),
+        }
+    }
+
+    /// A guest waits on event `e` until GPU work gets to `until`: the event is
+    /// cleared (the client never clears it), then signaled once the work gets
+    /// there, by the check below or by the boot thread. A wait already on `e`
+    /// for the same condition keeps its age: NVN arms again every 100 ms.
+    fn arm(&mut self, e: usize, until: Until) {
+        self.events[e].signaled = false;
+        let now = self.now();
+        let since = match self.gs.armed.iter().position(|a| a.event == e) {
+            Some(i) => Some(self.gs.armed.remove(i)).filter(|a| a.until == until).map_or(now, |a| a.since),
+            None => now,
+        };
+        self.gs.armed.push(Armed { event: e, until, since, cancelled: false });
+        self.signal_reached();
+        if self.gs.armed.iter().any(|a| a.event == e) {
+            self.count("gpu waits armed");
+        }
+    }
+
+    /// Signals the waits on GPU work that it has reached. The armed count is
+    /// published before the conditions are read, and the GPU thread moves a
+    /// syncpoint before it reads the count (all SeqCst): one side sees the other.
+    pub(crate) fn signal_reached(&mut self) {
+        let Some(p) = self.gpu_progress.clone() else { return };
+        if self.gs.armed.is_empty() {
+            return;
+        }
+        p.armed.store(self.gs.armed.len(), Ordering::SeqCst);
+        let (jobs, _) = p.jobs();
+        let now = self.now();
+        let mut i = 0;
+        while let Some(&a) = self.gs.armed.get(i) {
+            let reached = match a.until {
+                Until::Jobs(n) => jobs >= n,
+                Until::Syncpt(id, t) => self.gs.syncpts.get(id).is_none_or(|s| (s.load(Ordering::SeqCst).wrapping_sub(t) as i32) >= 0),
+            };
+            if !reached {
+                i += 1;
+                continue;
+            }
+            self.gs.armed.remove(i);
+            self.signal_event(a.event);
+            if now > a.since && self.journal.few("gpu wait ended", 8) {
+                self.log(&format!("gsv: a wait for {:?} ended after {:.1} ms (event {})", a.until, (now - a.since) as f64 / 31_250.0, a.event));
+            }
+        }
+        p.armed.store(self.gs.armed.len(), Ordering::SeqCst);
+    }
+
+    /// The boot thread's round (play mode): the waits reached are signaled.
+    /// Then, once the GPU thread is idle (every submit handed over applied, no
+    /// stop), a syncpoint wait armed STUCK ago or more, and not given up, has
+    /// its syncpoint raised: an anomaly, as the increment it waits for is one
+    /// we do not model.
+    pub(crate) fn check_gpu_waits(&mut self) {
+        self.signal_reached();
+        let Some(p) = self.gpu_progress.clone() else { return };
+        if self.gs.armed.is_empty() {
+            return;
+        }
+        let (jobs, alive) = p.jobs();
+        let submits = self.tally().counts.get("submits").copied().unwrap_or(0);
+        if !alive || jobs < submits {
+            return;
+        }
+        let now = self.now();
+        let stuck: Vec<(usize, u32, u64)> = self.gs.armed.iter().filter(|a| !a.cancelled && now.saturating_sub(a.since) >= STUCK).filter_map(|a| if let Until::Syncpt(id, t) = a.until { Some((id, t, a.since)) } else { None }).collect();
+        if stuck.is_empty() {
+            return;
+        }
+        for &(id, t, _) in &stuck {
+            if raise(&self.gs.syncpts[..], id, t) {
+                self.count("syncpoint waits raised");
+            }
+        }
+        self.signal_reached();
+        for (id, t, since) in stuck {
+            let s = now.saturating_sub(since) as f64 / TICKS_PER_SECOND as f64;
+            self.anomaly("gpu syncpoint wait not reached", &format!("syncpoint {id} threshold {t}: not reached {s:.1} s after it was armed, every submit applied; raised"));
+        }
+    }
 
     /// Signals the event of GPU event id `n`, as if the GPU had finished.
     pub fn signal_gpu(&mut self, n: usize) {

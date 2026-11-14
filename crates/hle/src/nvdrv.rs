@@ -177,20 +177,34 @@ pub struct GpuThread {
     thread: std::thread::JoinHandle<()>,
 }
 
-/// How far the GPU thread got; its waiters wake at each op.
+/// How far the GPU thread got; its waiters wake at each op. `armed` is the
+/// kernel's count of guest waits on GPU work (`gs::State::armed`): the GPU
+/// thread wakes the boot thread for them. The mutex is a leaf: it is taken
+/// under the kernel lock or the decoder lock, and nothing is taken under it.
 #[derive(Default)]
-struct Progress {
+pub(crate) struct Progress {
     state: Mutex<Applied>,
     changed: std::sync::Condvar,
+    pub(crate) armed: std::sync::atomic::AtomicUsize,
 }
 
 /// Ops applied so far (those after a stop are skipped, and counted), the
-/// stop the GPU thread met, and whether it ended.
+/// last submit whose ops are all applied (`Phase::submits`), the stop the
+/// GPU thread met, and whether it ended.
 #[derive(Default)]
 struct Applied {
     ops: u64,
+    jobs: u64,
     stop: Option<Stop>,
     ended: bool,
+}
+
+impl Progress {
+    /// The last submit done, and whether the GPU thread still applies ops.
+    pub(crate) fn jobs(&self) -> (u64, bool) {
+        let state = crate::lock(&self.state);
+        (state.jobs, state.stop.is_none() && !state.ended)
+    }
 }
 
 /// Ops in flight at most: about two heavy frames' GPFIFO entries.
@@ -231,6 +245,9 @@ pub enum GpuOp {
     Begin { space: u32 },
     /// What a GPFIFO entry, or a channel resumed at a present, did in `space`.
     Effects { space: u32, effects: Vec<Effect> },
+    /// The end of a submit's ops: once applied, the GPU thread counts the
+    /// submit done (`Applied::jobs`), which gpu memory 213 and 102 wait for.
+    End,
 }
 
 /// A named anomaly met by GPU work handed over at `at`, as `Kernel::anomaly`:
@@ -351,6 +368,7 @@ impl GpuSide {
                 self.gpu = gpu;
                 done
             }
+            GpuOp::End => Ok(()),
         };
         self.effects_ns += started.elapsed().as_nanos() as u64;
         done
@@ -496,7 +514,7 @@ impl Decoder {
                     t.send(phase, GpuOp::Effects { space, effects })?;
                 }
             }
-            Ok(())
+            self.gpu.as_mut().map_or(Err(gpu_thread_ended()), |t| t.send(phase, GpuOp::End))
         });
         let since = Instant::now();
         let joined = self.gpu.as_ref().map_or(Err(gpu_thread_ended()), GpuThread::join);
@@ -513,11 +531,15 @@ impl Decoder {
 
 impl GpuThread {
     /// Starts the GPU thread, with the guest threads' stack reservation:
-    /// shader translation and validation run on it.
-    pub fn start(side: Arc<Mutex<GpuSide>>) -> std::io::Result<GpuThread> {
+    /// shader translation and validation run on it. After an op that can end
+    /// a guest's wait on GPU work (syncpoint 1 moved, a submit ended), while
+    /// one is armed, it wakes `boot`, which signals it under the kernel lock:
+    /// the GPU thread never takes that lock.
+    pub fn start(side: Arc<Mutex<GpuSide>>, boot: std::thread::Thread) -> std::io::Result<GpuThread> {
         let (ops, rx) = std::sync::mpsc::sync_channel::<(Phase, GpuOp)>(IN_FLIGHT);
         let progress = Arc::new(Progress::default());
         let p = progress.clone();
+        let syncpts = crate::lock(&side).syncpts.clone();
         let thread = std::thread::Builder::new().name("gpu".into()).stack_size(gyroship_runtime::fiber::STACK_RESERVE).spawn(move || {
             /// However the thread ends (a panic too), its waiters wake and see it.
             struct Ended(Arc<Progress>);
@@ -528,16 +550,29 @@ impl GpuThread {
                 }
             }
             let _ended = Ended(p.clone());
+            let channel = &syncpts[CHANNEL_SYNCPT as usize];
+            let mut count = channel.load(Ordering::SeqCst);
             for (n, (phase, op)) in (0u64..).zip(rx) {
+                let job = matches!(op, GpuOp::End).then_some(phase.submits);
                 let stopped = crate::lock(&p.state).stop.is_some();
                 let done = if stopped { Ok(()) } else { apply_op(&side, phase, op, n) };
                 let mut state = crate::lock(&p.state);
                 state.ops += 1;
+                // ponytail: the last submit ended, not each one before it: exact while one thread submits at a time (T10 at boot, then T17).
+                if let Some(j) = job {
+                    state.jobs = state.jobs.max(j);
+                }
                 if let Err(e) = done {
                     state.stop.get_or_insert(e);
                 }
                 drop(state);
                 p.changed.notify_all();
+                // A guest may wait for this (`gs.rs`, `arm`): the boot thread signals the waits reached.
+                let now = channel.load(Ordering::SeqCst);
+                if (now != count || job.is_some()) && p.armed.load(Ordering::SeqCst) > 0 {
+                    boot.unpark();
+                }
+                count = now;
             }
         })?;
         Ok(GpuThread { ops, progress, sent: 0, thread })
@@ -600,10 +635,13 @@ fn apply_op(side: &Mutex<GpuSide>, phase: Phase, op: GpuOp, n: u64) -> Result<()
 }
 
 impl Kernel {
-    /// Play mode: from now on the GPU thread applies the submits' ops.
-    pub fn start_gpu_thread(&self) -> std::io::Result<()> {
-        let t = GpuThread::start(self.gpu_side.clone())?;
+    /// Play mode: from now on the GPU thread applies the submits' ops. Called
+    /// on the boot thread, which then runs `play::run_play`: the GPU thread
+    /// wakes it for the guests' waits on GPU work.
+    pub fn start_gpu_thread(&mut self) -> std::io::Result<()> {
+        let t = GpuThread::start(self.gpu_side.clone(), std::thread::current())?;
         self.gpu_side().wrote = Some(Vec::new());
+        self.gpu_progress = Some(t.progress.clone());
         crate::lock(&self.decoder).gpu = Some(t);
         Ok(())
     }
@@ -1101,7 +1139,9 @@ impl Gpu {
                     // increments the channel's syncpoint, whose value vi2's present fences
                     // name (syncpoint !0xfffffffe = 1, value = the count of such releases).
                     if r.addr == 0 && r.value == 1 && !r.timestamp {
-                        k.syncpts[CHANNEL_SYNCPT as usize].fetch_add(1, Ordering::AcqRel);
+                        // SeqCst: the GPU thread then reads the armed count, and the kernel
+                        // reads this after publishing it (gs.rs `signal_reached`): one sees the other.
+                        k.syncpts[CHANNEL_SYNCPT as usize].fetch_add(1, Ordering::SeqCst);
                         k.count("syncpoint increments");
                     } else if k.mem.publish_object(at, width, &bytes[width..], |_| r.value).is_err() {
                         k.anomaly(if r.addr == 0 { "gpu release at 0" } else { "gpu release not writable" }, &what)?;
@@ -1454,6 +1494,8 @@ mod tests {
         if threaded {
             k.start_gpu_thread().unwrap();
         }
+        // As the ioctl does: the submit's number goes into its Phase.
+        k.count("submits");
         k.gpu_work(GpuJob::Submit { fd: 1, space: 0, entries });
         let job = k.deferred.take().expect("a deferred job");
         (k, job)
@@ -1545,6 +1587,170 @@ mod tests {
         assert!(matches!(job.run(), Ok(After::Nothing)));
         assert!(k.tally().anomalies.is_empty());
         assert_eq!(word(&k, WORDS + 8), 7, "the third entry decoded the released payload");
+    }
+
+    /// A TIPC request to a gsv session: `command` and its arguments.
+    fn tipc(command: u32, data: &[u8]) -> Request {
+        Request {
+            kind: crate::ipc::Kind::Tipc(command),
+            command,
+            pid: None,
+            copy_handles: Vec::new(),
+            move_handles: Vec::new(),
+            x: Vec::new(),
+            a: Vec::new(),
+            b: Vec::new(),
+            w: Vec::new(),
+            c: Vec::new(),
+            data: data.to_vec(),
+            object: None,
+            in_objects: Vec::new(),
+            close_object: false,
+        }
+    }
+
+    /// syncpt 201's arguments: wait index `n`, syncpoint 1 (inverted on the wire), `threshold`, mode 0.
+    fn arm_wait(n: u32, threshold: u32) -> Vec<u8> {
+        [&n.to_le_bytes()[..], &(!CHANNEL_SYNCPT).to_le_bytes(), &u64::from(threshold).to_le_bytes(), &[0]].concat()
+    }
+
+    fn syncpoint(k: &Kernel) -> u32 {
+        k.gs.syncpts[CHANNEL_SYNCPT as usize].load(Ordering::SeqCst)
+    }
+
+    /// Waits until the GPU thread wakes the thread that started it (here the
+    /// test's), 4 s at most.
+    fn woken() -> bool {
+        let since = Instant::now();
+        std::thread::park_timeout(std::time::Duration::from_secs(5));
+        since.elapsed() < std::time::Duration::from_secs(4)
+    }
+
+    /// gpu memory 213's event waits for the GPU work handed over before the
+    /// unmap, even not yet decoded (it reads through the old mapping); without
+    /// the GPU thread, or with nothing queued, it is signaled at once.
+    #[test]
+    fn an_unmap_event_waits_for_the_queued_work() {
+        use crate::gs::Gs;
+        use gyroship_runtime::mem::Memory;
+        let unmap = |event: u32| [&0u32.to_le_bytes()[..], &0u64.to_le_bytes(), &0xffffu64.to_le_bytes(), &[0; 4], &event.to_le_bytes()].concat();
+        let mut k = Kernel::new(Memory::new().unwrap(), crate::journal::Journal::memory(), crate::Config::default());
+        Gs::Gpu.request(&mut k, &tipc(12, &3u32.to_le_bytes())).unwrap();
+        let e = k.gs.gpu_events[3].unwrap();
+        Gs::GpuMemory.request(&mut k, &tipc(213, &unmap(3))).unwrap();
+        assert!(k.events[e].signaled && k.gs.armed.is_empty());
+
+        let (mut k, job) = play_submit(true, false, &[semaphore(WORDS, 1, true)]);
+        Gs::Gpu.request(&mut k, &tipc(12, &3u32.to_le_bytes())).unwrap();
+        let e = k.gs.gpu_events[3].unwrap();
+        // Signaled, as the earlier calls on this id leave it.
+        Gs::Gpu.request(&mut k, &tipc(21, &3u32.to_le_bytes())).unwrap();
+        Gs::GpuMemory.request(&mut k, &tipc(213, &unmap(3))).unwrap();
+        assert!(!k.events[e].signaled, "the submit handed over before the unmap is not applied yet");
+        assert!(matches!(job.run(), Ok(After::Nothing)));
+        assert!(woken(), "the GPU thread wakes the boot thread once the submit is done");
+        k.check_gpu_waits();
+        assert!(k.events[e].signaled && k.gs.armed.is_empty());
+        assert_eq!(word(&k, WORDS), 1);
+        // A destroy with nothing queued: signaled at once, never left armed.
+        Gs::GpuMemory.request(&mut k, &tipc(102, &[0u32.to_le_bytes(), 3u32.to_le_bytes()].concat())).unwrap();
+        assert!(k.events[e].signaled);
+        assert_eq!(k.tally().counts.get("gpu waits armed").copied(), Some(1));
+    }
+
+    /// syncpt 201 with the GPU thread: the wait ends when the GPU thread's
+    /// increments reach the threshold, and the syncpoint is never raised;
+    /// without it, it is raised and signaled at once.
+    #[test]
+    fn syncpoint_201_is_signaled_when_the_gpu_thread_gets_there() {
+        use crate::gs::Gs;
+        use gyroship_runtime::mem::Memory;
+        let mut k = Kernel::new(Memory::new().unwrap(), crate::journal::Journal::memory(), crate::Config::default());
+        Gs::Syncpt.request(&mut k, &tipc(22, &0u32.to_le_bytes())).unwrap();
+        let e = k.gs.syncpt_waits[0].unwrap();
+        Gs::Syncpt.request(&mut k, &tipc(201, &arm_wait(0, 1))).unwrap();
+        assert!(k.events[e].signaled);
+        assert_eq!(syncpoint(&k), 1);
+
+        let config = crate::Config { play: true, vsync: false, ..crate::Config::default() };
+        let mut k = Kernel::new(Memory::new().unwrap(), crate::journal::Journal::memory(), config);
+        k.start_gpu_thread().unwrap();
+        Gs::Syncpt.request(&mut k, &tipc(22, &0u32.to_le_bytes())).unwrap();
+        let e = k.gs.syncpt_waits[0].unwrap();
+        Gs::Syncpt.request(&mut k, &tipc(201, &arm_wait(0, 0))).unwrap();
+        assert!(k.events[e].signaled, "already reached");
+        Gs::Syncpt.request(&mut k, &tipc(201, &arm_wait(0, 1))).unwrap();
+        assert!(!k.events[e].signaled);
+        assert_eq!(syncpoint(&k), 0, "no raise");
+        // NVN's increment, a release of 1 at address 0, applied by the GPU thread.
+        {
+            let mut d = crate::lock(&k.decoder);
+            let t = d.gpu.as_mut().unwrap();
+            let release = gyroship_gpu::pushbuf::Release { method: 0x1b0c, addr: 0, value: 1, width: 4, timestamp: false };
+            t.send(&Phase::default(), GpuOp::Effects { space: 0, effects: vec![Effect::Release(release)] }).unwrap();
+            t.join().unwrap();
+        }
+        assert!(woken(), "the GPU thread wakes the boot thread once the syncpoint moves");
+        k.check_gpu_waits();
+        assert!(k.events[e].signaled && k.gs.armed.is_empty());
+        assert_eq!(syncpoint(&k), 1);
+        assert_eq!(k.tally().counts.get("syncpoint waits raised"), None);
+        // Armed again, already reached: signaled by the arm's own check.
+        Gs::Syncpt.request(&mut k, &tipc(201, &arm_wait(0, 1))).unwrap();
+        assert!(k.events[e].signaled);
+    }
+
+    /// A syncpoint wait still unreached 2 s after it was first armed, with the
+    /// GPU thread idle, has its syncpoint raised (an anomaly); not while a
+    /// submit is still queued. NVN's rounds (201, 202, 201) keep its age.
+    #[test]
+    fn an_overdue_syncpoint_wait_is_raised_once_the_gpu_thread_is_idle() {
+        use crate::gs::Gs;
+        const S: u64 = 31_250_000;
+        let (mut k, job) = play_submit(true, true, &[semaphore(WORDS, 1, true)]);
+        Gs::Syncpt.request(&mut k, &tipc(22, &0u32.to_le_bytes())).unwrap();
+        let e = k.gs.syncpt_waits[0].unwrap();
+        Gs::Syncpt.request(&mut k, &tipc(201, &arm_wait(0, 5))).unwrap();
+        k.sched.real_now = 3 * S;
+        k.check_gpu_waits();
+        assert!(!k.events[e].signaled && syncpoint(&k) == 0, "not while a submit is queued");
+        assert!(matches!(job.run(), Ok(After::Nothing)));
+        k.check_gpu_waits();
+        assert!(k.events[e].signaled && k.gs.armed.is_empty());
+        assert_eq!(syncpoint(&k), 5);
+        {
+            let t = k.tally();
+            assert_eq!((t.counts.get("syncpoint waits raised").copied(), t.anomalies.get("gpu syncpoint wait not reached").copied()), (Some(1), Some(1)));
+        }
+        Gs::Syncpt.request(&mut k, &tipc(201, &arm_wait(0, 9))).unwrap();
+        k.sched.real_now = 3 * S + S / 10;
+        Gs::Syncpt.request(&mut k, &tipc(202, &0u32.to_le_bytes())).unwrap();
+        assert!(k.events[e].signaled, "202 signals");
+        k.sched.real_now = 4 * S + 9 * S / 10;
+        Gs::Syncpt.request(&mut k, &tipc(201, &arm_wait(0, 9))).unwrap();
+        assert!(!k.events[e].signaled);
+        k.sched.real_now = 5 * S + S / 10;
+        k.check_gpu_waits();
+        assert!(k.events[e].signaled, "armed 2.1 s ago, at its first 201");
+        assert_eq!(syncpoint(&k), 9);
+    }
+
+    /// A syncpoint wait the client gave up (202) is never raised, however
+    /// old: no one waits for it any more.
+    #[test]
+    fn a_syncpoint_wait_given_up_is_never_raised() {
+        use crate::gs::Gs;
+        use gyroship_runtime::mem::Memory;
+        let config = crate::Config { play: true, explore: true, vsync: false, ..crate::Config::default() };
+        let mut k = Kernel::new(Memory::new().unwrap(), crate::journal::Journal::memory(), config);
+        k.start_gpu_thread().unwrap();
+        Gs::Syncpt.request(&mut k, &tipc(22, &0u32.to_le_bytes())).unwrap();
+        Gs::Syncpt.request(&mut k, &tipc(201, &arm_wait(0, 5))).unwrap();
+        Gs::Syncpt.request(&mut k, &tipc(202, &0u32.to_le_bytes())).unwrap();
+        k.sched.real_now = 3 * 31_250_000;
+        k.check_gpu_waits();
+        assert_eq!((syncpoint(&k), k.gs.armed.len()), (0, 1));
+        assert!(k.tally().anomalies.is_empty());
     }
 }
 
