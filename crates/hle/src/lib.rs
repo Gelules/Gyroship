@@ -220,10 +220,12 @@ pub struct Kernel {
     pub saves: std::collections::BTreeMap<String, save::SaveFs>,
     /// Virtual timers (the audio sink).
     pub timers: Vec<thread::Timer>,
-    /// What GPU work needs (the host render targets, the channels, the
-    /// window), behind a lock of its own (`gpu_work`).
+    /// What GPU work needs (the host render targets, the window), behind a
+    /// lock of its own (`gpu_work`), and the channels' command processors,
+    /// behind another one, always taken first.
     pub gpu_side: Arc<Mutex<nvdrv::GpuSide>>,
-    /// Activity and anomaly counts, shared with the GPU side.
+    pub decoder: Arc<Mutex<nvdrv::Decoder>>,
+    /// Activity and anomaly counts, shared with the GPU side and the decoder.
     pub tally: Arc<Mutex<Tally>>,
     /// The host's live controller state, read at each hid sample.
     pub live_input: Option<LiveInput>,
@@ -264,9 +266,9 @@ const TOLERATED: &[&str] = &[];
 /// A stop the kernel makes next: exit code and why.
 pub type Stop = (i32, String);
 
-/// Activity and anomaly counts, for the summary line, shared by the kernel
-/// and its GPU side behind a lock of their own, under which no other lock is
-/// taken.
+/// Activity and anomaly counts, for the summary line, shared by the kernel,
+/// its GPU side and its decoder behind a lock of their own, under which no
+/// other lock is taken.
 #[derive(Default)]
 pub struct Tally {
     /// Normal activity, by name (submits, draws…).
@@ -306,7 +308,8 @@ impl Kernel {
         let audio_samples = config.audio_dump.as_ref().map(|_| Vec::new());
         let (mem, tally, gs) = (Arc::new(mem), Arc::new(Mutex::new(Tally::default())), gs::State::default());
         let gpu_side = Arc::new(Mutex::new(nvdrv::GpuSide::new(mem.clone(), journal.share(), tally.clone(), gs.syncpts.clone(), config.clone())));
-        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None, sessions: Vec::new(), objects: Vec::new(), domains: Vec::new(), allowed_services: Vec::new(), shared: Vec::new(), transfers: Vec::new(), time_shared: None, frame: (0, 0, 0), symbols: Vec::new(), romfs: None, deferred: None, gs, hid_shared: None, input: Default::default(), spin: Vec::new(), census: Census::default(), saves: Default::default(), timers: Vec::new(), gpu_side, tally, live_input: None, recorded, audio_out: None, audio_samples, opus: Default::default(), audio_gain: 1.0, audio_format: (2, 48_000), trace: None }
+        let decoder = Arc::new(Mutex::new(nvdrv::Decoder::new(mem.clone(), journal.share(), tally.clone(), config.clone())));
+        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None, sessions: Vec::new(), objects: Vec::new(), domains: Vec::new(), allowed_services: Vec::new(), shared: Vec::new(), transfers: Vec::new(), time_shared: None, frame: (0, 0, 0), symbols: Vec::new(), romfs: None, deferred: None, gs, hid_shared: None, input: Default::default(), spin: Vec::new(), census: Census::default(), saves: Default::default(), timers: Vec::new(), gpu_side, decoder, tally, live_input: None, recorded, audio_out: None, audio_samples, opus: Default::default(), audio_gain: 1.0, audio_format: (2, 48_000), trace: None }
     }
 
     /// The activity and anomaly counts.
@@ -396,9 +399,14 @@ impl Kernel {
     /// Writes the host-side reports a run asked for (`--profile`, `--perf`).
     pub fn host_reports(&mut self) {
         gyroship_runtime::profile::finish(&|a| self.symbolize(a));
-        // The GPU side, unless GPU work keeps it past GPU_WAIT (play engine): its reports are then left out.
+        // GPU work (play engine) may hold the decoder and the GPU side: GPU_WAIT
+        // for both, the decoder first (the locks' order), only for its macro
+        // statistics (--perf). Past it the GPU reports are left out.
+        let until = std::time::Instant::now() + GPU_WAIT;
+        let left = || until.saturating_duration_since(std::time::Instant::now());
+        let mme = self.config.perf.as_ref().and_then(|_| lock_within(&self.decoder, left())).map(|d| d.mme_stats());
         let side = self.gpu_side.clone();
-        let mut g = lock_within(&side, GPU_WAIT);
+        let mut g = lock_within(&side, left());
         if g.is_none() {
             eprintln!("gyroship: GPU work kept the GPU side past {} s: no GPU reports", GPU_WAIT.as_secs());
         }
@@ -484,7 +492,7 @@ impl Kernel {
                     eprintln!("gyroship: --perf {}: {e}", file.display());
                 }
             }
-            let m = g.as_ref().map(|g| g.gpu.mme_stats()).unwrap_or_default();
+            let m = mme.unwrap_or_default();
             eprintln!(
                 "gyroship: macros over {} presents: {} calls of {:.1} groups on average, {:.1}% repeating their macro's last parameters without reading registers or memory; {} zero-count LOOPs; {} taken branches with bit 14 ({} with an END pending)",
                 self.gs.presents,
@@ -747,8 +755,8 @@ pub enum Deferred {
     /// IStorage Read: `len` bytes of the image at `offset` into guest `addr`
     /// (found writable when queued).
     RomFsRead { romfs: Arc<fs::RomFs>, mem: Arc<Memory>, offset: u64, addr: u64, len: u64 },
-    /// GPU work (`Kernel::gpu_work`), on the GPU side, handed over at `phase`.
-    Gpu { side: Arc<Mutex<nvdrv::GpuSide>>, phase: nvdrv::Phase, job: nvdrv::GpuJob },
+    /// GPU work (`Kernel::gpu_work`), decoded and performed, handed over at `phase`.
+    Gpu { side: Arc<Mutex<nvdrv::GpuSide>>, decoder: Arc<Mutex<nvdrv::Decoder>>, phase: nvdrv::Phase, job: nvdrv::GpuJob },
 }
 
 /// What deferred work leaves for the kernel lock (`Kernel::after`).
@@ -771,7 +779,7 @@ impl Deferred {
                 mem.write(addr, &bytes).map_err(|e| (STOP_EXIT, format!("RomFS read at {offset:#x}+{len:#x}: {addr:#x} no longer writable ({e:?})")))?;
                 Ok(After::Nothing)
             }
-            Deferred::Gpu { side, phase, job } => nvdrv::run(&side, phase, job),
+            Deferred::Gpu { side, decoder, phase, job } => nvdrv::run(&side, &decoder, phase, job),
         }
     }
 }
@@ -865,10 +873,10 @@ pub struct Census {
 /// The `--perf` frames file: per present, counters so far (cpu_ms: the
 /// presenting host thread's CPU time; watched_pages: pages the textures' write
 /// watch went over; submit_ms: play mode, the GPU submit thread's busy time,
-/// as of the present's flush; decode_ms and effects_ms: host time decoding
-/// pushbuffers and performing their effects, `GpuSide::decode_ns`;
-/// submit_cpu_ms: the submit thread's CPU time); only `skipped` is the
-/// present's own.
+/// as of the present's flush; decode_ms: host time decoding pushbuffers,
+/// `Decoder::decode_ns`; effects_ms: host time performing their effects,
+/// `GpuSide::effects_ns`; submit_cpu_ms: the submit thread's CPU time); only
+/// `skipped` is the present's own.
 pub(crate) const FRAME_COLUMNS: &str = "present,cpu_ms,draws,skipped,views_made,bind_groups_made,flushed_bytes,upload_bytes,upload_ms,macro_calls,watched_pages,flush_ms,submit_ms,decode_ms,effects_ms,submit_cpu_ms\n";
 
 const COUNTER: u32 = 0x100;

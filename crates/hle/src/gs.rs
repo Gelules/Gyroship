@@ -8,10 +8,11 @@
 //! reached, and every wait it is asked about succeeds at once.
 
 use crate::ipc::{Reply, Request};
-use crate::nvdrv::GpuSide;
+use crate::nvdrv::{Decoder, GpuSide};
 use crate::service::Service;
 use crate::thread::Object;
 use crate::{Kernel, Stop};
+use gyroship_runtime::mem::Memory;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -119,12 +120,42 @@ fn span(table: &Table, space: u32, gpu: u64) -> (u64, u64) {
     }
 }
 
+/// The CPU address of a GPU address in address space `space`, through the
+/// mapping of `maps` made last that covers it; addresses no mapping covers
+/// are taken as CPU addresses (NVN maps the CPU's ASLR region one to one).
+pub fn gpu_to_cpu(maps: &Mappings, space: u32, gpu: u64) -> u64 {
+    lookup(&maps.table, space, gpu)
+}
+
+/// Reads guest memory at a GPU address for the GPU, through `maps`; false if
+/// a byte is not readable. A naturally aligned 4- or 8-byte read (the
+/// semaphore an acquire polls while guest threads release it) is one Acquire
+/// load. Other reads go through the mapping that covers each part.
+pub fn read_gpu(mem: &Memory, maps: &Mappings, space: u32, mut gpu: u64, mut out: &mut [u8]) -> bool {
+    let (mut at, mut room) = span(&maps.table, space, gpu);
+    let word = match out.len() {
+        4 if at.is_multiple_of(4) => mem.load_u32(at).map(u64::from),
+        8 if at.is_multiple_of(8) => mem.load_u64(at),
+        _ => loop {
+            let n = out.len().min(usize::try_from(room).unwrap_or(usize::MAX));
+            let (part, rest) = std::mem::take(&mut out).split_at_mut(n);
+            if mem.read(at, part).is_err() {
+                return false;
+            }
+            if rest.is_empty() {
+                return true;
+            }
+            (gpu, out) = (gpu + n as u64, rest);
+            (at, room) = span(&maps.table, space, gpu);
+        },
+    };
+    word.map(|v| out.copy_from_slice(&v.to_le_bytes()[..out.len()])).is_ok()
+}
+
 impl GpuSide {
-    /// The CPU address of a GPU address in address space `space`, through the
-    /// mapping made last that covers it; addresses no mapping covers are taken
-    /// as CPU addresses (NVN maps the CPU's ASLR region one to one).
+    /// [`gpu_to_cpu`] through the mappings of the work's hand-over.
     pub fn gpu_to_cpu(&self, space: u32, gpu: u64) -> u64 {
-        lookup(&self.at.maps.table, space, gpu)
+        gpu_to_cpu(&self.at.maps, space, gpu)
     }
 
     /// Writes `bytes` at GPU address `gpu` of `space`, each part through the
@@ -140,29 +171,9 @@ impl GpuSide {
         Ok(())
     }
 
-    /// Reads guest memory at a GPU address for the GPU; false if a byte is
-    /// not readable. A naturally aligned 4- or 8-byte read (the semaphore an
-    /// acquire polls while guest threads release it) is one Acquire load.
-    /// Other reads go through the mapping that covers each part, as `write_gpu`.
-    pub fn read_gpu(&mut self, space: u32, mut gpu: u64, mut out: &mut [u8]) -> bool {
-        let (mut at, mut room) = span(&self.at.maps.table, space, gpu);
-        let word = match out.len() {
-            4 if at.is_multiple_of(4) => self.mem.load_u32(at).map(u64::from),
-            8 if at.is_multiple_of(8) => self.mem.load_u64(at),
-            _ => loop {
-                let n = out.len().min(usize::try_from(room).unwrap_or(usize::MAX));
-                let (part, rest) = std::mem::take(&mut out).split_at_mut(n);
-                if self.mem.read(at, part).is_err() {
-                    return false;
-                }
-                if rest.is_empty() {
-                    return true;
-                }
-                (gpu, out) = (gpu + n as u64, rest);
-                (at, room) = span(&self.at.maps.table, space, gpu);
-            },
-        };
-        word.map(|v| out.copy_from_slice(&v.to_le_bytes()[..out.len()])).is_ok()
+    /// [`read_gpu`] through the mappings of the work's hand-over.
+    pub fn read_gpu(&mut self, space: u32, gpu: u64, out: &mut [u8]) -> bool {
+        read_gpu(&self.mem, &self.at.maps, space, gpu, out)
     }
 }
 
@@ -588,13 +599,13 @@ impl GpuSide {
     /// acquire fence (syncpoint id inverted, value) is checked, the host GPU's
     /// refusals and shader work are reported, and the image of drawn `area`
     /// is hashed, shown and dumped.
-    pub(crate) fn present(&mut self, n: u64, (fence_id, fence): (u32, u32), area: u32) -> Result<(), Stop> {
+    pub(crate) fn present(&mut self, d: &mut Decoder, n: u64, (fence_id, fence): (u32, u32), area: u32) -> Result<(), Stop> {
         // The GPU work submitted from here to the end of this present is this frame's.
         if let Some(s) = self.surfaces.as_mut() {
             s.present = n;
         }
         // GPU work that waited for the CPU's semaphores runs before the frame is shown.
-        crate::nvdrv::poll(self)?;
+        crate::nvdrv::poll(d, self)?;
         // The frame's acquire fence must be reached by now.
         if let Some(now) = self.syncpts.get(!fence_id as usize).map(|s| s.load(Ordering::Acquire))
             && (fence.wrapping_sub(now) as i32) > 0
@@ -619,7 +630,7 @@ impl GpuSide {
                 });
                 #[cfg(not(windows))]
                 let submit_cpu: Option<std::time::Duration> = None;
-                let (st, calls) = (&s.staging, self.gpu.mme_stats().calls);
+                let (st, calls) = (&s.staging, d.mme_stats().calls);
                 let row = format!(
                     "{n},{cpu:.1},{},{},{},{},{},{},{:.1},{calls},{},{:.1},{:.1},{:.1},{:.1},{:.1}\n",
                     s.drawn,
@@ -632,7 +643,7 @@ impl GpuSide {
                     self.watched,
                     st.flush_ns as f64 / 1e6,
                     st.submit_ns as f64 / 1e6,
-                    self.decode_ns as f64 / 1e6,
+                    d.decode_ns as f64 / 1e6,
                     self.effects_ns as f64 / 1e6,
                     submit_cpu.unwrap_or_default().as_secs_f64() * 1e3
                 );
