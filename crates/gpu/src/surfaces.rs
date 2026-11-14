@@ -421,6 +421,101 @@ impl Window {
         });
         Window { surface, config, pipeline, layout }
     }
+
+    /// Shows the top-left `area` of `texture` (a target of size `target`),
+    /// scaled to `size` with point sampling. Nothing happens with an empty area
+    /// or size (minimized).
+    fn show(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture, target: (u32, u32), area: (u32, u32), size: (u32, u32)) {
+        if size.0 == 0 || size.1 == 0 || area.0 == 0 || area.1 == 0 {
+            return;
+        }
+        if (self.config.width, self.config.height) != size {
+            (self.config.width, self.config.height) = size;
+            self.surface.configure(device, &self.config);
+        }
+        let frame = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+            // Resized or lost under us: configure again, show the next frame.
+            _ => {
+                self.surface.configure(device, &self.config);
+                return;
+            }
+        };
+        let area = (area.0.min(target.0), area.1.min(target.1));
+        let words: Vec<u8> = [area.0, area.1, size.0, size.1].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let params = wgpu::util::DeviceExt::create_buffer_init(device, &wgpu::util::BufferInitDescriptor { label: Some("show"), contents: &words, usage: wgpu::BufferUsages::UNIFORM });
+        let src = texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2), array_layer_count: Some(1), ..Default::default() });
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src) }, wgpu::BindGroupEntry { binding: 1, resource: params.as_entire_binding() }],
+        });
+        let view = frame.texture.create_view(&Default::default());
+        let mut encoder = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("show"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &view, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })],
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        queue.submit([encoder.finish()]);
+        queue.present(frame);
+    }
+}
+
+/// What a flush submits, in this order: the copies into new textures, the
+/// arena's bytes into its buffer, the frame's commands; and the present they
+/// belong to (for the frame clock).
+struct Frame {
+    uploads: Option<wgpu::CommandEncoder>,
+    arena: (wgpu::Buffer, Vec<u8>),
+    pending: Option<wgpu::CommandEncoder>,
+    present: u64,
+}
+
+/// The GPU half of a flush: `f`'s command buffers finished and submitted, its
+/// arena bytes copied through `belt`. The texture uploads' and the arena's
+/// copies run before the frame's commands (their command buffers come first),
+/// and after the previous frame's, which read the same arena bytes: queue
+/// order. Returns the arena bytes, emptied.
+fn submit_frame(device: &wgpu::Device, queue: &wgpu::Queue, belt: &mut wgpu::util::StagingBelt, mut clock: Option<&mut crate::timing::FrameClock>, timing: Option<&mut crate::timing::Timing>, f: Frame) -> Vec<u8> {
+    let mut buffers = Vec::with_capacity(3);
+    if let Some(uploads) = f.uploads {
+        buffers.push(uploads.finish());
+    }
+    let (arena, mut bytes) = f.arena;
+    if let Some(size) = wgpu::BufferSize::new(bytes.len() as u64) {
+        let mut upload = device.create_command_encoder(&Default::default());
+        belt.write_buffer(&mut upload, &arena, 0, size).copy_from_slice(&bytes);
+        belt.finish();
+        buffers.push(upload.finish());
+        bytes.clear();
+    }
+    if let Some(mut e) = f.pending {
+        if let Some(t) = &timing {
+            t.resolve(&mut e);
+        }
+        if let Some(c) = clock.as_deref_mut() {
+            c.close(device, &mut e);
+        }
+        buffers.push(e.finish());
+        queue.submit(buffers);
+        if let Some(t) = timing {
+            t.collect(device);
+        }
+        if let Some(c) = clock {
+            c.submitted(device, f.present);
+        }
+    } else if !buffers.is_empty() {
+        queue.submit(buffers);
+    }
+    // Chunks whose copies were submitted come back once the GPU is done.
+    belt.recall();
+    bytes
 }
 
 /// What the upload arena carried since the start: staged blocks (and those an
@@ -706,44 +801,7 @@ impl Surfaces {
         self.flush();
         let (Some(w), Some(key)) = (self.window.as_mut(), self.last_color) else { return };
         let Some(e) = self.map.get(&key) else { return };
-        if size.0 == 0 || size.1 == 0 || area.0 == 0 || area.1 == 0 {
-            return;
-        }
-        if (w.config.width, w.config.height) != size {
-            (w.config.width, w.config.height) = size;
-            w.surface.configure(&self.device, &w.config);
-        }
-        let frame = match w.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
-            // Resized or lost under us: configure again, show the next frame.
-            _ => {
-                w.surface.configure(&self.device, &w.config);
-                return;
-            }
-        };
-        let area = (area.0.min(e.surface.width), area.1.min(e.surface.height));
-        let words: Vec<u8> = [area.0, area.1, size.0, size.1].iter().flat_map(|v| v.to_le_bytes()).collect();
-        let params = wgpu::util::DeviceExt::create_buffer_init(&self.device, &wgpu::util::BufferInitDescriptor { label: Some("show"), contents: &words, usage: wgpu::BufferUsages::UNIFORM });
-        let src = e.texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2), array_layer_count: Some(1), ..Default::default() });
-        let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &w.layout,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src) }, wgpu::BindGroupEntry { binding: 1, resource: params.as_entire_binding() }],
-        });
-        let view = frame.texture.create_view(&Default::default());
-        let mut encoder = self.device.create_command_encoder(&Default::default());
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("show"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &view, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })],
-                ..Default::default()
-            });
-            pass.set_pipeline(&w.pipeline);
-            pass.set_bind_group(0, &group, &[]);
-            pass.draw(0..3, 0..1);
-        }
-        self.queue.submit([encoder.finish()]);
-        self.queue.present(frame);
+        w.show(&self.device, &self.queue, &e.texture, (e.surface.width, e.surface.height), area, size);
     }
 
     /// The encoder that collects a frame's passes: one submit per frame
@@ -991,47 +1049,17 @@ impl Surfaces {
         let started = std::time::Instant::now();
         self.pass = None;
         self.memo.clear();
-        // The texture uploads' and the arena's copies run before this submit's
-        // commands (their command buffers come first), and after the previous
-        // frame's, which read the same arena bytes: queue order. The texture
-        // staging is closed even with no upload: a refresh may have used it.
-        let mut buffers = Vec::with_capacity(3);
-        self.texture_belt.finish();
-        if let Some(uploads) = self.uploads.take() {
-            buffers.push(uploads.finish());
-        }
         let whole = self.arena.1.len().next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT as usize);
         self.arena.1.resize(whole, 0);
-        if let Some(size) = wgpu::BufferSize::new(whole as u64) {
-            self.staging.flushed += size.get();
+        if whole > 0 {
+            self.staging.flushed += whole as u64;
             self.staging.flushes += 1;
-            let mut upload = self.device.create_command_encoder(&Default::default());
-            self.belt.write_buffer(&mut upload, &self.arena.0, 0, size).copy_from_slice(&self.arena.1);
-            self.belt.finish();
-            buffers.push(upload.finish());
-            self.arena.1.clear();
             self.staged.clear();
         }
-        if let Some(mut e) = self.pending.take() {
-            if let Some(t) = &self.timing {
-                t.resolve(&mut e);
-            }
-            if let Some(c) = &mut self.clock {
-                c.close(&self.device, &mut e);
-            }
-            buffers.push(e.finish());
-            self.queue.submit(buffers);
-            if let Some(t) = &mut self.timing {
-                t.collect(&self.device);
-            }
-            if let Some(c) = &mut self.clock {
-                c.submitted(&self.device, self.present);
-            }
-        } else if !buffers.is_empty() {
-            self.queue.submit(buffers);
-        }
-        // Chunks whose copies were submitted come back once the GPU is done.
-        self.belt.recall();
+        // The texture staging is closed even with no upload: a refresh may have used it.
+        self.texture_belt.finish();
+        let f = Frame { uploads: self.uploads.take(), arena: (self.arena.0.clone(), std::mem::take(&mut self.arena.1)), pending: self.pending.take(), present: self.present };
+        self.arena.1 = submit_frame(&self.device, &self.queue, &mut self.belt, self.clock.as_mut(), self.timing.as_mut(), f);
         self.texture_belt.recall();
         self.staging.flush_ns += started.elapsed().as_nanos() as u64;
     }
