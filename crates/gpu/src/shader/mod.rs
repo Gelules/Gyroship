@@ -105,7 +105,16 @@ pub struct Image {
     pub read: bool,
     /// Reduced into (SURED): an r32uint image bound for atomics.
     pub atomic: bool,
+    /// An atomic's old value is taken back (SUATOM), which WGSL's texture atomics
+    /// do not give: bound as a storage buffer ([`IMAGE_BUFFER`]) the dispatch fills
+    /// from the image and copies back into it.
+    pub buffer: bool,
 }
+
+/// An image bound as a buffer (`Image::buffer`): a 256-byte header with its
+/// width, height, depth (or layers) and texels per row, then its texels, each
+/// row padded as a buffer copy pads it.
+pub const IMAGE_BUFFER: &str = "struct ImageBuffer { size: vec4<u32>, pad: array<vec4<u32>, 15>, texels: array<atomic<u32>> }\n";
 
 /// The binding of image slot 0; slot i is at `IMAGE_BINDING + i`.
 pub const IMAGE_BINDING: u32 = 512;
@@ -308,6 +317,7 @@ pub fn translate_with(code: &[u8], options: &Options) -> Result<Translation, Err
     };
     cx.read_write = handles(true).intersection(&handles(false)).copied().collect();
     cx.atomic = ops.iter().filter_map(|o| if let Op::Memory(MemoryOp::Sured { handle, .. }) = o { Some((handle.bank, handle.offset)) } else { None }).collect();
+    cx.returned = ops.iter().filter_map(|o| if let Op::Memory(MemoryOp::Suatom { handle, .. }) = o { Some((handle.bank, handle.offset)) } else { None }).collect();
     let body = cx.program(&words, &ops)?;
     let wgsl = cx.module(&body, options);
     for x in &cx.iface.textures {
@@ -424,6 +434,8 @@ struct Cx {
     read_write: BTreeSet<(u8, u16)>,
     /// Images reduced into (SURED), by constant-bank handle.
     atomic: BTreeSet<(u8, u16)>,
+    /// Images whose atomics' old values are used (SUATOM), by constant-bank handle.
+    returned: BTreeSet<(u8, u16)>,
     /// `Options::queried`.
     queried: BTreeMap<usize, TexDim>,
     int_attributes: BTreeMap<u8, bool>,
@@ -476,7 +488,7 @@ const SHM_CAS: &str = "fn shm_cas(i: u32, op: u32, v: u32) -> u32 {
 
 impl Cx {
     fn new(sph: Sph) -> Cx {
-        Cx { sph, regs: BTreeSet::new(), preds: BTreeSet::new(), uregs: BTreeSet::new(), upreds: BTreeSet::new(), iface: Interface::default(), decls: String::new(), helpers: BTreeSet::new(), temps: 0, uexpr: BTreeMap::new(), gexpr: BTreeMap::new(), images: Vec::new(), queried: BTreeMap::new(), int_attributes: BTreeMap::new(), jump_targets: None, clip_planes: 0, read_write: BTreeSet::new(), atomic: BTreeSet::new(), shm: false, lane: false, roots: BTreeMap::new() }
+        Cx { sph, regs: BTreeSet::new(), preds: BTreeSet::new(), uregs: BTreeSet::new(), upreds: BTreeSet::new(), iface: Interface::default(), decls: String::new(), helpers: BTreeSet::new(), temps: 0, uexpr: BTreeMap::new(), gexpr: BTreeMap::new(), images: Vec::new(), queried: BTreeMap::new(), int_attributes: BTreeMap::new(), jump_targets: None, clip_planes: 0, read_write: BTreeSet::new(), atomic: BTreeSet::new(), returned: BTreeSet::new(), shm: false, lane: false, roots: BTreeMap::new() }
     }
 
     /// A shared memory access's byte address, `reg × stride + ureg + offset`, as a new `let`.
@@ -1405,6 +1417,15 @@ impl Cx {
                     self.root_from(*dst, &[b]);
                 }
             }
+            // IABS: WGSL's abs keeps the most negative word as it is, as the hardware does.
+            IntOp::IAbs { dst, src } => {
+                let x = self.raw(src)?;
+                self.set(out, *dst, &format!("bitcast<u32>(abs(bitcast<i32>({x})))"));
+            }
+            IntOp::BRev { dst, src } => {
+                let x = self.raw(src)?;
+                self.set(out, *dst, &format!("reverseBits({x})"));
+            }
             IntOp::Sgxt { dst, a, bits, signed, wrap } => {
                 let (x, n) = (self.raw(a)?, self.raw(bits)?);
                 let n = if *wrap { format!("({n} & 31u)") } else { n };
@@ -1750,6 +1771,20 @@ impl Cx {
                 let layer = layer.map(|l| format!(", {l}")).unwrap_or_default();
                 let _ = writeln!(out, "if ({inside}) {{ textureStore(img{slot}, {at}{layer}, {ty}({})); }}", v.join(", "));
             }
+            // SUATOM: an image atomic whose old value the program uses, on the image's
+            // buffer (`image_atomic`). The game's 9 are U32 ADD on 3D images, each
+            // followed by a SURED OR on the same image.
+            MemoryOp::Suatom { dst, coord, data, handle, dim, op, ty: AtomType::U32, ba: false, pred_dst, .. } if self.sph.stage == Stage::Compute => {
+                let old = self.image_atomic(out, *coord, *data, *handle, *dim, *op)?;
+                if *dst != RZ {
+                    self.set(out, *dst, &old);
+                }
+                self.set_p(out, *pred_dst, "false");
+            }
+            // SURED on an image the program also takes old values from: its buffer too.
+            MemoryOp::Sured { coord, data, handle, dim, op, ty: AtomType::U32, ba: false, .. } if self.sph.stage == Stage::Compute && self.returned.contains(&(handle.bank, handle.offset)) => {
+                self.image_atomic(out, *coord, *data, *handle, *dim, *op)?;
+            }
             // SURED: an atomic on an image texel with no result (WGSL's texture atomics
             // return none), on an r32uint image bound for atomics; outside the image it is
             // dropped, as SUST. The game's 17 are all U32 ADD or OR on 3D images.
@@ -1969,12 +2004,15 @@ impl Cx {
         };
         let h = Handle::CBuf { bank: handle.bank, offset: handle.offset };
         if let Some(slot) = self.iface.images.iter().position(|i| i.handle == h) {
+            if self.iface.images[slot].buffer {
+                return Err("SULD or SUST on an image bound as a buffer (SUATOM)".into());
+            }
             return Ok(slot);
         }
         let slot = self.iface.images.len();
         let read = self.read_write.contains(&(handle.bank, handle.offset));
         let atomic = self.atomic.contains(&(handle.bank, handle.offset));
-        self.iface.images.push(Image { handle: h, dim, read, atomic });
+        self.iface.images.push(Image { handle: h, dim, read, atomic, buffer: false });
         let format = self.images.get(slot).cloned().unwrap_or_else(|| if atomic { "r32uint" } else { "rgba16float" }.into());
         if atomic && format != "r32uint" {
             return Err(format!("image atomics on a {format} image"));
@@ -1983,6 +2021,54 @@ impl Cx {
         let access = if atomic { "atomic" } else if read { "read_write" } else { "write" };
         let _ = writeln!(self.decls, "@group({g}) @binding({}) var img{slot}: {ty}<{format}, {access}>;", IMAGE_BINDING + slot as u32);
         Ok(slot)
+    }
+
+    /// The slot of an image bound as a buffer (`Image::buffer`), declared at its first use.
+    fn image_buffer(&mut self, handle: CbHandle, dim: ImageDim) -> R<usize> {
+        let h = Handle::CBuf { bank: handle.bank, offset: handle.offset };
+        if let Some(slot) = self.iface.images.iter().position(|i| i.handle == h) {
+            return Ok(slot);
+        }
+        let slot = self.iface.images.len();
+        self.iface.images.push(Image { handle: h, dim, read: false, atomic: true, buffer: true });
+        let format = self.images.get(slot).map_or("r32uint", String::as_str);
+        if !matches!(format, "r32uint" | "r32sint") {
+            return Err(format!("image atomics on a {format} image"));
+        }
+        self.helpers.insert(IMAGE_BUFFER);
+        let g = self.group();
+        let _ = writeln!(self.decls, "@group({g}) @binding({}) var<storage, read_write> imb{slot}: ImageBuffer;", IMAGE_BINDING + slot as u32);
+        Ok(slot)
+    }
+
+    /// An atomic `op` with `data` on a texel of an image bound as a buffer (WGSL's
+    /// texture atomics return no old value; buffer atomics do). Outside the image
+    /// it is dropped, as SURED, and gives 0. Returns the old value's variable.
+    fn image_atomic(&mut self, out: &mut String, coord: u8, data: u8, handle: CbHandle, dim: ImageDim, op: AtomOp) -> R<String> {
+        let f = match op {
+            AtomOp::Add => "atomicAdd",
+            AtomOp::Min => "atomicMin",
+            AtomOp::Max => "atomicMax",
+            AtomOp::And => "atomicAnd",
+            AtomOp::Or => "atomicOr",
+            AtomOp::Xor => "atomicXor",
+            AtomOp::Exch => "atomicExchange",
+            other => return Err(format!("image atomic {other:?}")),
+        };
+        let slot = self.image_buffer(handle, dim)?;
+        let (at, coords, layer) = self.image_coords(coord, dim)?;
+        let xyz = match (coords, layer) {
+            (3, _) => format!("vec3<u32>({at})"),
+            (2, Some(l)) => format!("vec3<u32>(vec2<u32>({at}), u32({l}))"),
+            (2, None) => format!("vec3<u32>(vec2<u32>({at}), 0u)"),
+            _ => format!("vec3<u32>(u32({at}), 0u, 0u)"),
+        };
+        let v = if data == RZ { "0u".to_string() } else { self.r(data) };
+        let (c, old, b) = (self.temp(), self.temp(), format!("imb{slot}"));
+        let _ = writeln!(out, "let {c} = {xyz};");
+        let _ = writeln!(out, "var {old} = 0u;");
+        let _ = writeln!(out, "if (all({c} < {b}.size.xyz)) {{ {old} = {f}(&{b}.texels[({c}.z * {b}.size.y + {c}.y) * {b}.size.w + {c}.x], {v}); }}");
+        Ok(old)
     }
 
     /// An image access's integer coordinates from the registers at `base`: the
@@ -2574,7 +2660,7 @@ mod tests {
         let t = translate_with(&code, &options).unwrap_or_else(|e| panic!("{e}"));
         validate(&t.wgsl).unwrap_or_else(|e| panic!("{e}\n{}", t.wgsl));
         assert_eq!(t.stage, Stage::Compute);
-        assert_eq!(t.interface.images, vec![Image { handle: Handle::CBuf { bank: 0, offset: 0x20 }, dim: ImageDim::D3, read: false, atomic: false }]);
+        assert_eq!(t.interface.images, vec![Image { handle: Handle::CBuf { bank: 0, offset: 0x20 }, dim: ImageDim::D3, read: false, atomic: false, buffer: false }]);
         for want in ["@workgroup_size(8, 8, 1)", "r0 = lid.x;", "r2 = wid.z;", "texture_storage_3d<rgba16float, write>", "textureStore(img0, vec3<i32>(i32(r0), i32(r1), i32(r2))"] {
             assert!(t.wgsl.contains(want), "{want}\n{}", t.wgsl);
         }
@@ -2598,7 +2684,7 @@ mod tests {
         }
         let t = translate_with(&code, &Options { workgroup: [8, 8, 1], ..Default::default() }).unwrap_or_else(|e| panic!("{e}"));
         validate(&t.wgsl).unwrap_or_else(|e| panic!("{e}\n{}", t.wgsl));
-        assert_eq!(t.interface.images, vec![Image { handle: Handle::CBuf { bank: 0, offset: 0x30 }, dim: ImageDim::D2, read: true, atomic: false }]);
+        assert_eq!(t.interface.images, vec![Image { handle: Handle::CBuf { bank: 0, offset: 0x30 }, dim: ImageDim::D2, read: true, atomic: false, buffer: false }]);
         assert!(t.interface.textures.is_empty());
         for want in ["texture_storage_2d<rgba16float, read_write>", "textureLoad(img0, vec2<i32>(i32(r0), i32(r1)))", "textureStore(img0,"] {
             assert!(t.wgsl.contains(want), "{want}\n{}", t.wgsl);
@@ -2623,7 +2709,7 @@ mod tests {
         let sured = |op: u128| w(0x59f, &[(24, 0), (32, 3), (40, 0x88 / 4), (54, 0), (61, 5), (77, 7), (84, 1), (87, op)]);
         let options = |f: &[&str]| Options { workgroup: [4, 4, 4], images: f.iter().map(|f| f.to_string()).collect(), ..Default::default() };
         let t = compute(&[s2r(0, 0x21), s2r(1, 0x22), s2r(2, 0x23), w(0x802, &[(16, 3), (32, 1), (72, 0xf)]), sured(0), sured(6)], &options(&["r32uint"]));
-        assert_eq!(t.interface.images, vec![Image { handle: Handle::CBuf { bank: 0, offset: 0x88 }, dim: ImageDim::D3, read: false, atomic: true }]);
+        assert_eq!(t.interface.images, vec![Image { handle: Handle::CBuf { bank: 0, offset: 0x88 }, dim: ImageDim::D3, read: false, atomic: true, buffer: false }]);
         for want in ["texture_storage_3d<r32uint, atomic>", "textureAtomicAdd(img0, vec3<i32>(i32(r0), i32(r1), i32(r2)), r3)", "textureAtomicOr(img0,"] {
             assert!(t.wgsl.contains(want), "{want}\n{}", t.wgsl);
         }
@@ -2631,6 +2717,26 @@ mod tests {
         let code: Vec<u8> = [sured(0), exit(), bra(-16)].concat();
         assert!(translate_with(&code, &options(&["rgba16float"])).is_err());
         validate(&translate_with(&code, &options(&[])).unwrap().wgsl).unwrap();
+    }
+
+    #[test]
+    fn an_image_atomic_whose_old_value_is_used_runs_on_a_buffer() {
+        // SUATOM.ADD.U32 R4 = the texel at (R0, R1, R2) of the 3D image c[0][0x90], plus R3;
+        // SURED.OR R3 there; SURED.ADD R3 on the image c[0][0x88]. The first image is bound
+        // as a buffer for both of its atomics; the second stays a texture.
+        let s2r = |dst: u128, sr: u128| w(0x919, &[(16, dst), (72, sr)]);
+        let su = |op: u16, dst: u128, at: u128, aop: u128| w(op, &[(16, dst), (24, 0), (32, 3), (40, at / 4), (54, 0), (61, 5), (77, 7), (81, 7), (84, 1), (87, aop)]);
+        let options = |f: &[&str]| Options { workgroup: [4, 4, 4], images: f.iter().map(|f| f.to_string()).collect(), ..Default::default() };
+        let ops = [s2r(0, 0x21), s2r(1, 0x22), s2r(2, 0x23), w(0x802, &[(16, 3), (32, 1), (72, 0xf)]), su(0x593, 4, 0x90, 0), su(0x59f, 0, 0x90, 6), su(0x59f, 0, 0x88, 0)];
+        let t = compute(&ops, &options(&["r32uint", "r32uint"]));
+        let image = |offset, buffer| Image { handle: Handle::CBuf { bank: 0, offset }, dim: ImageDim::D3, read: false, atomic: true, buffer };
+        assert_eq!(t.interface.images, vec![image(0x90, true), image(0x88, false)]);
+        for want in ["var<storage, read_write> imb0: ImageBuffer;", "= atomicAdd(&imb0.texels[", "= atomicOr(&imb0.texels[", "r4 = ", "textureAtomicAdd(img1,"] {
+            assert!(t.wgsl.contains(want), "{want}\n{}", t.wgsl);
+        }
+        // Refused on an image that is not 32-bit integers.
+        let code: Vec<u8> = [su(0x593, 4, 0x90, 0), exit(), bra(-16)].concat();
+        assert!(translate_with(&code, &options(&["rgba16float"])).is_err());
     }
 
     #[test]

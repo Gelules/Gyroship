@@ -60,6 +60,13 @@ fn storage_format(f: wgpu::TextureFormat) -> Option<(wgpu::TextureFormat, &'stat
 /// A translated compute program for one block size and set of image formats.
 pub(crate) type Compiled = Result<std::sync::Arc<(Translation, wgpu::ShaderModule)>, String>;
 
+/// What an image slot is bound to: a storage view of its texture, or (`Image::buffer`)
+/// a buffer the texture is copied into before the dispatch, and back out of after it.
+enum ImageBinding {
+    View(wgpu::TextureView),
+    Buffer(wgpu::Buffer, wgpu::Texture, wgpu::TexelCopyBufferLayout),
+}
+
 impl Surfaces {
     /// Runs a dispatch; an empty grid does nothing.
     pub fn dispatch(&mut self, l: &Launch, pools: Pools, mem: Mem) -> Result<(), String> {
@@ -114,7 +121,7 @@ impl Surfaces {
             if img.read && !self.adapter.get_texture_format_features(format).flags.contains(wgpu::TextureFormatFeatureFlags::STORAGE_READ_WRITE) {
                 return Err(format!("image format {format:?} both read and written"));
             }
-            if img.atomic && !self.device.features().contains(wgpu::Features::TEXTURE_ATOMIC) {
+            if img.atomic && !img.buffer && !self.device.features().contains(wgpu::Features::TEXTURE_ATOMIC) {
                 return Err("image atomics need TEXTURE_ATOMIC".into());
             }
             images.push((tic, format, name.to_string(), header));
@@ -145,7 +152,7 @@ impl Surfaces {
                 e.surface.addr == tic.address && t.format() == *format && t.width() == size.width && t.height() == size.height && !three_d && !array && !img.atomic && t.usage().contains(wgpu::TextureUsages::STORAGE_BINDING)
             });
             if let Some(e) = target {
-                views.push(e.texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2), array_layer_count: Some(1), ..Default::default() }));
+                views.push(ImageBinding::View(e.texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2), array_layer_count: Some(1), ..Default::default() })));
                 // Stamped once the dispatch is recorded: its own texture reads (and a
                 // dispatch that fails before) still see the targets as they were.
                 written.push((e.surface.addr, e.surface.format));
@@ -169,8 +176,23 @@ impl Surfaces {
                 });
                 self.cache.images.insert(tic.address, texture);
             }
+            let texture = &self.cache.images[&tic.address];
+            if img.buffer {
+                // After the 256-byte header (`shader::IMAGE_BUFFER`), rows padded as a copy pads them.
+                let row = (size.width * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+                let bytes = 256 + u64::from(row) * u64::from(size.height) * u64::from(size.depth_or_array_layers);
+                if bytes > self.device.limits().max_storage_buffer_binding_size {
+                    return Err(format!("image atomics on {bytes} bytes: past the storage buffer limit"));
+                }
+                let buffer = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("image atomics"), size: bytes, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+                // A new buffer: its write lands before any command that uses it.
+                let header: Vec<u8> = [size.width, size.height, size.depth_or_array_layers, row / 4].iter().flat_map(|v| v.to_le_bytes()).collect();
+                self.queue.write_buffer(&buffer, 0, &header);
+                views.push(ImageBinding::Buffer(buffer, texture.clone(), wgpu::TexelCopyBufferLayout { offset: 256, bytes_per_row: Some(row), rows_per_image: Some(size.height) }));
+                continue;
+            }
             let dimension = array.then_some(wgpu::TextureViewDimension::D2Array);
-            views.push(self.cache.images[&tic.address].create_view(&wgpu::TextureViewDescriptor { dimension, ..Default::default() }));
+            views.push(ImageBinding::View(texture.create_view(&wgpu::TextureViewDescriptor { dimension, ..Default::default() })));
         }
 
         // Global memory (LDG): each pointer's buffer, read from guest memory. The constant
@@ -222,22 +244,19 @@ impl Surfaces {
                 ImageDim::D2Array => wgpu::TextureViewDimension::D2Array,
                 _ => wgpu::TextureViewDimension::D2,
             };
-            layout_entries.push(wgpu::BindGroupLayoutEntry {
-                binding: IMAGE_BINDING + i as u32,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::StorageTexture {
-                    access: if img.atomic {
-                        wgpu::StorageTextureAccess::Atomic
-                    } else if img.read {
-                        wgpu::StorageTextureAccess::ReadWrite
-                    } else {
-                        wgpu::StorageTextureAccess::WriteOnly
-                    },
-                    format: *format,
-                    view_dimension,
-                },
-                count: None,
-            });
+            let access = if img.atomic {
+                wgpu::StorageTextureAccess::Atomic
+            } else if img.read {
+                wgpu::StorageTextureAccess::ReadWrite
+            } else {
+                wgpu::StorageTextureAccess::WriteOnly
+            };
+            let ty = if img.buffer {
+                wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }
+            } else {
+                wgpu::BindingType::StorageTexture { access, format: *format, view_dimension }
+            };
+            layout_entries.push(wgpu::BindGroupLayoutEntry { binding: IMAGE_BINDING + i as u32, visibility: wgpu::ShaderStages::COMPUTE, ty, count: None });
         }
         for i in 0..globals.len() as u32 {
             layout_entries.push(wgpu::BindGroupLayoutEntry {
@@ -289,7 +308,11 @@ impl Surfaces {
             }
         }
         for (i, view) in views.iter().enumerate() {
-            entries.push(wgpu::BindGroupEntry { binding: IMAGE_BINDING + i as u32, resource: wgpu::BindingResource::TextureView(view) });
+            let resource = match view {
+                ImageBinding::View(v) => wgpu::BindingResource::TextureView(v),
+                ImageBinding::Buffer(b, ..) => b.as_entire_binding(),
+            };
+            entries.push(wgpu::BindGroupEntry { binding: IMAGE_BINDING + i as u32, resource });
         }
         for (i, buffer) in globals.iter().enumerate() {
             entries.push(wgpu::BindGroupEntry { binding: shader::BUFFER_BINDING + i as u32, resource: buffer.as_entire_binding() });
@@ -297,12 +320,23 @@ impl Surfaces {
         let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &layout, entries: &entries });
         let timed = self.timing.as_mut().and_then(|t| t.next(format!("compute {key:016x}")));
         let mut encoder = self.encoder();
+        // Images bound as buffers: their texels in before the dispatch, back out after it.
+        for v in &views {
+            if let ImageBinding::Buffer(b, t, layout) = v {
+                encoder.copy_texture_to_buffer(t.as_image_copy(), wgpu::TexelCopyBufferInfo { buffer: b, layout: *layout }, t.size());
+            }
+        }
         {
             let timestamp_writes = timed.zip(self.timing.as_ref()).map(|(i, t)| wgpu::ComputePassTimestampWrites { query_set: &t.set, beginning_of_pass_write_index: Some(i), end_of_pass_write_index: Some(i + 1) });
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("dispatch"), timestamp_writes });
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &group, &[]);
             pass.dispatch_workgroups(l.grid[0], l.grid[1], l.grid[2]);
+        }
+        for v in &views {
+            if let ImageBinding::Buffer(b, t, layout) = v {
+                encoder.copy_buffer_to_texture(wgpu::TexelCopyBufferInfo { buffer: b, layout: *layout }, t.as_image_copy(), t.size());
+            }
         }
         self.record(encoder);
         for key in written {
@@ -509,6 +543,20 @@ mod tests {
         let Some(words) = run_warp(&code, global, 1, 0) else { return };
         for (l, &x) in values.iter().enumerate() {
             assert_eq!(words[4 * l..4 * l + 4], [unsigned(x), signed(x), sh(unsigned(x)), unsigned(!x)], "lane {l}: {x:#x}");
+        }
+    }
+
+    #[test]
+    fn iabs_and_brev_follow_ptx_abs_and_brev() {
+        let values: Vec<u32> = [0, 1, 0xffff_ffff, 0x8000_0000, 0x7fff_ffff, 0x8000_0001, 0x1234_5678, 0xfedc_ba98].into_iter().chain((0..24).map(|i| 0x9e37_79b9u32.wrapping_mul(i + 1))).collect();
+        let global: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        // R4 = lane's value; IABS R12 = |R4|; BREV R13 = R4 bit-reversed; SUST R12..R15 to (lane, 0).
+        let mut code = load_per_lane(4, 4);
+        code.extend([w(0x213, &[(16, 12), (32, 4)]), w(0x301, &[(16, 13), (32, 4)])]);
+        code.extend(store_row(0, 12));
+        let Some(words) = run_warp(&code, global, 1, 0) else { return };
+        for (l, &x) in values.iter().enumerate() {
+            assert_eq!(words[4 * l..4 * l + 2], [(x as i32).wrapping_abs() as u32, x.reverse_bits()], "lane {l}: {x:#x}");
         }
     }
 
@@ -818,6 +866,62 @@ mod tests {
         s.device.poll(wgpu::PollType::wait_indefinitely()).expect("GPU poll");
         let texel = buffer.slice(..).get_mapped_range().expect("mapped").to_vec();
         assert_eq!(texel, 32u32.to_le_bytes(), "{:?}", s.errors.lock().unwrap());
+    }
+
+    #[test]
+    fn an_image_atomic_gives_each_lane_its_old_value_on_the_gpu() {
+        let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
+            eprintln!("no GPU adapter: test skipped");
+            return;
+        };
+        s.background = true;
+        const PROGRAM: u64 = 0x10_0000;
+        const CBUF: u64 = 0x20_0000;
+        const HEADERS: u64 = 0x40_0000;
+        const IMAGE: u64 = 0x50_0000;
+        // 32 lanes: SUATOM.ADD.U32 R4 = texel (0, 0) of the 2D image c[0][0x20], plus R3 = 1;
+        // then SURED.ADD R3 at (R4, R5 = 1). The old values are 0..31, one per lane: row 1
+        // holds 1 in texels 0..31, and texel (0, 0) ends at 32.
+        let mov = |d: u128, v: u128| w(0x802, &[(16, d), (32, v), (72, 0xf)]);
+        let suatom = w(0x593, &[(16, 4), (24, 0), (32, 3), (40, 0x20 / 4), (54, 0), (61, 3), (77, 7), (81, 7), (84, 1)]);
+        let sured = w(0x59f, &[(24, 4), (32, 3), (40, 0x20 / 4), (54, 0), (61, 3), (77, 7), (84, 1)]);
+        let closing = [w(0x94d, &[(87, 7)]), w(0x947, &[(87, 7), (32, (-16i64 as u64 as u128) & ((1 << 50) - 1))])];
+        let mut program = [mov(0, 0), mov(1, 0), mov(3, 1), mov(5, 1), suatom, sured, closing[0], closing[1]].concat();
+        program.resize(0x1000, 0);
+        // Header 0: a 64 × 2 pitch R32 UINT image at IMAGE.
+        let mut header = [0u8; 32];
+        for (hi, lo, v) in [(6, 0, 0x0f), (9, 7, 4), (12, 10, 4), (15, 13, 4), (18, 16, 4), (21, 19, 2), (24, 22, 3), (27, 25, 4), (30, 28, 5), (63, 37, (IMAGE >> 5) as u32), (87, 85, 2), (111, 96, 256 >> 5), (144, 128, 63), (154, 151, 1), (175, 160, 1), (191, 191, 1)] {
+            put(&mut header, hi, lo, v);
+        }
+        let regions: Vec<(u64, Vec<u8>)> = vec![(PROGRAM, program), (CBUF, vec![0u8; 0x10000]), (HEADERS, header.to_vec())];
+        let mut mem = |addr: u64, out: &mut [u8]| {
+            regions.iter().any(|(at, data)| {
+                let Some(src) = addr.checked_sub(*at).and_then(|o| data.get(o as usize..o as usize + out.len())) else { return false };
+                out.copy_from_slice(src);
+                true
+            })
+        };
+        let reg = |m: u32| if m == 0x1578 { HEADERS as u32 } else { 0 };
+        let pools = Pools { headers: resources::header_pool(&reg), samplers: resources::sampler_pool(&reg), sampler_binding: resources::sampler_binding(&reg) };
+        let launch = Launch { program: PROGRAM, grid: [1, 1, 1], block: [32, 1, 1], shared: 0, cbufs: vec![(0, CBUF, 0x10000)] };
+        s.dispatch(&launch, pools, &mut mem).unwrap_or_else(|e| panic!("{e}"));
+        s.flush();
+        let buffer = s.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 512, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+        let mut encoder = s.device.create_command_encoder(&Default::default());
+        let layout = wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(256), rows_per_image: Some(2) };
+        let image = &s.cache.images[&IMAGE];
+        encoder.copy_texture_to_buffer(image.as_image_copy(), wgpu::TexelCopyBufferInfo { buffer: &buffer, layout }, image.size());
+        s.queue.submit([encoder.finish()]);
+        buffer.slice(..).map_async(wgpu::MapMode::Read, |r| r.expect("readback mapping failed"));
+        s.device.poll(wgpu::PollType::wait_indefinitely()).expect("GPU poll");
+        let bytes = buffer.slice(..).get_mapped_range().expect("mapped").to_vec();
+        let texels: Vec<u32> = bytes.as_chunks::<4>().0.iter().map(|b| u32::from_le_bytes(*b)).collect();
+        let want: Vec<u32> = (0..128).map(|i| match i {
+            0 => 32,
+            64..96 => 1,
+            _ => 0,
+        }).collect();
+        assert_eq!(texels, want, "{:?}", s.errors.lock().unwrap());
     }
 
     #[test]
