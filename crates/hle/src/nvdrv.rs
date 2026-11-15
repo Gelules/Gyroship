@@ -147,7 +147,7 @@ pub struct Decoder {
     stalls: BTreeMap<u32, u32>,
     /// Host nanoseconds so far reading and decoding pushbuffers (the command
     /// processor, macros included), and, apart, waiting for the GPU thread
-    /// (its barriers and the end of each submit), for `--perf`.
+    /// (its barriers, and with --gpu-sync the end of each job), for `--perf`.
     pub decode_ns: u64,
     pub gpu_wait_ns: u64,
     mem: Arc<Memory>,
@@ -165,13 +165,19 @@ pub struct Decoder {
 }
 
 /// The GPU thread (play mode): it applies the decoded ops in order while the
-/// submitting thread decodes the next GPFIFO entries. A submit returns once
-/// they are all applied (joined): the guest sees what it saw without it.
+/// submitting thread decodes the next GPFIFO entries. A job returns once its
+/// ops are sent; then a present waits until the previous present is applied,
+/// so at most one present is in flight behind the frame being decoded. With
+/// --gpu-sync every job waits until its ops are applied (S2's join).
 pub struct GpuThread {
     ops: std::sync::mpsc::SyncSender<(Phase, GpuOp)>,
     progress: Arc<Progress>,
-    /// Ops sent so far.
+    /// Ops sent so far, and up to the last present's `End`.
     sent: u64,
+    presented: u64,
+    /// Host nanoseconds the submitting thread waited for room: a full op
+    /// channel, and a present's wait for the previous one (`--perf`).
+    queue_wait_ns: u64,
     thread: std::thread::JoinHandle<()>,
 }
 
@@ -287,6 +293,7 @@ pub struct FrameIn {
     pub decode_ns: u64,
     pub gpu_wait_ns: u64,
     pub gpu_cpu: Duration,
+    pub queue_wait_ns: u64,
 }
 
 /// A named anomaly met by GPU work handed over at `at`, as `Kernel::anomaly`:
@@ -576,6 +583,7 @@ impl Decoder {
             decode_ns: self.decode_ns,
             gpu_wait_ns: self.gpu_wait_ns,
             gpu_cpu: self.gpu.as_ref().and_then(GpuThread::cpu_time).unwrap_or_default(),
+            queue_wait_ns: self.gpu.as_ref().map_or(0, |t| t.queue_wait_ns),
         })
     }
 
@@ -620,15 +628,27 @@ impl Decoder {
     }
 
     /// A job's end, once its ops are `sent`: `End`, even after a decode stop
-    /// (the job then counts as done: the drain, 213 and 102 wait for it), then
-    /// the wait until the GPU thread has applied them all. The first stop in
-    /// stream order wins: the GPU thread's comes from an earlier op than the decoder's.
-    fn end_job(&mut self, phase: &Phase, sent: Result<(), Stop>) -> Result<(), Stop> {
+    /// (the job then counts as done: the drain, 213 and 102 wait for it).
+    /// Then a present waits until the previous present is applied, and with
+    /// --gpu-sync every job until its own ops are. The first stop in stream
+    /// order wins: the GPU thread's comes from an earlier op than the decoder's.
+    fn end_job(&mut self, phase: &Phase, present: bool, sent: Result<(), Stop>) -> Result<(), Stop> {
         let ended = self.send(phase, GpuOp::End);
+        let Some(t) = self.gpu.as_mut() else { return sent.and(ended) };
         let since = Instant::now();
-        let joined = self.gpu.as_ref().map_or(Err(gpu_thread_ended()), GpuThread::join);
-        self.gpu_wait_ns += since.elapsed().as_nanos() as u64;
-        joined.and(sent).and(ended)
+        let waited = if self.config.gpu_sync {
+            let joined = t.join();
+            self.gpu_wait_ns += since.elapsed().as_nanos() as u64;
+            joined
+        } else if present {
+            let previous = std::mem::replace(&mut t.presented, t.sent);
+            let applied = t.wait_for(previous);
+            t.queue_wait_ns += since.elapsed().as_nanos() as u64;
+            applied
+        } else {
+            Ok(())
+        };
+        waited.and(sent).and(ended)
     }
 }
 
@@ -692,15 +712,25 @@ impl GpuThread {
                 count = now;
             }
         })?;
-        Ok(GpuThread { ops, progress, sent: 0, thread })
+        Ok(GpuThread { ops, progress, sent: 0, presented: 0, queue_wait_ns: 0, thread })
     }
 
-    /// Sends an op; the stop the thread met, if any, instead.
+    /// Sends an op; the stop the thread met, if any, instead. A full channel
+    /// waits for room, timed (`queue_wait_ns`).
     fn send(&mut self, phase: &Phase, op: GpuOp) -> Result<(), Stop> {
+        use std::sync::mpsc::TrySendError;
         if let Some(e) = crate::lock(&self.progress.state).stop.clone() {
             return Err(e);
         }
-        self.ops.send((phase.clone(), op)).map_err(|_| gpu_thread_ended())?;
+        match self.ops.try_send((phase.clone(), op)) {
+            Ok(()) => {}
+            Err(TrySendError::Full(op)) => {
+                let since = Instant::now();
+                self.ops.send(op).map_err(|_| gpu_thread_ended())?;
+                self.queue_wait_ns += since.elapsed().as_nanos() as u64;
+            }
+            Err(TrySendError::Disconnected(_)) => return Err(gpu_thread_ended()),
+        }
         self.sent += 1;
         Ok(())
     }
@@ -712,6 +742,8 @@ impl GpuThread {
 
     /// Waits until `n` ops are applied; the stop the thread met, if any.
     fn wait_for(&self, n: u64) -> Result<(), Stop> {
+        // A target never sent would wait for good, with no lock the watchdog sees held.
+        debug_assert!(n <= self.sent, "waiting for op {n} of {} sent", self.sent);
         let mut state = crate::lock(&self.progress.state);
         while state.ops < n && state.stop.is_none() && !state.ended {
             state = self.progress.changed.wait(state).unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -764,6 +796,8 @@ impl Kernel {
         self.gpu_side().wrote = Some(std::collections::VecDeque::new());
         self.gpu_progress = Some(t.progress.clone());
         crate::lock(&self.decoder).gpu = Some(t);
+        // Which mode a measurement ran in.
+        self.log(if self.config.gpu_sync { "gpu: the GPU thread applies the GPU work; a job returns once its ops are applied (--gpu-sync)" } else { "gpu: the GPU thread applies the GPU work; a job returns once its ops are sent, with one present in flight" });
         Ok(())
     }
 
@@ -779,6 +813,10 @@ impl Kernel {
             self.deferred = Some(crate::Deferred::Gpu { side: self.gpu_side.clone(), decoder: self.decoder.clone(), phase, job });
             return;
         }
+        // ponytail: in play mode this would run a second GPU job in one SVC, under the kernel lock,
+        // and none hands one over (one IPC request per SVC). Its barrier, full channel or present
+        // wait would then stall every guest thread, though never deadlock: the GPU thread never
+        // takes that lock. Queue a second job if a game ever does that.
         let done = run(&self.gpu_side, &self.decoder, phase, job);
         self.after(done);
     }
@@ -819,7 +857,7 @@ pub fn run(side: &Mutex<GpuSide>, decoder: &Mutex<Decoder>, phase: Phase, job: G
             GpuJob::Submit { fd, space, entries } => d.submit_ops(&phase, *fd, *space, entries),
             GpuJob::Present { n, fence, area, .. } => d.present_ops(&phase, *n, *fence, *area),
         };
-        d.end_job(&phase, sent)
+        d.end_job(&phase, matches!(job, GpuJob::Present { .. }), sent)
     } else {
         let mut g = crate::lock(side);
         // The play engine's watchdog sees who holds the GPU side, and since when.
@@ -1609,6 +1647,7 @@ mod tests {
                 k.after(done);
             }
             assert!(k.deferred.is_none());
+            assert_eq!(k.drain_gpu(), None);
             assert_eq!(ran(&k), Some(1));
         }
     }
@@ -1629,10 +1668,10 @@ mod tests {
     const PUSHBUFFERS: u64 = WORDS + 0x100;
 
     /// A play-mode kernel, strict unless `explore`, with the GPU thread if
-    /// `threaded`, and the page at `WORDS` mapped.
-    fn play_kernel(threaded: bool, explore: bool) -> Kernel {
+    /// `threaded` (joined with `sync`, as --gpu-sync), and the page at `WORDS` mapped.
+    fn play_kernel(threaded: bool, explore: bool, sync: bool) -> Kernel {
         use gyroship_runtime::mem::{Block, Memory, perm, state};
-        let config = crate::Config { play: true, explore, vsync: false, ..crate::Config::default() };
+        let config = crate::Config { play: true, explore, vsync: false, gpu_sync: sync, ..crate::Config::default() };
         let mut k = Kernel::new(Memory::new().unwrap(), crate::journal::Journal::memory(), config);
         k.mem.map(WORDS, 0x1000, Block::new(state::NORMAL, perm::RW)).unwrap();
         if threaded {
@@ -1664,10 +1703,10 @@ mod tests {
         k.deferred.take().expect("a deferred job")
     }
 
-    /// One submit of `segments` on channel 1 (`hand_over` at `PUSHBUFFERS`):
-    /// the kernel, and the job to run.
+    /// One submit of `segments` on channel 1 (`hand_over` at `PUSHBUFFERS`),
+    /// not joined: the kernel, and the job to run.
     fn play_submit(threaded: bool, explore: bool, segments: &[Vec<u32>]) -> (Kernel, crate::Deferred) {
-        let mut k = play_kernel(threaded, explore);
+        let mut k = play_kernel(threaded, explore, false);
         let job = hand_over(&mut k, 1, PUSHBUFFERS, segments);
         (k, job)
     }
@@ -1678,17 +1717,142 @@ mod tests {
         u32::from_le_bytes(b)
     }
 
+    /// Whether the thread running a job finishes within 5 s (a busy machine
+    /// may take a while).
+    fn finishes<T>(running: &std::thread::JoinHandle<T>) -> bool {
+        let since = Instant::now();
+        while !running.is_finished() && since.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        running.is_finished()
+    }
+
     /// The GPU thread applies what the submitting thread decodes, in order:
-    /// guest memory and the tally end as when one thread does both.
+    /// guest memory and the tally end as when one thread does both, joined
+    /// or not.
     #[test]
     fn the_gpu_thread_leaves_what_one_thread_leaves() {
         let segments = [semaphore(WORDS, 1, true), [semaphore(WORDS, 1, false), semaphore(WORDS + 8, 2, true)].concat()];
-        for threaded in [false, true] {
-            let (k, job) = play_submit(threaded, false, &segments);
+        for (threaded, sync) in [(false, false), (true, true), (true, false)] {
+            let mut k = play_kernel(threaded, false, sync);
+            let job = hand_over(&mut k, 1, PUSHBUFFERS, &segments);
             assert!(matches!(job.run(), Ok(After::Nothing)));
-            assert_eq!((word(&k, WORDS), word(&k, WORDS + 8)), (1, 2), "threaded: {threaded}");
+            assert_eq!(k.drain_gpu(), None);
+            assert_eq!((word(&k, WORDS), word(&k, WORDS + 8)), (1, 2), "threaded: {threaded}, sync: {sync}");
             assert!(k.tally().anomalies.is_empty());
         }
+    }
+
+    /// In play mode a job returns once its ops are sent, before the GPU
+    /// thread applies them; with --gpu-sync once they are applied.
+    #[test]
+    fn a_job_returns_before_its_ops_are_applied() {
+        for sync in [false, true] {
+            let mut k = play_kernel(true, false, sync);
+            let job = hand_over(&mut k, 1, PUSHBUFFERS, &[semaphore(WORDS, 1, true)]);
+            // The GPU thread applies nothing while the test holds the GPU side.
+            let side = k.gpu_side.clone();
+            let held = crate::lock(&side);
+            let running = std::thread::spawn(move || job.run());
+            if sync {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                assert!(!running.is_finished(), "--gpu-sync: the job waits until its ops are applied");
+            } else {
+                assert!(finishes(&running), "the job returns with its ops queued");
+                assert_eq!(word(&k, WORDS), 0);
+            }
+            drop(held);
+            assert!(matches!(running.join().unwrap(), Ok(After::Nothing)));
+            assert_eq!(k.drain_gpu(), None);
+            assert_eq!(word(&k, WORDS), 1, "sync: {sync}");
+        }
+    }
+
+    /// An acquire reads what a job before it released, still queued: its
+    /// read waits until that release is applied.
+    #[test]
+    fn an_acquire_waits_for_a_release_of_the_job_before() {
+        let mut k = play_kernel(true, false, false);
+        let first = hand_over(&mut k, 1, PUSHBUFFERS, &[semaphore(WORDS, 1, true)]);
+        let second = hand_over(&mut k, 1, PUSHBUFFERS + 0x100, &[[semaphore(WORDS, 1, false), semaphore(WORDS + 8, 2, true)].concat()]);
+        let side = k.gpu_side.clone();
+        let held = crate::lock(&side);
+        assert!(matches!(first.run(), Ok(After::Nothing)), "returns with its ops queued");
+        let running = std::thread::spawn(move || second.run());
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!running.is_finished(), "its acquire waits for the release queued before it");
+        drop(held);
+        assert!(matches!(running.join().unwrap(), Ok(After::Nothing)));
+        assert_eq!(k.drain_gpu(), None);
+        assert_eq!(word(&k, WORDS + 8), 2);
+        assert!(crate::lock(&k.decoder).waiting().is_empty());
+        assert!(k.tally().anomalies.is_empty());
+    }
+
+    /// One present in flight: a present returns once the previous one is
+    /// applied (the first at once); with --gpu-sync once it is applied itself.
+    #[test]
+    fn a_present_waits_for_the_present_before_it() {
+        for sync in [false, true] {
+            let mut k = play_kernel(true, false, sync);
+            let first = hand_present(&mut k, (!CHANNEL_SYNCPT, 0));
+            let second = hand_present(&mut k, (!CHANNEL_SYNCPT, 0));
+            let side = k.gpu_side.clone();
+            let held = crate::lock(&side);
+            let first = std::thread::spawn(move || first.run());
+            if sync {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                assert!(!first.is_finished(), "--gpu-sync: present 1 waits until it is applied");
+                drop(held);
+                assert!(matches!(first.join().unwrap(), Ok(After::Present { n: 1, .. })));
+                continue;
+            }
+            assert!(finishes(&first), "present 1 returns with its ops queued");
+            let second = std::thread::spawn(move || second.run());
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(!second.is_finished(), "present 2 waits until present 1 is applied");
+            drop(held);
+            assert!(matches!(first.join().unwrap(), Ok(After::Present { n: 1, .. })));
+            assert!(matches!(second.join().unwrap(), Ok(After::Present { n: 2, .. })));
+            assert_eq!(k.drain_gpu(), None);
+        }
+    }
+
+    /// A present's acquire fence is checked once its frame's ops are applied:
+    /// NVN's increment, queued in a submit before it, counts.
+    #[test]
+    fn the_present_fence_is_checked_after_the_frames_ops() {
+        let mut k = play_kernel(true, true, false);
+        let submit = hand_over(&mut k, 1, PUSHBUFFERS, &[semaphore(0, 1, true)]);
+        let present = hand_present(&mut k, (!CHANNEL_SYNCPT, 1));
+        let side = k.gpu_side.clone();
+        let held = crate::lock(&side);
+        assert!(matches!(submit.run(), Ok(After::Nothing)));
+        assert!(matches!(present.run(), Ok(After::Present { n: 1, .. })));
+        assert_eq!(syncpoint(&k), 0, "nothing applied yet");
+        drop(held);
+        assert_eq!(k.drain_gpu(), None);
+        assert_eq!(syncpoint(&k), 1);
+        assert_eq!(k.tally().anomalies.get("present fence not reached"), None);
+    }
+
+    /// A stop the GPU thread meets after its job returned reaches the drain,
+    /// the boot round and the next job.
+    #[test]
+    fn a_gpu_thread_stop_reaches_the_next_job() {
+        let mut k = play_kernel(true, false, false);
+        // SEMAPHORED with an operation no one implements: an ignored method.
+        let first = hand_over(&mut k, 1, PUSHBUFFERS, &[vec![header(1, 1, 0, 0x1c), 0x10], semaphore(WORDS + 8, 2, true)]);
+        let side = k.gpu_side.clone();
+        let held = crate::lock(&side);
+        assert!(matches!(first.run(), Ok(After::Nothing)), "returns before the GPU thread meets the anomaly");
+        drop(held);
+        let stop = k.drain_gpu().expect("the GPU thread's stop");
+        assert!(stop.1.contains("gpu method ignored"), "{stop:?}");
+        assert_eq!(word(&k, WORDS + 8), 0, "the release after the anomaly is not applied");
+        assert_eq!(k.gpu_progress.as_ref().and_then(|p| p.stopped()).as_ref(), Some(&stop));
+        let next = hand_over(&mut k, 1, PUSHBUFFERS + 0x100, &[semaphore(WORDS, 1, true)]);
+        assert_eq!(next.run().err(), Some(stop));
     }
 
     /// An acquire reads what the entries before it released, as with one
@@ -1696,7 +1860,7 @@ mod tests {
     #[test]
     fn an_acquire_waits_for_the_ops_sent_before_it() {
         let segments = [semaphore(WORDS, 1, true), [semaphore(WORDS, 1, false), semaphore(WORDS + 8, 2, true)].concat()];
-        let (k, job) = play_submit(true, false, &segments);
+        let (mut k, job) = play_submit(true, false, &segments);
         // The GPU thread cannot apply anything while the test holds the GPU side.
         let side = k.gpu_side.clone();
         let held = crate::lock(&side);
@@ -1705,18 +1869,21 @@ mod tests {
         assert!(!running.is_finished());
         drop(held);
         assert!(matches!(running.join().unwrap(), Ok(After::Nothing)));
+        assert_eq!(k.drain_gpu(), None);
         assert_eq!(word(&k, WORDS + 8), 2, "the acquire was met: the release after it ran");
         assert!(crate::lock(&k.decoder).waiting().is_empty());
     }
 
     /// In strict mode an anomaly on the GPU thread ends the submit there: the
-    /// ops after it are not applied, and the submit returns its stop, which
-    /// names its op. The drain and the boot round see the same stop at once.
+    /// ops after it are not applied, and the joined submit (--gpu-sync)
+    /// returns its stop, which names its op. The drain and the boot round see
+    /// the same stop at once.
     #[test]
     fn a_strict_anomaly_on_the_gpu_thread_ends_the_submit() {
         // SEMAPHORED with an operation no one implements: an ignored method.
         let segments = [vec![header(1, 1, 0, 0x1c), 0x10], semaphore(WORDS + 8, 2, true)];
-        let (mut k, job) = play_submit(true, false, &segments);
+        let mut k = play_kernel(true, false, true);
+        let job = hand_over(&mut k, 1, PUSHBUFFERS, &segments);
         let Err(stop) = job.run() else { panic!("no stop") };
         assert!(stop.0 == crate::STOP_EXIT && stop.1.contains("gpu method ignored") && stop.1.contains("(GPU op 1, handed over by thread 0 at tick 0, present 0)"), "{stop:?}");
         assert_eq!(word(&k, WORDS + 8), 0, "the release after the anomaly is not applied");
@@ -1747,7 +1914,7 @@ mod tests {
     /// not wait GPU_WAIT for it, and the ops sent before the stop are applied.
     #[test]
     fn a_decode_stop_still_ends_its_job() {
-        let mut k = play_kernel(true, false);
+        let mut k = play_kernel(true, false, false);
         let words = semaphore(WORDS, 1, true);
         k.mem.write(PUSHBUFFERS, &words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
         // The second entry's pushbuffer is not mapped.
@@ -1770,7 +1937,7 @@ mod tests {
         let second = PUSHBUFFERS + 5 * 4;
         let segments = [semaphore(second + 3 * 4, 7, true), semaphore(WORDS + 8, 2, true)];
         for threaded in [false, true] {
-            let (k, job) = play_submit(threaded, true, &segments);
+            let (mut k, job) = play_submit(threaded, true, &segments);
             // The GPU thread applies nothing before the second pushbuffer is read.
             let side = k.gpu_side.clone();
             let held = threaded.then(|| crate::lock(&side));
@@ -1778,6 +1945,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(100));
             drop(held);
             assert!(matches!(running.join().unwrap(), Ok(After::Nothing)));
+            assert_eq!(k.drain_gpu(), None);
             let hits = k.tally().anomalies.get("gpu wrote a pushbuffer read ahead").copied();
             if threaded {
                 assert_eq!(hits, Some(1));
@@ -1795,8 +1963,9 @@ mod tests {
         // payload word): decoding it waits for the first's op.
         let third = PUSHBUFFERS + 5 * 4 + 10 * 4;
         let segments = [semaphore(third + 3 * 4, 7, true), [semaphore(third + 3 * 4, 7, false), semaphore(WORDS, 1, true)].concat(), semaphore(WORDS + 8, 2, true)];
-        let (k, job) = play_submit(true, false, &segments);
+        let (mut k, job) = play_submit(true, false, &segments);
         assert!(matches!(job.run(), Ok(After::Nothing)));
+        assert_eq!(k.drain_gpu(), None);
         assert!(k.tally().anomalies.is_empty());
         assert_eq!(word(&k, WORDS + 8), 7, "the third entry decoded the released payload");
     }
@@ -1833,7 +2002,7 @@ mod tests {
     fn a_resumed_channel_sees_what_the_channel_resumed_before_it_released() {
         let (w1, w2, w3) = (WORDS + 0x10, WORDS + 0x20, WORDS + 0x30);
         for threaded in [false, true] {
-            let mut k = play_kernel(threaded, false);
+            let mut k = play_kernel(threaded, false, false);
             let first = hand_over(&mut k, 1, PUSHBUFFERS, &[[semaphore(w1, 1, false), semaphore(w2, 1, true)].concat()]);
             assert!(matches!(first.run(), Ok(After::Nothing)));
             let second = hand_over(&mut k, 2, PUSHBUFFERS + 0x100, &[[semaphore(w2, 1, false), semaphore(w3, 1, true)].concat()]);
@@ -1848,6 +2017,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(100));
             drop(held);
             assert!(matches!(running.join().unwrap(), Ok(After::Present { n: 1, .. })), "threaded: {threaded}");
+            assert_eq!(k.drain_gpu(), None);
             assert_eq!(word(&k, w3), 1, "threaded: {threaded}: channel 2 read channel 1's release");
             assert!(crate::lock(&k.decoder).waiting().is_empty());
             assert!(k.tally().anomalies.is_empty());
@@ -1990,10 +2160,12 @@ mod tests {
         k.check_gpu_waits();
         assert!(!k.events[e].signaled && syncpoint(&k) == 0, "not while a submit is queued");
         assert!(matches!(job.run(), Ok(After::Nothing)));
+        assert_eq!(k.drain_gpu(), None);
         let present = hand_present(&mut k, (!CHANNEL_SYNCPT, 0));
         k.check_gpu_waits();
         assert!(!k.events[e].signaled && syncpoint(&k) == 0, "not while a present is queued");
         assert!(matches!(present.run(), Ok(After::Present { n: 1, .. })));
+        assert_eq!(k.drain_gpu(), None);
         k.check_gpu_waits();
         assert!(k.events[e].signaled && k.gs.armed.is_empty());
         assert_eq!(syncpoint(&k), 5);

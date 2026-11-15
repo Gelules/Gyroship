@@ -156,6 +156,9 @@ pub struct Config {
     /// `--video FILE`: the presented images (as `--dump-frames` chooses
     /// frames) as an H.264 video, through ffmpeg (see [`video`]).
     pub video: Option<std::path::PathBuf>,
+    /// `--gpu-sync` (play mode): each GPU job returns once the GPU thread has
+    /// applied it (S2's join), as before S4: the A/B base and the fallback.
+    pub gpu_sync: bool,
 }
 
 impl Config {
@@ -173,7 +176,7 @@ impl Config {
 
 impl Default for Config {
     fn default() -> Config {
-        Config { seed: 0x5EED, explore: false, non_system_memory: 0x2_6410_0000, time_limit: None, frames: None, save_dir: None, vsync: true, work_time: false, gpfifo_dump: None, frames_dump: None, dump_every: 1, dump_from: 0, dump_draws: None, shaders_dump: None, replay: None, profile: None, perf: None, hashes: None, record: None, trace: None, audio_dump: None, play: false, pipeline_cache: None, late_frames: false, romfs_layer: None, hooks: None, video: None }
+        Config { seed: 0x5EED, explore: false, non_system_memory: 0x2_6410_0000, time_limit: None, frames: None, save_dir: None, vsync: true, work_time: false, gpfifo_dump: None, frames_dump: None, dump_every: 1, dump_from: 0, dump_draws: None, shaders_dump: None, replay: None, profile: None, perf: None, hashes: None, record: None, trace: None, audio_dump: None, play: false, pipeline_cache: None, late_frames: false, romfs_layer: None, hooks: None, video: None, gpu_sync: false }
     }
 }
 
@@ -896,9 +899,12 @@ pub struct Census {
 /// `Decoder::decode_ns`; effects_ms: host time performing their effects,
 /// `GpuSide::effects_ns`, on the GPU thread in play mode; submit_cpu_ms and
 /// gpu_cpu_ms: the submit thread's and the GPU thread's CPU time;
-/// gpu_wait_ms: the submitting thread's waits for the GPU thread,
-/// `Decoder::gpu_wait_ns`); only `skipped` is the present's own.
-pub(crate) const FRAME_COLUMNS: &str = "present,cpu_ms,draws,skipped,views_made,bind_groups_made,flushed_bytes,upload_bytes,upload_ms,macro_calls,watched_pages,flush_ms,submit_ms,decode_ms,effects_ms,submit_cpu_ms,gpu_cpu_ms,gpu_wait_ms\n";
+/// gpu_wait_ms: the submitting thread's waits for the GPU thread at its
+/// barriers, and with --gpu-sync at the end of each job,
+/// `Decoder::gpu_wait_ns`; queue_wait_ms: its waits for room, a full op
+/// channel and in play mode a present's wait for the previous one, as of the
+/// present's hand-over); only `skipped` is the present's own.
+pub(crate) const FRAME_COLUMNS: &str = "present,cpu_ms,draws,skipped,views_made,bind_groups_made,flushed_bytes,upload_bytes,upload_ms,macro_calls,watched_pages,flush_ms,submit_ms,decode_ms,effects_ms,submit_cpu_ms,gpu_cpu_ms,gpu_wait_ms,queue_wait_ms\n";
 
 const COUNTER: u32 = 0x100;
 const WAIT: u32 = 0x200;

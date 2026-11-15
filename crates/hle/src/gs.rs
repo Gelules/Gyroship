@@ -6,8 +6,9 @@
 //!
 //! The fake GPU is complaisant: every fence it hands out is already
 //! reached, and every wait it is asked about succeeds at once. In play mode,
-//! with the GPU thread, a wait on GPU progress (syncpt 201, gpu memory 213
-//! and 102) ends when the GPU thread gets there instead.
+//! with the GPU thread, a submit or a present returns once its ops are sent
+//! to that thread (--gpu-sync: once they are applied), and a wait on GPU
+//! progress (syncpt 201, gpu memory 213 and 102) ends when it gets there.
 
 use crate::ipc::{Reply, Request};
 use crate::nvdrv::{Decoder, GpuSide};
@@ -705,7 +706,7 @@ impl GpuSide {
                 let submit_cpu: Option<std::time::Duration> = None;
                 let (st, calls) = (&s.staging, p.macro_calls);
                 let row = format!(
-                    "{n},{cpu:.1},{},{},{},{},{},{},{:.1},{calls},{},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1}\n",
+                    "{n},{cpu:.1},{},{},{},{},{},{},{:.1},{calls},{},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1}\n",
                     s.drawn,
                     skipped.values().sum::<u64>(),
                     st.views[0],
@@ -720,7 +721,8 @@ impl GpuSide {
                     self.effects_ns as f64 / 1e6,
                     submit_cpu.unwrap_or_default().as_secs_f64() * 1e3,
                     p.gpu_cpu.as_secs_f64() * 1e3,
-                    p.gpu_wait_ns as f64 / 1e6
+                    p.gpu_wait_ns as f64 / 1e6,
+                    p.queue_wait_ns as f64 / 1e6
                 );
                 self.frames += &row;
             }

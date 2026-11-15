@@ -293,6 +293,7 @@ pub fn run(mut table: Vec<rt::Entry>, window: Option<HostWindow>) {
         romfs_layer: value("--romfs-layer").map(Into::into),
         hooks: value("--hooks").map(Into::into),
         video: value("--video").map(Into::into),
+        gpu_sync: flag("--gpu-sync"),
         ..Config::default()
     };
     if config.play {
