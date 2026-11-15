@@ -63,7 +63,7 @@ pub enum TexHandle {
 }
 
 /// Texture dimension, bits 61..64 (NAK `set_tex_dim`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum TexDim {
     D1,
     D2,

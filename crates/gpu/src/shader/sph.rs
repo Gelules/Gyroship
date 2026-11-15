@@ -7,7 +7,7 @@
 use crate::sass::Stage;
 
 /// How a pixel shader input component is interpolated (2 bits each).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Interp {
     Unused,
     /// Flat: the provoking vertex's value.

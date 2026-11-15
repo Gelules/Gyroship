@@ -66,6 +66,7 @@ field_enum!(
 );
 field_enum!(
     /// Surface dimensionality at 61..64 (NAK `set_image_dim`).
+    #[derive(serde::Serialize, serde::Deserialize)]
     ImageDim { D1 = 0, D1Buffer = 1, D1Array = 2, D2 = 3, D2Array = 4, D3 = 5 }
 );
 field_enum!(

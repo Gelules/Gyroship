@@ -42,7 +42,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
 /// A translated program.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Translation {
     pub key: u64,
     pub stage: Stage,
@@ -51,7 +51,7 @@ pub struct Translation {
 }
 
 /// What the renderer binds to a translated program.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Interface {
     /// Vertex: attribute location -> components read.
     pub attributes: BTreeMap<u8, u8>,
@@ -97,7 +97,7 @@ pub type JumpTable = (u8, u32, u16, Option<u32>);
 pub const BUFFER_BINDING: u32 = 600;
 
 /// A storage image a program writes: where its handle is, and its dimension.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Image {
     pub handle: Handle,
     pub dim: ImageDim,
@@ -119,7 +119,7 @@ pub const IMAGE_BUFFER: &str = "struct ImageBuffer { size: vec4<u32>, pad: array
 /// The binding of image slot 0; slot i is at `IMAGE_BINDING + i`.
 pub const IMAGE_BINDING: u32 = 512;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Texture {
     pub handle: Handle,
     pub dim: TexDim,
@@ -133,7 +133,7 @@ pub struct Texture {
 
 /// Where a texture instruction's 32-bit handle comes from (texture index in
 /// the low 20 bits, sampler index in the high 12).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Handle {
     CBuf { bank: u8, offset: u16 },
     /// A uniform register whose value the uniform datapath computed from
@@ -166,7 +166,7 @@ type R<T> = Result<T, String>;
 /// How a vertex shader is paired with its pixel shader: wgpu needs both
 /// stages to agree on each varying's interpolation, and every varying the
 /// pixel shader reads must be written.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Options {
     /// The pixel shader's varyings: a vertex shader declares each with this
     /// interpolation (a varying it never writes stays (0, 0, 0, 1)).
@@ -2880,5 +2880,68 @@ mod tests {
         assert_eq!(lop3(0xc0, "a", "b", "c"), "(a & b)");
         // 0xe8 (majority) takes the general path: minterms 3, 5, 6, 7.
         assert_eq!(lop3(0xe8, "a", "b", "c"), "((~a & b & c) | (a & ~b & c) | (a & b & ~c) | (a & b & c))");
+    }
+
+    /// Programs of the tests above with options: varyings, clip distances, textures by
+    /// bank word and by a uniform expression, images and atomics, a jump table, shared memory.
+    fn samples() -> Vec<(Vec<u8>, Options)> {
+        let ald = |dst: u128, attr: u128| w(0x321, &[(16, dst), (24, 255), (32, 255), (40, attr), (74, 1)]);
+        let ast = |data: u128, attr: u128, comps: u128| w(0x322, &[(24, 255), (32, data), (64, 255), (40, attr), (74, comps)]);
+        let ipa = |dst: u128, attr: u128| w(0x326, &[(16, dst), (64, attr / 4), (32, 255), (81, 7)]);
+        let ldc = |dst: u128, offset: u128| w(0xb82, &[(16, dst), (24, 255), (54, 2), (38, offset), (73, 4)]);
+        let s2r = |dst: u128, sr: u128| w(0x919, &[(16, dst), (72, sr)]);
+        let su = |op: u16, dst: u128, at: u128, aop: u128| w(op, &[(16, dst), (24, 0), (32, 3), (40, at / 4), (54, 0), (61, 5), (77, 7), (81, 7), (84, 1), (87, aop)]);
+        let compute = |insns: &[[u8; 16]]| [insns, &[exit(), bra(-16)][..]].concat().concat();
+        let skip = {
+            let mut b = bra(16);
+            b[1] = (b[1] & 0x0f) | 0x80;
+            b
+        };
+        let fsetp = w(0x80b, &[(24, 1), (32, 0x3f00_0000), (76, 4), (81, 0), (84, 7), (87, 7)]);
+        let tex = w(0xb60, &[(16, 0), (24, 1), (32, 2), (64, 255), (40, 0x70 / 4), (54, 2), (61, 1), (72, 1), (81, 7), (84, 1), (60, 1)]);
+        let lop3 = w(0x212, &[(16, 4), (24, 7), (32, 5), (64, 255), (72, 0xfc), (81, 7), (87, 7)]);
+        let bindless = w(0x361, &[(16, 0), (24, 1), (32, 4), (64, 255), (59, 1), (61, 1), (72, 1), (81, 7), (84, 1), (60, 1)]);
+        let brx = w(0x949, &[(24, 54), (34, ((-48i64 / 4) as u64 as u128) & ((1 << 48) - 1)), (87, 7)]);
+        let indexed = w(0xb82, &[(16, 54), (24, 20), (54, 1), (73, 4)]);
+        let vertex = Options { varyings: BTreeMap::from([(0, Interp::ScreenLinear), (1, Interp::Constant)]), clip_planes: 1, ..Default::default() };
+        let pixel = &[(0, 0x000c_5482), (6, 0xa), (18, 1)];
+        vec![
+            (program(&[(0, 0x020c_0481), (6, 0x33), (13, 0x3_3000)], &[ald(0, 0x90), ald(2, 0x80), ast(2, 0x70, 1), ast(0, 0x80, 1), ast(0, 0x2c0, 0), exit()]), vertex),
+            (program(pixel, &[ipa(1, 0x80), ipa(2, 0x84), fsetp, skip, tex, exit()]), Options::default()),
+            (program(pixel, &[ipa(1, 0x80), ipa(2, 0x84), ldc(7, 0x258), ldc(5, 0x5c0), lop3, bindless, exit()]), Options::default()),
+            (
+                compute(&[s2r(0, 0x21), s2r(1, 0x22), s2r(2, 0x23), w(0x802, &[(16, 3), (32, 1), (72, 0xf)]), su(0x593, 4, 0x90, 0), su(0x59f, 0, 0x90, 6), su(0x59f, 0, 0x88, 0)]),
+                Options { workgroup: [4, 4, 4], images: vec!["r32uint".into(), "r32uint".into()], ..Default::default() },
+            ),
+            (compute(&[s2r(20, 0x21), indexed, brx, s2r(1, 0x21), exit(), s2r(2, 0x21), exit()]), Options { workgroup: [8, 1, 1], jump_targets: Some(BTreeSet::from([3, 5])), ..Default::default() }),
+            (
+                compute(&[s2r(0, 0x21), w(0x388, &[(24, 0), (32, 0), (73, 4), (78, 1)]), w(0xb1d, &[]), w(0x38c, &[(16, 1), (24, 255), (32, 0), (40, 0x40)]), w(0x984, &[(16, 3), (24, 0), (40, 1)])]),
+                Options { workgroup: [64, 1, 1], shared: 0x48, queried: BTreeMap::from([(1, TexDim::D3)]), int_attributes: BTreeMap::from([(2, true)]), ..Default::default() },
+            ),
+        ]
+    }
+
+    #[test]
+    fn translations_round_trip_through_postcard() {
+        for (code, options) in samples() {
+            let t = translate_with(&code, &options).unwrap_or_else(|e| panic!("{e}"));
+            let back: (Translation, Options) = postcard::from_bytes(&postcard::to_stdvec(&(&t, &options)).unwrap()).unwrap();
+            assert_eq!(back, (t, options));
+        }
+    }
+
+    #[test]
+    fn naga_modules_round_trip_to_the_same_spirv() {
+        let spirv = |m: &naga::Module| {
+            let info = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all()).validate(m).unwrap();
+            naga::back::spv::write_vec(m, &info, &naga::back::spv::Options::default(), None).unwrap()
+        };
+        for (code, options) in samples() {
+            let module = naga::front::wgsl::parse_str(&translate_with(&code, &options).unwrap().wgsl).unwrap();
+            let bytes = postcard::to_stdvec(&module).unwrap();
+            let back: naga::Module = postcard::from_bytes(&bytes).unwrap();
+            assert_eq!(postcard::to_stdvec(&back).unwrap(), bytes);
+            assert_eq!(spirv(&back), spirv(&module));
+        }
     }
 }

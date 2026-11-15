@@ -141,7 +141,7 @@ pub fn stage(code: &[u8]) -> Stage {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub enum Stage {
     Vertex,
     TessControl,

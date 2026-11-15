@@ -6,7 +6,7 @@
 use std::collections::BTreeSet;
 
 /// A uniform register's value as an expression over constant-bank words.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum UExpr {
     Imm(u32),
     /// c[bank][byte offset].

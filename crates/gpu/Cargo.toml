@@ -10,4 +10,9 @@ wgpu = "30"
 pollster = "1"
 png = "0.18"
 lz4_flex = { version = "0.14", default-features = false, features = ["safe-decode", "std"] }
-naga = { version = "30", features = ["wgsl-in"] }
+naga = { version = "30", features = ["wgsl-in", "serialize", "deserialize"] }
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", default-features = false, features = ["use-std"] }
+
+[dev-dependencies]
+naga = { version = "30", features = ["spv-out"] }
