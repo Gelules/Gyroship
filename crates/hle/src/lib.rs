@@ -142,7 +142,8 @@ pub struct Config {
     /// of its own, in real time; never a reference run (D38).
     pub play: bool,
     /// `--pipeline-cache DIR`: the driver's compiled pipelines, kept between runs
-    /// (game-derived: a data folder, never Git). Same images, faster starts.
+    /// (game-derived: a data folder, never Git). Same images, faster starts. DIR
+    /// also keeps the translated shaders, in `shaders` (D72).
     pub pipeline_cache: Option<std::path::PathBuf>,
     /// `--late-frames` (play mode): a frame later than its vsync is shown at once
     /// instead of at the next vsync: more frames, an uneven cadence (D48).
@@ -436,6 +437,9 @@ impl Kernel {
         let mut g = g.as_deref_mut();
         if let Some(s) = g.as_mut().and_then(|g| g.surfaces.as_mut()) {
             s.finish_pipeline_cache(std::time::Duration::from_secs(3));
+            if let Some(c) = &mut s.shader_cache {
+                eprintln!("gyroship: shader cache: {}", c.finish(std::time::Duration::from_secs(3)));
+            }
         }
         if let Some(v) = g.as_mut().and_then(|g| g.video.take()) {
             let (skipped, path) = (v.skipped, self.config.video.clone().unwrap_or_default());
@@ -454,10 +458,13 @@ impl Kernel {
                 eprintln!("gyroship: staging over {} presents: {:?}", self.gs.presents, s.staging);
                 let c = &s.compile_total;
                 eprintln!(
-                    "gyroship: shaders over {} presents: {} modules in {:.1} s, {} pipelines in {:.1} s on the frame, {} made off it in {:.1} s; {} draws and dispatches waited for theirs",
+                    "gyroship: shaders over {} presents: {} modules in {:.1} s, {} loaded in {:.1} s ({:.1} s saved), {} pipelines in {:.1} s on the frame, {} made off it in {:.1} s; {} draws and dispatches waited for theirs",
                     self.gs.presents,
                     c.modules,
                     c.module_time.as_secs_f64(),
+                    c.loaded,
+                    c.load_time.as_secs_f64(),
+                    c.saved.as_secs_f64(),
                     c.pipelines,
                     c.pipeline_time.as_secs_f64(),
                     c.background,

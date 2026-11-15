@@ -276,6 +276,8 @@ pub struct Surfaces {
     pub finished: Arc<Mutex<Vec<(String, std::time::Duration)>>>,
     /// `--pipeline-cache`: the driver's compiled pipelines, kept on disk.
     pub(crate) disk_cache: Option<DiskCache>,
+    /// `--pipeline-cache DIR`: the translated shaders, kept in DIR/shaders (D72).
+    pub shader_cache: Option<crate::shader::cache::ShaderCache>,
     /// Texture views and bind groups, made once while the frames use them: a
     /// view per texture slot and a bind group per draw cost wgpu and the
     /// driver more than the rest of the draw.
@@ -314,10 +316,15 @@ pub(crate) const PIPELINE_WAIT: std::time::Duration = std::time::Duration::from_
 pub struct Compile {
     pub modules: u32,
     pub module_time: std::time::Duration,
+    /// Modules made from the shader cache's entries (D72), the time that took, and
+    /// the time translating them took when they were stored, less that.
+    pub loaded: u32,
+    pub load_time: std::time::Duration,
+    pub saved: std::time::Duration,
     pub pipelines: u32,
     pub pipeline_time: std::time::Duration,
-    /// What was made, in order: `m<program>/<variant>` for a module,
-    /// `p<vertex or compute program>+<pixel program>` for a pipeline (not summed).
+    /// What was made, in order: `m<program>/<variant>` for a module (`l…` when
+    /// loaded), `p<vertex or compute program>+<pixel program>` for a pipeline (not summed).
     pub made: Vec<String>,
     /// Draws and dispatches skipped while their pipeline was made (play mode).
     pub waited: u64,
@@ -330,6 +337,9 @@ impl std::ops::AddAssign for Compile {
     fn add_assign(&mut self, o: Compile) {
         self.modules += o.modules;
         self.module_time += o.module_time;
+        self.loaded += o.loaded;
+        self.load_time += o.load_time;
+        self.saved += o.saved;
         self.pipelines += o.pipelines;
         self.pipeline_time += o.pipeline_time;
         self.waited += o.waited;
@@ -835,7 +845,7 @@ impl Surfaces {
         let window = window.map(|(surface, size)| Window::new(&adapter, &device, surface, size));
         let timing = crate::timing::Timing::new(&device, &queue);
         let renderable = (0..=0xff).filter_map(color_format).chain((0..=0xff).filter_map(depth_format)).map(|f| (f, renderable_on(&adapter, &device, f))).collect();
-        Ok(Surfaces { renderable, adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pass: None, pending: None, timing, clock: None, present: 0, readbacks: Default::default(), hasher: None, arena, belt, big_upload: false, texture_belt, uploads: None, staging: Staging::default(), staged: FxMap::default(), last_color: None, window, submit: None, submit_ended: false, memo: Memo::default(), compile: Compile::default(), compile_total: Compile::default(), background: false, wait_left: PIPELINE_WAIT, workers: None, finished: Default::default(), disk_cache: None, views: Aged::default(), bind_groups: Groups::default(), dynamic_max, clip_distances })
+        Ok(Surfaces { renderable, adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pass: None, pending: None, timing, clock: None, present: 0, readbacks: Default::default(), hasher: None, arena, belt, big_upload: false, texture_belt, uploads: None, staging: Staging::default(), staged: FxMap::default(), last_color: None, window, submit: None, submit_ended: false, memo: Memo::default(), compile: Compile::default(), compile_total: Compile::default(), background: false, wait_left: PIPELINE_WAIT, workers: None, finished: Default::default(), disk_cache: None, shader_cache: None, views: Aged::default(), bind_groups: Groups::default(), dynamic_max, clip_distances })
     }
 
     /// Shows the presented image (the color target written last, its top-left

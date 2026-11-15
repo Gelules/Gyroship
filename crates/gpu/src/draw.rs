@@ -978,21 +978,61 @@ impl Surfaces {
     /// jump targets of variant `id.3`) into the module cache.
     fn translate_module(&mut self, id: ModuleId, pixel: Option<&Translation>, ints: &BTreeMap<u8, bool>, jump: Option<BTreeSet<usize>>) {
         let key = id.0;
-        let since = std::time::Instant::now();
         let options = Options { varyings: pixel.map(|p| p.interface.varyings.clone()).unwrap_or_default(), int_attributes: ints.clone(), jump_targets: jump, clip_planes: id.4, ..Default::default() };
-        let made = shader::translate_with(&self.cache.code[&key], &options).map_err(|e| format!("program {key:016x}: {e}")).and_then(|mut t| {
+        let made = self.translated(key, options, "program", format!("{key:016x}/{:x}", id.3), |t| {
             // GYROSHIP_WGSL_OVERRIDE=<dir>: <dir>/<key>.wgsl replaces the translation (a
-            // debugging aid: a program edited to show its intermediate values).
+            // debugging aid: a program edited to show its intermediate values; the shader
+            // cache is then off).
             if let Some(text) = std::env::var_os("GYROSHIP_WGSL_OVERRIDE").and_then(|d| std::fs::read_to_string(std::path::Path::new(&d).join(format!("{key:016x}.wgsl"))).ok()) {
                 t.wgsl = text;
             }
-            let m = self.shader_module(&format!("{key:016x}"), &t.wgsl).map_err(|()| format!("program {key:016x}: invalid WGSL"))?;
-            Ok(std::sync::Arc::new((t, m)))
         });
         self.cache.modules.insert(id, made);
+    }
+
+    /// Program `key` with `options` as a module: from the disk cache when it has the
+    /// entry (D72), else translated (`edit` may change the translation) and made, then
+    /// queued for the disk once wgpu accepted it. `what` names the program in errors,
+    /// `label` in the frame's list of what was made (`m` translated, `l` loaded).
+    pub(crate) fn translated(&mut self, key: u64, options: Options, what: &str, label: String, edit: impl FnOnce(&mut Translation)) -> Module {
+        let since = std::time::Instant::now();
+        if let Some((m, took)) = self.cached(key, &options) {
+            let elapsed = since.elapsed();
+            self.compile.loaded += 1;
+            self.compile.load_time += elapsed;
+            self.compile.saved += took.saturating_sub(elapsed);
+            self.compile.made.push(format!("l{label}"));
+            return Ok(m);
+        }
+        let made = shader::translate_with(&self.cache.code[&key], &options).map_err(|e| format!("{what} {key:016x}: {e}")).and_then(|mut t| {
+            edit(&mut t);
+            let m = self.shader_module(&format!("{key:016x}"), &t.wgsl).map_err(|()| format!("{what} {key:016x}: invalid WGSL"))?;
+            Ok(std::sync::Arc::new((t, m)))
+        });
+        let took = since.elapsed();
+        if let (Ok(m), Some(c)) = (&made, &mut self.shader_cache) {
+            c.store(key, &self.cache.code[&key], options, m.0.clone(), took);
+        }
         self.compile.modules += 1;
-        self.compile.module_time += since.elapsed();
-        self.compile.made.push(format!("m{key:016x}/{:x}", id.3));
+        self.compile.module_time += took;
+        self.compile.made.push(format!("m{label}"));
+        made
+    }
+
+    /// The module of program `key` with `options` from the disk cache, if it has the
+    /// entry and wgpu accepts its naga module, and what translating it took. wgpu checks
+    /// it in an error scope: a refusal is no wgpu error, the program is translated.
+    fn cached(&mut self, key: u64, options: &Options) -> Option<(std::sync::Arc<(Translation, wgpu::ShaderModule)>, std::time::Duration)> {
+        let c = self.shader_cache.as_mut()?;
+        let (t, ir, took) = c.load(key, &self.cache.code[&key], options)?;
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let m = self.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(&format!("{key:016x}")), source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(ir)) });
+        if pollster::block_on(scope.pop()).is_some() {
+            c.rejected += 1;
+            return None;
+        }
+        c.loaded += 1;
+        Some((std::sync::Arc::new((t, m)), took))
     }
 
     /// A module from translated WGSL, parsed and validated once, by wgpu; refused

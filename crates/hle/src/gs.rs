@@ -744,8 +744,8 @@ impl GpuSide {
                 let made: Vec<String> = finished.iter().map(|(label, t)| format!("{label} {} ms", t.as_millis())).collect();
                 self.log(&format!("gpu: present #{n}: made off the frame: {}", made.join(", ")));
             }
-            if self.config.play && c.module_time + c.pipeline_time >= SLOW_COMPILE {
-                self.log(&format!("gpu: present #{n}: {} modules in {} ms, {} pipelines in {} ms: {}", c.modules, c.module_time.as_millis(), c.pipelines, c.pipeline_time.as_millis(), c.made.join(" ")));
+            if self.config.play && c.module_time + c.load_time + c.pipeline_time >= SLOW_COMPILE {
+                self.log(&format!("gpu: present #{n}: {} modules in {} ms, {} loaded in {} ms, {} pipelines in {} ms: {}", c.modules, c.module_time.as_millis(), c.loaded, c.load_time.as_millis(), c.pipelines, c.pipeline_time.as_millis(), c.made.join(" ")));
             }
             // D42: a pipeline the driver works on that long; its draws wait meanwhile.
             for label in overdue {

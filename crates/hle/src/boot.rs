@@ -360,6 +360,17 @@ pub fn run(mut table: Vec<rt::Entry>, window: Option<HostWindow>) {
                         Ok((file, size)) => eprintln!("gyroship: pipeline cache {} ({} KiB)", file.display(), size / 1024),
                         Err(e) => eprintln!("gyroship: --pipeline-cache {}: {e}; pipelines are compiled every run", dir.display()),
                     }
+                    // D72: the translated shaders too; not while a debugging override replaces translations.
+                    match std::env::var_os("GYROSHIP_WGSL_OVERRIDE") {
+                        Some(_) => eprintln!("gyroship: shader cache off: GYROSHIP_WGSL_OVERRIDE is set"),
+                        None => match gyroship_gpu::shader::cache::ShaderCache::open(&dir.join("shaders")) {
+                            Ok(c) => {
+                                eprintln!("gyroship: shader cache {}", c.describe());
+                                s.shader_cache = Some(c);
+                            }
+                            Err(e) => eprintln!("gyroship: shader cache: {e}; shaders are translated every run"),
+                        },
+                    }
                 }
                 if k.config.perf.is_some() && !s.measure_frames() {
                     eprintln!("gyroship: --perf: this GPU has no timestamps inside command encoders: no GPU frame times");

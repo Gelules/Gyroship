@@ -352,16 +352,9 @@ impl Surfaces {
         if let Some(c) = self.cache.compute.get(&id) {
             return c.clone();
         }
-        let since = std::time::Instant::now();
         let options = Options { workgroup: l.block, shared: l.shared, images, queried, ..Default::default() };
-        let made = shader::translate_with(&self.cache.code[&key], &options).map_err(|e| format!("compute program {key:016x}: {e}")).and_then(|t| {
-            let module = self.shader_module(&format!("{key:016x}"), &t.wgsl).map_err(|()| format!("compute program {key:016x}: invalid WGSL"))?;
-            Ok(std::sync::Arc::new((t, module)))
-        });
+        let made = self.translated(key, options, "compute program", format!("{key:016x}/compute"), |_| {});
         self.cache.compute.insert(id, made.clone());
-        self.compile.modules += 1;
-        self.compile.module_time += since.elapsed();
-        self.compile.made.push(format!("m{key:016x}/compute"));
         made
     }
 }

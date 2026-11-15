@@ -226,6 +226,60 @@ mod tests {
     }
 
     #[test]
+    fn a_second_run_loads_the_modules_the_first_translated() {
+        let dir = folder("runs");
+        let samples = super::super::tests::samples();
+        let mut runs = Vec::new();
+        for run in 0..2 {
+            let Ok(mut s) = crate::surfaces::Surfaces::headless(crate::Backend::Auto) else {
+                eprintln!("no GPU adapter: test skipped");
+                return;
+            };
+            s.shader_cache = Some(ShaderCache::open(&dir).unwrap());
+            let mut made = Vec::new();
+            for (code, options) in &samples {
+                let key = super::super::translate_with(code, options).unwrap().key;
+                s.cache.code.insert(key, code.clone());
+                made.push(s.translated(key, options.clone(), "program", format!("{key:016x}"), |_| {}).unwrap().0.clone());
+            }
+            let line = s.shader_cache.as_mut().unwrap().finish(Duration::from_secs(10));
+            // Run 1 translates and writes them all, run 2 loads them all.
+            let n = samples.len() as u32;
+            assert_eq!((s.compile.modules, s.compile.loaded), if run == 0 { (n, 0) } else { (0, n) }, "{line}");
+            assert!(s.errors.lock().unwrap().is_empty(), "{:?}", s.errors);
+            runs.push(made);
+        }
+        assert_eq!(runs[0], runs[1]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_entry_wgpu_refuses_is_translated_instead() {
+        let dir = folder("refused");
+        let Ok(mut s) = crate::surfaces::Surfaces::headless(crate::Backend::Auto) else {
+            eprintln!("no GPU adapter: test skipped");
+            return;
+        };
+        // A pixel program, its naga module with a binding in group 1000: wgpu refuses it.
+        let (code, options) = super::super::tests::samples().swap_remove(1);
+        let t = super::super::translate_with(&code, &options).unwrap();
+        let mut module = naga::front::wgsl::parse_str(&t.wgsl).unwrap();
+        module.global_variables.iter_mut().find_map(|(_, g)| g.binding.as_mut()).expect("a binding").group = 1000;
+        let c = ShaderCache::open(&dir).unwrap();
+        std::fs::write(c.dir.join(name(t.key, &options)), entry(&body(&code, &options, 0, &t, &module).unwrap())).unwrap();
+        s.shader_cache = Some(c);
+        s.cache.code.insert(t.key, code);
+        let made = s.translated(t.key, options, "program", String::new(), |_| {});
+        assert_eq!(made.unwrap().0, t);
+        assert_eq!((s.compile.modules, s.compile.loaded, s.shader_cache.as_ref().map(|c| c.rejected)), (1, 0, Some(1)));
+        assert!(s.errors.lock().unwrap().is_empty(), "{:?}", s.errors);
+        // The translation replaces the entry.
+        let line = s.shader_cache.as_mut().unwrap().finish(Duration::from_secs(10));
+        assert!(line.contains("; 1 written"), "{line}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn the_build_stamp_covers_the_compiler_the_translator_and_naga() {
         let list = include_str!(concat!(env!("OUT_DIR"), "/shader-sources.txt"));
         assert!(list.starts_with("rustc "), "{list}");
