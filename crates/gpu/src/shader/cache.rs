@@ -9,8 +9,11 @@
 //! - An entry serves only when its checksum holds and its stored code and options
 //!   equal the live ones.
 //! - Only modules wgpu accepted are queued; a thread of their own writes them,
-//!   through a temporary file and a rename. A run never loads what it queued: its
-//!   first use of a program takes the same path with or without the cache.
+//!   through a temporary file and a rename. A run asks for each program and options
+//!   once (`Surfaces::translated` then shares the module), so it never loads what it
+//!   queued: its first use of a program takes the same path with or without the cache.
+//! - With debug assertions, wgpu keeps a WGSL module's source for the SPIR-V's debug
+//!   info, and has none for a loaded module: their SPIR-V differs, their rendering not.
 
 use super::{Options, Translation};
 use std::path::{Path, PathBuf};
@@ -42,10 +45,10 @@ struct Written {
 pub struct ShaderCache {
     dir: PathBuf,
     queue: Option<mpsc::Sender<Job>>,
-    writer: Option<std::thread::JoinHandle<()>>,
+    writer: std::thread::JoinHandle<()>,
     written: Arc<Mutex<Written>>,
     /// Entries queued this run.
-    queued: std::collections::HashSet<String>,
+    queued: u32,
     /// Entries made into modules, and entries rejected: unreadable, another program
     /// or other options in the file, or a module wgpu refused.
     pub loaded: u32,
@@ -86,7 +89,7 @@ impl ShaderCache {
                 }
             })
             .map_err(|e| format!("no writer thread: {e}"))?;
-        Ok(ShaderCache { dir, queue: Some(queue), writer: Some(writer), written, queued: Default::default(), loaded: 0, rejected: 0, read: Duration::ZERO })
+        Ok(ShaderCache { dir, queue: Some(queue), writer, written, queued: 0, loaded: 0, rejected: 0, read: Duration::ZERO })
     }
 
     /// Its folder, its entries, and the folders of other builds beside it (never
@@ -99,14 +102,10 @@ impl ShaderCache {
 
     /// The translation, naga module and making time stored for program `key` with this
     /// code and these options. None without such an entry (a missing file is not
-    /// counted as rejected), and for an entry this run queued.
+    /// counted as rejected).
     pub fn load(&mut self, key: u64, code: &[u8], options: &Options) -> Option<(Translation, naga::Module, Duration)> {
-        let name = name(key, options);
-        if self.queued.contains(&name) {
-            return None;
-        }
         let since = Instant::now();
-        let bytes = std::fs::read(self.dir.join(&name));
+        let bytes = std::fs::read(self.dir.join(name(key, options)));
         self.read += since.elapsed();
         match read(&bytes.ok()?) {
             Some((c, o, took, t, module)) if c == code && o == *options => Some((t, module, Duration::from_micros(took))),
@@ -118,13 +117,11 @@ impl ShaderCache {
     }
 
     /// Queues a module wgpu accepted: translation `t` of program `key` (this code, these
-    /// options), made in `took`. Once per entry and run.
+    /// options), made in `took`.
     pub fn store(&mut self, key: u64, code: &[u8], options: Options, t: Translation, took: Duration) {
-        let name = name(key, &options);
-        if let Some(queue) = &self.queue
-            && self.queued.insert(name.clone())
-        {
-            let _ = queue.send((self.dir.join(name), code.to_vec(), options, t, took));
+        if let Some(queue) = &self.queue {
+            self.queued += 1;
+            let _ = queue.send((self.dir.join(name(key, &options)), code.to_vec(), options, t, took));
         }
     }
 
@@ -133,11 +130,11 @@ impl ShaderCache {
     pub fn finish(&mut self, patience: Duration) -> String {
         self.queue = None;
         let since = Instant::now();
-        while self.writer.as_ref().is_some_and(|w| !w.is_finished()) && since.elapsed() < patience {
+        while !self.writer.is_finished() && since.elapsed() < patience {
             std::thread::sleep(Duration::from_millis(10));
         }
         let w = self.written.lock().unwrap_or_else(PoisonError::into_inner);
-        let left = (self.queued.len() as u32).saturating_sub(w.entries + w.failed);
+        let left = self.queued.saturating_sub(w.entries + w.failed);
         format!("{} loaded, {} rejected, {} ms reading; {} written ({} KiB), {} failed, {left} not written", self.loaded, self.rejected, self.read.as_millis(), w.entries, w.bytes / 1024, w.failed)
     }
 }
@@ -199,11 +196,8 @@ mod tests {
         let took = Duration::from_millis(5);
         let mut c = ShaderCache::open(&dir).unwrap();
         c.store(t.key, &code, options.clone(), t.clone(), took);
-        c.store(t.key, &code, options.clone(), t.clone(), took);
         let line = c.finish(Duration::from_secs(10));
         assert!(line.contains("; 1 written") && line.contains(" 0 failed, 0 not written"), "{line}");
-        // Written, but never loaded back by the run that queued it.
-        assert!(c.load(t.key, &code, &options).is_none());
         let mut c = ShaderCache::open(&dir).unwrap();
         let (back, module, stored) = c.load(t.key, &code, &options).expect("the entry");
         assert_eq!((&back, stored), (&t, took));
@@ -231,8 +225,11 @@ mod tests {
         let samples = super::super::tests::samples();
         let mut runs = Vec::new();
         for run in 0..2 {
-            let Ok(mut s) = crate::surfaces::Surfaces::headless(crate::Backend::Auto) else {
-                eprintln!("no GPU adapter: test skipped");
+            // The samples use clip distances and image atomics.
+            let wanted = wgpu::Features::CLIP_DISTANCES | wgpu::Features::TEXTURE_ATOMIC;
+            let Some(mut s) = crate::surfaces::Surfaces::headless(crate::Backend::Auto).ok().filter(|s| s.device.features().contains(wanted)) else {
+                assert_eq!(run, 0, "the adapter went away");
+                eprintln!("no GPU adapter with clip distances and image atomics: test skipped");
                 return;
             };
             s.shader_cache = Some(ShaderCache::open(&dir).unwrap());
@@ -295,5 +292,14 @@ mod tests {
         for want in ["Cargo.toml", "src/shader/mod.rs", "src/shader/cache.rs", "src/sass/mod.rs", "../../vendor/naga/Cargo.toml", "../../vendor/naga/src/front/mod.rs"] {
             assert!(list.lines().any(|l| l == want), "{want}\n{list}");
         }
+        // The stamp: the compiler's line, then each file's name, a zero and its bytes.
+        let (rustc, files) = list.split_once('\n').unwrap();
+        let mut bytes = format!("{rustc}\n").into_bytes();
+        for f in files.lines() {
+            bytes.extend(f.as_bytes());
+            bytes.push(0);
+            bytes.extend(std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join(f)).unwrap());
+        }
+        assert_eq!(format!("{:016x}", crate::sass::fnv(&bytes)), BUILD);
     }
 }

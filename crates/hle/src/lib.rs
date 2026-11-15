@@ -437,9 +437,6 @@ impl Kernel {
         let mut g = g.as_deref_mut();
         if let Some(s) = g.as_mut().and_then(|g| g.surfaces.as_mut()) {
             s.finish_pipeline_cache(std::time::Duration::from_secs(3));
-            if let Some(c) = &mut s.shader_cache {
-                eprintln!("gyroship: shader cache: {}", c.finish(std::time::Duration::from_secs(3)));
-            }
         }
         if let Some(v) = g.as_mut().and_then(|g| g.video.take()) {
             let (skipped, path) = (v.skipped, self.config.video.clone().unwrap_or_default());
@@ -559,6 +556,11 @@ impl Kernel {
             if let Err(e) = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::write(path, csv)) {
                 eprintln!("gyroship: --hashes {}: {e}", path.display());
             }
+        }
+        // Last, after the run's own files: an entry not written yet is only translated
+        // again by a later run.
+        if let Some(c) = g.as_mut().and_then(|g| g.surfaces.as_mut()).and_then(|s| s.shader_cache.as_mut()) {
+            eprintln!("gyroship: shader cache: {}", c.finish(std::time::Duration::from_secs(3)));
         }
     }
 

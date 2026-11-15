@@ -29,6 +29,9 @@ Requires a recent stable Rust toolchain (MSVC on Windows).
     gyroship-tools recompile <exefs> -o generated/game     # every function, Cranelift, plus a linkable harness
                                                           #   (--probes FILE: log the first pass at listed addresses)
     generated/game/target/release/harness boot <exefs> --log FILE  # boot the recompiled game (--explore, --all-svcs)
+                                                          #   (--pipeline-cache DIR: keep the driver's pipelines and the
+                                                          #   translated shaders in DIR; DIR/shaders holds one folder per
+                                                          #   translator build, never removed: delete it to reclaim space)
     gyroship-tools experiment <exefs> -o generated/exp/x  # recompile a sample (--backend rust|clif)
     gyroship-tools measure <command> ...                  # wall time and peak memory of a process tree
     gyroship-tools boost-check <trace>...                 # boost reimplementation vs --trace files, frame by frame

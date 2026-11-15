@@ -22,4 +22,7 @@ more rules:
 
 Both the repository's workspace and the generated game workspace use it through
 `[patch.crates-io]`. Remove the folder and those patch sections once a naga
-release used by wgpu has the same fix.
+release used by wgpu has the same fix. Then replace `../../vendor/naga` in
+`crates/gpu/build.rs` with exact pins of `naga` and `naga-types` in
+`crates/gpu/Cargo.toml`, which the stamp hashes: without them, a naga upgrade would
+keep serving entries made with the older naga.
