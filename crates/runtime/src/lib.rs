@@ -357,13 +357,11 @@ pub fn probe_counts() -> Vec<(u64, &'static str, u64)> {
     PROBES.get().map_or_else(Vec::new, |p| p.iter().map(|(a, n, c)| (*a, n.as_str(), c.load(Ordering::Relaxed))).collect())
 }
 
-/// How many passes of a probe are reported: all of them for `trace:...`,
-/// every one up to 512 for `each:...`, four for `stack:...` and `dump:...`,
-/// otherwise the first.
+/// How many passes of a probe are reported: every one up to 512 for `each:...`,
+/// four for `stack:...` and `dump:...`, otherwise the first (`trace:...` probes
+/// report every pass and are not counted, see `gyroship_probe`).
 fn reported_passes(name: &str) -> u64 {
-    if name.starts_with("trace:") {
-        u64::MAX
-    } else if name.starts_with("each:") {
+    if name.starts_with("each:") {
         512
     } else if name.starts_with("stack:") || name.starts_with("dump:") {
         4
@@ -380,8 +378,10 @@ fn reported_passes(name: &str) -> u64 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gyroship_probe(cpu: *mut Cpu, pc: u64) {
     let Some(p) = PROBES.get() else { return };
+    // A `trace:` probe reports every pass without its shared counter: the game's job
+    // threads pass some hundreds of times a frame, and the count is never read.
     if let Ok(i) = p.binary_search_by_key(&pc, |e| e.0)
-        && p[i].2.fetch_add(1, Ordering::Relaxed) < reported_passes(&p[i].1)
+        && (p[i].1.starts_with("trace:") || p[i].2.fetch_add(1, Ordering::Relaxed) < reported_passes(&p[i].1))
     {
         match HOOKS.get() {
             // SAFETY: guaranteed by the caller.

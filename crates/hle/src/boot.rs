@@ -167,10 +167,17 @@ fn hex(b: &[u8]) -> String {
     format!("{:#x}", u64::from_le_bytes(v))
 }
 
+/// Whether `--trace` writes its file. Without it, a `trace:` probe's pass leaves at once:
+/// job threads pass them hundreds of times a frame, and the kernel lock is all they would take.
+static TRACING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// The probe hook: the first pass is journaled; the oracle runs at `nn::init::Start`.
 /// Every pass of a `trace:` probe goes to the `--trace` file only.
 pub(crate) unsafe fn on_probe(cpu: *mut Cpu, pc: u64, name: &str) {
     if name.starts_with("trace:") {
+        if !TRACING.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         crate::with(|k| {
             let stamp = (k.now(), k.sched.current.map_or(0, |t| k.sched.threads[t].id), k.gs.presents);
             if let Some(t) = k.trace.as_mut() {
@@ -328,6 +335,7 @@ pub fn run(mut table: Vec<rt::Entry>, window: Option<HostWindow>) {
             eprintln!("gyroship: --trace {}: {e}", path.display());
             std::process::exit(2);
         }));
+        TRACING.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     // The host GPU runs the game's work when frames are dumped, filmed or measured, or with --gpu.
     if window.is_some() || k.config.frames_dump.is_some() || k.config.video.is_some() || k.config.perf.is_some() || k.config.hashes.is_some() || flag("--gpu") {
