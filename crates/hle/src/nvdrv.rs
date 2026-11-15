@@ -72,7 +72,7 @@ const TPC_MASK: u32 = 0x3f;
 /// GetVARegions: the 64 KiB-page region, at the top of each AS.
 const BIG_PAGES: u64 = 0x10_0000_0000;
 /// The channel's syncpoint; Lichii's present fences carry id 1.
-const CHANNEL_SYNCPT: u32 = 1;
+pub(crate) const CHANNEL_SYNCPT: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Device {
@@ -187,8 +187,8 @@ pub(crate) struct Progress {
 }
 
 /// Ops applied so far (those after a stop are skipped, and counted), the
-/// last submit whose ops are all applied (`Phase::submits`), the stop the
-/// GPU thread met, and whether it ended.
+/// last job whose `End` is applied (`Phase::job`), the stop the GPU thread
+/// met, and whether it ended.
 #[derive(Default)]
 struct Applied {
     ops: u64,
@@ -197,11 +197,31 @@ struct Applied {
     ended: bool,
 }
 
+impl Applied {
+    /// The stop the GPU thread met, or its end.
+    fn stopped(&self) -> Option<Stop> {
+        self.stop.clone().or_else(|| self.ended.then(gpu_thread_ended))
+    }
+}
+
 impl Progress {
-    /// The last submit done, and whether the GPU thread still applies ops.
+    /// The last job done, and whether the GPU thread still applies ops.
     pub(crate) fn jobs(&self) -> (u64, bool) {
         let state = crate::lock(&self.state);
         (state.jobs, state.stop.is_none() && !state.ended)
+    }
+
+    /// The stop the GPU thread met, or its end.
+    pub(crate) fn stopped(&self) -> Option<Stop> {
+        crate::lock(&self.state).stopped()
+    }
+
+    /// Waits until job `job` is done, a stop or the end, `patience` at most:
+    /// the stop (or end), and the last job done.
+    fn drain(&self, job: u64, patience: Duration) -> (Option<Stop>, u64) {
+        let state = crate::lock(&self.state);
+        let (state, _) = self.changed.wait_timeout_while(state, patience, |s| s.jobs < job && s.stop.is_none() && !s.ended).unwrap_or_else(std::sync::PoisonError::into_inner);
+        (state.stopped(), state.jobs)
     }
 }
 
@@ -253,8 +273,9 @@ pub enum GpuOp {
     PresentBegin { n: u64 },
     /// The rest of present `n`, after its frame's ops (`GpuSide::finish_present`).
     PresentEnd { n: u64, fence: (u32, u32), area: u32, perf: Option<FrameIn> },
-    /// The end of a submit's ops: once applied, the GPU thread counts the
-    /// submit done (`Applied::jobs`), which gpu memory 213 and 102 wait for.
+    /// The end of a job's ops (a submit's or a present's): once applied, the
+    /// GPU thread counts the job done (`Applied::jobs`), which gpu memory 213
+    /// and 102 and the drain at a run's end wait for.
     End,
 }
 
@@ -331,6 +352,14 @@ pub struct Phase {
     pub presents: u64,
     pub submits: u64,
     pub maps: Arc<crate::gs::Mappings>,
+}
+
+impl Phase {
+    /// The job's number: jobs (submits and presents) are numbered in
+    /// hand-over order, each counted just before `Kernel::gpu_work`.
+    pub(crate) fn job(&self) -> u64 {
+        self.presents + self.submits
+    }
 }
 
 /// GPU work the kernel hands over (`Kernel::gpu_work`).
@@ -590,15 +619,16 @@ impl Decoder {
         self.send(phase, GpuOp::PresentEnd { n, fence, area, perf })
     }
 
-    /// A job's end, once its ops are `sent`: `End`, then the wait until the
-    /// GPU thread has applied them all. The first stop in stream order wins:
-    /// the GPU thread's comes from an earlier op than the decoder's.
+    /// A job's end, once its ops are `sent`: `End`, even after a decode stop
+    /// (the job then counts as done: the drain, 213 and 102 wait for it), then
+    /// the wait until the GPU thread has applied them all. The first stop in
+    /// stream order wins: the GPU thread's comes from an earlier op than the decoder's.
     fn end_job(&mut self, phase: &Phase, sent: Result<(), Stop>) -> Result<(), Stop> {
-        let sent = sent.and_then(|()| self.send(phase, GpuOp::End));
+        let ended = self.send(phase, GpuOp::End);
         let since = Instant::now();
         let joined = self.gpu.as_ref().map_or(Err(gpu_thread_ended()), GpuThread::join);
         self.gpu_wait_ns += since.elapsed().as_nanos() as u64;
-        joined.and(sent)
+        joined.and(sent).and(ended)
     }
 }
 
@@ -640,12 +670,12 @@ impl GpuThread {
             let channel = &syncpts[CHANNEL_SYNCPT as usize];
             let mut count = channel.load(Ordering::SeqCst);
             for (n, (phase, op)) in (0u64..).zip(rx) {
-                let job = matches!(op, GpuOp::End).then_some(phase.submits);
+                let job = matches!(op, GpuOp::End).then(|| phase.job());
                 let stopped = crate::lock(&p.state).stop.is_some();
                 let done = if stopped { Ok(()) } else { apply_op(&side, phase, op, n) };
                 let mut state = crate::lock(&p.state);
                 state.ops += 1;
-                // ponytail: the last submit ended, not each one before it: exact while one thread submits at a time (T10 at boot, then T17).
+                // ponytail: the last job ended, not each one before it: exact while one thread hands jobs over at a time (T10 at boot, then T17).
                 if let Some(j) = job {
                     state.jobs = state.jobs.max(j);
                 }
@@ -714,7 +744,11 @@ fn apply_op(side: &Mutex<GpuSide>, phase: Phase, op: GpuOp, n: u64) -> Result<()
     crate::GPU_HOLDER.store(gyroship_runtime::profile::thread_id(), Ordering::Relaxed);
     g.at = phase;
     g.applying = n;
-    let done = g.apply(op);
+    // An anomaly's stop names its op: the run may stop on it a job later, or from the boot thread.
+    let done = g.apply(op).map_err(|(code, line)| match code {
+        crate::STOP_EXIT => (code, format!("{line} (GPU op {n}, handed over by thread {} at tick {}, present {})", g.at.thread, g.at.now, g.at.presents)),
+        _ => (code, line),
+    });
     // The mappings' snapshot goes: a change to them need not copy them.
     g.at = Phase::default();
     crate::GPU_HOLDER.store(0, Ordering::Relaxed);
@@ -747,6 +781,28 @@ impl Kernel {
         }
         let done = run(&self.gpu_side, &self.decoder, phase, job);
         self.after(done);
+    }
+
+    /// The GPU jobs handed over so far: the last one's `Phase::job`.
+    pub(crate) fn gpu_jobs(&self) -> u64 {
+        let submits = self.tally().counts.get("submits").copied().unwrap_or(0);
+        self.gs.presents + submits
+    }
+
+    /// Play mode: waits until the GPU thread has done every job handed over
+    /// (but this scope's own, never run once the run stops), met a stop or
+    /// ended, GPU_WAIT at most; the stop it met, if any. A wait cut short is
+    /// journaled: what the GPU thread still had to do may be missing.
+    pub(crate) fn drain_gpu(&mut self) -> Option<Stop> {
+        let p = self.gpu_progress.clone()?;
+        let handed = self.gpu_jobs() - u64::from(matches!(self.deferred, Some(crate::Deferred::Gpu { .. })));
+        let (stop, done) = p.drain(handed, crate::GPU_WAIT);
+        if stop.is_none() && done < handed {
+            let line = format!("gpu: the GPU thread had done {done} of {handed} jobs after {} s: the last frames' lines, rows and hashes may be missing", crate::GPU_WAIT.as_secs());
+            eprintln!("gyroship: {line}");
+            self.log(&line);
+        }
+        stop
     }
 }
 
@@ -981,6 +1037,12 @@ impl Nvdrv {
             (Device::Gpu, 0xc018481b) => {
                 let flags = u32_at(&input, 0xc);
                 put32(&mut out, 0xc, 0);
+                // With the GPU thread, that fence would be reached before the work it fences:
+                // syncpoint 1 would run ahead of the GPU thread for good. NVN never asks (flags
+                // 0x104). Before the count: a strict stop must leave no job the drain waits for.
+                if flags & 2 != 0 && k.gpu_progress.is_some() {
+                    k.anomaly("gpu submit fence", &format!("channel fd {fd}: submit flags {flags:#x} ask for a fence, which would be reached before the GPU thread applies the work"));
+                }
                 let n = k.count("submits");
                 let mut fence = String::new();
                 if flags & 2 != 0 {
@@ -1648,15 +1710,56 @@ mod tests {
     }
 
     /// In strict mode an anomaly on the GPU thread ends the submit there: the
-    /// ops after it are not applied, and the submit returns its stop.
+    /// ops after it are not applied, and the submit returns its stop, which
+    /// names its op. The drain and the boot round see the same stop at once.
     #[test]
     fn a_strict_anomaly_on_the_gpu_thread_ends_the_submit() {
         // SEMAPHORED with an operation no one implements: an ignored method.
         let segments = [vec![header(1, 1, 0, 0x1c), 0x10], semaphore(WORDS + 8, 2, true)];
-        let (k, job) = play_submit(true, false, &segments);
-        assert!(matches!(job.run(), Err((crate::STOP_EXIT, line)) if line.contains("gpu method ignored")));
+        let (mut k, job) = play_submit(true, false, &segments);
+        let Err(stop) = job.run() else { panic!("no stop") };
+        assert!(stop.0 == crate::STOP_EXIT && stop.1.contains("gpu method ignored") && stop.1.contains("(GPU op 1, handed over by thread 0 at tick 0, present 0)"), "{stop:?}");
         assert_eq!(word(&k, WORDS + 8), 0, "the release after the anomaly is not applied");
         assert_eq!(k.tally().anomalies["gpu method ignored"], 1);
+        let since = Instant::now();
+        assert_eq!(k.drain_gpu().as_ref(), Some(&stop));
+        assert_eq!(k.gpu_progress.as_ref().and_then(|p| p.stopped()).as_ref(), Some(&stop));
+        assert!(since.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    /// The drain waits for every job handed over, even one whose ops are not
+    /// sent yet: here the submit runs 100 ms after the drain starts.
+    #[test]
+    fn a_drain_waits_for_a_job_handed_over_but_not_yet_run() {
+        let (mut k, job) = play_submit(true, false, &[semaphore(WORDS, 1, true)]);
+        let running = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            job.run()
+        });
+        let since = Instant::now();
+        assert_eq!(k.drain_gpu(), None);
+        assert!(since.elapsed() >= std::time::Duration::from_millis(90));
+        assert_eq!(word(&k, WORDS), 1);
+        assert!(matches!(running.join().unwrap(), Ok(After::Nothing)));
+    }
+
+    /// A submit that a decode stop ends still ends its job: the drain does
+    /// not wait GPU_WAIT for it, and the ops sent before the stop are applied.
+    #[test]
+    fn a_decode_stop_still_ends_its_job() {
+        let mut k = play_kernel(true, false);
+        let words = semaphore(WORDS, 1, true);
+        k.mem.write(PUSHBUFFERS, &words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+        // The second entry's pushbuffer is not mapped.
+        let entries = [PUSHBUFFERS | (words.len() as u64) << 42, 0x7000_0000 | 4 << 42].iter().flat_map(|e| e.to_le_bytes()).collect();
+        k.count("submits");
+        k.gpu_work(GpuJob::Submit { fd: 1, space: 0, entries });
+        let done = k.deferred.take().expect("a deferred job").run();
+        assert!(matches!(done, Err((crate::STOP_EXIT, line)) if line.contains("gpfifo unreadable")));
+        let since = Instant::now();
+        assert_eq!(k.drain_gpu(), None);
+        assert!(since.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(word(&k, WORDS), 1);
     }
 
     /// A GPU write into a pushbuffer decoded before the write was applied
@@ -1815,9 +1918,19 @@ mod tests {
         assert!(k.events[e].signaled && k.gs.armed.is_empty());
         assert_eq!(word(&k, WORDS), 1);
         // A destroy with nothing queued: signaled at once, never left armed.
-        Gs::GpuMemory.request(&mut k, &tipc(102, &[0u32.to_le_bytes(), 3u32.to_le_bytes()].concat())).unwrap();
+        let destroy = [0u32.to_le_bytes(), 3u32.to_le_bytes()].concat();
+        Gs::GpuMemory.request(&mut k, &tipc(102, &destroy)).unwrap();
         assert!(k.events[e].signaled);
         assert_eq!(k.tally().counts.get("gpu waits armed").copied(), Some(1));
+        // A present handed over before: its resumed channels may read through the old mapping too.
+        let present = hand_present(&mut k, (!CHANNEL_SYNCPT, 0));
+        Gs::GpuMemory.request(&mut k, &tipc(102, &destroy)).unwrap();
+        assert!(!k.events[e].signaled, "the present handed over before the destroy is not applied yet");
+        assert!(matches!(present.run(), Ok(After::Present { n: 1, .. })));
+        assert!(woken(), "the GPU thread wakes the boot thread once the present is done");
+        k.check_gpu_waits();
+        assert!(k.events[e].signaled && k.gs.armed.is_empty());
+        assert_eq!(k.tally().counts.get("gpu waits armed").copied(), Some(2));
     }
 
     /// syncpt 201 with the GPU thread: the wait ends when the GPU thread's
@@ -1864,7 +1977,7 @@ mod tests {
 
     /// A syncpoint wait still unreached 2 s after it was first armed, with the
     /// GPU thread idle, has its syncpoint raised (an anomaly); not while a
-    /// submit is still queued. NVN's rounds (201, 202, 201) keep its age.
+    /// submit or a present is still queued. NVN's rounds (201, 202, 201) keep its age.
     #[test]
     fn an_overdue_syncpoint_wait_is_raised_once_the_gpu_thread_is_idle() {
         use crate::gs::Gs;
@@ -1877,6 +1990,10 @@ mod tests {
         k.check_gpu_waits();
         assert!(!k.events[e].signaled && syncpoint(&k) == 0, "not while a submit is queued");
         assert!(matches!(job.run(), Ok(After::Nothing)));
+        let present = hand_present(&mut k, (!CHANNEL_SYNCPT, 0));
+        k.check_gpu_waits();
+        assert!(!k.events[e].signaled && syncpoint(&k) == 0, "not while a present is queued");
+        assert!(matches!(present.run(), Ok(After::Present { n: 1, .. })));
         k.check_gpu_waits();
         assert!(k.events[e].signaled && k.gs.armed.is_empty());
         assert_eq!(syncpoint(&k), 5);

@@ -18,8 +18,9 @@ thread_local! {
     static PREEMPTED: Cell<u64> = const { Cell::new(0) };
 }
 
-/// How often the boot thread looks at the run's end, its time limit and the
-/// guests' waits on GPU work (the GPU thread also wakes it for those).
+/// How often the boot thread looks at the run's end, its time limit, a stop
+/// the GPU thread met, and the guests' waits on GPU work (the GPU thread also
+/// wakes it for those).
 const CHECK: Duration = Duration::from_millis(250);
 
 /// The play engine's boot thread: starts the ready threads (the main thread)
@@ -50,6 +51,10 @@ pub fn run_play() -> Outcome {
         let outcome = crate::with(|k| {
             let outcome = k.sched.outcome.clone();
             if outcome.is_none() {
+                // The thread that handed the work over may never hand over another job to report it.
+                if let Some((code, why)) = k.gpu_progress.as_ref().and_then(|p| p.stopped()) {
+                    k.stop(code, &why);
+                }
                 k.check_gpu_waits();
             }
             outcome

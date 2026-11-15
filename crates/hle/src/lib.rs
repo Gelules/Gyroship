@@ -361,6 +361,18 @@ impl Kernel {
 
     /// Ends the run: logs why, flushes the journal, exits with `code`.
     pub fn stop(&mut self, code: i32, why: &str) -> ! {
+        // Play mode: the GPU thread's queued work lands first (its lines, the last frames' rows,
+        // hashes and dumps); the journal so far is written before, as a fault meanwhile exits.
+        // A stop the GPU thread met comes earlier in stream order: journaled first, and its code
+        // replaces a normal end's 0.
+        self.journal.flush();
+        let mut code = code;
+        if let Some((c, line)) = self.drain_gpu().filter(|s| s.1 != why) {
+            self.log(&line);
+            if code == 0 {
+                code = c;
+            }
+        }
         self.log(why);
         let summary = self.summary();
         self.log(&summary);
@@ -652,6 +664,11 @@ fn on_fault(what: &str) {
     }
     k.log(if k.config.play { "stack at the last SVC (of any thread):" } else { "stack at the last SVC:" });
     for line in k.backtrace() {
+        k.log(&line);
+    }
+    // Play mode: the GPU thread's queued lines first; FAULT_WAIT and GPU_WAIT stay under the 5 s
+    // after which a later fault exits.
+    if let Some((_, line)) = k.drain_gpu() {
         k.log(&line);
     }
     k.journal.flush();

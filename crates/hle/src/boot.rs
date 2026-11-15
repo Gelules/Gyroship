@@ -391,6 +391,10 @@ pub fn run(mut table: Vec<rt::Entry>, window: Option<HostWindow>) {
     let outcome = if play { crate::play::run_play() } else { thread::run() };
     crate::with(|k| match &outcome {
         thread::Outcome::Finished => {
+            // Play mode: the GPU thread's queued work first; a stop it met ends the run with its code.
+            if let Some((code, why)) = k.drain_gpu() {
+                k.stop(code, &why);
+            }
             k.log("every guest thread ended");
             let summary = k.summary();
             k.log(&summary);
