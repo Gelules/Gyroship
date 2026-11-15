@@ -24,6 +24,7 @@
 //!
 //! Anything not supported is an error naming the instruction, never a guess.
 
+pub mod cache;
 pub mod sph;
 pub mod uexpr;
 
@@ -2513,7 +2514,7 @@ fn shf_l(lo: u32, hi: u32, s: u32) -> vec2<u32> {
 ";
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A word: opcode, guard PT, fields (lo, value).
@@ -2884,7 +2885,7 @@ mod tests {
 
     /// Programs of the tests above with options: varyings, clip distances, textures by
     /// bank word and by a uniform expression, images and atomics, a jump table, shared memory.
-    fn samples() -> Vec<(Vec<u8>, Options)> {
+    pub(crate) fn samples() -> Vec<(Vec<u8>, Options)> {
         let ald = |dst: u128, attr: u128| w(0x321, &[(16, dst), (24, 255), (32, 255), (40, attr), (74, 1)]);
         let ast = |data: u128, attr: u128, comps: u128| w(0x322, &[(24, 255), (32, data), (64, 255), (40, attr), (74, comps)]);
         let ipa = |dst: u128, attr: u128| w(0x326, &[(16, dst), (64, attr / 4), (32, 255), (81, 7)]);

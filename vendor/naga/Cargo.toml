@@ -135,7 +135,7 @@ default-features = false
 version = "0.4.29"
 
 [dependencies.naga-types]
-version = "30.0.0"
+version = "=30.0.1"
 
 [dependencies.num-traits]
 version = "0.2.16"

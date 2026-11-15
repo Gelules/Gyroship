@@ -222,7 +222,7 @@ pub fn compute_key(code: &[u8]) -> Option<(u64, usize)> {
     Some((fnv(&code[..len]), len))
 }
 
-fn fnv(code: &[u8]) -> u64 {
+pub(crate) fn fnv(code: &[u8]) -> u64 {
     code.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
 }
 
