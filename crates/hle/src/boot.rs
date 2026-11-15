@@ -220,6 +220,93 @@ pub(crate) unsafe fn on_probe(cpu: *mut Cpu, pc: u64, name: &str) {
     });
 }
 
+/// Every option after `boot <exefs>`, the host window's too, and whether it takes a
+/// value. Anything else, or a valued option given twice, ends the start: a misspelt option
+/// used to be ignored without a word.
+pub const OPTIONS: &[(&str, bool)] = &[
+    // The host (crates/gyroship).
+    ("--headless", false),
+    ("--backend", true),
+    ("--sdl", true),
+    ("--fullscreen", false),
+    // The run.
+    ("--log", true),
+    ("--all-svcs", false),
+    ("--explore", false),
+    ("--frames", true),
+    ("--seconds", true),
+    ("--replay", true),
+    ("--save", true),
+    ("--record", true),
+    ("--play", false),
+    ("--no-vsync", false),
+    ("--late-frames", false),
+    ("--gpu-sync", false),
+    ("--work-time", false),
+    ("--gpu", false),
+    ("--pipeline-cache", true),
+    ("--romfs-layer", true),
+    ("--hooks", true),
+    ("--language", true),
+    // Reports and dumps.
+    ("--perf", true),
+    ("--hashes", true),
+    ("--profile", true),
+    ("--profile-from", true),
+    ("--trace", true),
+    ("--dump-frames", true),
+    ("--dump-every", true),
+    ("--dump-from", true),
+    ("--dump-draws", true),
+    ("--dump-shaders", true),
+    ("--dump-gpfifo", true),
+    ("--dump-audio", true),
+    ("--video", true),
+    ("--help", false),
+];
+
+/// Checks `boot <exefs> [options]` (the program's arguments, without its name): every
+/// option is known, each valued one has its value and comes once.
+pub fn check_options(args: &[String]) -> Result<(), String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut rest = args.iter().skip(2);
+    while let Some(a) = rest.next() {
+        let Some(&(name, valued)) = OPTIONS.iter().find(|(o, _)| o == a) else {
+            return Err(format!("unknown option {a} (--help lists them)"));
+        };
+        if valued {
+            if rest.next().is_none() {
+                return Err(format!("{name} needs a value"));
+            }
+            if !seen.insert(name) {
+                return Err(format!("{name} given twice"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `--help`: the options, one per line.
+pub fn usage() -> String {
+    let mut s = String::from("usage: harness boot <exefs> [options]\noptions:\n");
+    for (o, valued) in OPTIONS {
+        s += &format!("  {o}{}\n", if *valued { " VALUE" } else { "" });
+    }
+    s
+}
+
+/// The option names a source text quotes, as the option readers spell them (for the tests
+/// that check `OPTIONS` against the code reading them).
+pub fn literals(src: &str) -> Vec<&str> {
+    src.match_indices("\"--")
+        .filter_map(|(i, _)| {
+            let s = &src[i + 1..];
+            let end = 2 + s[2..].find(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'))?;
+            (end > 2 && s.as_bytes()[end] == b'"').then(|| &s[..end])
+        })
+        .collect()
+}
+
 /// The generated harness's `main`: `boot <exefs> [--log FILE] [--explore]
 /// [--all-svcs] [--seconds N] [--frames N] [--gpu] [--backend auto|vulkan|dx12]
 /// [--play] ...` runs the game (until N frames are presented, or for N
@@ -301,6 +388,12 @@ pub fn run(mut table: Vec<rt::Entry>, window: Option<HostWindow>) {
         hooks: value("--hooks").map(Into::into),
         video: value("--video").map(Into::into),
         gpu_sync: flag("--gpu-sync"),
+        language: value("--language").map(|v| {
+            gyroship_practice::texts::language_code(&v).unwrap_or_else(|| {
+                eprintln!("gyroship: --language {v}: not a console language code ({})", gyroship_practice::texts::LANGUAGE_CODES.join(", "));
+                std::process::exit(2);
+            })
+        }),
         ..Config::default()
     };
     if config.play {
@@ -425,4 +518,23 @@ pub fn run(mut table: Vec<rt::Entry>, window: Option<HostWindow>) {
     });
     // The kernel ends with the run, as the thread-local one did with its thread.
     drop(crate::uninstall());
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn options_are_known_and_valued_ones_come_once() {
+        let line = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
+        assert_eq!(super::check_options(&line("boot exefs --play --log a --perf b --language fr")), Ok(()));
+        assert!(super::check_options(&line("boot exefs --languge fr")).unwrap_err().contains("--languge"));
+        assert!(super::check_options(&line("boot exefs --hooks a --hooks b")).unwrap_err().contains("twice"));
+        assert!(super::check_options(&line("boot exefs --log")).unwrap_err().contains("needs a value"));
+        // Every option the boot reads is in the list.
+        let code = include_str!("boot.rs").split("#[cfg(test)]").next().unwrap();
+        let read = super::literals(code);
+        assert!(read.contains(&"--log") && read.contains(&"--language") && read.contains(&"--video"), "{read:?}");
+        for o in read {
+            assert!(super::OPTIONS.iter().any(|(n, _)| *n == o), "{o} is read but not listed");
+        }
+    }
 }

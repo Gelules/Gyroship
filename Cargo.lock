@@ -1031,6 +1031,7 @@ version = "0.1.0"
 dependencies = [
  "gyroship-gpu",
  "gyroship-loader",
+ "gyroship-practice",
  "gyroship-runtime",
  "unsafe-libopus",
 ]

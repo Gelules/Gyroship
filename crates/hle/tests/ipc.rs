@@ -204,6 +204,26 @@ fn the_applet_says_it_has_the_focus() {
 }
 
 #[test]
+fn the_desired_language_is_en_us_unless_the_language_option_says_otherwise() {
+    for (language, want) in [(None, *b"en-US\0\0\0"), (Some("zh-Hans"), *b"zh-Hans\0")] {
+        let (mut k, mut cpu) = kernel();
+        k.config.language = language;
+        k.allowed_services.push("appletOE".to_string());
+        let sm = connect_sm(&mut k, &mut cpu);
+        let (_, oe) = get_service(&mut k, &mut cpu, sm, "appletOE");
+        let (_, w) = send(&mut k, &mut cpu, oe, &cmif(&[4], 10, &[0, 0], None));
+        let proxy = moved(&w);
+        // GetApplicationFunctions, then GetDesiredLanguage: the code in the data words.
+        let (_, w) = send(&mut k, &mut cpu, proxy, &cmif(&[4], 20, &[], None));
+        let functions = moved(&w);
+        let (_, w) = send(&mut k, &mut cpu, functions, &cmif(&[4], 21, &[], None));
+        assert_eq!(cmif_result(&w, 2), SUCCESS);
+        let code: Vec<u8> = w[8..10].iter().flat_map(|x| x.to_le_bytes()).collect();
+        assert_eq!(code, want, "{language:?}");
+    }
+}
+
+#[test]
 fn time_s_shared_memory_has_a_steady_clock_source() {
     let (mut k, mut cpu) = kernel();
     k.allowed_services.push("time:u".to_string());

@@ -136,8 +136,16 @@ impl Applet {
                 p[8..24].copy_from_slice(&crate::account::user_id(k));
                 return applet(Applet::Storage(p));
             }
-            // GetDesiredLanguage.
-            (Applet::Functions { .. }, 21) => Reply::with(b"en-US\0\0\0"),
+            // GetDesiredLanguage: the console's language code, en-US unless --language.
+            (Applet::Functions { .. }, 21) => {
+                let code = k.config.language.unwrap_or("en-US");
+                if code != "en-US" {
+                    k.log(&format!("am: desired language {code} (--language)"));
+                }
+                let mut bytes = [0u8; 8];
+                bytes[..code.len()].copy_from_slice(code.as_bytes());
+                Reply::with(&bytes)
+            }
             // IStorage Open; IStorageAccessor GetSize, Read(offset) into the B buffer.
             (Applet::Storage(bytes), 0) => return applet(Applet::StorageAccessor(bytes.clone())),
             (Applet::StorageAccessor(bytes), 0) => Reply::with(&(bytes.len() as u64).to_le_bytes()),

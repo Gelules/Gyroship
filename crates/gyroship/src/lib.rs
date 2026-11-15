@@ -28,6 +28,14 @@ const HEIGHT: u32 = 1080;
 /// `--headless`; the runtime's own modes otherwise.
 pub fn main(table: Vec<Entry>) {
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("boot") {
+        if args.iter().any(|a| a == "--help") {
+            return print!("{}", gyroship_hle::boot::usage());
+        }
+        if let Err(e) = gyroship_hle::boot::check_options(&args[1..]) {
+            fail(&e);
+        }
+    }
     if args.get(1).map(String::as_str) != Some("boot") || args.iter().any(|a| a == "--headless") {
         return gyroship_hle::boot::main(table);
     }
@@ -355,6 +363,16 @@ fn input(shared: Arc<Shared>) -> gyroship_hle::LiveInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_option_the_host_reads_is_listed() {
+        let code = include_str!("lib.rs").split("#[cfg(test)]").next().unwrap();
+        let read = gyroship_hle::boot::literals(code);
+        assert!(read.contains(&"--fullscreen") && read.contains(&"--sdl"), "{read:?}");
+        for o in read {
+            assert!(gyroship_hle::boot::OPTIONS.iter().any(|(n, _)| *n == o), "{o} is read but not listed");
+        }
+    }
 
     #[test]
     fn keys_make_buttons_and_a_full_stick() {
