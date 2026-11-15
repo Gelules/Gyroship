@@ -532,10 +532,9 @@ mod tests {
         let lines = super::stack_of(TID.load(Ordering::Relaxed));
         STOP.store(true, Ordering::Relaxed);
         t.join().unwrap();
-        let addrs: Vec<usize> = lines.iter().filter_map(|l| usize::from_str_radix(l.split_whitespace().next()?.trim_start_matches("0x"), 16).ok()).collect();
-        let within = |f: usize, a: usize| (f..f + 0x400).contains(&a);
-        let (spin, caller) = (spin as fn() -> u64 as usize, caller as fn() -> u64 as usize);
-        assert!(addrs.first().is_some_and(|&a| within(spin, a)), "{lines:?}");
-        assert!(addrs.iter().skip(1).any(|&a| within(caller, a)), "{lines:?}");
+        // By name, anywhere in the stack: a debug build samples the spin in the atomic
+        // load it does not inline, above `spin`.
+        let at = |name: &str| lines.iter().position(|l| l.ends_with(name));
+        assert!(at("::spin").is_some_and(|s| at("::caller").is_some_and(|c| s < c)), "{lines:?}");
     }
 }
