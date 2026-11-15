@@ -17,7 +17,7 @@ use gyroship_runtime::Cpu;
 use gyroship_runtime::mem::Memory;
 
 #[derive(Debug, Clone, PartialEq)]
-enum Expr {
+pub(crate) enum Expr {
     Reg(usize),
     Const(u64),
     Deref(Box<Expr>),
@@ -25,7 +25,7 @@ enum Expr {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum Ty {
+pub(crate) enum Ty {
     U8,
     U16,
     U32,
@@ -36,7 +36,7 @@ enum Ty {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum Item {
+pub(crate) enum Item {
     X(usize),
     W(usize),
     S(usize),
@@ -93,7 +93,7 @@ fn expr(s: &str) -> Option<(Expr, &str)> {
     }
 }
 
-fn item(token: &str) -> Option<Item> {
+pub(crate) fn item(token: &str) -> Option<Item> {
     if let Some((ty, e)) = token.split_once('@') {
         let ty = match ty {
             "u8" => Ty::U8,
@@ -124,6 +124,24 @@ fn filter(token: &str) -> Option<Filter> {
     Some(Filter { reg, mask, values: values.split(',').map(hex).collect::<Option<_>>()? })
 }
 
+impl Ty {
+    fn size(self) -> usize {
+        match self {
+            Ty::U8 => 1,
+            Ty::U16 => 2,
+            Ty::U32 | Ty::I32 | Ty::F32 => 4,
+            Ty::U64 | Ty::F64 => 8,
+        }
+    }
+}
+
+/// Where a memory item lies and its size; None for a register, or a pointer that cannot be
+/// read.
+pub(crate) fn place(item: &Item, cpu: &Cpu, mem: &Memory) -> Option<(u64, usize)> {
+    let Item::Mem(ty, e) = item else { return None };
+    Some((eval(e, cpu, mem)?, ty.size()))
+}
+
 fn eval(e: &Expr, cpu: &Cpu, mem: &Memory) -> Option<u64> {
     Some(match e {
         Expr::Reg(n) => cpu.x[*n],
@@ -144,12 +162,7 @@ fn value(item: &Item, cpu: &Cpu, mem: &Memory) -> String {
         Item::S(n) => f32::from_bits(cpu.vr[*n] as u32).to_string(),
         Item::D(n) => f64::from_bits(cpu.vr[*n] as u64).to_string(),
         Item::Mem(ty, e) => {
-            let size = match ty {
-                Ty::U8 => 1,
-                Ty::U16 => 2,
-                Ty::U32 | Ty::I32 | Ty::F32 => 4,
-                Ty::U64 | Ty::F64 => 8,
-            };
+            let size = ty.size();
             let mut b = [0u8; 8];
             if eval(e, cpu, mem).is_none_or(|at| mem.read(at, &mut b[..size]).is_err()) {
                 return "?".into();

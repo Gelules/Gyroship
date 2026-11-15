@@ -22,6 +22,7 @@ pub mod journal;
 pub mod nvdrv;
 pub mod opus;
 pub mod play;
+pub mod practice;
 pub mod save;
 pub mod service;
 pub mod shared;

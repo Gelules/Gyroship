@@ -172,19 +172,24 @@ fn hex(b: &[u8]) -> String {
 static TRACING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The probe hook: the first pass is journaled; the oracle runs at `nn::init::Start`.
-/// Every pass of a `trace:` probe goes to the `--trace` file only.
+/// Every pass of a `trace:` probe goes to the `--trace` file only, then to the practice
+/// actions (`--practice`), which run without the kernel lock.
 pub(crate) unsafe fn on_probe(cpu: *mut Cpu, pc: u64, name: &str) {
     if name.starts_with("trace:") {
-        if !TRACING.load(std::sync::atomic::Ordering::Relaxed) {
-            return;
+        // The trace line first: the state the game left at the probe.
+        if TRACING.load(std::sync::atomic::Ordering::Relaxed) {
+            crate::with(|k| {
+                let stamp = (k.now(), k.sched.current.map_or(0, |t| k.sched.threads[t].id), k.gs.presents);
+                if let Some(t) = k.trace.as_mut() {
+                    // SAFETY: the running thread's context, which this hook only reads.
+                    t.pass(pc, name, unsafe { &*cpu }, &k.mem, stamp);
+                }
+            });
         }
-        crate::with(|k| {
-            let stamp = (k.now(), k.sched.current.map_or(0, |t| k.sched.threads[t].id), k.gs.presents);
-            if let Some(t) = k.trace.as_mut() {
-                // SAFETY: the running thread's context, which this hook only reads.
-                t.pass(pc, name, unsafe { &*cpu }, &k.mem, stamp);
-            }
-        });
+        if let Some(p) = crate::practice::actions() {
+            // SAFETY: the running thread's context, which the actions only read.
+            p.act(pc, unsafe { &*cpu });
+        }
         return;
     }
     // SAFETY: the running thread's context, read before anything else runs.
@@ -248,6 +253,8 @@ pub const OPTIONS: &[(&str, bool)] = &[
     ("--romfs-layer", true),
     ("--hooks", true),
     ("--language", true),
+    ("--practice", true),
+    ("--boost", true),
     // Reports and dumps.
     ("--perf", true),
     ("--hashes", true),
@@ -429,6 +436,31 @@ pub fn run(mut table: Vec<rt::Entry>, window: Option<HostWindow>) {
             std::process::exit(2);
         }));
         TRACING.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    // M6: practice actions at trace: probes; the journal says so, as a run with them is never
+    // a reference.
+    let boost = value("--boost").map(|b| {
+        crate::practice::Boost::parse(&b).unwrap_or_else(|| {
+            eprintln!("gyroship: --boost {b}: not a boost mode (infinite)");
+            std::process::exit(2);
+        })
+    });
+    match value("--practice") {
+        Some(path) => {
+            let practice = std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| crate::practice::Practice::parse(&t, boost, k.mem.clone(), &rt::probe_counts()));
+            crate::practice::install(practice.unwrap_or_else(|e| {
+                eprintln!("gyroship: --practice {path}: {e}");
+                std::process::exit(2);
+            }));
+            if let Some(b) = boost {
+                k.log(&format!("practice: boost {} (--boost)", b.name()));
+            }
+        }
+        None if boost.is_some() => {
+            eprintln!("gyroship: --boost needs --practice FILE");
+            std::process::exit(2);
+        }
+        None => {}
     }
     // The host GPU runs the game's work when frames are dumped, filmed or measured, or with --gpu.
     if window.is_some() || k.config.frames_dump.is_some() || k.config.video.is_some() || k.config.perf.is_some() || k.config.hashes.is_some() || flag("--gpu") {
