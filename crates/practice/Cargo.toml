@@ -1,6 +1,6 @@
 [package]
 name = "gyroship-practice"
-description = "Speedrun practice tools: save states, mission teleport with chosen starting state, practice menu"
+description = "Speedrun practice tools: boost aids, the text under the game's HUD, in-game texts in the game's languages"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true

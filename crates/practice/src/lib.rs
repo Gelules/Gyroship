@@ -1,3 +1,4 @@
-//! Speedrun practice tools: save states, mission teleport with chosen starting state, practice menu.
-//!
-//! Skeleton created in M0; its content starts with the milestone that needs it.
+//! Speedrun practice tools (D73): the boost aids, the text under the game's HUD, Gyroship's
+//! own texts in the game's languages.
+
+pub mod texts;
