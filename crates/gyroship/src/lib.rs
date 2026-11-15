@@ -18,7 +18,7 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::window::{Window, WindowId};
+use winit::window::{Fullscreen, Window, WindowId};
 
 /// The window's client size at start: the console's 1080p output.
 const WIDTH: u32 = 1920;
@@ -33,7 +33,7 @@ pub fn main(table: Vec<Entry>) {
     }
     let event_loop = EventLoop::new().unwrap_or_else(|e| fail(&format!("cannot open a window: {e}")));
     event_loop.set_control_flow(ControlFlow::Wait);
-    let mut app = App { table: Some(table), shared: Arc::new(Shared::default()), window: None, pads: None };
+    let mut app = App { table: Some(table), shared: Arc::new(Shared::default()), window: None, pads: None, alt: false };
     if let Err(e) = event_loop.run_app(&mut app) {
         fail(&format!("window: {e}"));
     }
@@ -84,6 +84,15 @@ struct App {
     window: Option<Arc<Window>>,
     /// SDL's gamepads, polled from this thread (SDL's rule), if SDL3.dll loads.
     pads: Option<pads::Pads>,
+    /// Alt is held: Alt+Enter switches between the window and fullscreen.
+    alt: bool,
+}
+
+/// Borderless fullscreen on the window's monitor, or back to the window; the mouse
+/// cursor shows only in the window.
+fn set_fullscreen(window: &Window, on: bool) {
+    window.set_fullscreen(on.then_some(Fullscreen::Borderless(None)));
+    window.set_cursor_visible(!on);
 }
 
 /// `--sdl FILE`, else SDL3.dll next to the executable.
@@ -102,6 +111,9 @@ impl ApplicationHandler for App {
         let Some(table) = self.table.take() else { return };
         let attributes = Window::default_attributes().with_title("Gyroship").with_inner_size(winit::dpi::PhysicalSize::new(WIDTH, HEIGHT));
         let window = Arc::new(event_loop.create_window(attributes).unwrap_or_else(|e| fail(&format!("cannot open a window: {e}"))));
+        if std::env::args().any(|a| a == "--fullscreen") {
+            set_fullscreen(&window, true);
+        }
         let size = window.inner_size();
         self.shared.size.store(u64::from(size.width) << 32 | u64::from(size.height), Ordering::Relaxed);
         // The surface comes from this thread: winit gives window handles only here.
@@ -153,9 +165,18 @@ impl ApplicationHandler for App {
             // A key drives the controller (`key_bit`) and, for the game's debug
             // tools, the keyboard (`hid_usage`), which the game only reads when
             // its keyboard setting is on.
+            WindowEvent::ModifiersChanged(m) => self.alt = m.state().alt_key(),
             WindowEvent::KeyboardInput { event, .. } if !event.repeat => {
                 let PhysicalKey::Code(code) = event.physical_key else { return };
                 let (s, down) = (&self.shared, event.state == ElementState::Pressed);
+                // Alt+Enter: fullscreen or the window. Enter is the controller's A: the
+                // game never sees this one.
+                if code == KeyCode::Enter && self.alt {
+                    if let (true, Some(w)) = (down, &self.window) {
+                        set_fullscreen(w, w.fullscreen().is_none());
+                    }
+                    return;
+                }
                 if let Some(bit) = key_bit(code) {
                     set(&s.held, &s.pressed, bit, down);
                 }
