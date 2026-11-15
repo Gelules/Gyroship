@@ -902,8 +902,11 @@ pub struct Census {
 /// gpu_wait_ms: the submitting thread's waits for the GPU thread at its
 /// barriers, and with --gpu-sync at the end of each job,
 /// `Decoder::gpu_wait_ns`; queue_wait_ms: its waits for room, a full op
-/// channel and in play mode a present's wait for the previous one, as of the
-/// present's hand-over); only `skipped` is the present's own.
+/// channel and in play mode a present's wait for the previous one). cpu_ms,
+/// macro_calls, decode_ms, gpu_wait_ms and queue_wait_ms are the presenting
+/// thread's, as of the present's hand-over; the others are read at the
+/// frame's end, on the GPU thread in play mode. Only `skipped` is the
+/// present's own.
 pub(crate) const FRAME_COLUMNS: &str = "present,cpu_ms,draws,skipped,views_made,bind_groups_made,flushed_bytes,upload_bytes,upload_ms,macro_calls,watched_pages,flush_ms,submit_ms,decode_ms,effects_ms,submit_cpu_ms,gpu_cpu_ms,gpu_wait_ms,queue_wait_ms\n";
 
 const COUNTER: u32 = 0x100;

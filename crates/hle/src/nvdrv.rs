@@ -178,7 +178,6 @@ pub struct GpuThread {
     /// Host nanoseconds the submitting thread waited for room: a full op
     /// channel, and a present's wait for the previous one (`--perf`).
     queue_wait_ns: u64,
-    thread: std::thread::JoinHandle<()>,
 }
 
 /// How far the GPU thread got; its waiters wake at each op. `armed` is the
@@ -285,14 +284,13 @@ pub enum GpuOp {
     End,
 }
 
-/// A frame's `--perf` values only the presenting thread can read (its handle
-/// on the GPU thread is the decoder's), for its row (`FRAME_COLUMNS`).
+/// A frame's `--perf` values only the presenting thread can read, as of the
+/// present's hand-over, for its row (`FRAME_COLUMNS`).
 pub struct FrameIn {
     pub cpu: Duration,
     pub macro_calls: u64,
     pub decode_ns: u64,
     pub gpu_wait_ns: u64,
-    pub gpu_cpu: Duration,
     pub queue_wait_ns: u64,
 }
 
@@ -450,6 +448,10 @@ impl GpuSide {
 
     /// With the GPU thread: the op being applied writes `len` bytes of guest
     /// memory at `at` (checked against the pushbuffers decoded ahead).
+    // ponytail: one CPU range, from the first byte's mapping; a write or copy across two mappings
+    // that are not contiguous in CPU memory lands elsewhere too. Exact while every mapping is the
+    // identity (all seen so far); note `gs::cpu_ranges` if a game maps otherwise (a false or a
+    // missed read-ahead anomaly). Its Vec per write would cost the GPU thread, the frame's bound.
     fn note_write(&mut self, at: u64, len: usize) {
         if let Some(w) = &mut self.wrote {
             w.push_back((self.applying, at, at + len as u64));
@@ -582,7 +584,6 @@ impl Decoder {
             macro_calls: self.mme_stats().calls,
             decode_ns: self.decode_ns,
             gpu_wait_ns: self.gpu_wait_ns,
-            gpu_cpu: self.gpu.as_ref().and_then(GpuThread::cpu_time).unwrap_or_default(),
             queue_wait_ns: self.gpu.as_ref().map_or(0, |t| t.queue_wait_ns),
         })
     }
@@ -631,10 +632,11 @@ impl Decoder {
     /// (the job then counts as done: the drain, 213 and 102 wait for it).
     /// Then a present waits until the previous present is applied, and with
     /// --gpu-sync every job until its own ops are. The first stop in stream
-    /// order wins: the GPU thread's comes from an earlier op than the decoder's.
+    /// order wins: the GPU thread's (from the wait, or which the send of `End`
+    /// returns) comes from an earlier op than the decoder's.
     fn end_job(&mut self, phase: &Phase, present: bool, sent: Result<(), Stop>) -> Result<(), Stop> {
         let ended = self.send(phase, GpuOp::End);
-        let Some(t) = self.gpu.as_mut() else { return sent.and(ended) };
+        let Some(t) = self.gpu.as_mut() else { return ended.and(sent) };
         let since = Instant::now();
         let waited = if self.config.gpu_sync {
             let joined = t.join();
@@ -648,7 +650,7 @@ impl Decoder {
         } else {
             Ok(())
         };
-        waited.and(sent).and(ended)
+        waited.and(ended).and(sent)
     }
 }
 
@@ -677,7 +679,8 @@ impl GpuThread {
         let progress = Arc::new(Progress::default());
         let p = progress.clone();
         let syncpts = crate::lock(&side).syncpts.clone();
-        let thread = std::thread::Builder::new().name("gpu".into()).stack_size(gyroship_runtime::fiber::STACK_RESERVE).spawn(move || {
+        // Detached: it ends with its sender, the decoder's `GpuThread`, or on a panic.
+        std::thread::Builder::new().name("gpu".into()).stack_size(gyroship_runtime::fiber::STACK_RESERVE).spawn(move || {
             /// However the thread ends (a panic too), its waiters wake and see it.
             struct Ended(Arc<Progress>);
             impl Drop for Ended {
@@ -712,7 +715,7 @@ impl GpuThread {
                 count = now;
             }
         })?;
-        Ok(GpuThread { ops, progress, sent: 0, presented: 0, queue_wait_ns: 0, thread })
+        Ok(GpuThread { ops, progress, sent: 0, presented: 0, queue_wait_ns: 0 })
     }
 
     /// Sends an op; the stop the thread met, if any, instead. A full channel
@@ -753,17 +756,6 @@ impl GpuThread {
             None if state.ops < n => Err(gpu_thread_ended()),
             None => Ok(()),
         }
-    }
-
-    /// The thread's CPU time so far (`--perf`; Windows only).
-    pub fn cpu_time(&self) -> Option<std::time::Duration> {
-        #[cfg(windows)]
-        {
-            use std::os::windows::io::AsRawHandle;
-            gyroship_runtime::profile::cpu_time(self.thread.as_raw_handle() as usize)
-        }
-        #[cfg(not(windows))]
-        None
     }
 }
 
@@ -1899,13 +1891,13 @@ mod tests {
     #[test]
     fn a_drain_waits_for_a_job_handed_over_but_not_yet_run() {
         let (mut k, job) = play_submit(true, false, &[semaphore(WORDS, 1, true)]);
+        let since = Instant::now();
         let running = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(100));
             job.run()
         });
-        let since = Instant::now();
         assert_eq!(k.drain_gpu(), None);
-        assert!(since.elapsed() >= std::time::Duration::from_millis(90));
+        assert!(since.elapsed() >= std::time::Duration::from_millis(100));
         assert_eq!(word(&k, WORDS), 1);
         assert!(matches!(running.join().unwrap(), Ok(After::Nothing)));
     }

@@ -697,6 +697,9 @@ impl GpuSide {
             let skipped = std::mem::take(&mut s.skipped);
             if let Some(p) = &perf {
                 let cpu = p.cpu.as_secs_f64() * 1e3;
+                // With the GPU thread this runs on it (`PresentEnd`): its CPU time as of this
+                // frame's end, as effects_ns. Without it, no GPU thread.
+                let gpu_cpu = if self.wrote.is_some() { gyroship_runtime::profile::own_cpu_time() } else { None };
                 #[cfg(windows)]
                 let submit_cpu = s.submit_thread().and_then(|h| {
                     use std::os::windows::io::AsRawHandle;
@@ -720,7 +723,7 @@ impl GpuSide {
                     p.decode_ns as f64 / 1e6,
                     self.effects_ns as f64 / 1e6,
                     submit_cpu.unwrap_or_default().as_secs_f64() * 1e3,
-                    p.gpu_cpu.as_secs_f64() * 1e3,
+                    gpu_cpu.unwrap_or_default().as_secs_f64() * 1e3,
                     p.gpu_wait_ns as f64 / 1e6,
                     p.queue_wait_ns as f64 / 1e6
                 );
