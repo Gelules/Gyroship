@@ -42,12 +42,22 @@ pub fn region(code: &str) -> usize {
     first.unwrap_or(0)
 }
 
+/// A region's tag, as practice.txt's `font` lines write it: "en-US", "es-419", "ja-JP"...
+pub fn tag(region: usize) -> String {
+    let r = region.min(REGIONS - 1);
+    format!("{}-{}", LANGUAGE[r], COUNTRY[r].to_ascii_uppercase())
+}
+
 /// A text Gyroship draws, or adds to the game's own menus.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Text {
     QuitGame,
     Speed,
 }
+
+/// Every text, in the table's order.
+pub const ALL: [Text; 2] = [Text::QuitGame, Text::Speed];
+const _: () = assert!(ALL.len() == TEXTS.len());
 
 /// One row per `Text`, one column per region. Written upper case, like the game's HUD and
 /// buttons, with the game's own words where it has them. An empty variant (en-GB, es-419,
@@ -111,8 +121,13 @@ mod tests {
     }
 
     #[test]
+    fn a_region_tag_is_its_language_and_country() {
+        assert_eq!([0, 4, 10, 13].map(tag), ["en-US", "es-419", "ja-JP", "zh-CN"]);
+    }
+
+    #[test]
     fn every_text_exists_in_every_base_language() {
-        for t in [Text::QuitGame, Text::Speed] {
+        for t in ALL {
             for r in 0..REGIONS {
                 let s = TEXTS[t as usize][r];
                 // The variants alone may be empty, and fall back to their parent.
