@@ -190,6 +190,10 @@ pub struct Cache {
     /// mask of the attributes fetched as integers, hash of the jump targets or
     /// 0, user clip planes enabled).
     modules: FxMap<ModuleId, Module>,
+    /// Modules made, by program key and options: pairings that give a program the
+    /// same options (a vertex program with pixel programs of the same varyings)
+    /// share one (D72).
+    shared: FxMap<(u64, Options), std::sync::Arc<(Translation, wgpu::ShaderModule)>>,
     pipelines: FxMap<PipelineKey, (Made<wgpu::RenderPipeline>, Vec<wgpu::BindGroupLayout>)>,
     /// Bind group layouts by their entries, shared by the pipelines.
     layouts: FxMap<Vec<wgpu::BindGroupLayoutEntry>, wgpu::BindGroupLayout>,
@@ -990,32 +994,47 @@ impl Surfaces {
         self.cache.modules.insert(id, made);
     }
 
-    /// Program `key` with `options` as a module: from the disk cache when it has the
-    /// entry (D72), else translated (`edit` may change the translation) and made, then
-    /// queued for the disk once wgpu accepted it. `what` names the program in errors,
-    /// `label` in the frame's list of what was made (`m` translated, `l` loaded).
+    /// Program `key` with `options` as a module: the one made for another pairing with
+    /// these options, else from the disk cache when it has the entry (D72), else
+    /// translated (`edit` may change the translation) and made, then queued for the disk
+    /// once wgpu accepted it. A failure is not kept: the next pairing tries again.
+    /// `what` names the program in errors, `label` in the frame's list of what was made
+    /// (`m` translated, `l` loaded).
     pub(crate) fn translated(&mut self, key: u64, options: Options, what: &str, label: String, edit: impl FnOnce(&mut Translation)) -> Module {
+        let id = (key, options);
+        if let Some(m) = self.cache.shared.get(&id) {
+            return Ok(m.clone());
+        }
+        let (key, options) = id;
         let since = std::time::Instant::now();
-        if let Some((m, took)) = self.cached(key, &options) {
-            let elapsed = since.elapsed();
-            self.compile.loaded += 1;
-            self.compile.load_time += elapsed;
-            self.compile.saved += took.saturating_sub(elapsed);
-            self.compile.made.push(format!("l{label}"));
-            return Ok(m);
+        let made = match self.cached(key, &options) {
+            Some((m, took)) => {
+                let elapsed = since.elapsed();
+                self.compile.loaded += 1;
+                self.compile.load_time += elapsed;
+                self.compile.saved += took.saturating_sub(elapsed);
+                self.compile.made.push(format!("l{label}"));
+                Ok(m)
+            }
+            None => {
+                let made = shader::translate_with(&self.cache.code[&key], &options).map_err(|e| format!("{what} {key:016x}: {e}")).and_then(|mut t| {
+                    edit(&mut t);
+                    let m = self.shader_module(&format!("{key:016x}"), &t.wgsl).map_err(|()| format!("{what} {key:016x}: invalid WGSL"))?;
+                    Ok(std::sync::Arc::new((t, m)))
+                });
+                let took = since.elapsed();
+                if let (Ok(m), Some(c)) = (&made, &mut self.shader_cache) {
+                    c.store(key, &self.cache.code[&key], options.clone(), m.0.clone(), took);
+                }
+                self.compile.modules += 1;
+                self.compile.module_time += took;
+                self.compile.made.push(format!("m{label}"));
+                made
+            }
+        };
+        if let Ok(m) = &made {
+            self.cache.shared.insert((key, options), m.clone());
         }
-        let made = shader::translate_with(&self.cache.code[&key], &options).map_err(|e| format!("{what} {key:016x}: {e}")).and_then(|mut t| {
-            edit(&mut t);
-            let m = self.shader_module(&format!("{key:016x}"), &t.wgsl).map_err(|()| format!("{what} {key:016x}: invalid WGSL"))?;
-            Ok(std::sync::Arc::new((t, m)))
-        });
-        let took = since.elapsed();
-        if let (Ok(m), Some(c)) = (&made, &mut self.shader_cache) {
-            c.store(key, &self.cache.code[&key], options, m.0.clone(), took);
-        }
-        self.compile.modules += 1;
-        self.compile.module_time += took;
-        self.compile.made.push(format!("m{label}"));
         made
     }
 

@@ -240,12 +240,21 @@ mod tests {
             for (code, options) in &samples {
                 let key = super::super::translate_with(code, options).unwrap().key;
                 s.cache.code.insert(key, code.clone());
-                made.push(s.translated(key, options.clone(), "program", format!("{key:016x}"), |_| {}).unwrap().0.clone());
+                let first = s.translated(key, options.clone(), "program", format!("{key:016x}"), |_| {}).unwrap();
+                // Another pairing with the same options shares the module.
+                let again = s.translated(key, options.clone(), "program", format!("{key:016x}"), |_| {}).unwrap();
+                assert!(std::sync::Arc::ptr_eq(&first, &again));
+                made.push(first.0.clone());
+            }
+            // A failure is not shared: tried again each time, and never written.
+            s.cache.code.insert(1, vec![0; 256]);
+            for _ in 0..2 {
+                assert!(s.translated(1, Options::default(), "program", String::new(), |_| {}).is_err());
             }
             let line = s.shader_cache.as_mut().unwrap().finish(Duration::from_secs(10));
             // Run 1 translates and writes them all, run 2 loads them all.
             let n = samples.len() as u32;
-            assert_eq!((s.compile.modules, s.compile.loaded), if run == 0 { (n, 0) } else { (0, n) }, "{line}");
+            assert_eq!((s.compile.modules, s.compile.loaded), if run == 0 { (n + 2, 0) } else { (2, n) }, "{line}");
             assert!(s.errors.lock().unwrap().is_empty(), "{:?}", s.errors);
             runs.push(made);
         }
