@@ -13,7 +13,7 @@ use gyroship_gpu::pushbuf::{Channel, Effect};
 use gyroship_runtime::mem::{Memory, PAGE};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::ipc::{Reply, Request};
 use crate::{After, Kernel, Stop};
@@ -249,9 +249,23 @@ pub enum GpuOp {
     /// with the GPU thread, the entry's pushbuffer read: the ops applied when
     /// it was read, and its CPU range (the read-ahead check).
     Effects { space: u32, effects: Vec<Effect>, read: Option<PushRead> },
+    /// Present `n` starts (`GpuSide::begin_present`): its resumed channels' ops follow.
+    PresentBegin { n: u64 },
+    /// The rest of present `n`, after its frame's ops (`GpuSide::finish_present`).
+    PresentEnd { n: u64, fence: (u32, u32), area: u32, perf: Option<FrameIn> },
     /// The end of a submit's ops: once applied, the GPU thread counts the
     /// submit done (`Applied::jobs`), which gpu memory 213 and 102 wait for.
     End,
+}
+
+/// A frame's `--perf` values only the presenting thread can read (its handle
+/// on the GPU thread is the decoder's), for its row (`FRAME_COLUMNS`).
+pub struct FrameIn {
+    pub cpu: Duration,
+    pub macro_calls: u64,
+    pub decode_ns: u64,
+    pub gpu_wait_ns: u64,
+    pub gpu_cpu: Duration,
 }
 
 /// A named anomaly met by GPU work handed over at `at`, as `Kernel::anomaly`:
@@ -352,10 +366,16 @@ impl GpuSide {
         anomaly(&self.tally, &self.journal, self.config.explore, &self.at, name, text)
     }
 
-    /// Performs a decoded op; its host time goes to `effects_ns`.
+    /// Performs a decoded op; its host time goes to `effects_ns`, but a
+    /// present's end, which reports the frame.
     pub fn apply(&mut self, op: GpuOp) -> Result<(), Stop> {
         let started = Instant::now();
         let done = match op {
+            GpuOp::PresentEnd { n, fence, area, perf } => return self.finish_present(n, fence, area, perf),
+            GpuOp::PresentBegin { n } => {
+                self.begin_present(n);
+                Ok(())
+            }
             GpuOp::Begin { space } => {
                 forget_written_textures(self, space);
                 if let Some(s) = self.surfaces.as_mut() {
@@ -457,20 +477,9 @@ impl Decoder {
         let (channel, channel_space) = channels.entry(fd).or_insert_with(|| (Channel::default(), space));
         *channel_space = space;
         let before = channel.waiting();
-        // The acquires and macro DMA reads see the earlier entries' effects, as
-        // without the GPU thread: a read waits until the last op sent that may
-        // write its bytes is applied. A stop then ends the submit after decoding.
-        let mut waited = std::time::Duration::ZERO;
+        let mut waited = Duration::ZERO;
         let effects = channel.run_with(&words, &mut |a, buf| {
-            if let Some(t) = gpu.as_ref() {
-                let read = crate::gs::cpu_ranges(&phase.maps, space, a, buf.len() as u64);
-                let writer = writes.iter().rev().find(|(_, w)| w.as_ref().is_none_or(|w| w.iter().any(|&(s, e)| read.iter().any(|&(a, b)| s < b && a < e))));
-                if let Some(&(op, _)) = writer {
-                    let since = Instant::now();
-                    let _ = t.wait_for(op + 1);
-                    waited += since.elapsed();
-                }
-            }
+            waited += barrier(gpu.as_ref(), writes, &phase.maps, space, a, buf.len() as u64);
             crate::gs::read_gpu(mem, &phase.maps, space, a, buf)
         });
         let after = channel.waiting();
@@ -489,10 +498,14 @@ impl Decoder {
     /// what it did, and its address space.
     fn resume(&mut self, fd: u32) -> Result<Option<(u32, Vec<Effect>)>, Stop> {
         let decoding = Instant::now();
-        let Decoder { channels, stalls, mem, journal, tally, config, at: phase, .. } = self;
+        let Decoder { channels, stalls, mem, journal, tally, config, at: phase, gpu, writes, .. } = self;
         let Some((channel, space)) = channels.get_mut(&fd) else { return Ok(None) };
         let space = *space;
-        let read = &mut |a, buf: &mut [u8]| crate::gs::read_gpu(mem, &phase.maps, space, a, buf);
+        let mut waited = Duration::ZERO;
+        let read = &mut |a, buf: &mut [u8]| {
+            waited += barrier(gpu.as_ref(), writes, &phase.maps, space, a, buf.len() as u64);
+            crate::gs::read_gpu(mem, &phase.maps, space, a, buf)
+        };
         let before = channel.waiting();
         let mut effects = channel.resume(read);
         // ponytail: a watchdog. A semaphore no one we model releases would hang
@@ -509,7 +522,8 @@ impl Decoder {
         }
         let after = channel.waiting();
         self.note_wait(fd, space, before, after);
-        self.decode_ns += decoding.elapsed().as_nanos() as u64;
+        self.decode_ns += decoding.elapsed().saturating_sub(waited).as_nanos() as u64;
+        self.gpu_wait_ns += waited.as_nanos() as u64;
         Ok(Some((space, effects)))
     }
 
@@ -524,27 +538,82 @@ impl Decoder {
         all
     }
 
-    /// Play mode: a submit decoded here while the GPU thread applies its ops;
-    /// it returns once they are all applied. The first stop in stream order
-    /// wins: the GPU thread's comes from an earlier op than the decoder's.
-    fn run_threaded(&mut self, phase: &Phase, fd: u32, space: u32, entries: &[u8]) -> Result<(), Stop> {
-        let Some(t) = self.gpu.as_mut() else { return Err(gpu_thread_ended()) };
-        let sent = t.send(phase, GpuOp::Begin { space }).and_then(|()| {
-            for (rank, e) in entries.as_chunks::<8>().0.iter().map(|e| u64::from_le_bytes(*e)).enumerate() {
-                if let Some((effects, read)) = self.decode(fd, space, rank, e)?
-                    && let Some(t) = self.gpu.as_mut()
-                {
-                    self.writes.push((t.sent, writes_of(&self.at.maps, space, &effects)));
-                    t.send(phase, GpuOp::Effects { space, effects, read })?;
-                }
+    /// The presenting thread's `--perf` values for its frame's row (None without `--perf`).
+    pub(crate) fn frame_in(&self) -> Option<FrameIn> {
+        self.config.perf.as_ref()?;
+        Some(FrameIn {
+            cpu: gyroship_runtime::profile::own_cpu_time().unwrap_or_default(),
+            macro_calls: self.mme_stats().calls,
+            decode_ns: self.decode_ns,
+            gpu_wait_ns: self.gpu_wait_ns,
+            gpu_cpu: self.gpu.as_ref().and_then(GpuThread::cpu_time).unwrap_or_default(),
+        })
+    }
+
+    /// Sends an op to the GPU thread; the stop it met, if any, instead.
+    fn send(&mut self, phase: &Phase, op: GpuOp) -> Result<(), Stop> {
+        self.gpu.as_mut().map_or(Err(gpu_thread_ended()), |t| t.send(phase, op))
+    }
+
+    /// Sends what an entry or a resumed channel did in `space`; the guest
+    /// memory it may write joins `writes` once sent: no barrier waits for an
+    /// op never sent.
+    fn send_effects(&mut self, phase: &Phase, space: u32, effects: Vec<Effect>, read: Option<PushRead>) -> Result<(), Stop> {
+        let (op, w) = (self.gpu.as_ref().map_or(0, |t| t.sent), writes_of(&phase.maps, space, &effects));
+        self.send(phase, GpuOp::Effects { space, effects, read })?;
+        self.writes.push((op, w));
+        Ok(())
+    }
+
+    /// Play mode: a submit's ops, decoded here while the GPU thread applies them.
+    fn submit_ops(&mut self, phase: &Phase, fd: u32, space: u32, entries: &[u8]) -> Result<(), Stop> {
+        self.send(phase, GpuOp::Begin { space })?;
+        for (rank, e) in entries.as_chunks::<8>().0.iter().map(|e| u64::from_le_bytes(*e)).enumerate() {
+            if let Some((effects, read)) = self.decode(fd, space, rank, e)? {
+                self.send_effects(phase, space, effects, read)?;
             }
-            self.gpu.as_mut().map_or(Err(gpu_thread_ended()), |t| t.send(phase, GpuOp::End))
-        });
+        }
+        Ok(())
+    }
+
+    /// Play mode: present `n`'s ops. The channels waiting for the CPU go on
+    /// (behind the barrier) before the frame is shown; the rest of the present
+    /// carries the values only this thread can read.
+    fn present_ops(&mut self, phase: &Phase, n: u64, fence: (u32, u32), area: u32) -> Result<(), Stop> {
+        self.send(phase, GpuOp::PresentBegin { n })?;
+        for fd in self.waiting() {
+            if let Some((space, effects)) = self.resume(fd)? {
+                self.send_effects(phase, space, effects, None)?;
+            }
+        }
+        let perf = self.frame_in();
+        self.send(phase, GpuOp::PresentEnd { n, fence, area, perf })
+    }
+
+    /// A job's end, once its ops are `sent`: `End`, then the wait until the
+    /// GPU thread has applied them all. The first stop in stream order wins:
+    /// the GPU thread's comes from an earlier op than the decoder's.
+    fn end_job(&mut self, phase: &Phase, sent: Result<(), Stop>) -> Result<(), Stop> {
+        let sent = sent.and_then(|()| self.send(phase, GpuOp::End));
         let since = Instant::now();
         let joined = self.gpu.as_ref().map_or(Err(gpu_thread_ended()), GpuThread::join);
         self.gpu_wait_ns += since.elapsed().as_nanos() as u64;
         joined.and(sent)
     }
+}
+
+/// With the GPU thread, a read of `len` bytes at GPU address `at` in `space`
+/// sees what the ops sent before it write, as without the GPU thread: it
+/// waits until the last op sent that may write those bytes is applied. The
+/// time waited; a stop is left for the next send to report.
+fn barrier(gpu: Option<&GpuThread>, writes: &[(u64, Option<Ranges>)], maps: &crate::gs::Mappings, space: u32, at: u64, len: u64) -> Duration {
+    let Some(t) = gpu else { return Duration::ZERO };
+    let read = crate::gs::cpu_ranges(maps, space, at, len);
+    let writer = writes.iter().rev().find(|(_, w)| w.as_ref().is_none_or(|w| w.iter().any(|&(s, e)| read.iter().any(|&(a, b)| s < b && a < e))));
+    let Some(&(op, _)) = writer else { return Duration::ZERO };
+    let since = Instant::now();
+    let _ = t.wait_for(op + 1);
+    since.elapsed()
 }
 
 impl GpuThread {
@@ -682,41 +751,42 @@ impl Kernel {
 }
 
 /// Runs `job`, handed over at `phase`: the decoder decodes it and the GPU
-/// side performs it, op by op (decoder lock first); what it leaves for the
-/// kernel lock.
+/// side performs it, op by op (decoder lock first), on the GPU thread if
+/// there is one; what it leaves for the kernel lock.
 pub fn run(side: &Mutex<GpuSide>, decoder: &Mutex<Decoder>, phase: Phase, job: GpuJob) -> Result<After, Stop> {
-    let mut d = crate::lock(decoder);
-    // Play mode: the GPU thread applies a submit's ops while this thread decodes.
-    if d.gpu.is_some()
-        && let GpuJob::Submit { fd, space, entries } = &job
-    {
-        d.at = phase.clone();
-        let done = d.run_threaded(&phase, *fd, *space, entries);
-        d.at = Phase::default();
-        return done.map(|()| After::Nothing);
-    }
-    let mut g = crate::lock(side);
-    // The play engine's watchdog sees who holds the GPU side, and since when.
-    let play = g.config.play;
-    if play {
-        crate::GPU_SINCE.store(crate::play::real_ticks(), Ordering::Relaxed);
-        crate::GPU_GUEST.store(phase.thread, Ordering::Relaxed);
-        crate::GPU_HOLDER.store(gyroship_runtime::profile::thread_id(), Ordering::Relaxed);
-    }
     let at = phase.now;
+    let mut d = crate::lock(decoder);
     d.at = phase.clone();
-    g.at = phase;
-    let done = match &job {
-        GpuJob::Submit { fd, space, entries } => run_gpfifo(&mut d, &mut g, *fd, *space, entries),
-        GpuJob::Present { n, fence, area, .. } => g.present(&mut d, *n, *fence, *area),
+    let done = if d.gpu.is_some() {
+        // Play mode: the GPU thread applies the job's ops while this thread decodes.
+        let sent = match &job {
+            GpuJob::Submit { fd, space, entries } => d.submit_ops(&phase, *fd, *space, entries),
+            GpuJob::Present { n, fence, area, .. } => d.present_ops(&phase, *n, *fence, *area),
+        };
+        d.end_job(&phase, sent)
+    } else {
+        let mut g = crate::lock(side);
+        // The play engine's watchdog sees who holds the GPU side, and since when.
+        let play = g.config.play;
+        if play {
+            crate::GPU_SINCE.store(crate::play::real_ticks(), Ordering::Relaxed);
+            crate::GPU_GUEST.store(phase.thread, Ordering::Relaxed);
+            crate::GPU_HOLDER.store(gyroship_runtime::profile::thread_id(), Ordering::Relaxed);
+        }
+        g.at = phase;
+        let done = match &job {
+            GpuJob::Submit { fd, space, entries } => run_gpfifo(&mut d, &mut g, *fd, *space, entries),
+            GpuJob::Present { n, fence, area, .. } => g.present(&mut d, *n, *fence, *area),
+        };
+        // The mappings' snapshot goes: a change to them need not copy them.
+        g.at = Phase::default();
+        if play {
+            crate::GPU_HOLDER.store(0, Ordering::Relaxed);
+        }
+        done
     };
-    // The mappings' snapshot goes: a change to them need not copy them.
-    g.at = Phase::default();
     d.at = Phase::default();
-    if play {
-        crate::GPU_HOLDER.store(0, Ordering::Relaxed);
-    }
-    drop((g, d));
+    drop(d);
     done?;
     Ok(match job {
         GpuJob::Present { n, interval, .. } => After::Present { n, interval, at },
@@ -1055,12 +1125,9 @@ fn page_spans(ranges: &[(u64, u64, u64)]) -> Vec<&[(u64, u64, u64)]> {
 }
 
 /// Lets the channels that wait on a semaphore go on, once the CPU has
-/// released it (called at each present; a submit resumes its own channel).
+/// released it (at each present without the GPU thread, `present_ops` with
+/// it; a submit resumes its own channel).
 pub fn poll(d: &mut Decoder, k: &mut GpuSide) -> Result<(), Stop> {
-    if let Some(s) = k.surfaces.as_mut() {
-        // No take here: no refresh in place.
-        s.new_submit(false);
-    }
     for fd in d.waiting() {
         if let Some((space, effects)) = d.resume(fd)? {
             k.apply(GpuOp::Effects { space, effects, read: None })?;
@@ -1458,13 +1525,19 @@ mod tests {
 
     /// The play engine leaves GPU work for after the kernel lock, as the SVC's
     /// deferred work; the deterministic engine runs it at once. Here a
-    /// present's GPU part finds its fence not reached, then its rest runs.
+    /// present's GPU part finds its fence not reached (with the GPU thread,
+    /// that thread checks it), then its rest runs.
     #[test]
     fn the_play_engine_runs_gpu_work_after_the_kernel_lock() {
         use gyroship_runtime::mem::Memory;
-        for play in [false, true] {
+        for (play, threaded) in [(false, false), (true, false), (true, true)] {
             let config = crate::Config { play, explore: true, vsync: false, ..crate::Config::default() };
             let mut k = Kernel::new(Memory::new().unwrap(), crate::journal::Journal::memory(), config);
+            if threaded {
+                k.start_gpu_thread().unwrap();
+            }
+            // As vi2 229 does: the present is counted, then handed over.
+            k.gs.presents = 1;
             k.gpu_work(GpuJob::Present { n: 1, fence: (!CHANNEL_SYNCPT, 5), area: 0, interval: 1 });
             let ran = |k: &Kernel| k.tally().anomalies.get("present fence not reached").copied();
             if play {
@@ -1493,29 +1566,47 @@ mod tests {
     const WORDS: u64 = crate::layout::ALIAS.0;
     const PUSHBUFFERS: u64 = WORDS + 0x100;
 
-    /// One submit of `segments` (a GPFIFO entry each), queued in play mode,
-    /// strict unless `explore`, with the GPU thread if `threaded`: the
-    /// kernel, and the job to run.
-    fn play_submit(threaded: bool, explore: bool, segments: &[Vec<u32>]) -> (Kernel, crate::Deferred) {
+    /// A play-mode kernel, strict unless `explore`, with the GPU thread if
+    /// `threaded`, and the page at `WORDS` mapped.
+    fn play_kernel(threaded: bool, explore: bool) -> Kernel {
         use gyroship_runtime::mem::{Block, Memory, perm, state};
         let config = crate::Config { play: true, explore, vsync: false, ..crate::Config::default() };
         let mut k = Kernel::new(Memory::new().unwrap(), crate::journal::Journal::memory(), config);
         k.mem.map(WORDS, 0x1000, Block::new(state::NORMAL, perm::RW)).unwrap();
+        if threaded {
+            k.start_gpu_thread().unwrap();
+        }
+        k
+    }
+
+    /// A submit on channel `fd` of `segments` (a GPFIFO entry each, written
+    /// from `at`), handed over as the ioctl does: the job to run.
+    fn hand_over(k: &mut Kernel, fd: u32, mut at: u64, segments: &[Vec<u32>]) -> crate::Deferred {
         let mut entries = Vec::new();
-        let mut at = PUSHBUFFERS;
         for words in segments {
             let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
             k.mem.write(at, &bytes).unwrap();
             entries.extend((at | (words.len() as u64) << 42).to_le_bytes());
             at += bytes.len() as u64;
         }
-        if threaded {
-            k.start_gpu_thread().unwrap();
-        }
-        // As the ioctl does: the submit's number goes into its Phase.
+        // The submit's number goes into its Phase.
         k.count("submits");
-        k.gpu_work(GpuJob::Submit { fd: 1, space: 0, entries });
-        let job = k.deferred.take().expect("a deferred job");
+        k.gpu_work(GpuJob::Submit { fd, space: 0, entries });
+        k.deferred.take().expect("a deferred job")
+    }
+
+    /// The next present, with acquire `fence`, handed over as vi2 229 does: the job to run.
+    fn hand_present(k: &mut Kernel, fence: (u32, u32)) -> crate::Deferred {
+        k.gs.presents += 1;
+        k.gpu_work(GpuJob::Present { n: k.gs.presents, fence, area: 0, interval: 1 });
+        k.deferred.take().expect("a deferred job")
+    }
+
+    /// One submit of `segments` on channel 1 (`hand_over` at `PUSHBUFFERS`):
+    /// the kernel, and the job to run.
+    fn play_submit(threaded: bool, explore: bool, segments: &[Vec<u32>]) -> (Kernel, crate::Deferred) {
+        let mut k = play_kernel(threaded, explore);
+        let job = hand_over(&mut k, 1, PUSHBUFFERS, segments);
         (k, job)
     }
 
@@ -1631,6 +1722,33 @@ mod tests {
         assert!(matches!(missed, Err((crate::STOP_EXIT, line)) if line.contains("gpu wrote a pushbuffer read ahead")));
         // Read once op 1 was applied: it saw the write.
         assert_eq!(apply(4, GpuOp::Effects { space: 0, effects: vec![], read: read(2) }), Ok(()));
+    }
+
+    /// A channel resumed at a present reads what a channel resumed before it
+    /// released: with the GPU thread, its read waits until that is applied.
+    #[test]
+    fn a_resumed_channel_sees_what_the_channel_resumed_before_it_released() {
+        let (w1, w2, w3) = (WORDS + 0x10, WORDS + 0x20, WORDS + 0x30);
+        for threaded in [false, true] {
+            let mut k = play_kernel(threaded, false);
+            let first = hand_over(&mut k, 1, PUSHBUFFERS, &[[semaphore(w1, 1, false), semaphore(w2, 1, true)].concat()]);
+            assert!(matches!(first.run(), Ok(After::Nothing)));
+            let second = hand_over(&mut k, 2, PUSHBUFFERS + 0x100, &[[semaphore(w2, 1, false), semaphore(w3, 1, true)].concat()]);
+            assert!(matches!(second.run(), Ok(After::Nothing)));
+            assert_eq!(crate::lock(&k.decoder).waiting(), [1, 2]);
+            k.mem.write(w1, &1u32.to_le_bytes()).unwrap();
+            let present = hand_present(&mut k, (!CHANNEL_SYNCPT, 0));
+            // The GPU thread applies nothing for 100 ms.
+            let side = k.gpu_side.clone();
+            let held = threaded.then(|| crate::lock(&side));
+            let running = std::thread::spawn(move || present.run());
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(held);
+            assert!(matches!(running.join().unwrap(), Ok(After::Present { n: 1, .. })), "threaded: {threaded}");
+            assert_eq!(word(&k, w3), 1, "threaded: {threaded}: channel 2 read channel 1's release");
+            assert!(crate::lock(&k.decoder).waiting().is_empty());
+            assert!(k.tally().anomalies.is_empty());
+        }
     }
 
     /// A TIPC request to a gsv session: `command` and its arguments.

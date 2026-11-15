@@ -631,8 +631,6 @@ impl Kernel {
     /// the frame limit, the summary line, and the display's cadence, from
     /// kernel time `at`, when the present was handed over.
     pub(crate) fn present_end(&mut self, n: u64, interval: u64, at: u64) {
-        // The present resumed channels on this thread: their increments wake no one else.
-        self.signal_reached();
         if self.config.frames.is_some_and(|f| n >= f) {
             self.stop(0, &format!("{n} frames presented"));
         }
@@ -655,17 +653,32 @@ impl Kernel {
 }
 
 impl GpuSide {
-    /// Present `n`'s GPU part: the channels waiting for the CPU go on, the
-    /// acquire fence (syncpoint id inverted, value) is checked, the host GPU's
-    /// refusals and shader work are reported, and the image of drawn `area`
-    /// is hashed, shown and dumped.
-    pub(crate) fn present(&mut self, d: &mut Decoder, n: u64, (fence_id, fence): (u32, u32), area: u32) -> Result<(), Stop> {
-        // The GPU work submitted from here to the end of this present is this frame's.
-        if let Some(s) = self.surfaces.as_mut() {
-            s.present = n;
-        }
+    /// Present `n`'s GPU part without the GPU thread: the channels waiting for
+    /// the CPU go on, then the rest of the present (`finish_present`). With
+    /// it, `Decoder::present_ops` sends the same steps as ops.
+    pub(crate) fn present(&mut self, d: &mut Decoder, n: u64, fence: (u32, u32), area: u32) -> Result<(), Stop> {
+        self.begin_present(n);
         // GPU work that waited for the CPU's semaphores runs before the frame is shown.
         crate::nvdrv::poll(d, self)?;
+        let perf = d.frame_in();
+        self.finish_present(n, fence, area, perf)
+    }
+
+    /// Present `n` starts: the GPU work from here to the end of this present is this frame's.
+    pub(crate) fn begin_present(&mut self, n: u64) {
+        if let Some(s) = self.surfaces.as_mut() {
+            s.present = n;
+            // No take here: no refresh in place.
+            s.new_submit(false);
+        }
+    }
+
+    /// The rest of present `n`, after its frame's GPU work: the acquire fence
+    /// (syncpoint id inverted, value) is checked, the host GPU's refusals and
+    /// shader work are reported, the `--perf` row is written with the
+    /// presenting thread's values (`perf`), and the image of drawn `area` is
+    /// hashed, shown and dumped.
+    pub(crate) fn finish_present(&mut self, n: u64, (fence_id, fence): (u32, u32), area: u32, perf: Option<crate::nvdrv::FrameIn>) -> Result<(), Stop> {
         // The frame's acquire fence must be reached by now.
         if let Some(now) = self.syncpts.get(!fence_id as usize).map(|s| s.load(Ordering::Acquire))
             && (fence.wrapping_sub(now) as i32) > 0
@@ -681,8 +694,8 @@ impl GpuSide {
             }
             s.next_frame();
             let skipped = std::mem::take(&mut s.skipped);
-            if self.config.perf.is_some() {
-                let cpu = gyroship_runtime::profile::own_cpu_time().unwrap_or_default().as_secs_f64() * 1e3;
+            if let Some(p) = &perf {
+                let cpu = p.cpu.as_secs_f64() * 1e3;
                 #[cfg(windows)]
                 let submit_cpu = s.submit_thread().and_then(|h| {
                     use std::os::windows::io::AsRawHandle;
@@ -690,8 +703,7 @@ impl GpuSide {
                 });
                 #[cfg(not(windows))]
                 let submit_cpu: Option<std::time::Duration> = None;
-                let gpu_cpu = d.gpu.as_ref().and_then(crate::nvdrv::GpuThread::cpu_time);
-                let (st, calls) = (&s.staging, d.mme_stats().calls);
+                let (st, calls) = (&s.staging, p.macro_calls);
                 let row = format!(
                     "{n},{cpu:.1},{},{},{},{},{},{},{:.1},{calls},{},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1}\n",
                     s.drawn,
@@ -704,11 +716,11 @@ impl GpuSide {
                     self.watched,
                     st.flush_ns as f64 / 1e6,
                     st.submit_ns as f64 / 1e6,
-                    d.decode_ns as f64 / 1e6,
+                    p.decode_ns as f64 / 1e6,
                     self.effects_ns as f64 / 1e6,
                     submit_cpu.unwrap_or_default().as_secs_f64() * 1e3,
-                    gpu_cpu.unwrap_or_default().as_secs_f64() * 1e3,
-                    d.gpu_wait_ns as f64 / 1e6
+                    p.gpu_cpu.as_secs_f64() * 1e3,
+                    p.gpu_wait_ns as f64 / 1e6
                 );
                 self.frames += &row;
             }
