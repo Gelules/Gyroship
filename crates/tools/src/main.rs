@@ -185,6 +185,9 @@ enum Command {
         /// Trace files written with --trace
         #[arg(required = true)]
         traces: Vec<PathBuf>,
+        /// The --boost practice action the runs had on: the model applies its writes too
+        #[arg(long, value_enum)]
+        apply: Option<boost::Apply>,
     },
     /// Convert NSO executables to AArch64 ELF files for disassemblers
     Nso2elf {
@@ -213,7 +216,7 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Command::Nso(NsoCommand::Info { nso, symbols }) => nso_info(&nso, symbols).map(|_| true),
         Command::Nso2elf { inputs, out } => nso2elf(&inputs, &out).map(|_| true),
-        Command::BoostCheck { traces } => boost::check(&traces),
+        Command::BoostCheck { traces, apply } => boost::check(&traces, apply),
         Command::Gpfifo { dir, first, last, methods, listing, bench, profile, repeat } => gpfifo::run(&dir, first, last, methods, listing, bench.then_some((profile, repeat))).map(|_| true),
         Command::Shaders { zip, samples } => shaders::run(&zip, samples.as_deref()),
         Command::DatazipFind { zips, patterns, out, context } => shaders::find(&zips, &patterns, out.as_deref(), context).map(|_| true),

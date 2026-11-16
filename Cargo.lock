@@ -1032,6 +1032,7 @@ dependencies = [
  "gyroship-gpu",
  "gyroship-loader",
  "gyroship-practice",
+ "gyroship-research",
  "gyroship-runtime",
  "unsafe-libopus",
 ]

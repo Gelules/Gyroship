@@ -3,7 +3,7 @@
 //! shields probes saw), and reports every value that differs from the game's,
 //! bit for bit.
 
-use gyroship_research::boost::{ARWING, BLUE_MARINE, LANDMASTER, Linear, State, add_calc};
+use gyroship_research::boost::{ARWING, BLUE_MARINE, LANDMASTER, Linear, State, add_calc, release_now};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -69,6 +69,9 @@ struct Run {
     pauses: usize,
     hits_seen: usize,
     forced: usize,
+    /// `--apply perfect`: the rule's count of releases since rest, and the releases made.
+    released: usize,
+    fired: usize,
 }
 
 /// Applies the hits taken after a frame's update; true if one forced the cooldown.
@@ -96,18 +99,26 @@ struct LmFrame {
 /// The Landmaster's boost and brake function (main+0x9bac300), which reads its inputs.
 const LM_BOOST: std::ops::Range<u64> = 0x71_09ba_c300..0x71_09ba_dca0;
 
-pub fn check(traces: &[PathBuf]) -> crate::Result<bool> {
+/// The `--boost` practice action a traced run had on, which the model then applies too: its
+/// writes happen after the trace line, at each update's entry.
+#[derive(Clone, Copy, PartialEq, clap::ValueEnum)]
+pub enum Apply {
+    Infinite,
+    Perfect,
+}
+
+pub fn check(traces: &[PathBuf], apply: Option<Apply>) -> crate::Result<bool> {
     let mut ok = true;
     for path in traces {
         println!("{}", path.display());
-        ok &= check_text(&std::fs::read_to_string(path)?)?;
+        ok &= check_text(&std::fs::read_to_string(path)?, apply)?;
     }
     Ok(ok)
 }
 
 /// The probes see one vehicle, the player's, whose script process (S, at
 /// [x0]+0x18) moves from frame to frame: frames chain by probe, in order.
-fn check_text(text: &str) -> crate::Result<bool> {
+fn check_text(text: &str, apply: Option<Apply>) -> crate::Result<bool> {
     let mut runs: Vec<(&str, Run)> = Vec::new();
     let mut open: HashMap<&str, LmFrame> = HashMap::new();
     let mut lm: Vec<LmFrame> = Vec::new();
@@ -126,18 +137,18 @@ fn check_text(text: &str) -> crate::Result<bool> {
                     gauge_state: p.int(&format!("u32@{ST}+0x4c"))? as u32,
                 };
                 let input = (p.flag(&format!("u8@{IN}+0x86"))?, p.flag(&format!("u8@{IN}+0x87"))?);
+                let d = |k: u32| p.f32(&format!("f32@[[[x0]+0x18]+0x30]+{k:#x}"));
+                let live = Linear { warp: d(0)?, accel: d(0x18)?, decel: d(0x30)?, max: d(0x48)?, brake: d(0x60)?, brake_recover: d(0x78)?, brake_floor: d(0x90)?, gauge_max: d(0xa8)?, fill: d(0xc0)?, drain: d(0xd8)? };
                 let i = match runs.iter().position(|(k, _)| *k == s) {
                     Some(i) => i,
                     None => {
-                        let d = |k: u32| p.f32(&format!("f32@[[[x0]+0x18]+0x30]+{k:#x}"));
-                        let params = Linear { warp: d(0)?, accel: d(0x18)?, decel: d(0x30)?, max: d(0x48)?, brake: d(0x60)?, brake_recover: d(0x78)?, brake_floor: d(0x90)?, gauge_max: d(0xa8)?, fill: d(0xc0)?, drain: d(0xd8)? };
                         let name = match p.label {
-                            "aw-update" if params == ARWING => "arwing",
+                            "aw-update" if live == ARWING => "arwing",
                             "aw-update" => "arwing (other settings)",
-                            _ if params == BLUE_MARINE => "blue-marine",
+                            _ if live == BLUE_MARINE => "blue-marine",
                             _ => "blue-marine (other settings)",
                         };
-                        runs.push((s, Run { name, params, last: None, hits: Vec::new(), frames: 0, exact: 0, pauses: 0, hits_seen: 0, forced: 0 }));
+                        runs.push((s, Run { name, params: live, last: None, hits: Vec::new(), frames: 0, exact: 0, pauses: 0, hits_seen: 0, forced: 0, released: 0, fired: 0 }));
                         runs.len() - 1
                     }
                 };
@@ -157,7 +168,17 @@ fn check_text(text: &str) -> crate::Result<bool> {
                         bad.push(format!("p{} {}, boost={} brake={} hits {:?} dt={dt}: model {}, game {}", p.present, r.name, boost as u8, brake as u8, r.hits, show(&e), show(&state)));
                     }
                 }
-                r.last = Some((p.present, state, input.0, input.1, p.f32("s0")?));
+                // The update runs from the entry as the practice action leaves it.
+                let mut entry = state;
+                match apply {
+                    Some(Apply::Infinite) => (entry.gauge, entry.locked) = (0.0, false),
+                    Some(Apply::Perfect) if release_now(&state, &live, &mut r.released) == Some(true) => {
+                        entry.locked = true;
+                        r.fired += 1;
+                    }
+                    _ => {}
+                }
+                r.last = Some((p.present, entry, input.0, input.1, p.f32("s0")?));
                 r.hits.clear();
             }
             // The Arwing's hits go through arwing_shields (aw-hit) or vehicle_shields (aw-damage).
@@ -206,7 +227,7 @@ fn check_text(text: &str) -> crate::Result<bool> {
         }
     }
     for (_, r) in &runs {
-        println!("  {:12} {} frames, {} exact; {} hits, {} forced a cooldown; {} pauses", r.name, r.frames, r.exact, r.hits_seen, r.forced, r.pauses);
+        println!("  {:12} {} frames, {} exact; {} hits, {} forced a cooldown; {} pauses; {} perfect releases", r.name, r.frames, r.exact, r.hits_seen, r.forced, r.pauses, r.fired);
     }
     if !lm.is_empty() {
         let (mut n, mut settings, mut calc, mut speed, mut carried, mut gauge, mut gating, mut pauses, mut inputs, mut decided, mut hits, mut forced) = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
@@ -254,6 +275,10 @@ fn check_text(text: &str) -> crate::Result<bool> {
             m.landmaster_gauge(&LANDMASTER, dt, actions);
             forced += take_hits(&mut m, &f.hits) as usize;
             hits += f.hits.len();
+            // The next frame's lm-tick empties the meter before its lm-gauge reads it.
+            if apply == Some(Apply::Infinite) {
+                (m.gauge, m.locked) = (0.0, false);
+            }
             if (m.gauge.to_bits(), m.locked, m.gauge_state) == (g2.gauge.to_bits(), g2.locked, g2.gauge_state) {
                 gauge += 1;
             } else {

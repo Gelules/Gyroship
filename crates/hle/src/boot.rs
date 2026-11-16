@@ -198,9 +198,10 @@ pub(crate) unsafe fn on_probe(cpu: *mut Cpu, pc: u64, name: &str) {
                 }
             });
         }
-        // Then the actions that write (--boost), lock-free.
-        if let Some(p) = practice {
-            p.act(pc, cpu);
+        // Then the actions that write (--boost), lock-free; a perfect release's guard speaks once.
+        if let Some(line) = practice.and_then(|p| p.act(pc, cpu)) {
+            eprintln!("gyroship: {line}");
+            crate::with(|k| k.log(&line));
         }
         return;
     }
@@ -455,7 +456,7 @@ pub fn run(mut table: Vec<rt::Entry>, window: Option<HostWindow>) {
     // a reference.
     let boost = value("--boost").map(|b| {
         crate::practice::Boost::parse(&b).unwrap_or_else(|| {
-            eprintln!("gyroship: --boost {b}: not a boost mode (infinite)");
+            eprintln!("gyroship: --boost {b}: not a boost mode (infinite, perfect)");
             std::process::exit(2);
         })
     });

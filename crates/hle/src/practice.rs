@@ -25,8 +25,9 @@ use gyroship_gpu::surfaces::Mask;
 use gyroship_practice::{font, texts};
 use gyroship_runtime::Cpu;
 use gyroship_runtime::mem::Memory;
+use gyroship_research::boost as rule;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, OnceLock};
 
 /// The run's actions: set at boot with `--practice`, never otherwise.
@@ -39,22 +40,46 @@ pub(crate) static PRESENTS: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Boost {
     Infinite,
+    /// The boost ends where `gyroship_research::boost::release_now` says, boost held.
+    Perfect,
 }
 
 impl Boost {
     pub fn parse(s: &str) -> Option<Boost> {
-        (s == "infinite").then_some(Boost::Infinite)
+        match s {
+            "infinite" => Some(Boost::Infinite),
+            "perfect" => Some(Boost::Perfect),
+            _ => None,
+        }
     }
 
     pub fn name(self) -> &'static str {
         match self {
             Boost::Infinite => "infinite",
+            Boost::Perfect => "perfect",
         }
     }
 }
 
-/// A boost update: its probe's pc, the vehicle, and its fields by name.
-type Line = (u64, String, Vec<(String, Item)>);
+/// The fields `--boost perfect` reads on an Arwing or Blue-Marine line: the state at the
+/// update's entry, then the ten settings of `rule::Linear`, by its names.
+const PERFECT: [&str; 14] = ["gauge", "speed", "lock", "boosting", "warp", "accel", "decel", "max", "brake", "brake_recover", "brake_floor", "gauge_max", "fill", "drain"];
+
+/// A boost update: its probe's pc, the vehicle, its fields by name, and the perfect release's
+/// state: the releases since rest, and whether its guard has spoken.
+struct Line {
+    pc: u64,
+    vehicle: String,
+    fields: Vec<(String, Item)>,
+    released: AtomicUsize,
+    warned: AtomicBool,
+}
+
+impl Line {
+    fn field(&self, name: &str) -> Option<&Item> {
+        self.fields.iter().find(|(n, _)| n == name).map(|(_, i)| i)
+    }
+}
 
 pub struct Practice {
     mem: Arc<Memory>,
@@ -110,37 +135,82 @@ impl Practice {
                 continue;
             }
             let vehicle = words.next().ok_or_else(|| format!("{}: no vehicle", at()))?.to_string();
+            if !["arwing", "blue-marine", "landmaster"].contains(&vehicle.as_str()) {
+                return Err(format!("{}: unknown vehicle {vehicle}", at()));
+            }
             let mut fields = Vec::new();
             for w in words {
                 let (name, item) = w.split_once('=').ok_or_else(|| format!("{}: {w} is not name=item", at()))?;
-                let item = trace::item(item).filter(|i| matches!(i, Item::Mem(..))).ok_or_else(|| format!("{}: {item} is not TYPE@EXPR", at()))?;
+                // The lock and the boosting flag are bytes; the gauge, the speed and the settings f32.
+                let ty = if matches!(name, "lock" | "boosting") { Ty::U8 } else { Ty::F32 };
+                let item = trace::item(item).filter(|i| matches!(i, Item::Mem(t, _) if *t == ty || !PERFECT.contains(&name))).ok_or_else(|| format!("{}: {name}={item} is not {}@EXPR", at(), if ty == Ty::U8 { "u8" } else { "f32" }))?;
                 fields.push((name.to_string(), item));
             }
-            for need in boost.map_or(&[][..], |_| &["gauge", "lock"][..]) {
+            let need: &[&str] = match (boost, vehicle.as_str()) {
+                (Some(Boost::Infinite), _) => &["gauge", "lock"],
+                (Some(Boost::Perfect), "arwing" | "blue-marine") => &PERFECT,
+                _ => &[],
+            };
+            for need in need {
                 if !fields.iter().any(|(f, _)| f == need) {
                     return Err(format!("{}: {vehicle} has no {need} field", at()));
                 }
             }
-            p.lines.push((pc, vehicle, fields));
+            p.lines.push(Line { pc, vehicle, fields, released: AtomicUsize::new(0), warned: AtomicBool::new(false) });
         }
         if hud && !p.speeds.is_empty() && p.hud_at.is_none() {
             return Err("hud-speed lines need a hud-at line".into());
         }
-        p.lines.sort_by_key(|l| l.0);
+        p.lines.sort_by_key(|l| l.pc);
         Ok(p)
     }
 
     /// A pass of a `trace:` probe at `pc`: its line's actions. A field whose pointers cannot
-    /// be read is left alone.
-    pub(crate) fn act(&self, pc: u64, cpu: &Cpu) {
-        let Some(Boost::Infinite) = self.boost else { return };
-        let Ok(i) = self.lines.binary_search_by_key(&pc, |l| l.0) else { return };
-        for (name, item) in &self.lines[i].2 {
+    /// be read is left alone. Returns the perfect release's guard line, once per line.
+    pub(crate) fn act(&self, pc: u64, cpu: &Cpu) -> Option<String> {
+        let boost = self.boost?;
+        let line = &self.lines[self.lines.binary_search_by_key(&pc, |l| l.pc).ok()?];
+        if boost == Boost::Perfect {
+            return self.perfect(line, cpu);
+        }
+        for (name, item) in &line.fields {
             if matches!(name.as_str(), "gauge" | "lock")
                 && let Some((addr, size)) = trace::place(item, cpu, &self.mem)
             {
                 let _ = self.mem.write(addr, &[0u8; 8][..size]);
             }
+        }
+        None
+    }
+
+    /// `--boost perfect` at a boost update's entry: the lock set when the rule ends the boost
+    /// under way, and no other byte written. The Landmaster holds boost to the end: nothing to
+    /// do. The guard's line, the first time a line's settings are not those the rule was made
+    /// for; no release while they differ.
+    fn perfect(&self, line: &Line, cpu: &Cpu) -> Option<String> {
+        if line.vehicle == "landmaster" {
+            return None;
+        }
+        let f = |n: &str| trace::f32_of(line.field(n)?, cpu, &self.mem);
+        let p = rule::Linear { warp: f("warp")?, accel: f("accel")?, decel: f("decel")?, max: f("max")?, brake: f("brake")?, brake_recover: f("brake_recover")?, brake_floor: f("brake_floor")?, gauge_max: f("gauge_max")?, fill: f("fill")?, drain: f("drain")? };
+        let byte = |n: &str| {
+            let (at, _) = trace::place(line.field(n)?, cpu, &self.mem)?;
+            let mut b = [0u8];
+            self.mem.read(at, &mut b).ok()?;
+            Some((at, b[0] != 0))
+        };
+        let ((lock_at, locked), (_, boosting)) = (byte("lock")?, byte("boosting")?);
+        let s = rule::State { gauge: f("gauge")?, speed: f("speed")?, locked, boosting, ..rule::State::default() };
+        let mut released = line.released.load(Relaxed);
+        let release = rule::release_now(&s, &p, &mut released);
+        line.released.store(released, Relaxed);
+        match release {
+            Some(true) => {
+                let _ = self.mem.write(lock_at, &[1]);
+                None
+            }
+            Some(false) => None,
+            None => (!line.warned.swap(true, Relaxed)).then(|| format!("practice: boost perfect: the {} line's settings are not those the rule was made for ({p:?}): no release while they differ", line.vehicle)),
         }
     }
 
@@ -288,7 +358,7 @@ mod tests {
         (mem, cpu)
     }
 
-    const PROBES: [(u64, &str, u64); 2] = [(PC, "trace:aw-update x0", 0), (PC + 4, "nnMain", 0)];
+    const PROBES: [(u64, &str, u64); 3] = [(PC, "trace:aw-update x0", 0), (PC + 4, "nnMain", 0), (PC + 8, "trace:lm-tick x0", 0)];
     const FILE: &str = "# synthetic\nboost 71001000 arwing gauge=f32@[x0]+0x10 lock=u8@[x0]+0x14\n";
 
     fn state(mem: &Memory) -> (f32, [u8; 2]) {
@@ -324,7 +394,7 @@ mod tests {
         assert!(parse("boost 71001004 arwing gauge=f32@x0 lock=u8@x0").contains("not a trace: probe"));
         assert!(parse("boost 71002000 arwing gauge=f32@x0 lock=u8@x0").contains("not a trace: probe"));
         assert!(parse("boost 71001000 arwing gauge=f32@x0").contains("no lock field"));
-        assert!(parse("boost 71001000 arwing gauge=x0 lock=u8@x0").contains("not TYPE@EXPR"));
+        assert!(parse("boost 71001000 arwing gauge=x0 lock=u8@x0").contains("gauge=x0 is not f32@EXPR"));
         assert!(parse("speed 71001000 arwing").contains("unknown kind"));
         assert_eq!(parse(FILE), "");
     }
@@ -372,6 +442,99 @@ mod tests {
         // Without --hud, the same file reads nothing.
         cpu.x[0] = AT;
         assert_eq!(Practice::parse(HUD, None, false, mem, &PROBES).unwrap().read_speed(PC, &cpu), None);
+    }
+
+    /// A perfect line on a synthetic layout: the state at [x0] (gauge +0x10, lock +0x14,
+    /// boosting +0x16, speed +0x18), the ten settings at [[x0] + 0x8] + 8i.
+    fn perfect_file(vehicle: &str, pc: u64) -> String {
+        let settings: Vec<String> = PERFECT[4..].iter().enumerate().map(|(i, n)| format!("{n}=f32@[[x0]+0x8]+{:#x}", 8 * i)).collect();
+        format!("boost {pc:x} {vehicle} gauge=f32@[x0]+0x10 lock=u8@[x0]+0x14 boosting=u8@[x0]+0x16 speed=f32@[x0]+0x18 {}\n", settings.join(" "))
+    }
+
+    /// A state and settings written into the synthetic vehicle, with a neighbour byte 0x5a
+    /// between the lock and the boosting flag.
+    fn put(mem: &Memory, s: &rule::State, p: &rule::Linear) {
+        mem.write(AT + 0x108, &(AT + 0x400).to_le_bytes()).unwrap();
+        for (i, x) in [p.warp, p.accel, p.decel, p.max, p.brake, p.brake_recover, p.brake_floor, p.gauge_max, p.fill, p.drain].iter().enumerate() {
+            mem.write(AT + 0x400 + 8 * i as u64, &x.to_le_bytes()).unwrap();
+        }
+        mem.write(AT + 0x110, &s.gauge.to_le_bytes()).unwrap();
+        mem.write(AT + 0x114, &[u8::from(s.locked), 0x5a, u8::from(s.boosting)]).unwrap();
+        mem.write(AT + 0x118, &s.speed.to_le_bytes()).unwrap();
+    }
+
+    const TOP: rule::State = rule::State { gauge: 30.0, speed: 900.0, locked: false, boosting: true, braking: false, gauge_state: 0 };
+
+    #[test]
+    fn the_perfect_release_writes_the_lock_byte_alone() {
+        let (mem, cpu) = vehicle();
+        let p = Practice::parse(&perfect_file("arwing", PC), Some(Boost::Perfect), false, mem.clone(), &PROBES).unwrap();
+        // A frame before the cap, a lock already set, no boost: nothing written.
+        for s in [rule::State { speed: 870.00006, ..TOP }, rule::State { locked: true, ..TOP }, rule::State { boosting: false, ..TOP }] {
+            put(&mem, &s, &rule::ARWING);
+            let before = block(&mem);
+            assert_eq!(p.act(PC, &cpu), None);
+            assert_eq!(block(&mem), before, "{s:?}");
+        }
+        put(&mem, &TOP, &rule::ARWING);
+        let before = block(&mem);
+        assert_eq!(p.act(PC + 4, &cpu), None, "another pc");
+        assert_eq!(block(&mem), before);
+        assert_eq!(p.act(PC, &cpu), None);
+        let after = block(&mem);
+        assert_eq!((0..before.len()).filter(|&i| before[i] != after[i]).collect::<Vec<_>>(), [0x114]);
+        assert_eq!(after[0x114], 1);
+    }
+
+    #[test]
+    fn the_perfect_release_keeps_off_other_settings_and_says_so_once() {
+        let (mem, cpu) = vehicle();
+        let file = perfect_file("arwing", PC) + &perfect_file("landmaster", PC + 8);
+        let p = Practice::parse(&file, Some(Boost::Perfect), false, mem.clone(), &PROBES).unwrap();
+        put(&mem, &TOP, &rule::Linear { accel: 1801.0, ..rule::ARWING });
+        let before = block(&mem);
+        assert!(p.act(PC, &cpu).is_some_and(|l| l.contains("arwing")));
+        assert_eq!(p.act(PC, &cpu), None, "said once");
+        assert_eq!(block(&mem), before, "no write");
+        // The Landmaster holds boost to the end: nothing, even at the cap.
+        put(&mem, &TOP, &rule::ARWING);
+        let before = block(&mem);
+        assert_eq!(p.act(PC + 8, &cpu), None);
+        assert_eq!(block(&mem), before);
+    }
+
+    #[test]
+    fn the_perfect_blue_marine_plays_its_sequence_through_the_action() {
+        let (mem, cpu) = vehicle();
+        let p = Practice::parse(&perfect_file("blue-marine", PC), Some(Boost::Perfect), false, mem.clone(), &PROBES).unwrap();
+        let (mut s, mut lengths, mut was) = (rule::State::default(), Vec::new(), false);
+        for _ in 0..2000 {
+            put(&mem, &s, &rule::BLUE_MARINE);
+            p.act(PC, &cpu);
+            let mut lock = [0u8];
+            mem.read(AT + 0x114, &mut lock).unwrap();
+            s.locked = lock[0] != 0;
+            s.linear(&rule::BLUE_MARINE, rule::DT, true, false);
+            match (was, s.boosting) {
+                (false, true) => lengths.push(1),
+                (true, true) => *lengths.last_mut().unwrap() += 1,
+                _ => {}
+            }
+            was = s.boosting;
+        }
+        assert_eq!(&lengths[..6], &[68, 45, 34, 8, 8, 8]);
+    }
+
+    #[test]
+    fn perfect_lines_carry_the_fields_the_rule_reads() {
+        let mem = vehicle().0;
+        let parse = |text: &str| Practice::parse(text, Some(Boost::Perfect), false, mem.clone(), &PROBES).err().unwrap_or_default();
+        let full = perfect_file("arwing", PC);
+        assert_eq!(parse(&full), "");
+        assert!(parse(&full.replace(" boosting=u8@[x0]+0x16", "")).contains("no boosting field"));
+        assert!(parse(&full.replace("lock=u8@", "lock=f32@")).contains("lock=f32@[x0]+0x14 is not u8@EXPR"));
+        assert!(parse(&full.replace("arwing", "tank")).contains("unknown vehicle tank"));
+        assert_eq!(parse("boost 71001008 landmaster gauge=f32@[x0]+0x10 lock=u8@[x0]+0x14"), "");
     }
 
     #[test]
