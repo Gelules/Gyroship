@@ -66,14 +66,18 @@ tool: Minus in the pause menu and in the main menu, and the console (hold L+R+ZL
 click a stick, or the backquote key and F1 to F12 on the keyboard). The same file can set
 the game's cheat settings at boot without leaving the retail build. The hook
 `requirement-met` opens the menus' debug buttons while the build setting stays retail.
-The dump itself is only ever read. In a `--replay` script, `K=35,3a` adds keyboard keys
-(USB HID usages, hex) to a line.
+The hook `quit` makes a menu button's handler that does nothing quit the game; its line
+has a third word, `<hex address> quit <hex address of a byte>`: the byte the game's frame
+loop polls to end the application. The dump itself is only ever read. In a `--replay`
+script, `K=35,3a` adds keyboard keys (USB HID usages, hex) to a line.
 
 A layer can also replace entries inside the game's asset archive, without a copy of the
 archive: each file of `DIR/data.zip.entries`, named like an entry and holding its decoded
-content, takes that entry's place. Two such entries, built from the player's own dump, add
-a QUIT GAME choice to the QUIT confirmation of the game's pause menu, in the game's 14
-languages: the game then shuts itself down and exits.
+content, takes that entry's place. Three such entries, built from the player's own dump,
+add QUIT GAME to the game's menus, in the game's 14 languages: a third choice in the QUIT
+confirmation of the pause menu, and a sixth line in the main menu, which needs the `quit`
+hook (without it the line shows and does nothing). The game then shuts itself down and
+exits.
 
 ## Layout
 

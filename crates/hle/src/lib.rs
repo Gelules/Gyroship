@@ -154,7 +154,8 @@ pub struct Config {
     /// replaces entries of the archive at that path; never a reference run.
     pub romfs_layer: Option<std::path::PathBuf>,
     /// `--hooks FILE`: game functions replaced by ours, `<hex address> <hook>`
-    /// per line (see [`hooks`]); the addresses stay in data files (D21).
+    /// per line, plus the address of the byte it sets for `quit` (see
+    /// [`hooks`]); the addresses stay in data files (D21).
     pub hooks: Option<std::path::PathBuf>,
     /// `--video FILE`: the presented images (as `--dump-frames` chooses
     /// frames) as an H.264 video, through ffmpeg (see [`video`]).
