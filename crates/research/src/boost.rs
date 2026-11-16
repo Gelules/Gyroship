@@ -177,6 +177,42 @@ impl State {
     }
 }
 
+/// The Blue-Marine's release levels for `--boost perfect` (D74, D79: the user's own rule,
+/// played exactly): the gauge at which the n-th boost since rest ends, the last level for
+/// every later one. A boost from an empty gauge ends after the first frame whose gauge reaches
+/// its level: these are the gauges after 68, 45, 34 and 8 frames (1/2, 1/3 and 1/4 of the
+/// meter, then the short boosts) in the game's f32. After 45 frames the gauge is 29.999989,
+/// so a level of 30.0 would make the second boost 46 frames long.
+pub const BLUE_MARINE_HUMAN: [f32; 4] = [45.333344, 29.999989, 22.666662, 5.333333];
+
+/// `--boost perfect` at a boost update's entry, before it runs: whether the boost under way
+/// ends now. The caller then sets the lock, as a big hit does ([`State::hit`]), and the frame
+/// drains as after a release (`gauge_state` 2 instead of 1 while boost is held). `s` is the
+/// state at the entry, `p` the settings read with it, and `released` the releases since the
+/// vehicle was last at rest (not boosting, boost speed back to 0), which the caller keeps,
+/// from 0.
+/// - Arwing: once the boost speed has reached its cap: 30 frames of boost from rest, then 60
+///   of cooldown.
+/// - Blue-Marine: once the gauge has reached `BLUE_MARINE_HUMAN[released]`.
+///
+/// None, and no release, with other settings: the Arwing's optimum rests on its ratios
+/// (accel = 2 decel, fill = 2 drain), the Blue-Marine's levels on its fill rate.
+pub fn release_now(s: &State, p: &Linear, released: &mut usize) -> Option<bool> {
+    if !s.boosting && s.speed <= 0.0 {
+        *released = 0;
+    }
+    let under_way = s.boosting && !s.locked && s.gauge > 0.0;
+    let now = if *p == ARWING {
+        under_way && s.speed >= p.max
+    } else if *p == BLUE_MARINE {
+        under_way && s.gauge >= BLUE_MARINE_HUMAN[(*released).min(BLUE_MARINE_HUMAN.len() - 1)]
+    } else {
+        return None;
+    };
+    *released += usize::from(now);
+    Some(now)
+}
+
 /// `frames` frames from a standstill: `step` advances the vehicle by one frame
 /// with boost held or not, as `pattern` decides from the state so far.
 pub fn simulate(frames: usize, mut step: impl FnMut(&mut State, bool), mut pattern: impl FnMut(&State) -> bool) -> Vec<State> {
@@ -251,16 +287,80 @@ mod tests {
         s.landmaster(&LANDMASTER, DT, held, false);
     }
 
-    /// Frames of each run of equal `locked` values, in order.
-    fn lock_runs(run: &[State]) -> Vec<(bool, usize)> {
+    /// Frames of each run of equal `f` values, in order.
+    fn runs(run: &[State], f: impl Fn(&State) -> bool) -> Vec<(bool, usize)> {
         let mut out: Vec<(bool, usize)> = Vec::new();
         for s in run {
             match out.last_mut() {
-                Some((l, n)) if *l == s.locked => *n += 1,
-                _ => out.push((s.locked, 1)),
+                Some((l, n)) if *l == f(s) => *n += 1,
+                _ => out.push((f(s), 1)),
             }
         }
         out
+    }
+
+    fn lock_runs(run: &[State]) -> Vec<(bool, usize)> {
+        runs(run, |s| s.locked)
+    }
+
+    /// One frame with `--boost perfect`: the rule's write at the entry, then the update.
+    fn perfect(p: Linear) -> impl FnMut(&mut State, bool) {
+        let mut released = 0;
+        move |s, held| {
+            if release_now(s, &p, &mut released) == Some(true) {
+                s.locked = true;
+            }
+            s.linear(&p, DT, held, false);
+        }
+    }
+
+    /// The lengths of the boosts of a run.
+    fn boosts(run: &[State]) -> Vec<usize> {
+        runs(run, |s| s.boosting).into_iter().filter(|r| r.0).map(|r| r.1).collect()
+    }
+
+    #[test]
+    fn the_perfect_arwing_lets_go_at_the_cap() {
+        let run = simulate(3600, perfect(ARWING), |_| true);
+        assert_eq!(&runs(&run, |s| s.boosting)[..4], &[(true, 30), (false, 60), (true, 30), (false, 60)]);
+        assert_eq!((run[29].gauge, run[29].speed, run[30].speed), (30.0, 900.0, 885.0));
+        assert_eq!((run[89].gauge, run[89].speed, run[89].locked), (0.0, 0.0, false));
+        assert!((average(&run) - 450.00001209047105).abs() < 1e-9, "{}", average(&run));
+    }
+
+    #[test]
+    fn a_forced_lock_is_a_release_but_for_the_state_byte() {
+        for (p, n) in [(ARWING, 10), (BLUE_MARINE, 21)] {
+            let mid = simulate(n, |s, h| s.linear(&p, DT, h, false), |_| true)[n - 1];
+            let (mut released, mut forced) = (mid, mid);
+            released.linear(&p, DT, false, false);
+            forced.locked = true;
+            forced.linear(&p, DT, true, false);
+            let key = |s: &State| (s.gauge.to_bits(), s.speed.to_bits(), s.locked, s.boosting, s.braking);
+            assert_eq!(key(&released), key(&forced));
+            assert_eq!((released.gauge_state, forced.gauge_state), (1, 2));
+        }
+    }
+
+    #[test]
+    fn the_perfect_blue_marine_plays_the_human_rule() {
+        assert_eq!(&boosts(&simulate(3600, perfect(BLUE_MARINE), |_| true))[..6], &[68, 45, 34, 8, 8, 8]);
+        // A rest (boost let go for 400 frames: the boost speed falls to 0) brings the long
+        // boosts back.
+        let mut i = 0;
+        let run = simulate(3600, perfect(BLUE_MARINE), move |_| {
+            i += 1;
+            !(2001..=2400).contains(&i)
+        });
+        assert_eq!(boosts(&run).iter().filter(|&&n| n == 68).count(), 2);
+    }
+
+    #[test]
+    fn the_rule_acts_on_the_two_settings_it_was_made_for() {
+        let top = State { gauge: 30.0, speed: 900.0, boosting: true, ..Default::default() };
+        assert_eq!(release_now(&top, &ARWING, &mut 0), Some(true));
+        assert_eq!(release_now(&top, &Linear { accel: 1700.0, ..ARWING }, &mut 0), None);
+        assert_eq!(release_now(&State { locked: true, ..top }, &ARWING, &mut 0), Some(false));
     }
 
     #[test]
