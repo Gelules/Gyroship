@@ -126,19 +126,37 @@ impl Face {
         out
     }
 
-    /// `text` on one line at `px` pixels per em: ab_glyph's scale is the height from descent
-    /// to ascent, so a CJK font with a taller box would come out smaller at the same scale.
+    /// `text` at `px` pixels per em, one line per `\n`, each in a line box of the font's height
+    /// (an empty line keeps its place). ab_glyph's scale is the height from descent to ascent,
+    /// so a CJK font with a taller box would come out smaller at the same scale.
     pub fn mask(&mut self, text: &str, px: u16) -> Mask {
         let scale = PxScale::from(f32::from(px) * self.font.height_unscaled() / self.font.units_per_em().unwrap_or(1000.0));
         // ponytail: the cache keeps every size drawn (a window dragged through many sizes); clear it if that ever shows.
-        for c in text.chars() {
+        for c in text.chars().filter(|&c| c != '\n') {
             let id = self.font.glyph_id(c);
             self.cache.entry((id, px)).or_insert_with(|| coverage(&self.font, id, scale));
         }
         let scaled = self.font.as_scaled(scale);
         let (ascent, descent) = (scaled.ascent(), scaled.descent());
-        lay_out(text, ascent.ceil() as i32, (ascent - descent).ceil() as u32, |c| &self.cache[&(self.font.glyph_id(c), px)])
+        let lines: Vec<Mask> = text.split('\n').map(|line| lay_out(line, ascent.ceil() as i32, (ascent - descent).ceil() as u32, |c| &self.cache[&(self.font.glyph_id(c), px)])).collect();
+        stack(&lines)
     }
+}
+
+/// Lines laid out by [`lay_out`], stacked top down: the widest sets the width.
+pub fn stack(lines: &[Mask]) -> Mask {
+    let width = lines.iter().map(|m| m.width).max().unwrap_or(1);
+    let height = lines.iter().map(|m| m.height).sum::<u32>().max(1);
+    let mut bytes = vec![0u8; (width * height) as usize];
+    let mut top = 0;
+    for m in lines {
+        for (y, row) in m.bytes.chunks(m.width as usize).enumerate() {
+            let at = (top + y) * width as usize;
+            bytes[at..at + row.len()].copy_from_slice(row);
+        }
+        top += m.height as usize;
+    }
+    Mask { width, height, bytes }
 }
 
 /// One glyph's coverage at `scale`, drawn at the pen (0, 0).
@@ -245,6 +263,21 @@ mod tests {
         let (half, full) = (Coverage { width: 2, height: 1, alpha: vec![128, 128], advance: 1.0, ..a.clone() }, Coverage { width: 1, height: 1, alpha: vec![255], advance: 1.0, ..a.clone() });
         let m = lay_out("hf", 3, 1, |c| if c == 'h' { &half } else { &full });
         assert_eq!(&m.bytes[..3], &[128, 255, 0]);
+    }
+
+    #[test]
+    fn lines_stack_in_their_boxes_and_an_empty_one_keeps_its_place() {
+        // A line as lay_out makes it: ink in its first row, then the shadow's column and row.
+        let line = |width: usize, ink: u8| {
+            let mut bytes = vec![0u8; width * 2];
+            bytes[..width - 1].fill(ink);
+            Mask { width: width as u32, height: 2, bytes }
+        };
+        let m = stack(&[line(3, 9), line(2, 7)]);
+        assert_eq!(m, Mask { width: 3, height: 4, bytes: vec![9, 9, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0] });
+        // An empty first line (its own box, one column wide) keeps the second one down.
+        let m = stack(&[line(1, 0), line(2, 7)]);
+        assert_eq!(m, Mask { width: 2, height: 4, bytes: vec![0, 0, 0, 0, 7, 0, 0, 0] });
     }
 
     #[test]

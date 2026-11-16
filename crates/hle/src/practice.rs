@@ -25,6 +25,7 @@ use gyroship_gpu::surfaces::Mask;
 use gyroship_practice::{font, texts};
 use gyroship_runtime::Cpu;
 use gyroship_runtime::mem::Memory;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, OnceLock};
 
@@ -179,13 +180,33 @@ impl Practice {
 /// A mask made, with what it was made for: the text, the image size and the output size.
 type Made = (String, (u32, u32), (u32, u32), Arc<Mask>);
 
-/// `--hud`'s speed line: its label in the run's language, its origin (presented-image
-/// pixels), the font that draws it, and the last mask made.
+/// `--hud`'s text: the speed line, then the frame rate. Their labels in the run's language,
+/// the origin (presented-image pixels), the font that draws them, the presents of the last
+/// second, and the last mask made.
 pub struct Hud {
     label: &'static str,
+    fps_label: &'static str,
     origin: (u32, u32),
     face: font::Face,
+    presents: VecDeque<u64>,
+    /// When the text was loaded: the wall clock's origin.
+    born: std::time::Instant,
     last: Option<Made>,
+}
+
+/// Presents per second at `now` (ticks of 32 ns): `now` joins `window`, which keeps the
+/// presents of the last second, and the rate is their intervals over their span, so that a
+/// present handed over a little later after its vsync than the one a second before cannot
+/// add one.
+fn rate(window: &mut VecDeque<u64>, now: u64) -> u32 {
+    window.push_back(now);
+    while window.front().is_some_and(|&t| t + crate::gs::TICKS_PER_SECOND <= now) {
+        window.pop_front();
+    }
+    match now.saturating_sub(window[0]) {
+        0 => 0,
+        span => ((window.len() - 1) as f64 * crate::gs::TICKS_PER_SECOND as f64 / span as f64).round() as u32,
+    }
 }
 
 impl Hud {
@@ -204,12 +225,17 @@ impl Hud {
             eprintln!("gyroship: --hud: {} cannot draw {}", face.source, missing.join(" "));
         }
         eprintln!("gyroship: --hud: {} texts in {}", texts::tag(region), face.source);
-        Ok(Hud { label: texts::text(texts::Text::Speed, region), origin: origin.unwrap_or_default(), face, last: None })
+        Ok(Hud { label: texts::text(texts::Text::Speed, region), fps_label: texts::text(texts::Text::Fps, region), origin: origin.unwrap_or_default(), face, presents: VecDeque::new(), born: std::time::Instant::now(), last: None })
     }
 
-    /// The speed line to draw with present `n`, while a fresh speed was read.
-    pub(crate) fn text(&self, n: u64) -> Option<String> {
-        Some(format!("{} {}", self.label, actions()?.speed_at(n)?.round() as i64))
+    /// The text to draw with present `n`, handed over at `now` (virtual ticks): the speed line
+    /// while a fresh speed was read (else an empty line, so the counter keeps its place), then
+    /// the frame rate. With a window, on the wall clock: the rate it shows. Without, on the
+    /// virtual clock: the game's own rate, the same in every run, so dumps stay reproducible.
+    pub(crate) fn text(&mut self, n: u64, now: u64, windowed: bool) -> String {
+        let at = if windowed { (self.born.elapsed().as_nanos() / 32) as u64 } else { now };
+        let speed = actions().and_then(|p| p.speed_at(n)).map_or(String::new(), |v| format!("{} {}", self.label, v.round() as i64));
+        format!("{speed}\n{} {}", self.fps_label, rate(&mut self.presents, at))
     }
 
     /// The mask of `text` for an output of `size` pixels showing an image of `area`: the
@@ -346,6 +372,25 @@ mod tests {
         // Without --hud, the same file reads nothing.
         cpu.x[0] = AT;
         assert_eq!(Practice::parse(HUD, None, false, mem, &PROBES).unwrap().read_speed(PC, &cpu), None);
+    }
+
+    #[test]
+    fn the_frame_rate_counts_the_presents_of_the_last_second() {
+        let second = crate::gs::TICKS_PER_SECOND;
+        let mut window = VecDeque::new();
+        // 60 Hz: right from the second present, and on.
+        let counts: Vec<u32> = (0..180).map(|k| rate(&mut window, k * second / 60)).collect();
+        assert_eq!((counts[0], counts[1], counts[59], counts[60], counts[179]), (0, 60, 60, 60, 60));
+        // Then 30 Hz: down to 30 within a second.
+        let start = 180 * second / 60;
+        let counts: Vec<u32> = (1..=60).map(|k| rate(&mut window, start + k * second / 30)).collect();
+        assert_eq!((counts[0] > 30, counts[29], counts[59]), (true, 30, 30));
+        // 30 Hz with each present handed over some time after its vsync (its frame's work
+        // varies): still 30, never 31.
+        let mut window = VecDeque::new();
+        let late = [0, 12_000, 5_000, 9_000];
+        let counts: Vec<u32> = (0..120u64).map(|k| rate(&mut window, k * second / 30 + late[k as usize % 4])).collect();
+        assert!(counts[1..].iter().all(|&c| c == 30), "{counts:?}");
     }
 
     #[test]

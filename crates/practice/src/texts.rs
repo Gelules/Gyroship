@@ -53,18 +53,21 @@ pub fn tag(region: usize) -> String {
 pub enum Text {
     QuitGame,
     Speed,
+    /// Frames per second.
+    Fps,
 }
 
 /// Every text, in the table's order.
-pub const ALL: [Text; 2] = [Text::QuitGame, Text::Speed];
+pub const ALL: [Text; 3] = [Text::QuitGame, Text::Speed, Text::Fps];
 const _: () = assert!(ALL.len() == TEXTS.len());
 
 /// One row per `Text`, one column per region. Written upper case, like the game's HUD and
 /// buttons, with the game's own words where it has them. An empty variant (en-GB, es-419,
 /// fr-CA) shows its parent's text.
-const TEXTS: [[&str; REGIONS]; 2] = [
+const TEXTS: [[&str; REGIONS]; 3] = [
     ["QUIT GAME", "", "SPIEL BEENDEN", "SALIR DEL JUEGO", "", "ESCI DAL GIOCO", "SAIR DO JOGO", "SPEL AFSLUITEN", "QUITTER LE JEU", "", "ゲームを終了", "게임 종료", "退出遊戲", "退出游戏"],
     ["SPEED", "", "TEMPO", "VELOCIDAD", "", "VELOCITÀ", "VELOCIDADE", "SNELHEID", "VITESSE", "", "スピード", "스피드", "速度", "速度"],
+    ["FPS", "", "FPS", "FPS", "", "FPS", "FPS", "FPS", "IPS", "", "FPS", "FPS", "FPS", "FPS"],
 ];
 
 /// Each region's parent: a variant's base language, else itself.
@@ -140,5 +143,6 @@ mod tests {
         assert_eq!(text(Text::QuitGame, 9), "QUITTER LE JEU");
         assert_eq!(text(Text::Speed, 4), "VELOCIDAD");
         assert_eq!(text(Text::Speed, 1), "SPEED");
+        assert_eq!(text(Text::Fps, 9), "IPS");
     }
 }
