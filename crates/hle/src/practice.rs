@@ -94,6 +94,11 @@ pub struct Practice {
     hud_at: Option<(u32, u32)>,
     /// The last speed read: its f32 bits << 32 | the low 32 bits of its present; 0: none yet.
     speed: AtomicU64,
+    /// `marker <vehicle> x0 y0 … x3 y3`: the release markers in the boost bar, a quad each.
+    markers: Vec<(String, [f32; 8])>,
+    /// The vehicle whose boost update passed last: its present << 8 | its line's index << 1 |
+    /// whether its settings are those the markers were made for; 0: none yet.
+    active: AtomicU64,
 }
 
 impl Practice {
@@ -101,7 +106,7 @@ impl Practice {
     /// `gyroship_runtime::probe_counts` gives them): each probe line's pc is a `trace:` probe,
     /// and carries the fields its mode needs.
     pub fn parse(text: &str, boost: Option<Boost>, hud: bool, mem: Arc<Memory>, probes: &[(u64, &str, u64)]) -> Result<Practice, String> {
-        let mut p = Practice { mem, boost, lines: Vec::new(), hud, speeds: Vec::new(), hud_at: None, speed: AtomicU64::new(0) };
+        let mut p = Practice { mem, boost, lines: Vec::new(), hud, speeds: Vec::new(), hud_at: None, speed: AtomicU64::new(0), markers: Vec::new(), active: AtomicU64::new(0) };
         for (n, line) in text.lines().enumerate().filter(|(_, l)| !l.trim().is_empty() && !l.trim_start().starts_with('#')) {
             let at = || format!("line {}", n + 1);
             let mut words = line.split_whitespace();
@@ -117,6 +122,16 @@ impl Practice {
                     continue;
                 }
                 "font" => continue,
+                "marker" => {
+                    let vehicle = words.next().unwrap_or_default();
+                    if !["arwing", "blue-marine", "landmaster"].contains(&vehicle) {
+                        return Err(format!("{}: unknown vehicle {vehicle}", at()));
+                    }
+                    let xy: Option<Vec<f32>> = words.map(|w| w.parse().ok()).collect();
+                    let Some(quad) = xy.and_then(|v| <[f32; 8]>::try_from(v).ok()) else { return Err(format!("{}: marker takes a vehicle and the x y of 4 corners", at())) };
+                    p.markers.push((vehicle.to_string(), quad));
+                    continue;
+                }
                 w => return Err(format!("{}: unknown kind {w}", at())),
             }
             let pc = words.next().and_then(|w| u64::from_str_radix(w, 16).ok()).ok_or_else(|| format!("{}: no pc", at()))?;
@@ -245,10 +260,42 @@ impl Practice {
     pub(crate) fn hud_at(&self) -> Option<(u32, u32)> {
         self.hud_at
     }
+
+    /// With `--hud`, a pass at a boost line's pc: that vehicle is the one the markers are
+    /// for, from this present on, and its line's settings say whether they apply (the rule's
+    /// own guard: an Arwing or a Blue-Marine with other settings gets none). No guest write.
+    pub(crate) fn mark_pass(&self, pc: u64, cpu: &Cpu) {
+        if !self.hud || self.markers.is_empty() {
+            return;
+        }
+        let Ok(i) = self.lines.binary_search_by_key(&pc, |l| l.pc) else { return };
+        let line = &self.lines[i];
+        let f = |n: &str| trace::f32_of(line.field(n)?, cpu, &self.mem);
+        let settings = || Some(rule::Linear { warp: f("warp")?, accel: f("accel")?, decel: f("decel")?, max: f("max")?, brake: f("brake")?, brake_recover: f("brake_recover")?, brake_floor: f("brake_floor")?, gauge_max: f("gauge_max")?, fill: f("fill")?, drain: f("drain")? });
+        let ok = match line.vehicle.as_str() {
+            "arwing" => settings() == Some(rule::ARWING),
+            "blue-marine" => settings() == Some(rule::BLUE_MARINE),
+            _ => true,
+        };
+        self.active.store(word(PRESENTS.load(Relaxed), i, ok), Relaxed);
+    }
+
+    /// The markers to draw with present `shown`: those of the vehicle whose boost update
+    /// passed last, while [`gate`] lets them through.
+    pub(crate) fn marks_at(&self, shown: u64) -> Vec<[f32; 8]> {
+        let Some(i) = gate(self.active.load(Relaxed), shown) else { return Vec::new() };
+        let vehicle = &self.lines[i].vehicle;
+        self.markers.iter().filter(|(v, _)| v == vehicle).map(|(_, q)| *q).collect()
+    }
 }
 
-/// A mask made, with what it was made for: the text, the image size and the output size.
-type Made = (String, (u32, u32), (u32, u32), Arc<Mask>);
+/// A mask made, with what it was made for: the text, the markers, the image size and the
+/// output size.
+type Made = (String, Vec<[f32; 8]>, (u32, u32), (u32, u32), Arc<Mask>);
+
+/// The release markers' colour: a magenta that neither the bar's fill (white, orange) nor its
+/// frame (cyan) uses.
+const MARK: [f32; 4] = [1.0, 0.2, 0.8, 1.0];
 
 /// `--hud`'s text: the speed line, then the frame rate. Their labels in the run's language,
 /// the origin (presented-image pixels), the font that draws them, the presents of the last
@@ -311,21 +358,35 @@ impl Hud {
     /// The mask of `text` for an output of `size` pixels showing an image of `area`: the
     /// glyphs at the output's scale, stretched back over the image, so that each output pixel
     /// shows one mask texel. The last one again when nothing changed.
-    pub(crate) fn mask(&mut self, text: &str, area: (u32, u32), size: (u32, u32)) -> Option<Arc<Mask>> {
+    pub(crate) fn mask(&mut self, text: &str, marks: &[[f32; 8]], area: (u32, u32), size: (u32, u32)) -> Option<Arc<Mask>> {
         if size.0 == 0 || size.1 == 0 {
             return None;
         }
-        if let Some((t, a, s, m)) = &self.last
-            && (t.as_str(), *a, *s) == (text, area, size)
+        if let Some((t, k, a, s, m)) = &self.last
+            && (t.as_str(), &k[..], *a, *s) == (text, marks, area, size)
         {
             return Some(m.clone());
         }
         let m = self.face.mask(text, font::px(size.1));
         let rect = [self.origin.0 as f32, self.origin.1 as f32, m.width as f32 * area.0 as f32 / size.0 as f32, m.height as f32 * area.1 as f32 / size.1 as f32];
-        let mask = Arc::new(Mask::new(rect, (m.width, m.height), m.bytes, [1.0; 4])?);
-        self.last = Some((text.to_string(), area, size, mask.clone()));
+        let mask = Arc::new(Mask::new(rect, (m.width, m.height), m.bytes, [1.0; 4])?.with_marks(marks, MARK));
+        self.last = Some((text.to_string(), marks.to_vec(), area, size, mask.clone()));
         Some(mask)
     }
+}
+
+/// What a boost pass tells the markers: its present << 8 | its line's index << 1 | whether
+/// its settings hold.
+fn word(present: u64, line: usize, ok: bool) -> u64 {
+    (present & 0xff_ffff_ffff_ffff) << 8 | (line as u64 & 0x7f) << 1 | u64::from(ok)
+}
+
+/// The markers' gate at present `shown`: the line of the last boost pass, while it passed at
+/// least at `shown` − 2 (a later present counts: in play mode the GPU thread shows a present
+/// the guest has passed) and its settings hold.
+fn gate(word: u64, shown: u64) -> Option<usize> {
+    let (stamp, line, ok) = (word >> 8, (word >> 1 & 0x7f) as usize, word & 1 == 1);
+    (stamp != 0 && stamp + 2 >= shown && ok).then_some(line)
 }
 
 /// Installs the run's actions (at boot, once).
@@ -535,6 +596,33 @@ mod tests {
         assert!(parse(&full.replace("lock=u8@", "lock=f32@")).contains("lock=f32@[x0]+0x14 is not u8@EXPR"));
         assert!(parse(&full.replace("arwing", "tank")).contains("unknown vehicle tank"));
         assert_eq!(parse("boost 71001008 landmaster gauge=f32@[x0]+0x10 lock=u8@[x0]+0x14"), "");
+    }
+
+    #[test]
+    fn markers_show_with_the_vehicle_in_flight_while_its_settings_hold() {
+        // The gate: fresh at n and n + 2, gone at n + 3; a later stamp counts; never without a
+        // stamp or with other settings.
+        let w = word(100, 0, true);
+        assert_eq!([100, 102, 103, 99].map(|n| gate(w, n)), [Some(0), Some(0), None, Some(0)]);
+        assert_eq!((gate(word(100, 0, false), 100), gate(word(0, 0, true), 0)), (None, None));
+        // A pass with the measured settings says they hold, with others not.
+        let (mem, cpu) = vehicle();
+        let file = perfect_file("arwing", PC) + "marker arwing 1 2 3 4 5 6 7 8\nmarker landmaster 9 9 9 9 9 9 9 9\n";
+        let p = Practice::parse(&file, None, true, mem.clone(), &PROBES).unwrap();
+        put(&mem, &TOP, &rule::ARWING);
+        p.mark_pass(PC, &cpu);
+        assert_eq!(p.active.load(Relaxed) & 0xff, 0b1);
+        put(&mem, &TOP, &rule::Linear { accel: 1801.0, ..rule::ARWING });
+        p.mark_pass(PC, &cpu);
+        assert_eq!(p.active.load(Relaxed) & 0xff, 0b0);
+        // The vehicle's own markers, and only while the gate lets them through.
+        p.active.store(word(100, 0, true), Relaxed);
+        assert_eq!(p.marks_at(100), [[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]]);
+        assert!(p.marks_at(103).is_empty());
+        // Marker lines are checked.
+        let parse = |text: &str| Practice::parse(text, None, true, mem.clone(), &PROBES).err().unwrap_or_default();
+        assert!(parse("marker tank 1 2 3 4 5 6 7 8").contains("unknown vehicle tank"));
+        assert!(parse("marker arwing 1 2 3").contains("the x y of 4 corners"));
     }
 
     #[test]

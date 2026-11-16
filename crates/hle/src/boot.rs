@@ -184,8 +184,12 @@ pub(crate) unsafe fn on_probe(cpu: *mut Cpu, pc: u64, name: &str) {
         // SAFETY: the running thread's context, which this hook and the actions only read.
         let cpu = unsafe { &*cpu };
         let practice = crate::practice::actions();
-        // The speed line's reading (--hud) writes nothing: it may come before the trace line.
+        // The speed line's reading and the markers' vehicle (--hud) write nothing: they may come
+        // before the trace line.
         let speed = practice.and_then(|p| p.read_speed(pc, cpu));
+        if let Some(p) = practice {
+            p.mark_pass(pc, cpu);
+        }
         // The trace line first: the state the game left at the probe; then the reading.
         if TRACING.load(std::sync::atomic::Ordering::Relaxed) {
             crate::with(|k| {

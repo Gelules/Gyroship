@@ -379,37 +379,71 @@ pub struct Mask {
     size: (u32, u32),
     coverage: Vec<u8>,
     color: [f32; 4],
+    /// Marks drawn over it all: convex quads (corners in order, presented-image pixels), at
+    /// most [`MARKS`], in `mark` (alpha: opacity).
+    marks: Vec<[f32; 8]>,
+    mark: [f32; 4],
+}
+
+/// The marks SHOW takes.
+pub const MARKS: usize = 4;
+
+/// Whether `q` lies in the convex quad `k` (corners in order, either way round).
+fn inside(q: [f32; 2], k: &[f32; 8]) -> bool {
+    let e: [f32; 4] = std::array::from_fn(|i| {
+        let (a, b) = ([k[2 * i], k[2 * i + 1]], [k[(2 * i + 2) % 8], k[(2 * i + 3) % 8]]);
+        (b[0] - a[0]) * (q[1] - a[1]) - (b[1] - a[1]) * (q[0] - a[0])
+    });
+    e.iter().all(|&v| v >= 0.0) || e.iter().all(|&v| v <= 0.0)
 }
 
 impl Mask {
     /// None for an empty mask, or one short of its texels.
     pub fn new(rect: [f32; 4], size: (u32, u32), coverage: Vec<u8>, color: [f32; 4]) -> Option<Mask> {
-        (size.0 > 0 && size.1 > 0 && coverage.len() == size.0 as usize * size.1 as usize).then_some(Mask { rect, size, coverage, color })
+        (size.0 > 0 && size.1 > 0 && coverage.len() == size.0 as usize * size.1 as usize).then_some(Mask { rect, size, coverage, color, marks: Vec::new(), mark: [0.0; 4] })
     }
 
-    /// SHOW's text on the CPU: `rgb` is the image at the pixel whose centre is `q`
-    /// (presented-image pixels); the shadow, then the text, are mixed in as the shader does.
+    /// The same, with up to [`MARKS`] marks in `color` over it (the rest are dropped).
+    pub fn with_marks(mut self, quads: &[[f32; 8]], color: [f32; 4]) -> Mask {
+        self.marks = quads.iter().take(MARKS).copied().collect();
+        self.mark = color;
+        self
+    }
+
+    /// SHOW's overlay on the CPU: `rgb` is the image at the pixel whose centre is `q`
+    /// (presented-image pixels); the shadow, the text, then the marks are mixed in as the
+    /// shader does.
     fn over(&self, q: [f32; 2], rgb: &mut [u8]) {
+        let mut c: [f32; 3] = std::array::from_fn(|i| f32::from(rgb[i]) / 255.0);
         let [x, y, w, h] = self.rect;
-        if !(q[0] >= x && q[1] >= y && q[0] < x + w && q[1] < y + h) {
-            return;
+        if q[0] >= x && q[1] >= y && q[0] < x + w && q[1] < y + h {
+            let (mw, mh) = (i64::from(self.size.0), i64::from(self.size.1));
+            let t = [((q[0] - x) * mw as f32 / w).floor() as i64, ((q[1] - y) * mh as f32 / h).floor() as i64];
+            let cover = |u: i64, v: i64| if (0..mw).contains(&u) && (0..mh).contains(&v) { f32::from(self.coverage[(v * mw + u) as usize]) / 255.0 } else { 0.0 };
+            let (shadow, text) = (cover(t[0] - 1, t[1] - 1) * self.color[3], cover(t[0], t[1]) * self.color[3]);
+            for (v, k) in c.iter_mut().zip(self.color) {
+                *v = *v * (1.0 - shadow) * (1.0 - text) + k * text;
+            }
         }
-        let (mw, mh) = (i64::from(self.size.0), i64::from(self.size.1));
-        let t = [((q[0] - x) * mw as f32 / w).floor() as i64, ((q[1] - y) * mh as f32 / h).floor() as i64];
-        let cover = |u: i64, v: i64| if (0..mw).contains(&u) && (0..mh).contains(&v) { f32::from(self.coverage[(v * mw + u) as usize]) / 255.0 } else { 0.0 };
-        let (shadow, text) = (cover(t[0] - 1, t[1] - 1) * self.color[3], cover(t[0], t[1]) * self.color[3]);
-        for (c, k) in rgb.iter_mut().zip(self.color).take(3) {
-            let v = f32::from(*c) / 255.0 * (1.0 - shadow);
-            *c = ((v * (1.0 - text) + k * text) * 255.0).round() as u8;
+        for _ in self.marks.iter().filter(|k| inside(q, k)) {
+            for (v, m) in c.iter_mut().zip(self.mark) {
+                *v = *v * (1.0 - self.mark[3]) + m * self.mark[3];
+            }
+        }
+        for (o, v) in rgb.iter_mut().zip(c) {
+            *o = (v * 255.0).round() as u8;
         }
     }
 }
 
-/// `mask` painted into `rgba`, an image of `w` × `h` pixels shown at its own size.
+/// `mask` painted into `rgba`, an image of `w` × `h` pixels shown at its own size: the pixels
+/// of the text's rectangle and of the marks' bounds.
 fn paint(mask: &Mask, rgba: &mut [u8], w: u32, h: u32) {
     let [x, y, mw, mh] = mask.rect;
-    for py in y.max(0.0) as u32..((y + mh).ceil() as u32).min(h) {
-        for px in x.max(0.0) as u32..((x + mw).ceil() as u32).min(w) {
+    let boxes = std::iter::once([x, y, x + mw, y + mh]).chain(mask.marks.iter().map(|k| [k[0].min(k[2]).min(k[4]).min(k[6]), k[1].min(k[3]).min(k[5]).min(k[7]), k[0].max(k[2]).max(k[4]).max(k[6]), k[1].max(k[3]).max(k[5]).max(k[7])]));
+    let [x0, y0, x1, y1] = boxes.fold([f32::MAX, f32::MAX, f32::MIN, f32::MIN], |a, b| [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]);
+    for py in y0.max(0.0) as u32..(y1.ceil() as u32).min(h) {
+        for px in x0.max(0.0) as u32..(x1.ceil() as u32).min(w) {
             let at = (py * w + px) as usize * 4;
             mask.over([px as f32 + 0.5, py as f32 + 0.5], &mut rgba[at..at + 4]);
         }
@@ -420,10 +454,20 @@ fn paint(mask: &Mask, rgba: &mut [u8], w: u32, h: u32) {
 /// texel values, as the console's display sends them), then mixes the text mask over it: its
 /// shadow, then its colour. A zero rectangle draws no text.
 const SHOW: &str = r#"
-struct Params { area: vec2<u32>, size: vec2<u32>, rect: vec4<f32>, color: vec4<f32> };
+struct Params { area: vec2<u32>, size: vec2<u32>, rect: vec4<f32>, color: vec4<f32>, mark: vec4<f32>, marks: vec4<u32>, quads: array<vec4<f32>, 8> };
 @group(0) @binding(0) var src: texture_2d<f32>;
 @group(0) @binding(1) var<uniform> params: Params;
 @group(0) @binding(2) var mask: texture_2d<f32>;
+
+fn cross2(u: vec2<f32>, v: vec2<f32>) -> f32 {
+    return u.x * v.y - u.y * v.x;
+}
+
+// Whether q lies in the convex quad a, b, c, d (corners in order, either way round).
+fn inside(q: vec2<f32>, a: vec2<f32>, b: vec2<f32>, c: vec2<f32>, d: vec2<f32>) -> bool {
+    let e = vec4(cross2(b - a, q - a), cross2(c - b, q - b), cross2(d - c, q - c), cross2(a - d, q - d));
+    return all(e >= vec4(0.0)) || all(e <= vec4(0.0));
+}
 
 @vertex
 fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
@@ -448,6 +492,13 @@ fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
         let t = vec2<i32>(floor((q - r.xy) * vec2<f32>(textureDimensions(mask)) / r.zw));
         c = mix(c, vec3(0.0), cover(t - vec2(1)) * params.color.a);
         c = mix(c, params.color.rgb, cover(t) * params.color.a);
+    }
+    for (var i = 0u; i < params.marks.x; i++) {
+        let k0 = params.quads[2u * i];
+        let k1 = params.quads[2u * i + 1u];
+        if inside(q, k0.xy, k0.zw, k1.xy, k1.zw) {
+            c = mix(c, params.mark.rgb, params.mark.a);
+        }
     }
     return vec4(c, 1.0);
 }
@@ -522,8 +573,12 @@ impl Show {
             self.mask.1 = Some(m.clone());
         }
         let area = (area.0.min(target.0), area.1.min(target.1));
-        let (rect, color) = mask.map_or(([0.0; 4], [0.0; 4]), |m| (m.rect, m.color));
-        let words: Vec<u8> = [area.0, area.1, size.0, size.1].into_iter().chain(rect.map(f32::to_bits)).chain(color.map(f32::to_bits)).flat_map(u32::to_le_bytes).collect();
+        let (rect, color, mark, marks) = mask.map_or(([0.0; 4], [0.0; 4], [0.0; 4], &[][..]), |m| (m.rect, m.color, m.mark, &m.marks[..]));
+        let mut quads = [0f32; 8 * MARKS];
+        for (i, k) in marks.iter().enumerate() {
+            quads[8 * i..8 * i + 8].copy_from_slice(k);
+        }
+        let words: Vec<u8> = [area.0, area.1, size.0, size.1].into_iter().chain(rect.map(f32::to_bits)).chain(color.map(f32::to_bits)).chain(mark.map(f32::to_bits)).chain([marks.len() as u32, 0, 0, 0]).chain(quads.map(f32::to_bits)).flat_map(u32::to_le_bytes).collect();
         let params = wgpu::util::DeviceExt::create_buffer_init(device, &wgpu::util::BufferInitDescriptor { label: Some("show"), contents: &words, usage: wgpu::BufferUsages::UNIFORM });
         let src = texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2), array_layer_count: Some(1), ..Default::default() });
         let text = self.mask.0.create_view(&Default::default());
@@ -2075,11 +2130,12 @@ mod tests {
         let mut show = Show::new(&s.device, wgpu::TextureFormat::Rgba8Unorm);
         for (ww, wh) in [(iw, ih), (1280, 720)] {
             let rect = [40.0, 212.0, 30.0 * iw as f32 / ww as f32, 12.0 * ih as f32 / wh as f32];
-            let mask = Arc::new(Mask::new(rect, (30, 12), coverage.clone(), [1.0; 4]).unwrap());
+            let quad = [175.10, 94.0, 178.10, 94.0, 167.10, 116.0, 164.10, 116.0];
+            let mask = Arc::new(Mask::new(rect, (30, 12), coverage.clone(), [1.0; 4]).unwrap().with_marks(&[quad], [1.0, 0.0, 1.0, 1.0]));
             let out = texture((ww, wh), wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC);
             show.draw(&s.device, &s.queue, &source, (iw, ih), (iw, ih), (ww, wh), Some(&mask), &out.create_view(&Default::default()));
             let got = s.rgba(&Entry { surface: Surface { addr: 0, width: ww, height: wh, format: 0xd5, layers: 1 }, texture: out, written: 0 }).unwrap();
-            let mut text = 0;
+            let (mut text, mut marked) = (0, 0);
             for (i, p) in got.chunks(4).enumerate() {
                 let (x, y) = (i as u32 % ww, i as u32 / ww);
                 let q = [(x as f32 + 0.5) * iw as f32 / ww as f32, (y as f32 + 0.5) * ih as f32 / wh as f32];
@@ -2087,9 +2143,11 @@ mod tests {
                 let mut want = image[at..at + 4].to_vec();
                 mask.over(q, &mut want);
                 text += usize::from(want != image[at..at + 4]);
+                marked += usize::from(inside(q, &quad));
                 assert!(p.iter().zip(&want).all(|(a, b)| a.abs_diff(*b) <= 1), "window {ww}x{wh}, pixel ({x}, {y}): {p:?}, painted {want:?}");
             }
             assert!(text > 100, "window {ww}x{wh}: the text changed {text} pixels");
+            assert!(marked > 20, "window {ww}x{wh}: the mark covered {marked} pixels");
         }
         assert!(s.errors.lock().unwrap().is_empty(), "{:?}", s.errors.lock().unwrap());
     }

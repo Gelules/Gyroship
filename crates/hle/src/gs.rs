@@ -804,9 +804,11 @@ impl GpuSide {
         // frame only (after the hashes and the video).
         let windowed = self.window.is_some();
         let text = self.hud.as_mut().map(|h| h.text(n, now, windowed));
+        // And the release markers of the vehicle in flight (step 5).
+        let marks = crate::practice::actions().map(|p| p.marks_at(n)).unwrap_or_default();
         let shown = ((area & 0xffff) + 1, (area >> 16) + 1);
         if let (Some(s), Some((pace, size))) = (self.surfaces.as_mut(), self.window.as_mut()) {
-            let mask = text.as_deref().and_then(|t| self.hud.as_mut()?.mask(t, shown, *size));
+            let mask = text.as_deref().and_then(|t| self.hud.as_mut()?.mask(t, &marks, shown, *size));
             s.show(shown, *size, mask);
             match pace(now) {
                 Some(new) => *size = new,
@@ -818,7 +820,7 @@ impl GpuSide {
         if let (Some(dir), Some(s)) = (self.config.frames_dump.clone(), self.surfaces.as_mut())
             && dumped
         {
-            let mask = text.as_deref().and_then(|t| self.hud.as_mut()?.mask(t, shown, shown));
+            let mask = text.as_deref().and_then(|t| self.hud.as_mut()?.mask(t, &marks, shown, shown));
             let line = match s.dump(&dir, &format!("frame-{n:04}"), mask.as_deref()) {
                 Ok(count) => format!("gpu: frame {n}: {count} render targets dumped; {} draws done", s.drawn),
                 Err(e) => format!("gpu: frame {n}: dump failed: {e}"),
