@@ -407,11 +407,19 @@ impl Kernel {
                 self.log(&format!("  probe {name} at {addr:#x}: {n} passes"));
             }
         }
-        // Every thread: who holds the cores, who waits.
+        // Every thread: who holds the cores, who waits; with GYROSHIP_THREAD_STACKS (a
+        // diagnostic for lockstep runs, whose guest threads are all stopped fibers here), the
+        // call stack each one stopped in.
+        let stacks = !self.config.play && std::env::var_os("GYROSHIP_THREAD_STACKS").is_some();
         for i in 0..self.sched.threads.len() {
             let t = &self.sched.threads[i];
             let line = format!("  thread {} {:?} priority {} core {} affinity {:#x} cpu time {} wait {:?}", t.id, t.state, t.priority, t.core, t.affinity, t.cpu_time, t.wait);
+            // SAFETY: lockstep: no guest code runs while the run stops; the context is only read.
+            let frame = (stacks && !t.cpu.is_null()).then(|| unsafe { ((*t.cpu).pc, (*t.cpu).x[30], (*t.cpu).x[29]) });
             self.log(&line);
+            for l in frame.map(|f| self.backtrace_from(f)).unwrap_or_default() {
+                self.log(&format!("    {l}"));
+            }
         }
         self.journal.flush();
         if let Some(t) = &self.trace {
