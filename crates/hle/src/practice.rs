@@ -694,7 +694,7 @@ mod tests {
             }
             was = s.boosting;
         }
-        assert_eq!(&lengths[..6], &[68, 45, 34, 8, 8, 8]);
+        assert_eq!(&lengths[..6], &[68, 45, 34, 27, 27, 27]);
     }
 
     #[test]

@@ -177,13 +177,13 @@ impl State {
     }
 }
 
-/// The Blue-Marine's release levels for `--boost perfect` (D74, D79: the user's own rule,
+/// The Blue-Marine's release levels for `--boost perfect` (D74, D84: the user's own rule,
 /// played exactly): the gauge at which the n-th boost since rest ends, the last level for
 /// every later one. A boost from an empty gauge ends after the first frame whose gauge reaches
-/// its level: these are the gauges after 68, 45, 34 and 8 frames (1/2, 1/3 and 1/4 of the
-/// meter, then the short boosts) in the game's f32. After 45 frames the gauge is 29.999989,
-/// so a level of 30.0 would make the second boost 46 frames long.
-pub const BLUE_MARINE_HUMAN: [f32; 4] = [45.333344, 29.999989, 22.666662, 5.333333];
+/// its level: these are the gauges after 68, 45, 34 and 27 frames (1/2, 1/3, 1/4, then 1/5 of
+/// the meter every time) in the game's f32. After 45 frames the gauge is 29.999989, so a level
+/// of 30.0 would make the second boost 46 frames long; after 27 it is exactly 18.
+pub const BLUE_MARINE_HUMAN: [f32; 4] = [45.333344, 29.999989, 22.666662, 18.0];
 
 /// `--boost perfect` at a boost update's entry, before it runs: whether the boost under way
 /// ends now. The caller then sets the lock, as a big hit does ([`State::hit`]), and the frame
@@ -344,7 +344,7 @@ mod tests {
 
     #[test]
     fn the_perfect_blue_marine_plays_the_human_rule() {
-        assert_eq!(&boosts(&simulate(3600, perfect(BLUE_MARINE), |_| true))[..6], &[68, 45, 34, 8, 8, 8]);
+        assert_eq!(&boosts(&simulate(3600, perfect(BLUE_MARINE), |_| true))[..6], &[68, 45, 34, 27, 27, 27]);
         // A rest (boost let go for 400 frames: the boost speed falls to 0) brings the long
         // boosts back.
         let mut i = 0;
