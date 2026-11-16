@@ -86,6 +86,11 @@ pub fn map_module(m: &Memory, base: u64, module: &Module) -> Result<u64, String>
     Ok(base + data_end)
 }
 
+/// The dump's romfs folder: next to the exefs.
+fn romfs_dir(exefs: &Path) -> Option<std::path::PathBuf> {
+    exefs.parent().map(|p| p.join("romfs")).filter(|p| p.is_dir())
+}
+
 /// A kernel with the modules mapped and the main thread ready at rtld's entry.
 pub fn boot(exefs: &Path, journal: Journal, config: Config) -> Result<Kernel, String> {
     let modules = read_modules(exefs)?;
@@ -105,7 +110,7 @@ pub fn boot(exefs: &Path, journal: Journal, config: Config) -> Result<Kernel, St
     k.allowed_services = npdm_services(&npdm).ok_or("main.npdm: no service access control")?;
     let services = format!("npdm: {} services granted: {}", k.allowed_services.len(), k.allowed_services.join(" "));
     k.log(&services);
-    let romfs = exefs.parent().map(|p| p.join("romfs")).filter(|p| p.is_dir()).ok_or("no romfs folder next to the exefs")?;
+    let romfs = romfs_dir(exefs).ok_or("no romfs folder next to the exefs")?;
     let layer = k.config.romfs_layer.clone();
     let (image, replaced) = crate::fs::RomFs::layered(&romfs, layer.as_deref()).map_err(|e| format!("{}: {e}", romfs.display()))?;
     k.log(&format!("romfs: an image of {} bytes", image.size()));
@@ -176,19 +181,26 @@ static TRACING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 /// actions (`--practice`), which run without the kernel lock.
 pub(crate) unsafe fn on_probe(cpu: *mut Cpu, pc: u64, name: &str) {
     if name.starts_with("trace:") {
-        // The trace line first: the state the game left at the probe.
+        // SAFETY: the running thread's context, which this hook and the actions only read.
+        let cpu = unsafe { &*cpu };
+        let practice = crate::practice::actions();
+        // The speed line's reading (--hud) writes nothing: it may come before the trace line.
+        let speed = practice.and_then(|p| p.read_speed(pc, cpu));
+        // The trace line first: the state the game left at the probe; then the reading.
         if TRACING.load(std::sync::atomic::Ordering::Relaxed) {
             crate::with(|k| {
                 let stamp = (k.now(), k.sched.current.map_or(0, |t| k.sched.threads[t].id), k.gs.presents);
                 if let Some(t) = k.trace.as_mut() {
-                    // SAFETY: the running thread's context, which this hook only reads.
-                    t.pass(pc, name, unsafe { &*cpu }, &k.mem, stamp);
+                    t.pass(pc, name, cpu, &k.mem, stamp);
+                    if let Some([s, m, b, v]) = speed {
+                        t.note(stamp, &format!("hud speed={v} s={s} m={m} b={b}"));
+                    }
                 }
             });
         }
-        if let Some(p) = crate::practice::actions() {
-            // SAFETY: the running thread's context, which the actions only read.
-            p.act(pc, unsafe { &*cpu });
+        // Then the actions that write (--boost), lock-free.
+        if let Some(p) = practice {
+            p.act(pc, cpu);
         }
         return;
     }
@@ -255,6 +267,7 @@ pub const OPTIONS: &[(&str, bool)] = &[
     ("--language", true),
     ("--practice", true),
     ("--boost", true),
+    ("--hud", false),
     // Reports and dumps.
     ("--perf", true),
     ("--hashes", true),
@@ -401,6 +414,7 @@ pub fn run(mut table: Vec<rt::Entry>, window: Option<HostWindow>) {
                 std::process::exit(2);
             })
         }),
+        hud: flag("--hud"),
         ..Config::default()
     };
     if config.play {
@@ -447,17 +461,30 @@ pub fn run(mut table: Vec<rt::Entry>, window: Option<HostWindow>) {
     });
     match value("--practice") {
         Some(path) => {
-            let practice = std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| crate::practice::Practice::parse(&t, boost, k.mem.clone(), &rt::probe_counts()));
-            crate::practice::install(practice.unwrap_or_else(|e| {
+            let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
                 eprintln!("gyroship: --practice {path}: {e}");
                 std::process::exit(2);
-            }));
+            });
+            let practice = crate::practice::Practice::parse(&text, boost, k.config.hud, k.mem.clone(), &rt::probe_counts()).unwrap_or_else(|e| {
+                eprintln!("gyroship: --practice {path}: {e}");
+                std::process::exit(2);
+            });
+            // --hud: the font is read once, here; the speed line is drawn on the GPU side.
+            if k.config.hud {
+                let zip = romfs_dir(Path::new(exefs)).map(|r| r.join("data.zip")).ok_or_else(|| "no romfs folder next to the exefs".to_string());
+                let hud = zip.and_then(|zip| crate::practice::Hud::load(&text, practice.hud_at(), &zip, k.config.language)).unwrap_or_else(|e| {
+                    eprintln!("gyroship: --hud: {e}");
+                    std::process::exit(2);
+                });
+                k.gpu_side().hud = Some(hud);
+            }
+            crate::practice::install(practice);
             if let Some(b) = boost {
                 k.log(&format!("practice: boost {} (--boost)", b.name()));
             }
         }
-        None if boost.is_some() => {
-            eprintln!("gyroship: --boost needs --practice FILE");
+        None if boost.is_some() || k.config.hud => {
+            eprintln!("gyroship: {} needs --practice FILE", if boost.is_some() { "--boost" } else { "--hud" });
             std::process::exit(2);
         }
         None => {}

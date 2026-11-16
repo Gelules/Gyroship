@@ -370,20 +370,60 @@ fn fnv(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
 }
 
-/// A window's surface and the pipeline that copies an image into it.
-struct Window {
-    surface: wgpu::Surface<'static>,
-    config: wgpu::SurfaceConfiguration,
-    pipeline: wgpu::RenderPipeline,
-    layout: wgpu::BindGroupLayout,
+/// Text over the presented image (`--hud`), in the window and the dumped frame only, never in
+/// a game target: an 8-bit coverage mask of `size` texels, rows packed, stretched over `rect`
+/// (x, y, width, height in presented-image pixels), in `color` (alpha: opacity), over a black
+/// copy one texel to the lower right (its shadow).
+pub struct Mask {
+    rect: [f32; 4],
+    size: (u32, u32),
+    coverage: Vec<u8>,
+    color: [f32; 4],
 }
 
-/// Copies the drawn area of a target into the window, scaled with point
-/// sampling: the raw texel values, as the console's display sends them.
+impl Mask {
+    /// None for an empty mask, or one short of its texels.
+    pub fn new(rect: [f32; 4], size: (u32, u32), coverage: Vec<u8>, color: [f32; 4]) -> Option<Mask> {
+        (size.0 > 0 && size.1 > 0 && coverage.len() == size.0 as usize * size.1 as usize).then_some(Mask { rect, size, coverage, color })
+    }
+
+    /// SHOW's text on the CPU: `rgb` is the image at the pixel whose centre is `q`
+    /// (presented-image pixels); the shadow, then the text, are mixed in as the shader does.
+    fn over(&self, q: [f32; 2], rgb: &mut [u8]) {
+        let [x, y, w, h] = self.rect;
+        if !(q[0] >= x && q[1] >= y && q[0] < x + w && q[1] < y + h) {
+            return;
+        }
+        let (mw, mh) = (i64::from(self.size.0), i64::from(self.size.1));
+        let t = [((q[0] - x) * mw as f32 / w).floor() as i64, ((q[1] - y) * mh as f32 / h).floor() as i64];
+        let cover = |u: i64, v: i64| if (0..mw).contains(&u) && (0..mh).contains(&v) { f32::from(self.coverage[(v * mw + u) as usize]) / 255.0 } else { 0.0 };
+        let (shadow, text) = (cover(t[0] - 1, t[1] - 1) * self.color[3], cover(t[0], t[1]) * self.color[3]);
+        for (c, k) in rgb.iter_mut().zip(self.color).take(3) {
+            let v = f32::from(*c) / 255.0 * (1.0 - shadow);
+            *c = ((v * (1.0 - text) + k * text) * 255.0).round() as u8;
+        }
+    }
+}
+
+/// `mask` painted into `rgba`, an image of `w` × `h` pixels shown at its own size.
+fn paint(mask: &Mask, rgba: &mut [u8], w: u32, h: u32) {
+    let [x, y, mw, mh] = mask.rect;
+    for py in y.max(0.0) as u32..((y + mh).ceil() as u32).min(h) {
+        for px in x.max(0.0) as u32..((x + mw).ceil() as u32).min(w) {
+            let at = (py * w + px) as usize * 4;
+            mask.over([px as f32 + 0.5, py as f32 + 0.5], &mut rgba[at..at + 4]);
+        }
+    }
+}
+
+/// Copies the drawn area of a target into the window, scaled with point sampling (the raw
+/// texel values, as the console's display sends them), then mixes the text mask over it: its
+/// shadow, then its colour. A zero rectangle draws no text.
 const SHOW: &str = r#"
-struct Params { area: vec2<u32>, size: vec2<u32> };
+struct Params { area: vec2<u32>, size: vec2<u32>, rect: vec4<f32>, color: vec4<f32> };
 @group(0) @binding(0) var src: texture_2d<f32>;
 @group(0) @binding(1) var<uniform> params: Params;
+@group(0) @binding(2) var mask: texture_2d<f32>;
 
 @vertex
 fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
@@ -391,36 +431,65 @@ fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
     return vec4(p, 0.0, 1.0);
 }
 
+// The mask's coverage at texel t; 0 outside it.
+fn cover(t: vec2<i32>) -> f32 {
+    if any(t < vec2(0)) || any(t >= vec2<i32>(textureDimensions(mask))) {
+        return 0.0;
+    }
+    return textureLoad(mask, t, 0).r;
+}
+
 @fragment
 fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
-    let at = vec2<u32>(floor(p.xy * vec2<f32>(params.area) / vec2<f32>(params.size)));
-    return vec4(textureLoad(src, min(at, params.area - 1u), 0).rgb, 1.0);
+    let q = p.xy * vec2<f32>(params.area) / vec2<f32>(params.size);
+    var c = textureLoad(src, min(vec2<u32>(floor(q)), params.area - 1u), 0).rgb;
+    let r = params.rect;
+    if all(q >= r.xy) && all(q < r.xy + r.zw) {
+        let t = vec2<i32>(floor((q - r.xy) * vec2<f32>(textureDimensions(mask)) / r.zw));
+        c = mix(c, vec3(0.0), cover(t - vec2(1)) * params.color.a);
+        c = mix(c, params.color.rgb, cover(t) * params.color.a);
+    }
+    return vec4(c, 1.0);
 }
 "#;
 
-impl Window {
-    fn new(adapter: &wgpu::Adapter, device: &wgpu::Device, surface: wgpu::Surface<'static>, size: (u32, u32)) -> Window {
-        let caps = surface.get_capabilities(adapter);
-        // Not sRGB: the image's bytes are already encoded (no second gamma).
-        let format = caps.formats.iter().copied().find(|f| !f.is_srgb()).unwrap_or(caps.formats[0]);
-        // D27: no tearing and no queue of old frames; virtual time sets the pace.
-        let present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) { wgpu::PresentMode::Mailbox } else { wgpu::PresentMode::AutoVsync };
-        let mut config = surface.get_default_config(adapter, size.0.max(1), size.1.max(1)).expect("a surface the adapter can present to");
-        config.format = format;
-        config.present_mode = present_mode;
-        config.desired_maximum_frame_latency = 1;
-        surface.configure(device, &config);
+/// The SHOW pass, apart from any window: a test draws it offscreen.
+struct Show {
+    pipeline: wgpu::RenderPipeline,
+    layout: wgpu::BindGroupLayout,
+    /// The mask's texture (1 × 1 until a mask comes), and the mask it holds.
+    mask: (wgpu::Texture, Option<Arc<Mask>>),
+}
+
+/// An 8-bit texture for a mask's coverage.
+fn mask_texture(device: &wgpu::Device, (width, height): (u32, u32)) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("show mask"),
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    })
+}
+
+impl Show {
+    fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Show {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("show"), source: wgpu::ShaderSource::Wgsl(SHOW.into()) });
+        let texture = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+            count: None,
+        };
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
             entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
-                    count: None,
-                },
+                texture(0),
                 wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                texture(2),
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&layout)], ..Default::default() });
@@ -435,13 +504,80 @@ impl Window {
             multiview_mask: None,
             cache: None,
         });
-        Window { surface, config, pipeline, layout }
+        Show { pipeline, layout, mask: (mask_texture(device, (1, 1)), None) }
+    }
+
+    /// Draws the top-left `area` of `texture` (a target of size `target`) into `view`, of size
+    /// `size`, with point sampling, and `mask` over it. The mask is uploaded when it changes.
+    #[allow(clippy::too_many_arguments)]
+    fn draw(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture, target: (u32, u32), area: (u32, u32), size: (u32, u32), mask: Option<&Arc<Mask>>, view: &wgpu::TextureView) {
+        if let Some(m) = mask
+            && !self.mask.1.as_ref().is_some_and(|old| Arc::ptr_eq(old, m))
+        {
+            let extent = wgpu::Extent3d { width: m.size.0, height: m.size.1, depth_or_array_layers: 1 };
+            if self.mask.0.size() != extent {
+                self.mask.0 = mask_texture(device, m.size);
+            }
+            queue.write_texture(self.mask.0.as_image_copy(), &m.coverage, wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(m.size.0), rows_per_image: None }, extent);
+            self.mask.1 = Some(m.clone());
+        }
+        let area = (area.0.min(target.0), area.1.min(target.1));
+        let (rect, color) = mask.map_or(([0.0; 4], [0.0; 4]), |m| (m.rect, m.color));
+        let words: Vec<u8> = [area.0, area.1, size.0, size.1].into_iter().chain(rect.map(f32::to_bits)).chain(color.map(f32::to_bits)).flat_map(u32::to_le_bytes).collect();
+        let params = wgpu::util::DeviceExt::create_buffer_init(device, &wgpu::util::BufferInitDescriptor { label: Some("show"), contents: &words, usage: wgpu::BufferUsages::UNIFORM });
+        let src = texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2), array_layer_count: Some(1), ..Default::default() });
+        let text = self.mask.0.create_view(&Default::default());
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src) },
+                wgpu::BindGroupEntry { binding: 1, resource: params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&text) },
+            ],
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("show"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })],
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        queue.submit([encoder.finish()]);
+    }
+}
+
+/// A window's surface and the pass that copies an image into it.
+struct Window {
+    surface: wgpu::Surface<'static>,
+    config: wgpu::SurfaceConfiguration,
+    show: Show,
+}
+
+impl Window {
+    fn new(adapter: &wgpu::Adapter, device: &wgpu::Device, surface: wgpu::Surface<'static>, size: (u32, u32)) -> Window {
+        let caps = surface.get_capabilities(adapter);
+        // Not sRGB: the image's bytes are already encoded (no second gamma).
+        let format = caps.formats.iter().copied().find(|f| !f.is_srgb()).unwrap_or(caps.formats[0]);
+        // D27: no tearing and no queue of old frames; virtual time sets the pace.
+        let present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) { wgpu::PresentMode::Mailbox } else { wgpu::PresentMode::AutoVsync };
+        let mut config = surface.get_default_config(adapter, size.0.max(1), size.1.max(1)).expect("a surface the adapter can present to");
+        config.format = format;
+        config.present_mode = present_mode;
+        config.desired_maximum_frame_latency = 1;
+        surface.configure(device, &config);
+        Window { surface, config, show: Show::new(device, format) }
     }
 
     /// Shows the top-left `area` of `texture` (a target of size `target`),
-    /// scaled to `size` with point sampling. Nothing happens with an empty area
-    /// or size (minimized).
-    fn show(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture, target: (u32, u32), area: (u32, u32), size: (u32, u32)) {
+    /// scaled to `size` with point sampling, and `mask` over it. Nothing happens
+    /// with an empty area or size (minimized).
+    #[allow(clippy::too_many_arguments)]
+    fn show(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture, target: (u32, u32), area: (u32, u32), size: (u32, u32), mask: Option<&Arc<Mask>>) {
         if size.0 == 0 || size.1 == 0 || area.0 == 0 || area.1 == 0 {
             return;
         }
@@ -457,28 +593,7 @@ impl Window {
                 return;
             }
         };
-        let area = (area.0.min(target.0), area.1.min(target.1));
-        let words: Vec<u8> = [area.0, area.1, size.0, size.1].iter().flat_map(|v| v.to_le_bytes()).collect();
-        let params = wgpu::util::DeviceExt::create_buffer_init(device, &wgpu::util::BufferInitDescriptor { label: Some("show"), contents: &words, usage: wgpu::BufferUsages::UNIFORM });
-        let src = texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2), array_layer_count: Some(1), ..Default::default() });
-        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &self.layout,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src) }, wgpu::BindGroupEntry { binding: 1, resource: params.as_entire_binding() }],
-        });
-        let view = frame.texture.create_view(&Default::default());
-        let mut encoder = device.create_command_encoder(&Default::default());
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("show"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &view, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })],
-                ..Default::default()
-            });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &group, &[]);
-            pass.draw(0..3, 0..1);
-        }
-        queue.submit([encoder.finish()]);
+        self.show.draw(device, queue, texture, target, area, size, mask, &frame.texture.create_view(&Default::default()));
         queue.present(frame);
     }
 }
@@ -849,9 +964,10 @@ impl Surfaces {
     }
 
     /// Shows the presented image (the color target written last, its top-left
-    /// `area`) in the window, scaled to `size` with point sampling. Nothing
-    /// happens without a window, with nothing written, or while minimized.
-    pub fn show(&mut self, area: (u32, u32), size: (u32, u32)) {
+    /// `area`) in the window, scaled to `size` with point sampling, with `mask`
+    /// over it. Nothing happens without a window, with nothing written, or
+    /// while minimized.
+    pub fn show(&mut self, area: (u32, u32), size: (u32, u32), mask: Option<Arc<Mask>>) {
         self.flush();
         let Some(e) = self.last_color.and_then(|k| self.map.get(&k)) else { return };
         let (texture, target) = (e.texture.clone(), (e.surface.width, e.surface.height));
@@ -859,12 +975,12 @@ impl Surfaces {
             // Play mode: the submit thread shows it, after the frame it was just given.
             return self.send(Box::new(move |s: &mut Submitter| {
                 if let Some(w) = &mut s.window {
-                    w.show(&s.device, &s.queue, &texture, target, area, size);
+                    w.show(&s.device, &s.queue, &texture, target, area, size, mask.as_ref());
                 }
             }));
         }
         if let Some(w) = &mut self.window {
-            w.show(&self.device, &self.queue, &texture, target, area, size);
+            w.show(&self.device, &self.queue, &texture, target, area, size, mask.as_ref());
         }
     }
 
@@ -1682,19 +1798,33 @@ impl Surfaces {
 
     /// Writes every color target touched since the last call as
     /// `{prefix}-{address}-{format}-{w}x{h}.png` in `dir`; returns how many.
-    pub fn dump(&mut self, dir: &Path, prefix: &str) -> Result<usize, String> {
+    /// `mask` is painted into the presented image's file only, as SHOW draws it
+    /// at the image's own size.
+    pub fn dump(&mut self, dir: &Path, prefix: &str, mask: Option<&Mask>) -> Result<usize, String> {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         self.flush();
         self.sync();
         let mut keys = std::mem::take(&mut self.touched);
-        // GYROSHIP_DUMP_ONLY=<hex address>: that target alone (dumps every few frames).
-        if let Some(only) = std::env::var("GYROSHIP_DUMP_ONLY").ok().and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()) {
-            keys.retain(|k| k.0 == only);
+        // GYROSHIP_DUMP_ONLY=<hex address>: that target alone (dumps every few frames);
+        // `presented`: the presented image, whichever buffer holds it.
+        match std::env::var("GYROSHIP_DUMP_ONLY").ok().as_deref() {
+            Some("presented") => keys.retain(|k| Some(*k) == self.last_color),
+            Some(v) => {
+                if let Ok(only) = u64::from_str_radix(v.trim_start_matches("0x"), 16) {
+                    keys.retain(|k| k.0 == only);
+                }
+            }
+            None => {}
         }
         for key in &keys {
             let e = &self.map[key];
             let (w, h) = (e.surface.width.max(1), e.surface.height.max(1));
-            let rgba = self.rgba(e)?;
+            let mut rgba = self.rgba(e)?;
+            if let Some(m) = mask
+                && Some(*key) == self.last_color
+            {
+                paint(m, &mut rgba, w, h);
+            }
             let name = format!("{prefix}-{:010x}-{:02x}-{w}x{h}.png", e.surface.addr, e.surface.format);
             crate::write_png(&dir.join(name), w, h, &rgba).map_err(|e| e.to_string())?;
         }
@@ -1925,6 +2055,43 @@ mod tests {
             let left = i % 4 < 2;
             assert_eq!(p, if left { [255, 0, 255, 255] } else { [0, 0, 255, 255] }, "pixel {i}: {rgba:?}");
         }
+    }
+
+    /// SHOW draws the image and the text as a dump paints them, at the image's size and in a
+    /// 1280 × 720 window, within one unit (the GPU's rounding). The numbers keep every floor
+    /// at least 0.16 from an integer. Needs a GPU adapter.
+    #[test]
+    fn show_draws_the_image_and_the_text_as_a_dump_paints_them() {
+        let Ok(s) = Surfaces::headless(crate::Backend::Auto) else {
+            eprintln!("no GPU adapter: test skipped");
+            return;
+        };
+        let texture = |(width, height), usage| s.device.create_texture(&wgpu::TextureDescriptor { label: None, size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::Rgba8Unorm, usage, view_formats: &[] });
+        let (iw, ih) = (1920u32, 1080u32);
+        let image: Vec<u8> = (0..iw * ih).flat_map(|i| [(i % iw) as u8, (i / iw) as u8, (i % 251) as u8, 255]).collect();
+        let source = texture((iw, ih), wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
+        s.queue.write_texture(source.as_image_copy(), &image, wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(iw * 4), rows_per_image: None }, source.size());
+        let coverage: Vec<u8> = (0..30 * 12).map(|i| [0, 255, 128][i % 3]).collect();
+        let mut show = Show::new(&s.device, wgpu::TextureFormat::Rgba8Unorm);
+        for (ww, wh) in [(iw, ih), (1280, 720)] {
+            let rect = [40.0, 212.0, 30.0 * iw as f32 / ww as f32, 12.0 * ih as f32 / wh as f32];
+            let mask = Arc::new(Mask::new(rect, (30, 12), coverage.clone(), [1.0; 4]).unwrap());
+            let out = texture((ww, wh), wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC);
+            show.draw(&s.device, &s.queue, &source, (iw, ih), (iw, ih), (ww, wh), Some(&mask), &out.create_view(&Default::default()));
+            let got = s.rgba(&Entry { surface: Surface { addr: 0, width: ww, height: wh, format: 0xd5, layers: 1 }, texture: out, written: 0 }).unwrap();
+            let mut text = 0;
+            for (i, p) in got.chunks(4).enumerate() {
+                let (x, y) = (i as u32 % ww, i as u32 / ww);
+                let q = [(x as f32 + 0.5) * iw as f32 / ww as f32, (y as f32 + 0.5) * ih as f32 / wh as f32];
+                let at = ((q[1] as u32).min(ih - 1) * iw + (q[0] as u32).min(iw - 1)) as usize * 4;
+                let mut want = image[at..at + 4].to_vec();
+                mask.over(q, &mut want);
+                text += usize::from(want != image[at..at + 4]);
+                assert!(p.iter().zip(&want).all(|(a, b)| a.abs_diff(*b) <= 1), "window {ww}x{wh}, pixel ({x}, {y}): {p:?}, painted {want:?}");
+            }
+            assert!(text > 100, "window {ww}x{wh}: the text changed {text} pixels");
+        }
+        assert!(s.errors.lock().unwrap().is_empty(), "{:?}", s.errors.lock().unwrap());
     }
 
     /// A guest range read again in a submit comes from the memo; a GPU write on

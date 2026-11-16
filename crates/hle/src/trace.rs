@@ -142,6 +142,20 @@ pub(crate) fn place(item: &Item, cpu: &Cpu, mem: &Memory) -> Option<(u64, usize)
     Some((eval(e, cpu, mem)?, ty.size()))
 }
 
+/// An `sN` or `f32@EXPR` item's value at this pass; None for another item, or for an address
+/// that cannot be read.
+pub(crate) fn f32_of(item: &Item, cpu: &Cpu, mem: &Memory) -> Option<f32> {
+    match item {
+        Item::S(n) => Some(f32::from_bits(cpu.vr[*n] as u32)),
+        Item::Mem(Ty::F32, e) => {
+            let mut b = [0u8; 4];
+            mem.read(eval(e, cpu, mem)?, &mut b).ok()?;
+            Some(f32::from_le_bytes(b))
+        }
+        _ => None,
+    }
+}
+
 fn eval(e: &Expr, cpu: &Cpu, mem: &Memory) -> Option<u64> {
     Some(match e {
         Expr::Reg(n) => cpu.x[*n],

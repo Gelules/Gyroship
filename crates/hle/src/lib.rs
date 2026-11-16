@@ -165,6 +165,9 @@ pub struct Config {
     /// `gyroship_practice::texts::LANGUAGE_CODES`; None: en-US. The game picks its text
     /// region from it once, at boot.
     pub language: Option<&'static str>,
+    /// `--hud` (needs `--practice`): Gyroship's overlays, in the window and in dumped frames
+    /// only, never in the hashes, the video or the journal.
+    pub hud: bool,
 }
 
 impl Config {
@@ -182,7 +185,7 @@ impl Config {
 
 impl Default for Config {
     fn default() -> Config {
-        Config { seed: 0x5EED, explore: false, non_system_memory: 0x2_6410_0000, time_limit: None, frames: None, save_dir: None, vsync: true, work_time: false, gpfifo_dump: None, frames_dump: None, dump_every: 1, dump_from: 0, dump_draws: None, shaders_dump: None, replay: None, profile: None, perf: None, hashes: None, record: None, trace: None, audio_dump: None, play: false, pipeline_cache: None, late_frames: false, romfs_layer: None, hooks: None, video: None, gpu_sync: false, language: None }
+        Config { seed: 0x5EED, explore: false, non_system_memory: 0x2_6410_0000, time_limit: None, frames: None, save_dir: None, vsync: true, work_time: false, gpfifo_dump: None, frames_dump: None, dump_every: 1, dump_from: 0, dump_draws: None, shaders_dump: None, replay: None, profile: None, perf: None, hashes: None, record: None, trace: None, audio_dump: None, play: false, pipeline_cache: None, late_frames: false, romfs_layer: None, hooks: None, video: None, gpu_sync: false, language: None, hud: false }
     }
 }
 

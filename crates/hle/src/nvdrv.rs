@@ -324,6 +324,8 @@ pub struct GpuSide {
     pub video: Option<crate::video::Video>,
     /// The host window's pace hook and its last size (`boot::HostWindow`).
     pub window: Option<(crate::Pace, (u32, u32))>,
+    /// `--hud`: the speed line drawn over the shown and dumped frames.
+    pub hud: Option<crate::practice::Hud>,
     /// Textures found rewritten by the CPU: (present, GPU address, size), for `--perf`.
     pub rewrites: Vec<(u64, u64, u64)>,
     /// `--perf`: the frames file's rows (`FRAME_COLUMNS`), and the pages the
@@ -378,7 +380,7 @@ pub enum GpuJob {
 
 impl GpuSide {
     pub fn new(mem: Arc<Memory>, journal: crate::journal::Journal, tally: Arc<Mutex<crate::Tally>>, syncpts: Arc<[AtomicU32; 32]>, config: crate::Config) -> GpuSide {
-        GpuSide { surfaces: None, gpu: Gpu::default(), frame_hashes: Vec::new(), video: None, window: None, rewrites: Vec::new(), frames: String::new(), watched: 0, effects_ns: 0, applying: 0, wrote: None, mem, journal, tally, syncpts, config, at: Phase::default() }
+        GpuSide { surfaces: None, gpu: Gpu::default(), frame_hashes: Vec::new(), video: None, window: None, hud: None, rewrites: Vec::new(), frames: String::new(), watched: 0, effects_ns: 0, applying: 0, wrote: None, mem, journal, tally, syncpts, config, at: Phase::default() }
     }
 
     /// The kernel time the work was handed over at.
@@ -1363,7 +1365,7 @@ impl Gpu {
                         if let (Some(dir), Some(n)) = (&k.config.frames_dump, k.config.dump_draws)
                             && k.at.presents + 1 == n
                         {
-                            let _ = s.dump(dir, &format!("frame-{n:04}-draw-{draw:06}"));
+                            let _ = s.dump(dir, &format!("frame-{n:04}-draw-{draw:06}"), None);
                         }
                         k.surfaces = Some(s);
                     }

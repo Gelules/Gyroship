@@ -578,6 +578,7 @@ impl Kernel {
     /// vi2 229: one more frame. The first three and every 60th are journaled.
     fn present(&mut self, req: &Request) {
         self.gs.presents += 1;
+        crate::practice::PRESENTS.store(self.gs.presents, Ordering::Relaxed);
         self.gs.presenter = self.sched.current.map_or(0, |t| self.sched.threads[t].id);
         let n = self.gs.presents;
         // In --trace, the presents bracket the presenting thread's waits and probe passes.
@@ -797,11 +798,15 @@ impl GpuSide {
                 }
             }
         }
+        // --hud: the speed line while fresh, in the window and the dumped frame only (after the
+        // hashes and the video).
+        let text = self.hud.as_ref().and_then(|h| h.text(n));
         // The host window: show the frame, then wait for its time on the wall clock.
         let now = self.now();
         let shown = ((area & 0xffff) + 1, (area >> 16) + 1);
         if let (Some(s), Some((pace, size))) = (self.surfaces.as_mut(), self.window.as_mut()) {
-            s.show(shown, *size);
+            let mask = text.as_deref().and_then(|t| self.hud.as_mut()?.mask(t, shown, *size));
+            s.show(shown, *size, mask);
             match pace(now) {
                 Some(new) => *size = new,
                 None => return Err((0, "window closed".into())),
@@ -812,7 +817,8 @@ impl GpuSide {
         if let (Some(dir), Some(s)) = (self.config.frames_dump.clone(), self.surfaces.as_mut())
             && dumped
         {
-            let line = match s.dump(&dir, &format!("frame-{n:04}")) {
+            let mask = text.as_deref().and_then(|t| self.hud.as_mut()?.mask(t, shown, shown));
+            let line = match s.dump(&dir, &format!("frame-{n:04}"), mask.as_deref()) {
                 Ok(count) => format!("gpu: frame {n}: {count} render targets dumped; {} draws done", s.drawn),
                 Err(e) => format!("gpu: frame {n}: dump failed: {e}"),
             };
