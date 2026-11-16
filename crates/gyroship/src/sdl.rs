@@ -45,6 +45,8 @@ pub mod button {
     pub const WEST: i32 = 2;
     pub const NORTH: i32 = 3;
     pub const BACK: i32 = 4;
+    /// Guide, PS or Home: never the game's, Gyroship's practice switch.
+    pub const GUIDE: i32 = 5;
     pub const START: i32 = 6;
     pub const LEFT_STICK: i32 = 7;
     pub const RIGHT_STICK: i32 = 8;

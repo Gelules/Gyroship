@@ -99,6 +99,8 @@ pub struct Practice {
     /// The vehicle whose boost update passed last: its present << 8 | its line's index << 1 |
     /// whether its settings are those the markers were made for; 0: none yet.
     active: AtomicU64,
+    /// `--boost perfect` switched off ([`toggle_perfect`]): the game's own, full boosts.
+    perfect_off: AtomicBool,
 }
 
 impl Practice {
@@ -106,7 +108,7 @@ impl Practice {
     /// `gyroship_runtime::probe_counts` gives them): each probe line's pc is a `trace:` probe,
     /// and carries the fields its mode needs.
     pub fn parse(text: &str, boost: Option<Boost>, hud: bool, mem: Arc<Memory>, probes: &[(u64, &str, u64)]) -> Result<Practice, String> {
-        let mut p = Practice { mem, boost, lines: Vec::new(), hud, speeds: Vec::new(), hud_at: None, speed: AtomicU64::new(0), markers: Vec::new(), active: AtomicU64::new(0) };
+        let mut p = Practice { mem, boost, lines: Vec::new(), hud, speeds: Vec::new(), hud_at: None, speed: AtomicU64::new(0), markers: Vec::new(), active: AtomicU64::new(0), perfect_off: AtomicBool::new(false) };
         for (n, line) in text.lines().enumerate().filter(|(_, l)| !l.trim().is_empty() && !l.trim_start().starts_with('#')) {
             let at = || format!("line {}", n + 1);
             let mut words = line.split_whitespace();
@@ -218,6 +220,14 @@ impl Practice {
         let s = rule::State { gauge: f("gauge")?, speed: f("speed")?, locked, boosting, ..rule::State::default() };
         let mut released = line.released.load(Relaxed);
         let release = rule::release_now(&s, &p, &mut released);
+        if self.perfect_off.load(Relaxed) {
+            // Switched off: the game's own boost runs to the end; only a rest still brings
+            // the long start back.
+            if released == 0 {
+                line.released.store(0, Relaxed);
+            }
+            return None;
+        }
         line.released.store(released, Relaxed);
         match release {
             Some(true) => {
@@ -283,6 +293,10 @@ impl Practice {
     /// The markers to draw with present `shown`: those of the vehicle whose boost update
     /// passed last, while [`gate`] lets them through.
     pub(crate) fn marks_at(&self, shown: u64) -> Vec<[f32; 8]> {
+        // While --boost perfect is switched off for a full boost, the markers hide.
+        if self.boost == Some(Boost::Perfect) && self.perfect_off.load(Relaxed) {
+            return Vec::new();
+        }
         let Some(i) = gate(self.active.load(Relaxed), shown) else { return Vec::new() };
         let vehicle = &self.lines[i].vehicle;
         self.markers.iter().filter(|(v, _)| v == vehicle).map(|(_, q)| *q).collect()
@@ -387,6 +401,16 @@ fn word(present: u64, line: usize, ok: bool) -> u64 {
 fn gate(word: u64, shown: u64) -> Option<usize> {
     let (stamp, line, ok) = (word >> 8, (word >> 1 & 0x7f) as usize, word & 1 == 1);
     (stamp != 0 && stamp + 2 >= shown && ok).then_some(line)
+}
+
+/// `--boost perfect`'s switch, the controller's Guide button or the G key (D82): off, each
+/// boost runs as the game has it, to the end of the meter, and the markers hide; on again, the
+/// rule resumes. Nothing in the other modes.
+pub fn toggle_perfect() {
+    if let Some(p) = actions().filter(|p| p.boost == Some(Boost::Perfect)) {
+        let off = !p.perfect_off.fetch_xor(true, Relaxed);
+        eprintln!("gyroship: practice: boost perfect {}", if off { "off: full boosts (Guide or G: on again)" } else { "on" });
+    }
 }
 
 /// Installs the run's actions (at boot, once).
@@ -584,6 +608,25 @@ mod tests {
             was = s.boosting;
         }
         assert_eq!(&lengths[..6], &[68, 45, 34, 8, 8, 8]);
+    }
+
+    #[test]
+    fn switched_off_the_perfect_release_lets_the_boost_run_and_hides_the_markers() {
+        let (mem, cpu) = vehicle();
+        let file = perfect_file("arwing", PC) + "marker arwing 1 2 3 4 5 6 7 8\n";
+        let p = Practice::parse(&file, Some(Boost::Perfect), true, mem.clone(), &PROBES).unwrap();
+        p.perfect_off.store(true, Relaxed);
+        put(&mem, &TOP, &rule::ARWING);
+        let before = block(&mem);
+        assert_eq!(p.act(PC, &cpu), None);
+        assert_eq!(block(&mem), before, "no release while off");
+        p.active.store(word(100, 0, true), Relaxed);
+        assert!(p.marks_at(100).is_empty(), "the markers hide");
+        // On again: the release, and the markers.
+        p.perfect_off.store(false, Relaxed);
+        p.act(PC, &cpu);
+        assert_eq!(block(&mem)[0x114], 1);
+        assert_eq!(p.marks_at(100).len(), 1);
     }
 
     #[test]

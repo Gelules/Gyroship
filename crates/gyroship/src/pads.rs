@@ -108,6 +108,10 @@ impl Pads {
                     if let Some(bit) = bit_of(i32::from(e.button())) {
                         shared.pressed.fetch_or(1 << bit, Ordering::Relaxed);
                     }
+                    // Guide switches --boost perfect off for full boosts, and on again.
+                    if i32::from(e.button()) == b::GUIDE {
+                        gyroship_hle::practice::toggle_perfect();
+                    }
                 }
                 _ => {}
             }

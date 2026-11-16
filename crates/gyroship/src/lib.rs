@@ -185,6 +185,14 @@ impl ApplicationHandler for App {
                     }
                     return;
                 }
+                // G, as the controller's Guide: --boost perfect off for full boosts, and on
+                // again. The game never sees it.
+                if code == KeyCode::KeyG {
+                    if down {
+                        gyroship_hle::practice::toggle_perfect();
+                    }
+                    return;
+                }
                 if let Some(bit) = key_bit(code) {
                     set(&s.held, &s.pressed, bit, down);
                 }
