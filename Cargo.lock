@@ -1086,6 +1086,7 @@ dependencies = [
  "gyroship-analysis",
  "gyroship-gpu",
  "gyroship-loader",
+ "gyroship-practice",
  "gyroship-recomp",
  "gyroship-research",
  "gyroship-runtime",

@@ -12,6 +12,7 @@ mod gpfifo;
 mod measure;
 mod recompile;
 mod shaders;
+mod text_sheet;
 
 #[derive(Parser)]
 #[command(name = "gyroship-tools", version, about = "Gyroship developer tools")]
@@ -146,6 +147,21 @@ enum Command {
         #[arg(long, default_value_t = 48)]
         context: usize,
     },
+    /// Draw every text Gyroship adds in game, in the 14 regions, with the
+    /// fonts practice.txt's font lines name in data.zip (exit code 1 if a font
+    /// cannot draw a character; the sheet is game output: keep it out of the
+    /// repository)
+    TextSheet {
+        /// The romfs data.zip
+        #[arg(long)]
+        zip: PathBuf,
+        /// The practice file with the font lines
+        #[arg(long)]
+        practice: PathBuf,
+        /// The PNG to write
+        #[arg(long, short)]
+        out: PathBuf,
+    },
     /// List a dumped graphics program (--dump-shaders): its SPH and each
     /// decoded instruction
     Sass {
@@ -201,6 +217,7 @@ fn main() -> ExitCode {
         Command::Gpfifo { dir, first, last, methods, listing, bench, profile, repeat } => gpfifo::run(&dir, first, last, methods, listing, bench.then_some((profile, repeat))).map(|_| true),
         Command::Shaders { zip, samples } => shaders::run(&zip, samples.as_deref()),
         Command::DatazipFind { zips, patterns, out, context } => shaders::find(&zips, &patterns, out.as_deref(), context).map(|_| true),
+        Command::TextSheet { zip, practice, out } => text_sheet::run(&zip, &practice, &out),
         Command::Sass { file } => shaders::list(&file).map(|_| true),
         Command::Translate { files, out } => shaders::translate(&files, out.as_deref()),
         Command::Link { exefs, verbose } => link(&exefs, verbose),

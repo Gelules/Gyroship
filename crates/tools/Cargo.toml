@@ -13,6 +13,7 @@ gyroship-recomp = { version = "0.1.0", path = "../recomp" }
 gyroship-gpu = { version = "0.1.0", path = "../gpu" }
 gyroship-runtime = { version = "0.1.0", path = "../runtime" }
 gyroship-research = { version = "0.1.0", path = "../research" }
+gyroship-practice = { version = "0.1.0", path = "../practice" }
 memchr = "2"
 
 [target."cfg(windows)".dependencies]
