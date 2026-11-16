@@ -172,6 +172,11 @@ fn hex(b: &[u8]) -> String {
     format!("{:#x}", u64::from_le_bytes(v))
 }
 
+/// A `--trace` line's stamp: the virtual time, the guest thread, the present.
+fn stamp(k: &Kernel) -> (u64, u64, u64) {
+    (k.now(), k.sched.current.map_or(0, |t| k.sched.threads[t].id), k.gs.presents)
+}
+
 /// Whether `--trace` writes its file. Without it, a `trace:` probe's pass leaves at once:
 /// job threads pass them hundreds of times a frame, and the kernel lock is all they would take.
 static TRACING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -191,9 +196,10 @@ pub(crate) unsafe fn on_probe(cpu: *mut Cpu, pc: u64, name: &str) {
             p.mark_pass(pc, cpu);
         }
         // The trace line first: the state the game left at the probe; then the reading.
-        if TRACING.load(std::sync::atomic::Ordering::Relaxed) {
+        let tracing = TRACING.load(std::sync::atomic::Ordering::Relaxed);
+        if tracing {
             crate::with(|k| {
-                let stamp = (k.now(), k.sched.current.map_or(0, |t| k.sched.threads[t].id), k.gs.presents);
+                let stamp = stamp(k);
                 if let Some(t) = k.trace.as_mut() {
                     t.pass(pc, name, cpu, &k.mem, stamp);
                     if let Some([s, m, b, v]) = speed {
@@ -202,10 +208,21 @@ pub(crate) unsafe fn on_probe(cpu: *mut Cpu, pc: u64, name: &str) {
                 }
             });
         }
-        // Then the actions that write (--boost), lock-free; a perfect release's guard speaks once.
+        // Then the actions that write (--boost, ms lines), lock-free; a perfect release's guard
+        // speaks once.
         if let Some(line) = practice.and_then(|p| p.act(pc, cpu)) {
             eprintln!("gyroship: {line}");
             crate::with(|k| k.log(&line));
+        }
+        if let Some(text) = practice.and_then(|p| p.time_ms(pc, cpu))
+            && tracing
+        {
+            crate::with(|k| {
+                let stamp = stamp(k);
+                if let Some(t) = k.trace.as_mut() {
+                    t.note(stamp, &format!("ms text={text}"));
+                }
+            });
         }
         return;
     }
@@ -482,6 +499,10 @@ pub fn run(mut table: Vec<rt::Entry>, window: Option<HostWindow>) {
                     std::process::exit(2);
                 });
                 k.gpu_side().hud = Some(hud);
+            }
+            // A run whose actions write is never a reference: the journal says so.
+            if practice.writes_ms() {
+                k.log("practice: milliseconds after the game's level time (ms lines)");
             }
             crate::practice::install(practice);
             if let Some(b) = boost {

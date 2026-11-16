@@ -7,7 +7,20 @@
 //! hud-at <x> <y>
 //! hud-speed <pc> s=ITEM m=ITEM b=ITEM
 //! font <region tag | latin> <data.zip entry>
+//! ms-keep <pc> ms=wN
+//! ms <pc> out=xN
 //! ```
+//!
+//! The level time's milliseconds (M6 steps 6 and 6b, D83), whenever the file has these lines:
+//! an `ms-keep` pass keeps the ms in `wN` for its guest thread, where the game is about to
+//! format a level time; the thread's next `ms` pass takes it, where the game has just built that
+//! time's two-digit seconds, and appends "." and the 3 digits of its milliseconds in place: "SS"
+//! becomes "SS.mmm", a point in every language (D74). Only when those digits are the kept ms's
+//! seconds, and the variant at `out` is a string; else the game's text stays as it is. `out` must
+//! hold a variant that `string_utils.format_int` has just returned: its text sits at the start of
+//! a 0x80-byte block of its own, of which the 7 bytes written are the data file's guarantee. The
+//! game then places the seconds in its own strings, "MM:SS.mmm" on the results and in the HUD
+//! timer, sized by the game.
 //!
 //! `--boost infinite`: as each boost update starts, the gauge (a heat that boosting and braking
 //! raise: 0 is a full bar) goes back to 0 and the boost-and-brake lock is lifted, so Boost held
@@ -26,9 +39,9 @@ use gyroship_practice::{font, texts};
 use gyroship_runtime::Cpu;
 use gyroship_runtime::mem::Memory;
 use gyroship_research::boost as rule;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 /// The run's actions: set at boot with `--practice`, never otherwise.
 static ACTIONS: OnceLock<Practice> = OnceLock::new();
@@ -101,20 +114,44 @@ pub struct Practice {
     active: AtomicU64,
     /// `--boost perfect` switched off ([`toggle_perfect`]): the game's own, full boosts.
     perfect_off: AtomicBool,
+    /// `ms` lines: the pc and the register holding the string variant's address.
+    times: Vec<(u64, usize)>,
+    /// `ms-keep` lines: the pc and the register (`wN`) holding the ms.
+    keeps: Vec<(u64, usize)>,
+    /// The ms kept by each guest thread (its TPIDRRO_EL0), until its next `ms` pass: guest
+    /// threads interleave between the two passes, as fibers or in play mode.
+    kept: Mutex<HashMap<u64, i32>>,
 }
+
+/// The VM's string variant: the text's address at +0, its type byte at +0x10 (a string).
+const STRING_TYPE: (usize, u8) = (0x10, 0x0f);
 
 impl Practice {
     /// The file's lines, checked against this build's probes (`probes`, as
     /// `gyroship_runtime::probe_counts` gives them): each probe line's pc is a `trace:` probe,
     /// and carries the fields its mode needs.
     pub fn parse(text: &str, boost: Option<Boost>, hud: bool, mem: Arc<Memory>, probes: &[(u64, &str, u64)]) -> Result<Practice, String> {
-        let mut p = Practice { mem, boost, lines: Vec::new(), hud, speeds: Vec::new(), hud_at: None, speed: AtomicU64::new(0), markers: Vec::new(), active: AtomicU64::new(0), perfect_off: AtomicBool::new(false) };
+        let mut p = Practice {
+            mem,
+            boost,
+            lines: Vec::new(),
+            hud,
+            speeds: Vec::new(),
+            hud_at: None,
+            speed: AtomicU64::new(0),
+            markers: Vec::new(),
+            active: AtomicU64::new(0),
+            perfect_off: AtomicBool::new(false),
+            times: Vec::new(),
+            keeps: Vec::new(),
+            kept: Mutex::new(HashMap::new()),
+        };
         for (n, line) in text.lines().enumerate().filter(|(_, l)| !l.trim().is_empty() && !l.trim_start().starts_with('#')) {
             let at = || format!("line {}", n + 1);
             let mut words = line.split_whitespace();
             let kind = words.next().unwrap_or_default();
             match kind {
-                "boost" | "hud-speed" => {}
+                "boost" | "hud-speed" | "ms" | "ms-keep" => {}
                 "hud-at" => {
                     let xy: Option<Vec<u32>> = words.map(|w| w.parse().ok()).collect();
                     let Some(&[x, y]) = xy.as_deref() else { return Err(format!("{}: hud-at takes X and Y, in pixels", at())) };
@@ -149,6 +186,19 @@ impl Practice {
                 }
                 let [Some(s), Some(m), Some(b)] = items else { return Err(format!("{}: hud-speed needs s, m and b", at())) };
                 p.speeds.push((pc, [s, m, b]));
+                continue;
+            }
+            if kind == "ms" || kind == "ms-keep" {
+                let (name, wanted) = if kind == "ms" { ("out", "out=xN") } else { ("ms", "ms=wN") };
+                let item = match (words.next().and_then(|w| w.split_once('=')), words.next()) {
+                    (Some((n, item)), None) if n == name => trace::item(item),
+                    _ => None,
+                };
+                let r = match (kind, item) {
+                    ("ms", Some(Item::X(r))) | ("ms-keep", Some(Item::W(r))) => r,
+                    _ => return Err(format!("{}: {kind} takes {wanted} alone", at())),
+                };
+                if kind == "ms" { p.times.push((pc, r)) } else { p.keeps.push((pc, r)) }
                 continue;
             }
             let vehicle = words.next().ok_or_else(|| format!("{}: no vehicle", at()))?.to_string();
@@ -301,6 +351,43 @@ impl Practice {
         let vehicle = &self.lines[i].vehicle;
         self.markers.iter().filter(|(v, _)| v == vehicle).map(|(_, q)| *q).collect()
     }
+
+    /// Whether the file has `ms` lines, which write guest memory.
+    pub fn writes_ms(&self) -> bool {
+        !self.times.is_empty()
+    }
+
+    /// A pass at an `ms-keep` line's pc (the ms kept for this guest thread) or at an `ms` line's
+    /// (the thread's kept ms taken, its milliseconds after the game's seconds; see the module's
+    /// doc). Returns the new text when it wrote one.
+    pub(crate) fn time_ms(&self, pc: u64, cpu: &Cpu) -> Option<String> {
+        let kept = || self.kept.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(&(_, w)) = self.keeps.iter().find(|k| k.0 == pc) {
+            kept().insert(cpu.tpidrro, cpu.x[w] as u32 as i32);
+            return None;
+        }
+        let &(_, out) = self.times.iter().find(|t| t.0 == pc)?;
+        let ms = kept().remove(&cpu.tpidrro)?;
+        let mut v = [0u8; 0x11];
+        self.mem.read(cpu.x[out], &mut v).ok()?;
+        let at = u64::from_le_bytes(v[..8].try_into().unwrap());
+        // The text: two digits, then their NUL.
+        let mut text = [0u8; 3];
+        if v[STRING_TYPE.0] != STRING_TYPE.1 || at == 0 || self.mem.read(at, &mut text).is_err() || text[2] != 0 {
+            return None;
+        }
+        let new = with_ms(&text[..2], ms)?;
+        self.mem.write(at, &[new.as_bytes(), &[0]].concat()).ok()?;
+        Some(new)
+    }
+}
+
+/// The game's two-digit seconds `text`, with "." and the 3 digits of `ms`'s milliseconds after
+/// them, when they are `ms`'s seconds; None otherwise.
+fn with_ms(text: &[u8], ms: i32) -> Option<String> {
+    let ms = u32::try_from(ms).ok()?;
+    let seconds = std::str::from_utf8(text).ok().filter(|s| s.len() == 2 && s.bytes().all(|b| b.is_ascii_digit()))?;
+    (seconds.parse() == Ok(ms / 1000 % 60)).then(|| format!("{seconds}.{:03}", ms % 1000))
 }
 
 /// A mask made, with what it was made for: the text, the markers, the image size and the
@@ -700,5 +787,99 @@ mod tests {
         assert!(parse("hud-at 7").contains("takes X and Y"));
         assert!(parse("hud-at 7 9\nhud-at 1 2").contains("a second hud-at"));
         assert_eq!(parse("hud-at 7 9\nfont latin 12ab\nfont ja-JP 34cd\nhud-speed 71001000 s=s3 m=s4 b=f32@[x0]+0x4"), "");
+    }
+
+    #[test]
+    fn the_milliseconds_follow_the_games_seconds_only_when_they_are_its_time() {
+        for (ms, ss, with) in [(0, "00", "00.000"), (999, "00", "00.999"), (59_999, "59", "59.999"), (60_000, "00", "00.000"), (3_599_999, "59", "59.999")] {
+            assert_eq!(with_ms(ss.as_bytes(), ms).as_deref(), Some(with), "{ms}");
+        }
+        // Other seconds, one or three digits, not digits, a whole time, a negative time.
+        for (text, ms) in [("01", 0), ("5", 5_000), ("005", 5_000), ("0a", 0), ("", 0), ("00:00", 0), ("00", -1)] {
+            assert_eq!(with_ms(text.as_bytes(), ms), None, "{text} at {ms}");
+        }
+    }
+
+    /// `ms-keep` at PC + 0x10 (w2), `ms` at PC + 0x14 (x20); PC + 4 is not a trace: probe.
+    const MS_PROBES: [(u64, &str, u64); 3] = [(PC + 4, "nnMain", 0), (PC + 0x10, "trace:results-ms", 0), (PC + 0x14, "trace:results-ss", 0)];
+    const MS_FILE: &str = "ms-keep 71001010 ms=w2\nms 71001014 out=x20\n";
+
+    /// A string variant at AT (its text at AT + 0x200, type 0x0f at +0x10), `text` in a block
+    /// of 0x80 bytes of 0xee; `ms` in w2, on guest thread 7 (its TPIDRRO_EL0).
+    fn string_state(text: &[u8], ms: i32) -> (Arc<Memory>, Cpu) {
+        let mem = Arc::new(Memory::new().unwrap());
+        mem.map(AT, 0x2000, Block::new(state::NORMAL, perm::RW)).unwrap();
+        mem.write(AT, &(AT + 0x200).to_le_bytes()).unwrap();
+        mem.write(AT + 0x10, &[0x0f]).unwrap();
+        mem.write(AT + 0x200, &[0xee; 0x80]).unwrap();
+        mem.write(AT + 0x200, &[text, &[0]].concat()).unwrap();
+        let mut cpu = Cpu::new(std::ptr::null_mut());
+        (cpu.x[20], cpu.x[2], cpu.tpidrro) = (AT, u64::from(ms as u32), 7);
+        (mem, cpu)
+    }
+
+    #[test]
+    fn the_milliseconds_are_written_in_place_after_the_games_seconds() {
+        let (mem, mut cpu) = string_state(b"07", 7_654);
+        let p = Practice::parse(MS_FILE, None, false, mem.clone(), &MS_PROBES).unwrap();
+        assert!(p.writes_ms());
+        let before = block(&mem);
+        assert_eq!(p.time_ms(PC + 0x14, &cpu), None, "nothing kept yet");
+        assert_eq!(p.time_ms(PC + 4, &cpu), None, "another pc");
+        assert_eq!(p.time_ms(PC + 0x10, &cpu), None);
+        // Another guest thread's pass neither takes nor uses this one's ms.
+        cpu.tpidrro = 8;
+        assert_eq!(p.time_ms(PC + 0x14, &cpu), None);
+        assert_eq!(block(&mem), before);
+        cpu.tpidrro = 7;
+        assert_eq!(p.time_ms(PC + 0x14, &cpu).as_deref(), Some("07.654"));
+        let after = block(&mem);
+        assert_eq!((0..before.len()).filter(|&i| before[i] != after[i]).collect::<Vec<_>>(), (0x202..0x207).collect::<Vec<_>>());
+        assert_eq!(&after[0x200..0x208], b"07.654\0\xee");
+        // Taken once.
+        mem.write(AT + 0x200, b"07\0").unwrap();
+        assert_eq!(p.time_ms(PC + 0x14, &cpu), None, "the kept ms was taken");
+        // Without ms lines, nothing.
+        let p = Practice::parse("", None, false, mem.clone(), &MS_PROBES).unwrap();
+        assert!(!p.writes_ms());
+        let before = block(&mem);
+        assert_eq!((p.time_ms(PC + 0x10, &cpu), p.time_ms(PC + 0x14, &cpu)), (None, None));
+        assert_eq!(block(&mem), before);
+    }
+
+    #[test]
+    fn the_game_text_stays_as_it_is_unless_it_is_two_digits_of_the_kept_seconds() {
+        let practice = |mem: &Arc<Memory>| Practice::parse(MS_FILE, None, false, mem.clone(), &MS_PROBES).unwrap();
+        type Change = dyn Fn(&Memory, &mut Cpu);
+        let cases: [(&str, &Change); 5] = [
+            ("other seconds", &|m, _| m.write(AT + 0x200, b"08\0").unwrap()),
+            ("three digits", &|m, _| m.write(AT + 0x200, b"071\0").unwrap()),
+            ("a NULL text", &|m, _| m.write(AT, &0u64.to_le_bytes()).unwrap()),
+            ("another type", &|m, _| m.write(AT + 0x10, &[0x0e]).unwrap()),
+            ("an unreadable variant", &|_, c| c.x[20] = 0x10),
+        ];
+        for (why, change) in cases {
+            let (mem, mut cpu) = string_state(b"07", 7_654);
+            let p = practice(&mem);
+            p.time_ms(PC + 0x10, &cpu);
+            change(&mem, &mut cpu);
+            let before = block(&mem);
+            assert_eq!(p.time_ms(PC + 0x14, &cpu), None, "{why}");
+            assert_eq!(block(&mem), before, "{why}");
+        }
+        // The lines are checked.
+        let mem = string_state(b"07", 0).0;
+        let parse = |text: &str| Practice::parse(text, None, false, mem.clone(), &MS_PROBES).err().unwrap_or_default();
+        for (line, error) in [
+            ("ms 71001014 out=w20", "ms takes out=xN alone"),
+            ("ms 71001014 out=x20 ms=w2", "ms takes out=xN alone"),
+            ("ms 71001014", "ms takes out=xN alone"),
+            ("ms-keep 71001010 ms=x2", "ms-keep takes ms=wN alone"),
+            ("ms-keep 71001010 ms=i32@x19", "ms-keep takes ms=wN alone"),
+            ("ms 71001004 out=x20", "not a trace: probe"),
+        ] {
+            assert!(parse(line).contains(error), "{line}: {}", parse(line));
+        }
+        assert_eq!(parse(MS_FILE), "");
     }
 }
