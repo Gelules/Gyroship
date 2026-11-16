@@ -95,7 +95,8 @@ impl Audio {
                 let ev = k.lone_event()?;
                 Reply { copy_handles: vec![ev], data: tag.to_le_bytes().to_vec(), objects: vec![Service::Audio(manager)], ..Reply::ok() }
             }
-            (Audio::OpusManager { .. }, 0) => Reply::ok(),
+            // 1 (a zero word): when the game exits.
+            (Audio::OpusManager { .. }, 0 | 1) => Reply::ok(),
             // Execute(tasks of 16 bytes, in the X or A buffer: +2 instance, +4 I/O buffer,
             // +8 input size, +0xc reset): every task completes at once, in order. Its
             // input (a big-endian size, 4 bytes of 0, the Opus packet) decodes to 960
@@ -168,7 +169,8 @@ impl Audio {
                 }
                 Reply::ok()
             }
-            (Audio::DevMgrManager, 300 | 700) => Reply::ok(),
+            // 800: the stream detaches, when the game stops its audio output to exit.
+            (Audio::DevMgrManager, 300 | 700 | 800) => Reply::ok(),
             // audsmx: a user session; CreateStream (id 1) on the client's ring.
             (Audio::Mixer, 0) => return object(Audio::MixerSession),
             (Audio::MixerSession, 1) => {
@@ -217,6 +219,9 @@ impl Audio {
                 }
                 Reply::ok()
             }
+            // What the SDK's output stream sends when the game shuts its audio down to
+            // exit: 11 (one zero word), 8, then 1. The sink keeps its timer: the run ends.
+            (Audio::Stream { .. }, 1 | 8 | 11) => Reply::ok(),
             _ => return None,
         })
     }

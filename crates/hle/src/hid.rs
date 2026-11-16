@@ -219,8 +219,8 @@ impl Hid {
                 let m = k.hid_memory();
                 Reply { copy_handles: vec![k.handles.add(Object::SharedMemory(m))?], ..Reply::ok() }
             }
-            // Activations, touch screen size, six-axis and Jcms start.
-            (Hid::Service { .. }, 11 | 21 | 31 | 66 | 1004 | 3112 | 3150) => Reply::ok(),
+            // Activations, touch screen size, six-axis and Jcms start; 3111 when the game exits.
+            (Hid::Service { .. }, 11 | 21 | 31 | 66 | 1004 | 3111 | 3112 | 3150) => Reply::ok(),
             // ActivateNpadWithRevision: the condition becomes "initialized".
             (Hid::Service { .. }, 109) => {
                 k.npad_condition(1);

@@ -167,12 +167,13 @@ impl Service {
             // prepo: reports are accepted and dropped (offline).
             (Service::Prepo, _) => Reply::ok(),
             (Service::Ssl, 5) => Reply::ok(),
-            // chat:u: open a session, then 3, 11 (at every frame) and 23
-            // (SetScreenSharingMode, at the end of the tutorial) succeed empty;
-            // 17 (GetCameraImageProcessingModeForVirtualCamera, in the avatar
+            // chat:u: open a session, then 3, 11 (at every frame), 23
+            // (SetScreenSharingMode, at the end of the tutorial) and 61 (when the
+            // game exits) succeed empty; 17
+            // (GetCameraImageProcessingModeForVirtualCamera, in the avatar
             // settings) gives mode 0: there is no camera.
             (Service::Chat { session: false }, 0) => Reply::object(Service::Chat { session: true }),
-            (Service::Chat { session: false }, 3 | 11 | 23) => Reply::ok(),
+            (Service::Chat { session: false }, 3 | 11 | 23 | 61) => Reply::ok(),
             (Service::Chat { session: false }, 17) => Reply::with(&0u32.to_le_bytes()),
             // The session's event: never signaled.
             (Service::Chat { session: true }, 1) => match k.lone_event() {

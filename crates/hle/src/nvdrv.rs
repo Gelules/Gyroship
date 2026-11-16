@@ -1053,8 +1053,8 @@ impl Nvdrv {
                     self.channel_space.insert(u32_at(&input, 0), space);
                 }
             }
-            // tsg-gpu: bind a channel, time slice.
-            (Device::TsgGpu, 0xc018540b | 0xc0045408) => {}
+            // tsg-gpu: bind a channel, time slice; unbind the channel, when the game exits.
+            (Device::TsgGpu, 0xc018540b | 0xc0045408 | 0xc0045402) => {}
             // gpu (the channel): GPFIFO allocation hands out the channel's syncpoint.
             (Device::Gpu, 0xc020481a) => {
                 let value = k.gs.syncpts[CHANNEL_SYNCPT as usize].load(Ordering::Acquire);

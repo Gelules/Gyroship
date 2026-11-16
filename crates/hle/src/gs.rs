@@ -45,6 +45,13 @@ pub struct State {
     pub syncpt_waits: Vec<Option<usize>>,
     /// vi2 31: the native event of each index, which the change bindings signal.
     pub vi2_events: std::collections::BTreeMap<u32, usize>,
+    /// vi2 11: the notification hub's event; the notification ids signaled since
+    /// vi2 21 last took them, a bit each; vi2 101 and 201: the notification id
+    /// of each open display and layer (by the command, then its name's bytes or
+    /// its handle), which closing it (102, 202) signals.
+    pub vi2_hub: Option<usize>,
+    pub vi2_notified: [u32; 32],
+    pub vi2_opened: std::collections::BTreeMap<(u32, u64), u32>,
     /// vi2 229: the area the game says it drew, (height - 1) << 16 | (width - 1).
     pub drawn_area: u32,
     /// Handles handed out: GPU address spaces (gpu 33), GPU memories (gpu 101),
@@ -329,14 +336,23 @@ impl Gs {
             // GPU memory: create (a handle), destroy, map, change kind. The client then
             // waits for the event its last word names: signaled before replying. Map and
             // change kind answer the fallback kind (no compression).
-            // Unmap: the mapping goes; then its event.
+            // Unmap: the mapping goes; then its event. The answer is the bytes unmapped:
+            // the client keeps the sum of what each address space maps, and aborts when
+            // it destroys one that still maps something (the game's exit).
             (Gs::GpuMemory, 213) => {
                 let (space, first, last) = (req.u32_at(0)?, req.u64_at(4)?, req.u64_at(0xc)?);
                 let maps = Arc::make_mut(&mut k.gs.maps);
-                maps.list.retain(|m| m.0 != space || m.2 < first || m.1 > last);
+                let mut bytes = 0u64;
+                maps.list.retain(|m| {
+                    let stays = m.0 != space || m.2 < first || m.1 > last;
+                    if !stays {
+                        bytes += m.2 - m.1 + 1;
+                    }
+                    stays
+                });
                 maps.table = flatten(&maps.list);
                 k.signal_gpu_when_done(req.u32_at(0x18)? as usize);
-                Reply::ok()
+                Reply::with(&bytes.to_le_bytes())
             }
             (Gs::GpuMemory, c @ (101 | 102 | 211 | 212)) => {
                 k.memory_call(c);
@@ -431,14 +447,15 @@ impl Gs {
             (Gs::Supervisor, 602) => return gs(Gs::Camera),
             (Gs::Camera, 3 | 4 | 21 | 22 | 24 | 25 | 28 | 29) => Reply::ok(),
             // Window images: the size of an image (1510, 435), native memory (111, 423),
-            // the image (429), then 315.
+            // the image (429), then 315. When the game exits: 314, then the image (430)
+            // and its native memory (112) go.
             (Gs::Supervisor, 1510) => Reply::with(&[image_size(req).to_le_bytes(), 0x1000u64.to_le_bytes()].concat()),
             (Gs::Supervisor, 435) => Reply::with(&image_size(req).to_le_bytes()),
             (Gs::Supervisor, 111) => {
                 k.gs.native.push(req.u64_at(4)?);
                 Reply::with(&(k.gs.native.len() as u32).to_le_bytes())
             }
-            (Gs::Supervisor, 423 | 315) => Reply::ok(),
+            (Gs::Supervisor, 423 | 315 | 314 | 430 | 112) => Reply::ok(),
             (Gs::Supervisor, 429) => {
                 k.gs.images += 1;
                 let native = req.u32_at(0x44)?;
@@ -453,9 +470,13 @@ impl Gs {
             // timestamp recorders (5, at most 7).
             (Gs::Vi2, 1 | 3) => Reply::with(&1u32.to_le_bytes()),
             (Gs::Vi2, 5) => Reply::with(&7u32.to_le_bytes()),
-            // The notification hub (11): never signaled. A native event (31), kept by its
-            // index for the change bindings below.
-            (Gs::Vi2, 11) => Reply { move_handles: vec![k.lone_event()?], ..Reply::ok() },
+            // The notification hub (11): its event, signaled when a notification is (102 and
+            // 202 below). A native event (31), kept by its index for the change bindings below.
+            (Gs::Vi2, 11) => {
+                let (r, e) = k.numbered_event()?;
+                k.gs.vi2_hub = Some(e);
+                Reply { move_handles: vec![r], ..Reply::ok() }
+            }
             (Gs::Vi2, 31) => {
                 let n = req.u32_at(0).unwrap_or(0);
                 let (r, e) = k.numbered_event()?;
@@ -471,15 +492,33 @@ impl Gs {
                 }
                 Reply::ok()
             }
-            // Signaled notification ids (21): none.
+            // Signaled notification ids (21): a bit each, in 0x80 bytes; taken once.
             (Gs::Vi2, 21) => {
                 if let Some(b) = req.out_buffer(0) {
-                    let _ = k.mem.write(b.addr, &vec![0; b.size.min(0x80) as usize]);
+                    let ids: Vec<u8> = std::mem::take(&mut k.gs.vi2_notified).iter().flat_map(|w| w.to_le_bytes()).collect();
+                    let _ = k.mem.write(b.addr, &ids[..b.size.min(0x80) as usize]);
                 }
                 Reply::ok()
             }
-            // Display, layer and event bindings, recorders, checkpoints.
-            (Gs::Vi2, 13 | 51 | 101 | 111 | 201 | 251 | 351) => Reply::ok(),
+            // A display (101: its name, then a notification id the client picks) and a
+            // layer (201: its handle, then two ids). When the game exits it closes them
+            // (102, 202), then waits for the notification of that id, the first.
+            (Gs::Vi2, c @ (101 | 201)) => {
+                k.gs.vi2_opened.insert((c, req.u64_at(0)?), req.u32_at(8)?);
+                Reply::ok()
+            }
+            (Gs::Vi2, c @ (102 | 202)) => {
+                if let Some(id) = k.gs.vi2_opened.remove(&(c - 1, req.u64_at(0)?)) {
+                    k.gs.vi2_notified[id as usize / 32 % 32] |= 1 << (id % 32);
+                    if let Some(e) = k.gs.vi2_hub {
+                        k.signal_event(e);
+                    }
+                }
+                Reply::ok()
+            }
+            // Layer and event bindings, recorders, checkpoints; when the game exits, the
+            // bindings undone (the layer's 252 and 112, the change events' 264 to 270).
+            (Gs::Vi2, 13 | 51 | 111 | 112 | 251 | 252 | 264 | 266 | 268 | 270 | 351) => Reply::ok(),
             // Refresh rate: 60 Hz ({60, 0}: the SDK accepts -1, 60 or 120); dynamic range:
             // SDR (1) and a 400-nit peak; paper white 203 nits; maximum buffer
             // resolution: 1080p (2). Values as a reference emulator answers them.
@@ -1000,6 +1039,78 @@ mod tests {
         assert_eq!(super::next_vsync(10, 1, 14, true), (13, false));
         // Interval 2: due at 12, now before it: wait for 12.
         assert_eq!(super::next_vsync(10, 2, 12, true), (12, true));
+    }
+
+    /// The client names notification ids when it opens a display (one) and creates a
+    /// layer (two), and waits for the first once it has closed each: the hub's event
+    /// is signaled then, and the signaled ids hold that one, once.
+    #[test]
+    fn a_closed_display_or_layer_signals_its_first_notification_id() {
+        use crate::ipc::{Buffer, Kind};
+        use gyroship_runtime::mem::{Block, Memory, perm, state};
+        const OUT: u64 = 0x10_0000;
+        let mem = Memory::new().unwrap();
+        mem.map(OUT, 0x1000, Block::new(state::NORMAL, perm::RW)).unwrap();
+        let mut k = Kernel::new(mem, crate::journal::Journal::memory(), crate::Config::default());
+        let ask = |k: &mut Kernel, command: u32, data: &[u8], out: u64| {
+            let b = vec![Buffer { addr: OUT, size: out }];
+            let req = Request { kind: Kind::Tipc(command), command, pid: None, copy_handles: vec![], move_handles: vec![], x: vec![], a: vec![], b, w: vec![], c: vec![], data: data.to_vec(), object: None, in_objects: vec![], close_object: false };
+            Gs::Vi2.request(k, &req).expect("a command the session knows")
+        };
+        let ids = |k: &mut Kernel| {
+            ask(k, 21, &[], 0x80);
+            let mut bits = [0u8; 0x80];
+            k.mem.read(OUT, &mut bits).unwrap();
+            bits
+        };
+        let hub = ask(&mut k, 11, &1u32.to_le_bytes(), 0).move_handles[0];
+        let hub = k.event_of(hub).expect("the hub's event");
+        let display = [&b"default\0"[..], &1u32.to_le_bytes()].concat();
+        let layer = [&0x12_3456_7890u64.to_le_bytes()[..], &2u32.to_le_bytes(), &3u32.to_le_bytes()].concat();
+        ask(&mut k, 101, &display, 0);
+        ask(&mut k, 201, &layer, 0);
+        assert!(!k.events[hub].signaled && ids(&mut k) == [0; 0x80], "nothing while they are open");
+        for (closing, key, id) in [(202, &layer, 2), (102, &display, 1)] {
+            ask(&mut k, closing, &key[..8], 0);
+            assert!(std::mem::take(&mut k.events[hub].signaled), "command {closing}");
+            let mut want = [0u8; 0x80];
+            want[0] = 1 << id;
+            assert_eq!(ids(&mut k), want, "command {closing}: the first id, {id}");
+            assert_eq!(ids(&mut k), [0; 0x80], "taken once");
+        }
+        // Closing what is not open signals nothing.
+        ask(&mut k, 202, &layer[..8], 0);
+        assert!(!k.events[hub].signaled && ids(&mut k) == [0; 0x80]);
+    }
+
+    /// An unmap answers the bytes it unmapped, which the client takes off what it counts
+    /// as mapped in the address space: each mapping the range meets, once.
+    #[test]
+    fn an_unmap_answers_the_bytes_it_unmapped() {
+        let mut k = Kernel::new(gyroship_runtime::mem::Memory::new().unwrap(), crate::journal::Journal::memory(), crate::Config::default());
+        let ask = |k: &mut Kernel, command: u32, data: Vec<u8>| {
+            let req = Request { kind: crate::ipc::Kind::Tipc(command), command, pid: None, copy_handles: vec![], move_handles: vec![], x: vec![], a: vec![], b: vec![], w: vec![], c: vec![], data, object: None, in_objects: vec![], close_object: false };
+            Gs::GpuMemory.request(k, &req).expect("a command the session knows").data
+        };
+        // Words of a request: the address space, then the range's first and last bytes.
+        let range = |len: usize, space: u32, first: u64, last: u64| {
+            let mut d = vec![0u8; len];
+            d[..4].copy_from_slice(&space.to_le_bytes());
+            d[4..12].copy_from_slice(&first.to_le_bytes());
+            d[12..20].copy_from_slice(&last.to_le_bytes());
+            d
+        };
+        // GPU memory 1, mapped twice in space 1 and once in space 2 (211: the memory at +0x14).
+        assert_eq!(ask(&mut k, 101, 0x1000_0000u64.to_le_bytes().to_vec()), 1u32.to_le_bytes());
+        for (space, first, last) in [(1, 0x4000, 0x5fff), (1, 0x8000, 0x8fff), (2, 0x4000, 0x4fff)] {
+            let mut map = range(0x40, space, first, last);
+            map[0x14] = 1;
+            ask(&mut k, 211, map);
+        }
+        let unmap = |k: &mut Kernel, space: u32, first: u64, last: u64| ask(k, 213, range(0x1c, space, first, last));
+        assert_eq!(unmap(&mut k, 1, 0x4000, 0x8fff), 0x3000u64.to_le_bytes(), "both mappings of space 1");
+        assert_eq!(unmap(&mut k, 1, 0x4000, 0x8fff), 0u64.to_le_bytes(), "nothing left there");
+        assert_eq!(unmap(&mut k, 2, 0, 0xffff), 0x1000u64.to_le_bytes(), "space 2 kept its own");
     }
 
     /// The flattened table answers what a scan of the mappings from the last one

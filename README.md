@@ -69,6 +69,12 @@ the game's cheat settings at boot without leaving the retail build. The hook
 The dump itself is only ever read. In a `--replay` script, `K=35,3a` adds keyboard keys
 (USB HID usages, hex) to a line.
 
+A layer can also replace entries inside the game's asset archive, without a copy of the
+archive: each file of `DIR/data.zip.entries`, named like an entry and holding its decoded
+content, takes that entry's place. Two such entries, built from the player's own dump, add
+a QUIT GAME choice to the QUIT confirmation of the game's pause menu, in the game's 14
+languages: the game then shuts itself down and exits.
+
 ## Layout
 
     crates/loader     NSO executables, relocations, ELF export
