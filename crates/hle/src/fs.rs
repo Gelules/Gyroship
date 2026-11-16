@@ -11,6 +11,7 @@
 use crate::Kernel;
 use crate::ipc::{Reply, Request};
 use crate::service::Service;
+use gyroship_gpu::datazip::Overlay;
 use gyroship_runtime::mem::perm;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -25,6 +26,8 @@ struct File {
     path: PathBuf,
     offset: u64,
     size: u64,
+    /// An archive with entries replaced: what the image serves over the host file.
+    overlay: Option<Overlay>,
 }
 
 #[derive(Debug)]
@@ -71,7 +74,7 @@ struct Dir {
     name: Vec<u8>,
     parent: usize,
     dirs: Vec<usize>,
-    files: Vec<(Vec<u8>, PathBuf, u64)>,
+    files: Vec<(Vec<u8>, PathBuf, u64, Option<Overlay>)>,
 }
 
 impl RomFs {
@@ -82,7 +85,10 @@ impl RomFs {
 
     /// The image of the files under `root`, where a file at the same path
     /// under `layer` takes the dump file's place, bytes and size (the dump is
-    /// only read, rule 4). Also returns the paths the layer replaced.
+    /// only read, rule 4). A folder `<path>.entries` under `layer` replaces
+    /// entries of the archive at `<path>` instead, each by the file of its
+    /// name, decoded; a name the archive lacks is refused. Also returns what
+    /// the layer replaced.
     // ponytail: a layer only replaces files; one the dump lacks is ignored, and
     // the caller logs what was replaced so a misplaced file shows.
     pub fn layered(root: &Path, layer: Option<&Path>) -> std::io::Result<(RomFs, Vec<String>)> {
@@ -100,12 +106,28 @@ impl RomFs {
                     dirs.push(Dir { name, parent: d, dirs: Vec::new(), files: Vec::new() });
                     dirs[d].dirs.push(i);
                     todo.push((i, e.path(), rel));
-                } else if let Some(over) = layer.map(|l| l.join(&rel)).filter(|p| p.is_file()) {
-                    let size = std::fs::metadata(&over)?.len();
-                    replaced.push(rel.to_string_lossy().replace('\\', "/"));
-                    dirs[d].files.push((name, over, size));
                 } else {
-                    dirs[d].files.push((name, e.path(), e.metadata()?.len()));
+                    let shown = rel.to_string_lossy().replace('\\', "/");
+                    let over = layer.map(|l| l.join(&rel)).filter(|p| p.is_file());
+                    if over.is_some() {
+                        replaced.push(shown.clone());
+                    }
+                    let host = over.unwrap_or_else(|| e.path());
+                    let mut size = std::fs::metadata(&host)?.len();
+                    let mut overlay = None;
+                    if let Some(folder) = layer.map(|l| l.join(format!("{shown}.entries"))).filter(|p| p.is_dir()) {
+                        let mut entries = Vec::new();
+                        for f in std::fs::read_dir(&folder)? {
+                            let f = f?;
+                            entries.push((f.file_name().to_string_lossy().into_owned(), std::fs::read(f.path())?));
+                        }
+                        entries.sort();
+                        let o = gyroship_gpu::datazip::overlay(&host, &entries)?;
+                        replaced.push(entries.iter().fold(format!("{shown} entries"), |s, (n, _)| s + " " + n));
+                        size += o.end.len() as u64;
+                        overlay = Some(o);
+                    }
+                    dirs[d].files.push((name, host, size, overlay));
                 }
             }
         }
@@ -121,13 +143,13 @@ impl RomFs {
         let mut at = 0;
         let mut files = Vec::new();
         let mut data = 0u64;
-        for d in &dirs {
+        for d in &mut dirs {
             let mut here = Vec::new();
-            for (name, path, size) in &d.files {
+            for (name, path, size, overlay) in &mut d.files {
                 here.push(at as u32);
                 at += entry(name, 0x20);
-                files.push(File { path: path.clone(), offset: DATA + data, size: *size });
-                data = (data + size).next_multiple_of(16);
+                files.push(File { path: path.clone(), offset: DATA + data, size: *size, overlay: overlay.take() });
+                data = (data + *size).next_multiple_of(16);
             }
             file_at.push(here);
         }
@@ -150,7 +172,7 @@ impl RomFs {
             dir_meta.extend(&d.name);
             pad4(&mut dir_meta);
             dir_hash[h] = dir_at[i];
-            for (k, (name, _, size)) in d.files.iter().enumerate() {
+            for (k, (name, _, size, _)) in d.files.iter().enumerate() {
                 let me = file_at[i][k];
                 let h = hash(dir_at[i], name) as usize % file_hash.len();
                 let sibling = file_at[i].get(k + 1).copied().unwrap_or(EMPTY);
@@ -201,11 +223,29 @@ impl RomFs {
         for (f, open) in self.files.iter().zip(&self.open) {
             let (lo, hi) = (offset.max(f.offset), end.min(f.offset + f.size));
             if lo < hi {
-                if open.get().is_none() {
-                    let _ = open.set(std::fs::File::open(&f.path)?);
+                let out = &mut out[(lo - offset) as usize..(hi - offset) as usize];
+                // The host file's bytes, all of them before what an overlay adds.
+                let (at, cut) = (lo - f.offset, f.size - f.overlay.as_ref().map_or(0, |o| o.end.len() as u64));
+                let host = cut.saturating_sub(at).min(out.len() as u64) as usize;
+                if host > 0 {
+                    if open.get().is_none() {
+                        let _ = open.set(std::fs::File::open(&f.path)?);
+                    }
+                    let file = open.get().ok_or_else(|| std::io::Error::other("RomFS file not open"))?;
+                    read_at(file, at, &mut out[..host])?;
                 }
-                let file = open.get().ok_or_else(|| std::io::Error::other("RomFS file not open"))?;
-                read_at(file, lo - f.offset, &mut out[(lo - offset) as usize..(hi - offset) as usize])?;
+                // Over them, the overlay's patches; after them, its end.
+                if let Some(o) = &f.overlay {
+                    for (p, bytes) in &o.patches {
+                        let (lo, hi) = (at.max(*p), (at + host as u64).min(p + bytes.len() as u64));
+                        if lo < hi {
+                            out[(lo - at) as usize..(hi - at) as usize].copy_from_slice(&bytes[(lo - p) as usize..(hi - p) as usize]);
+                        }
+                    }
+                    let from = (at + host as u64).saturating_sub(cut) as usize;
+                    let rest = out.len() - host;
+                    out[host..].copy_from_slice(&o.end[from..from + rest]);
+                }
             }
         }
         Ok(())

@@ -150,7 +150,8 @@ pub struct Config {
     /// instead of at the next vsync: more frames, an uneven cadence (D48).
     pub late_frames: bool,
     /// `--romfs-layer DIR`: a file of DIR replaces the dump's file at the same
-    /// RomFS path (game settings, debug tools); never a reference run.
+    /// RomFS path (game settings, debug tools), and a folder `<path>.entries`
+    /// replaces entries of the archive at that path; never a reference run.
     pub romfs_layer: Option<std::path::PathBuf>,
     /// `--hooks FILE`: game functions replaced by ours, `<hex address> <hook>`
     /// per line (see [`hooks`]); the addresses stay in data files (D21).

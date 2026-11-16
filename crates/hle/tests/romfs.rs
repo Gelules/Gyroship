@@ -127,6 +127,57 @@ fn a_layer_file_replaces_the_dumps() {
     assert_eq!(std::fs::read(root.join("x_build.cvar")).unwrap(), b"{\"a\": true}", "the dump is untouched");
 }
 
+/// An archive as the game's engine reads it: an index block ("VZIP", a record
+/// count, the names' size; a 40-byte record per entry; the names, each ended
+/// by a zero), then each entry's raw bytes.
+fn archive_of(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let names: Vec<u8> = entries.iter().flat_map(|e| [e.0.as_bytes(), &[0]].concat()).collect();
+    let mut zip = [&b"VZIP"[..], &(entries.len() as u32).to_le_bytes(), &(names.len() as u32).to_le_bytes(), &vec![0; 40 * entries.len()][..], &names[..]].concat();
+    let mut name = 0u32;
+    for (k, &(n, data)) in entries.iter().enumerate() {
+        // A record: its name's offset; from its byte 8, where the bytes are, and their two sizes.
+        let (record, at) = (12 + 40 * k, zip.len() as u64);
+        zip[record..record + 4].copy_from_slice(&name.to_le_bytes());
+        zip[record + 8..record + 32].copy_from_slice(&[at, data.len() as u64, data.len() as u64].map(u64::to_le_bytes).concat());
+        zip.extend(data);
+        name += n.len() as u32 + 1;
+    }
+    zip
+}
+
+/// A layer's `<archive>.entries` folder replaces entries inside the dump's
+/// archive: the image serves the dump's bytes, but for the index record of
+/// the entry, which points at the new content after them.
+#[test]
+fn a_layer_entry_replaces_one_inside_the_dumps_archive() {
+    let (root, layer) = (folder("romfs-entries-dump"), folder("romfs-entries"));
+    let zip = archive_of(&[("aa", b"first"), ("bb", b"second")]);
+    std::fs::write(root.join("data.zip"), &zip).unwrap();
+    let entries = layer.join("data.zip.entries");
+    std::fs::create_dir_all(&entries).unwrap();
+    std::fs::write(entries.join("bb"), b"a longer second entry").unwrap();
+    let (r, replaced) = RomFs::layered(&root, Some(&layer)).unwrap();
+    assert_eq!(replaced, ["data.zip entries bb"]);
+    let (at, len) = lookup(&r, "data.zip").expect("data.zip");
+    let mut served = vec![0; len as usize];
+    r.read(at, &mut served).unwrap();
+    // The second record starts at 52: its bytes 8 to 32 changed, nothing else.
+    let [new, stored, size] = [60, 68, 76].map(|o| u64_at(&served, o));
+    assert!(new >= zip.len() as u64 && (stored, size) == (21, 21), "the record points past the dump's bytes");
+    assert_eq!(&served[new as usize..][..21], b"a longer second entry");
+    assert_eq!((&served[..60], &served[84..zip.len()]), (&zip[..60], &zip[84..]), "the dump's other bytes");
+    // The same bytes whatever a read's bounds, across the record and the dump's end too.
+    let mut pieces = vec![0; len as usize];
+    for (i, piece) in pieces.chunks_mut(7).enumerate() {
+        r.read(at + 7 * i as u64, piece).unwrap();
+    }
+    assert_eq!(pieces, served);
+    // A name the archive lacks is refused; the dump is only read.
+    std::fs::write(entries.join("cc"), b"x").unwrap();
+    assert!(RomFs::layered(&root, Some(&layer)).unwrap_err().to_string().contains("no entry named cc"));
+    assert_eq!(std::fs::read(root.join("data.zip")).unwrap(), zip, "the dump is untouched");
+}
+
 /// An empty folder of the test's own.
 fn folder(name: &str) -> std::path::PathBuf {
     let root = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
