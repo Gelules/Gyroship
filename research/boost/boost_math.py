@@ -144,6 +144,25 @@ def until_speed(limit):
     return lambda vehicle: vehicle.locked or vehicle.meter == 0 or vehicle.speed < limit
 
 
+def exact_rule(start=(68, 45, 34), rest=8):
+    """The Blue-Marine's rule played exactly, with boost held all along: the first boosts
+    last `start` frames (1/2, 1/3, then 1/4 of the meter), every later one `rest` frames
+    (a flick about 0.1 s after each restart, played without timing errors); each boost
+    restarts by itself the moment its cooldown ends."""
+    state = {"boost": 0, "frames": 0}
+
+    def held(vehicle):
+        length = start[state["boost"]] if state["boost"] < len(start) else rest
+        if state["frames"] >= length:
+            state["boost"], state["frames"] = state["boost"] + 1, 0
+            return False
+        if not vehicle.locked:
+            state["frames"] += 1
+        return True
+
+    return held
+
+
 class Player:
     """A human who holds boost and flicks it off for `flick` frames. Timing errors are
     about `sigma` frames, a reaction takes `reaction` frames (12 = 0.2 s, give or take 2),
@@ -294,6 +313,69 @@ def aquas_chart(plt, file="bluemarine-aquas.png"):
     print(f"wrote {file}")
 
 
+def levels(v):
+    """Ways to boost, side by side: the best a robot can play, the best rule a human can
+    play (played exactly), and letting go at a fixed share of the meter. Each entry is
+    (label, a function giving a fresh pattern, line style)."""
+    full = full_meter_frames(v)
+
+    def share(p, label):
+        n = max(1, round(full * p))
+        return (f"let go at {label} of the meter ({n} frames)", lambda: boost_for(n), "-")
+
+    robot, human = {
+        "Arwing": (("perfect robot: let go at 1/3 (30 frames)", lambda: boost_for(30)), ("perfect human: the same, 1/3", lambda: boost_for(30))),
+        "Blue-Marine": (("perfect robot: let go once boost speed is 296", lambda: until_speed(296)), ("perfect human: 1/2, 1/3, 1/4, then 8-frame flicks", lambda: exact_rule())),
+        "Landmaster": (("perfect robot: hold it (100%)", lambda: hold_always), ("perfect human: the same, hold it", lambda: hold_always)),
+    }[v["name"]]
+    return [
+        (*robot, "-"),
+        (*human, "--"),
+        ("hold until the meter is full (100%)", lambda: hold_always, "-"),
+        share(1 / 2, "50%"),
+        share(1 / 3, "33%"),
+        share(1 / 4, "25%"),
+        share(1 / 5, "20%"),
+    ]
+
+
+def levels_chart(plt, v, file, seconds):
+    """Left: boost speed over the first `seconds` for each way of `levels`. Right: the extra
+    distance boosting gives over a minute (boost speed / 60 each frame, summed)."""
+    fig, (left, right) = plt.subplots(1, 2, figsize=(13, 5.6))
+    colors = plt.get_cmap("tab10").colors
+    for i, (label, pattern, style) in enumerate(levels(v)):
+        trace = run(v, pattern(), 60)
+        t = [k / FPS for k in range(len(trace))]
+        speed = [s for _, s, _ in trace]
+        width = 2.2 if i < 2 else 1.0
+        left.plot(t[: seconds * FPS], speed[: seconds * FPS], style, color=colors[i], linewidth=width, label=label)
+        ahead, total = [], 0.0
+        for s in speed:
+            total += s / FPS
+            ahead.append(total)
+        right.plot(t, ahead, style, color=colors[i], linewidth=width)
+        right.annotate(f"{total:,.0f}", (60, total), textcoords="offset points", xytext=(4, 0), fontsize=8, color=colors[i], va="center")
+    left.set(title=f"{v['name']}: boost speed over time", xlabel="time (s)", ylabel="boost speed (extra speed)")
+    left.grid(alpha=0.3)
+    right.set(title=f"{v['name']}: extra distance from boosting", xlabel="time (s)", ylabel="extra distance (units)")
+    right.set_xlim(0, 66)
+    right.grid(alpha=0.3)
+    fig.legend(loc="lower center", ncol=3, fontsize=9, frameon=False)
+    fig.tight_layout(rect=(0, 0.13, 1, 1))
+    fig.savefig(file, dpi=100)
+    plt.close(fig)
+    print(f"wrote {file}")
+
+
+def levels_table():
+    for v in (ARWING, BLUE_MARINE, LANDMASTER):
+        print(f"\n{v['name']}: each way to boost, boost held from a standstill")
+        for label, pattern, _ in levels(v):
+            trace = run(v, pattern(), 60)
+            print(f"  {label:58}: average boost speed {average(trace):6.1f}, extra distance after 60 s {sum(s for _, s, _ in trace) / FPS:9,.0f}")
+
+
 def draw(plt):
     chart(plt, ARWING, "arwing.png", 6, [("let go at 1/3 meter (30 frames)", boost_for(30)), ("hold until the meter is full", hold_always)], 90, [(30, "best: 33%"), (90, "100%")])
     chart(plt, LANDMASTER, "landmaster.png", 9, [("hold the whole time (100%)", hold_always), ("let go at half meter", boost_for(90)), ("let go at 1/3 meter", boost_for(60))], 180, [(60, "33%"), (90, "50%"), (180, "best: 100%")])
@@ -307,6 +389,9 @@ def draw(plt):
         [(3, "shortest"), (34, "25%"), (45, "33%"), (135, "100%")],
     )
     aquas_chart(plt)
+    levels_chart(plt, ARWING, "arwing-levels.png", 10)
+    levels_chart(plt, BLUE_MARINE, "bluemarine-levels.png", 25)
+    levels_chart(plt, LANDMASTER, "landmaster-levels.png", 20)
 
 
 def table(v, ns):
@@ -364,6 +449,7 @@ if __name__ == "__main__":
     ]:
         print(f"  {name:55}: average boost speed {average(run(BLUE_MARINE, pattern)):6.1f}")
     aquas_table()
+    levels_table()
     try:
         import matplotlib
 

@@ -1,6 +1,6 @@
 # Boost management in Star Fox (2026): when to let go, and why
 
-*First draft — November 2026. 60 fps. Updated on 13 November: a new Blue-Marine technique, from a brute force over Aquas (see "The best you can do by hand").*
+*First draft — November 2026. 60 fps. Updated on 13 November: a new Blue-Marine technique, from a brute force over Aquas (see "The best you can do by hand"). Updated on 16 November: every way to boost side by side, for the three vehicles (see "Every way to boost, side by side").*
 
 This follows up on the earlier boost management guide, which compared 25%, 33%, 50% and
 100% boosts on video. This time the numbers come from the game itself: the boost values
@@ -93,6 +93,42 @@ on the Landmaster.
 - **How long is a unit in real life?** Unknown: nothing we found ties it to meters.
   Compare with the cruise speed instead: full boost adds 75% on the Arwing and the
   Blue-Marine, and 71% on the Landmaster.
+
+## Every way to boost, side by side
+
+Each chart starts from a standstill with boost held, and compares seven ways to boost: the
+best a robot can play (frame-perfect), the best rule a human can play (here played exactly,
+with no timing error), and letting go at a fixed share of the meter: 100% (hold until the
+meter is full), 50%, 33%, 25% and 20%. On the left, the boost speed over time; on the right,
+the extra distance boosting gives over a minute. The gaps between the lines on the right are
+what each technique wins or loses.
+
+![Arwing: seven ways to boost, side by side](arwing-levels.png)
+
+![Blue-Marine: seven ways to boost, side by side](bluemarine-levels.png)
+
+![Landmaster: seven ways to boost, side by side](landmaster-levels.png)
+
+| Extra distance after 60 s (average boost speed) | Arwing | Blue-Marine | Landmaster |
+|---|---|---|---|
+| Perfect robot | **27,000** (450): let go at 1/3 | **16,588** (298): let go once boost speed is 296 | **7,503** (125): hold it |
+| Perfect human | **27,000** (450): the same | 15,655 (288): 1/2, 1/3, 1/4, then 8-frame boosts | **7,503** (125): the same |
+| 100% (hold until full) | 21,608 (352) | 8,550 (140) | **7,503** (125) |
+| 50% | 24,274 (400) | 11,534 (193) | 5,876 (98) |
+| 33% | **27,000** (450) | 13,226 (230) | 4,681 (78) |
+| 25% | 19,856 (330) | 13,842 (247) | 4,156 (69) |
+| 20% | 16,243 (270) | 14,059 (257) | 3,869 (65) |
+
+- **Arwing:** the robot and the human play the same thing, 1/3, and nothing else comes close:
+  letting go at 25% or 20% loses more ground than holding to 100%.
+- **Blue-Marine:** shorter is better, all the way down to 20%. The long start then short
+  boosts ends within 6% of the robot (933 units a minute behind), and 1,600 ahead of 20%.
+- **Landmaster:** holding to 100% wins, and every earlier release loses more.
+
+The perfect human's Blue-Marine boosts for 68, 45 and 34 frames (1/2, 1/3 and 1/4 of the
+meter), then 8 frames each time (the flick about 0.13 s after each restart), every one exact.
+By hand, with timing errors, the same rule averages about 285 (see "The best you can do by
+hand").
 
 ## Arwing: let go at 1/3
 
