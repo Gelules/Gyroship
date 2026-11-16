@@ -1,61 +1,52 @@
-# Boost management in Star Fox (2026): when to let go, and why
+# The Science of Boost management in Star Fox (2026)
 
-*First draft — November 2026. 60 fps. Updated on 13 November: a new Blue-Marine technique, from a brute force over Aquas (see "The best you can do by hand"). Updated on 16 November: every way to boost side by side, for the three vehicles (see "Every way to boost, side by side").*
-
-This follows up on the earlier boost management guide, which compared 25%, 33%, 50% and
+This follows up on [the earlier boost management guide](https://www.speedrun.com/sf2026/guides/ezzfs), which compared 25%, 33%, 50% and
 100% boosts on video. This time the numbers come from the game itself: the boost values
-of each vehicle were datamined from the game files, then checked frame by frame against
-the game running its own code. From there, the best way to boost is plain math.
-
-> **Status.** The strategies below come from an exact frame-by-frame simulation of the
-> game's boost rules, which matches the game itself on every one of 21,000 logged frames.
-> Recorded runs in Corneria, Aquas and Titania then measured the ground gained: each
-> technique we recorded pulled ahead of the alternative by the distance the simulation
-> predicts (see "Checked in real levels"). The Blue-Marine's by-hand technique also rests
-> on a model of human timing, and nobody has recorded it in a level yet.
+of each vehicle were datamined from the game files.
 
 ## TL;DR
 
-| Vehicle | What to do | Why |
-|---|---|---|
-| **Arwing** | Let go of boost when the meter is **1/3 full** (30 frames = 0.5 s of boost). When in doubt, a little late beats early. | That is the exact moment your boost speed maxes out. |
-| **Landmaster** | **Hold boost all the time** (100% every cycle). | Its boost speed builds slowly and fades fast, and every early release wastes a frame. |
-| **Blue-Marine** | **Start with three long boosts** (let go when the meter is 1/2 full, then 1/3, then 1/4), **then hold boost and flick it off about 0.1 s after each boost restarts.** Never before: a little late beats early. | Long boosts get boost speed up fastest from zero; once it has stacked up, short boosts keep it near max. |
+| Vehicle         | What to do                                                                                                                                                                                                                        | Why                                                                                                    |
+| --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| **Arwing**      | Let go of boost when the meter is **1/3 full** (30 frames = 0.5 s of boost). When in doubt, a little late beats early.                                                                                                            | That is the exact moment your boost speed maxes out.                                                   |
+| **Landmaster**  | **Hold boost all the time** (100% every cycle).                                                                                                                                                                                   | Its boost speed builds slowly and fades fast, and every early release wastes a frame.                  |
+| **Blue-Marine** | **Start with three long boosts** (let go when the meter is 1/2 full, then 1/3, then 1/4), **then let go every time it is 1/5 full** (4/5 of the bar left; 27 frames = 0.45 s of boost). When in doubt, a little early beats late. | Long boosts get boost speed up fastest from zero; once it has stacked up, shorter boosts keep it high. |
 
 How much it matters (average boost speed over a full boost + cooldown cycle):
 
-| Vehicle | Best technique | 100% (hold until full) | 1/3 meter | 1/4 meter |
-|---|---|---|---|---|
-| Arwing | **450** (1/3 meter) | 352 | 450 | ~340 |
-| Landmaster | **125** (100%) | 125 | 78 | 69 |
-| Blue-Marine | **about 285** by hand (long start, then quick flicks; 298 frame-perfect) | 140 | 230 | 247 |
+| Vehicle     | Recommended technique                                                                                        | 100% (hold until full) | 1/3 meter | 1/4 meter |
+| ----------- | ------------------------------------------------------------------------------------------------------------ | ---------------------- | --------- | --------- |
+| Arwing      | **450** (1/3 meter)                                                                                          | 352                    | 450       | 330       |
+| Landmaster  | **125** (100%)                                                                                               | 125                    | 78        | 69        |
+| Blue-Marine | **about 255** by hand (long start, then 1/5 every time; 257 played exactly, 298 for the frame-perfect robot) | 140                    | 230       | 247       |
 
 "Boost speed" here is the **extra** speed boosting adds on top of your cruise speed, in
 the game's distance units per second (see "Units"). Its average over a whole cycle is
 what decides how much ground you gain.
 
-## How the boost meter really works (all three vehicles)
+## How the boost meter really works
 
 1. **The meter is a heat meter.** It fills while you boost, and also while you brake: boost
-   and brake share the same meter. It drains when you let go.
+   and brake share the same meter. It drains when you let go. On screen, the boost bar shows
+   it the other way round: full when the meter is empty, emptying as the meter fills. So "the
+   meter is 1/5 full" means 4/5 of the bar is left.
 2. **Draining starts the very next frame.** There is no delay before the cooldown.
-3. **Once you let go with anything in the meter, boost and brake are locked until the
-   meter is completely empty.** You can't release at 50% and boost again at 30%.
+3. **Once you let go with anything in the meter, boost and brake are locked until the**
+   **meter is completely empty.** You can't release at 50% and boost again at 30%.
 4. **Holding boost during the cooldown costs nothing.** The boost restarts on its own the
    frame right after the meter is empty.
 5. **Releasing early does not give you more boost time.** On the Arwing and the
    Blue-Marine, the meter drains half as fast as it fills, so N frames of boost cost
-   2N frames of cooldown: you boost 1/3 of the time, whatever you do. (On the Blue-Marine,
-   the game's 32-bit rounding leaves a sliver in the meter after a boost of 4 to 7, 15 to 28
-   or 59 to 115 frames, and the cooldown lasts one frame more.) On the Landmaster, fill and
+   2N frames of cooldown (on the Blue-Marine, the game's rounding sometimes adds one: see
+   "The best you can do by hand"): you boost 1/3 of the time, whatever you do. On the Landmaster, fill and
    drain go at the same speed: N frames of boost cost N frames of cooldown, plus one extra
    frame if you let go before the meter is full.
 6. **A big hit while you boost or brake forces the cooldown**, as if you had let go. It
    takes a hit worth 40 or more (or exactly 38). In our runs, the hits worth 40 were not
    projectiles (collisions, it seems) and did it; laser shots were worth 20 and didn't.
 
-So what does change with your release timing? **How fast you go during and after each
-boost:** how the boost speed builds up while you boost, and how it fades during the
+So what does change with your release timing? **How fast you go during and after each**
+**boost:** how the boost speed builds up while you boost, and how it fades during the
 cooldown. That is where each vehicle's optimum comes from.
 
 ## The numbers
@@ -63,18 +54,18 @@ cooldown. That is where each vehicle's optimum comes from.
 Per second, and per frame at 60 fps (divide by 60). Speeds are in the game's distance
 units per second (see "Units" below the table).
 
-| | Arwing | Blue-Marine | Landmaster |
-|---|---|---|---|
-| Meter size | 90 | 90 | 90 |
-| Meter fill while boosting | 60/s (1 per frame) | 40/s (0.67 per frame) | 30/s (0.5 per frame) |
-| Meter drain during cooldown | 30/s (0.5 per frame) | 20/s (0.33 per frame) | 30/s (0.5 per frame) |
-| Full meter lasts | 1.5 s (90 frames) | 2.25 s (135 frames) | 3 s (180 frames) |
-| Cruise speed (no boost) | 1200 | 400 | 425 |
-| Boost speed max | 900 | 300 | 300 (eases in) |
-| Speed at max boost (cruise + boost) | 2100 (×1.75) | 700 (×1.75) | 725 (×1.71) |
-| Boost speed build-up | +1800/s (+30 per frame) | +250/s (+4.17 per frame) | up to +3 per frame, then easing in |
-| Boost speed fade (not boosting) | −900/s (−15 per frame) | −100/s (−1.67 per frame) | −5% of its value per frame |
-| Brake | −900/s down to −600, comes back at +450/s | −125/s down to −300, comes back at +100/s | eases toward −300 |
+|                                     | Arwing                                    | Blue-Marine                               | Landmaster                         |
+| ----------------------------------- | ----------------------------------------- | ----------------------------------------- | ---------------------------------- |
+| Meter size                          | 90                                        | 90                                        | 90                                 |
+| Meter fill while boosting           | 60/s (1 per frame)                        | 40/s (0.67 per frame)                     | 30/s (0.5 per frame)               |
+| Meter drain during cooldown         | 30/s (0.5 per frame)                      | 20/s (0.33 per frame)                     | 30/s (0.5 per frame)               |
+| Full meter lasts                    | 1.5 s (90 frames)                         | 2.25 s (135 frames)                       | 3 s (180 frames)                   |
+| Cruise speed (no boost)             | 1200                                      | 400                                       | 425                                |
+| Boost speed max                     | 900                                       | 300                                       | 300 (eases in)                     |
+| Speed at max boost (cruise + boost) | 2100 (×1.75)                              | 700 (×1.75)                               | 725 (×1.71)                        |
+| Boost speed build-up                | +1800/s (+30 per frame)                   | +250/s (+4.17 per frame)                  | up to +3 per frame, then easing in |
+| Boost speed fade (not boosting)     | −900/s (−15 per frame)                    | −100/s (−1.67 per frame)                  | −5% of its value per frame         |
+| Brake                               | −900/s down to −600, comes back at +450/s | −125/s down to −300, comes back at +100/s | eases toward −300                  |
 
 Boost and brake at the same time: boost wins on the Arwing and the Blue-Marine, brake wins
 on the Landmaster.
@@ -84,20 +75,20 @@ on the Landmaster.
 - **Speeds are in the game's own distance units per second**: the same units as the
   positions in the game world. Boost speed adds to the cruise speed, and the sum is how
   fast you move: at 60 fps, each frame moves you (cruise speed + boost speed) / 60 units.
-  The Arwing covers 20 units per frame with no boost, and 35 at full boost.
+  The Arwing covers 20 units per frame with no boost, and 35 at full boost;
 - **Build-up and fade are changes of the boost speed.** +1800/s means the boost speed goes
-  up by 1,800 every second (+30 every frame), so it reaches 900 after 30 frames.
+  up by 1,800 every second (+30 every frame), so it reaches 900 after 30 frames;
 - **Braking makes the boost speed negative**, and the sum still holds: at −600, the Arwing
-  moves at 1,200 − 600 = 600.
-- **The meter (0 to 90) has its own units**, unrelated to distance.
-- **How long is a unit in real life?** Unknown: nothing we found ties it to meters.
+  moves at 1,200 − 600 = 600;
+- **The meter has its own units**, unrelated to distance;
+- **How long is a unit in real life?** Unknown: nothing I found ties it to meters.
   Compare with the cruise speed instead: full boost adds 75% on the Arwing and the
   Blue-Marine, and 71% on the Landmaster.
 
-## Every way to boost, side by side
+## Every way to boost
 
 Each chart starts from a standstill with boost held, and compares seven ways to boost: the
-best a robot can play (frame-perfect), the best rule a human can play (here played exactly,
+best a robot can play (frame-perfect), a simple rule a human can follow (here played exactly,
 with no timing error), and letting go at a fixed share of the meter: 100% (hold until the
 meter is full), 50%, 33%, 25% and 20%. On the left, the boost speed over time; on the right,
 the extra distance boosting gives over a minute. The gaps between the lines on the right are
@@ -109,26 +100,35 @@ what each technique wins or loses.
 
 ![Landmaster: seven ways to boost, side by side](landmaster-levels.png)
 
-| Extra distance after 60 s (average boost speed) | Arwing | Blue-Marine | Landmaster |
-|---|---|---|---|
-| Perfect robot | **27,000** (450): let go at 1/3 | **16,588** (298): let go once boost speed is 296 | **7,503** (125): hold it |
-| Perfect human | **27,000** (450): the same | 15,655 (288): 1/2, 1/3, 1/4, then 8-frame boosts | **7,503** (125): the same |
-| 100% (hold until full) | 21,608 (352) | 8,550 (140) | **7,503** (125) |
-| 50% | 24,274 (400) | 11,534 (193) | 5,876 (98) |
-| 33% | **27,000** (450) | 13,226 (230) | 4,681 (78) |
-| 25% | 19,856 (330) | 13,842 (247) | 4,156 (69) |
-| 20% | 16,243 (270) | 14,059 (257) | 3,869 (65) |
+| Extra distance after 60 s (average boost speed once settled) | Arwing                          | Blue-Marine                                                                                                  | Landmaster                |
+| ------------------------------------------------------------ | ------------------------------- | ------------------------------------------------------------------------------------------------------------ | ------------------------- |
+| Perfect robot                                                | **27,000** (450): let go at 1/3 | **16,588** (298): let go once boost speed is 296 (boosts of 72, 58, 46, 37… frames, then 1 frame; see below) | **7,503** (125): hold it  |
+| Perfect human                                                | **27,000** (450): the same      | 14,511 (257): 1/2, 1/3, 1/4, then 1/5 every time                                                             | **7,503** (125): the same |
+| 100% (hold until full)                                       | 21,608 (352)                    | 8,550 (140)                                                                                                  | **7,503** (125)           |
+| 50%                                                          | 24,274 (400)                    | 11,534 (193)                                                                                                 | 5,876 (97)                |
+| 33%                                                          | **27,000** (450)                | 13,226 (230)                                                                                                 | 4,681 (78)                |
+| 25%                                                          | 19,856 (330)                    | 13,842 (247)                                                                                                 | 4,156 (69)                |
+| 20%                                                          | 16,243 (270)                    | 14,059 (257)                                                                                                 | 3,869 (65)                |
 
 - **Arwing:** the robot and the human play the same thing, 1/3, and nothing else comes close:
   letting go at 25% or 20% loses more ground than holding to 100%.
-- **Blue-Marine:** shorter is better, all the way down to 20%. The long start then short
-  boosts ends within 6% of the robot (933 units a minute behind), and 1,600 ahead of 20%.
+- **Blue-Marine:** shorter is better, all the way down to 20%. The long start then 1/5 ends
+  2,076 units behind the robot after a minute (13% less), and 453 ahead of 1/5 from the start.
 - **Landmaster:** holding to 100% wins, and every earlier release loses more.
 
 The perfect human's Blue-Marine boosts for 68, 45 and 34 frames (1/2, 1/3 and 1/4 of the
-meter), then 8 frames each time (the flick about 0.13 s after each restart), every one exact.
-By hand, with timing errors, the same rule averages about 285 (see "The best you can do by
-hand").
+meter), then 27 frames each time (1/5 of the meter, 0.45 s), every one exact. By hand, with
+timing errors, the same rule averages about 255 (see "The best you can do by hand").
+
+**What "let go once boost speed is 296" looks like.** Nothing in the game shows your boost
+speed, so here is the robot's Blue-Marine in frames, from a standstill with boost held. It
+lets go after 72 frames (1.2 s), then 58 (0.97 s), 46 (0.77 s), 37, 29, 24, 19, 16, 13, 10, 8,
+7, 6, 5, 4, 4, 4, 3, 3, 2 and 2 frames, and from 18.8 s on, every boost lasts a single frame.
+Each boost restarts by itself the frame after the meter empties, with more boost speed left than
+the one before (58 after the first cooldown, then 107, 145, 176, 200...), so each one tops
+out sooner. On the bar, the first release comes with 47% of it left, then 57%, 66%, 73%,
+79%..., and the last ones with almost all of it. You can watch the game play it in
+[this video](https://www.youtube.com/watch?v=4xGKIlfAu6g) (see "Checked in real levels").
 
 ## Arwing: let go at 1/3
 
@@ -153,18 +153,18 @@ with N, up to N = 30.
 frame of boost adds 2 frames of cooldown. Your boost speed is back to zero 60 frames after
 you let go, so the rest of the cooldown is spent at zero. The average drops: 300 + 4500/N.
 
-| Boost frames | Meter when you let go | Average boost speed |
-|---|---|---|
-| 25 | 28% | 375 |
-| 29 | 32% | 435 |
-| **30** | **33%** | **450** |
-| 31 | 34% | 445 |
-| 33 | 37% | 436 |
-| 35 | 39% | 429 |
-| 45 | 50% | 400 |
-| 60 | 67% | 375 |
-| 90 (full) | 100% | 350 |
-| 91 (held until it locks) | 100% | 352 |
+| Boost frames             | Meter when you let go | Average boost speed |
+| ------------------------ | --------------------- | ------------------- |
+| 25                       | 28%                   | 375                 |
+| 29                       | 32%                   | 435                 |
+| **30**                   | **33%**               | **450**             |
+| 31                       | 34%                   | 445                 |
+| 33                       | 37%                   | 436                 |
+| 35                       | 39%                   | 429                 |
+| 45                       | 50%                   | 400                 |
+| 60                       | 67%                   | 375                 |
+| 90 (full)                | 100%                  | 350                 |
+| 91 (held until it locks) | 100%                  | 352                 |
 
 **Timing tip.** Missing the mark is not symmetric: one frame early costs 3.3%, one frame
 late costs about 1%. Aim at **31 to 33 frames (34 to 37% of the meter)**: you lose only
@@ -185,23 +185,23 @@ The Landmaster works differently:
   once it is within 30 of the top (300), it covers 10% of the remaining gap each frame;
 - it **fades fast**: it loses 5% of its value every frame when you're not boosting (half
   gone in about 14 frames);
-- its meter fills and drains at the same speed, and **letting go before the meter is full
-  adds one dead frame** to the cooldown.
+- its meter fills and drains at the same speed, and **letting go before the meter is full**
+  **adds one dead frame** to the cooldown.
 
 A short boost never gives the boost speed time to build, and whatever it built is gone a
 few frames later. Holding boost keeps you near 300 for most of the boost, and the cycle
 restarts on its own when the meter is empty.
 
-| Boost frames | Meter when you let go | Average boost speed |
-|---|---|---|
-| 10 | 6% | 54 |
-| 45 | 25% | 69 |
-| 60 | 33% | 78 |
-| 90 | 50% | 97 |
-| 120 | 67% | 111 |
-| 150 | 83% | 119 |
-| 180 (full) | 100% | 124 |
-| **181 (held until it locks)** | **100%** | **125** |
+| Boost frames                  | Meter when you let go | Average boost speed |
+| ----------------------------- | --------------------- | ------------------- |
+| 10                            | 6%                    | 54                  |
+| 45                            | 25%                   | 69                  |
+| 60                            | 33%                   | 78                  |
+| 90                            | 50%                   | 97                  |
+| 120                           | 67%                   | 111                 |
+| 150                           | 83%                   | 119                 |
+| 180 (full)                    | 100%                  | 124                 |
+| **181 (held until it locks)** | **100%**              | **125**             |
 
 Careful: from the game code, the Landmaster's lean moves (tilting left or right) also use
 the boost meter, so leaning while boosting fills it twice as fast. That part has not been
@@ -219,21 +219,23 @@ but its boost speed builds faster than it fades:
   you boosted.
 
 Every cycle you **keep some boost speed**: about +50 for each second of boosting. So the
-boost speed **stacks up** from one boost to the next, until it reaches the max (300). It
-takes about 15 to 17 seconds of non-stop boosting cycles to get there from zero.
+boost speed **stacks up** from one boost to the next, until it reaches the max (300). From
+zero, that takes about 13 to 14 seconds with the 1/5 rule below, and about 18 with the
+shortest boosts.
 
 Once you're at the top, **short boosts are best**: after a short boost, the cooldown is
 short too, so the boost speed barely has time to fade.
 
 | Boost frames | Meter when you let go | Average boost speed (once stacked) |
-|---|---|---|
-| 2 | 1.5% | 297 |
-| 3 | 2.2% | 295 |
-| 6 | 4.4% | 290 |
-| 15 | 11% | 276 |
-| 34 | 25% | 247 |
-| 45 | 33% | 230 |
-| 135 (full) | 100% | 140 |
+| ------------ | --------------------- | ---------------------------------- |
+| 2            | 1.5%                  | 297                                |
+| 3            | 2.2%                  | 295                                |
+| 6            | 4.4%                  | 290                                |
+| 15           | 11%                   | 276                                |
+| 27           | 20%                   | 257                                |
+| 34           | 25%                   | 247                                |
+| 45           | 33%                   | 230                                |
+| 135 (full)   | 100%                  | 140                                |
 
 That's why 25% looked better than 33% in the video comparisons: shorter is better, all the
 way down.
@@ -245,25 +247,34 @@ console video of Aquas shows it: tapping about 3.4 times a second, with presses 
 first boost to the boss arena, that run took 253.7 s: 89 s more than a 3:53 speedrun that
 boosts about 39 frames at a time (164.6 s). Instead:
 
-> **Start with three long boosts: let go when the meter is 1/2 full, then 1/3, then 1/4.
-> Then hold boost, and flick it off (a quick release, 2 to 4 frames) about 0.1 s after
-> each boost restarts. Never before it: a little late beats early.**
+> **Start with three long boosts: let go when the meter is 1/2 full, then 1/3, then 1/4.**
+> **Then let go every time it is 1/5 full (27 frames, 0.45 s of boost). Keep boost held**
+> **in between: a little early beats late.**
 
-The boost restarts by itself the moment each cooldown ends, and each flick just ends the
-current boost. Once settled, that's about 7 frames of boost and 14 of cooldown: close to
-3 flicks a second, each just after the boost comes back. Can't watch for it? After the same
-start, short flicks 4 to 5 times a second, without looking, cost about 1 s (see "The best
-you can do by hand" below).
+Holding boost through the cooldown costs nothing: the boost restarts by itself the moment
+the meter is empty, and each quick release just ends the boost under way. After the long
+start, each cycle is 27 frames of boost and 55 of cooldown (0.45 s and 0.92 s; the game's
+rounding adds a frame to the cooldown): let go when 4/5 of the bar is left. A cycle lasts
+about 1.4 s, but time each release from the bar, not on a beat: as on the Arwing, a beat
+drifts. 1/4 works too, but it is about 2 s slower on Aquas (see "The best you can do by
+hand" below).
 
-With perfect timing, a fixed rhythm gives these averages once stacked:
+**Faster, but much harder: flicks.** Shorter boosts are faster all the way down. Hold boost
+and flick it off (a quick release, 2 to 4 frames) about 0.1 s after each boost restarts:
+once settled, that's about 7 frames of boost and 14 to 15 of cooldown, close to 3 flicks a
+second.
+That gains about 6 s on Aquas over the 1/5 rule, but each flick has to land just after the
+boost comes back. Without looking, short flicks 4 to 5 times a second still gain about 5 s.
 
-| Technique | Average boost speed |
-|---|---|
-| Hold, release 2 frames every 9 frames (6.7 per second) | 295 |
-| Hold, release 3 frames every 12 frames (5 per second) | 284 |
-| Hold, release 3 frames every 15 frames (4 per second) | 280 |
-| Hold, release 2 frames every 6 frames (10 per second) | 101 (too fast: cycles can't fit) |
-| Hold the whole time | 140 |
+With perfect timing, a fixed rhythm of flicks gives these averages once stacked:
+
+| Technique                                              | Average boost speed                                                                      |
+| ------------------------------------------------------ | ---------------------------------------------------------------------------------------- |
+| Hold, release 2 frames every 9 frames (6.7 per second) | 295                                                                                      |
+| Hold, release 3 frames every 12 frames (5 per second)  | 284                                                                                      |
+| Hold, release 3 frames every 15 frames (4 per second)  | 280                                                                                      |
+| Hold, release 2 frames every 6 frames (10 per second)  | 101 from 30 to 60 s, and still stacking at only +2 a second (too fast: cycles can't fit) |
+| Hold the whole time                                    | 140                                                                                      |
 
 By hand, the timing is never perfect: see "The best you can do by hand" below.
 
@@ -280,13 +291,15 @@ video. Each race starts with no boost speed, at cruise speed 400 plus boost spee
 
 **Every boost length, frame-perfect** (black curve): from 1 frame to the full meter, the
 same length every time. Shorter is faster, all the way down to 1-frame boosts: 150.1 s. The
-bump at 4 to 7 frames and the step at 15 come from the extra cooldown frame of rule 5.
+bump at 4 to 7 frames and the step at 15 come from the game's rounding: after a boost of 4 to
+7, 15 to 28 or 59 to 115 frames, a sliver stays in the meter and the cooldown lasts one frame
+more.
 
 **Long boosts first is better still.** While you boost, boost speed climbs at 250 per
 second; in the cooldown it falls at only 100 per second. Below the max, a longer boost rides
 higher through its whole cycle; at the max, it only adds cooldown. So each boost should end
 as boost speed tops out: let go as soon as it is 296 or more (the max is 300). From zero,
-that gives boosts of 72, 58, 46, 37, 29, 24... frames, down to 1 frame after 19 s, and
+that gives boosts of 72, 58, 46, 37, 29, 24... frames, down to 1 frame from 18.8 s on, and
 148.2 s: a search over boost sequences found nothing faster. Over the first 20 s, boost
 speed averages 233 that way, against 167 with 1-frame boosts. Waiting for exactly 300 gives
 150.0 s: the boosts get stuck at 6 frames.
@@ -301,50 +314,50 @@ at the same length every time (red curve) can't let go sooner than a reaction af
 boost restarts: about 13 frames with the input lag, 10% of the meter. Aiming shorter still
 gives 153.8 s.
 
-| Aquas, first boost to the boss arena | Time |
-|---|---|
-| Frame-perfect: let go once boost speed is 296 or more | 148.2 s |
-| Frame-perfect: 1-frame boosts all along | 150.1 s |
-| **By hand: long start, then flick 0.1 s after each boost restarts** | **151.5 s** |
+| Aquas, first boost to the boss arena                                  | Time             |
+| --------------------------------------------------------------------- | ---------------- |
+| Frame-perfect: let go once boost speed is 296 or more                 | 148.2 s          |
+| Frame-perfect: 1-frame boosts all along                               | 150.1 s          |
+| By hand: long start, then flick 0.1 s after each boost restarts       | 151.5 s          |
 | By hand: long start, then flick 4 to 5 times a second without looking | 152.4 to 152.8 s |
-| By hand: long start, then flick when you see the boost restart | 152.8 s |
-| By hand: no long start, flick 2 frames every 9 (6.7 a second) | 154.3 s |
-| Frame-perfect: 39-frame boosts (29% of the meter) | 161.1 s |
-| The 3:53 speedrun (about 39-frame boosts), measured on its video | 164.6 s |
-| Hold boost the whole time | 189.0 s |
-| The tapping run, measured on its video | 253.7 s |
+| By hand: long start, then flick when you see the boost restart        | 152.8 s          |
+| By hand: no long start, flick 2 frames every 9 (6.7 a second)         | 154.3 s          |
+| **By hand: long start, then let go at 1/5 every time**                | **157.3 s**      |
+| By hand: no long start, let go at 1/5 every time                      | 158.0 s          |
+| By hand: long start, then let go at 1/4 every time                    | 159.6 s          |
+| Frame-perfect: 39-frame boosts (29% of the meter)                     | 161.1 s          |
+| The 3:53 speedrun (about 39-frame boosts), measured on its video      | 164.6 s          |
+| Hold boost the whole time                                             | 189.0 s          |
+| The tapping run, measured on its video                                | 253.7 s          |
 
-The rule is 1.4 s behind frame-perfect 1-frame boosts and 3.3 s behind the best
-frame-perfect play, and 12 to 13 s ahead of the speedrun's boosting. The long start alone is
-worth 1.4 s (152.9 s without it).
+The 1/5 rule is 9.1 s behind the best frame-perfect play and 7.3 s ahead of the speedrun's
+boosting. It beats 1/4 by about 2 s, and the long start is worth about 0.6 s. Once stacked,
+it averages a boost speed of about 255 (257 played exactly). Flicks gain about 6 s more, if
+you can time them.
 
-**It doesn't need precision.** Starting from the rule (151.5 s):
+**It doesn't need precision.** Starting from the 1/5 rule (157.3 s):
 
-| What goes wrong | Time |
-|---|---|
-| Each flick 4 frames (0.07 s) too early | 153.8 s |
-| Each flick 4 frames too late | 152.2 s |
-| Timing errors of 4 frames instead of 2 | 152.7 s |
-| Each long boost 8 frames too short | 151.9 s |
-| First long boost at 2/3 of the meter instead of 1/2 | 153.1 s |
-| Reacting to the restart, in 0.28 s (slow reactions, or a TV's lag) | 154.4 s |
-| Without looking: 6-frame flicks 4 times a second | 154.0 s |
-| Without looking: 6-frame flicks 5 times a second | 191.5 s |
+| What goes wrong                                     | Time    |
+| --------------------------------------------------- | ------- |
+| Each 1/5 release 4 frames (0.07 s) early            | 156.2 s |
+| Each 1/5 release 4 frames late                      | 158.5 s |
+| Timing errors of 4 frames instead of 2              | 157.7 s |
+| Each long boost 8 frames too short                  | 157.6 s |
+| First long boost at 2/3 of the meter instead of 1/2 | 158.4 s |
 
-- **Too early costs more than too late**, as on the Arwing. A flick that lands while the
-  meter is still emptying does nothing, so that boost runs on until you react; one that
-  overlaps the restart delays it.
-- **Anticipate the restart rather than react to it.** It comes back at a steady beat, about
-  every third of a second: flick just after each one. Reacting works (152.8 s with 0.2 s
-  reactions), but each frame of reaction time costs about 0.3 s.
-- **Without looking, keep the flicks short.** About 40% of them land in the cooldown and do
-  nothing, which is fine. But long flicks at a fast rate are tapping: at 5 a second,
-  6-frame flicks are slower than holding boost.
+- **Early beats late.** Letting go a little before 1/5 is even faster (shorter boosts are
+  better: 1/5 is a mark you can see, not a limit), and a little after costs about as much.
+  If in doubt, let go sooner.
+- **The long start is forgiving.** Long boosts 8 frames short cost about 0.25 s; holding the first
+  one to 2/3 of the meter costs 1.1 s.
+- **Flicks are less forgiving.** A flick that lands while the meter is still emptying does
+  nothing, so with flicks, too early costs more than too late (153.8 s against 152.2 s, 4
+  frames either way): anticipate each restart, which comes back about every third of a
+  second, rather than react to it.
 
-## The rules, as code
+## Code
 
 This is the whole boost logic, frame by frame, at 60 fps (values from the tables above).
-The game computes in 32-bit floats; the full script rounds every step the same way.
 
 ```python
 # Arwing and Blue-Marine
@@ -429,11 +442,11 @@ Two recorded runs per mission, identical up to a point where the vehicle can boo
 run covered, and the boost speed logs predict the gap: the boost speed difference, added
 up frame by frame.
 
-| Mission | Technique A | Technique B | Average boost speed, A / B | Ground A gained | Predicted |
-|---|---|---|---|---|---|
-| Corneria (Arwing) | boost 30 frames, let go until the meter is empty | hold | 432 / 379 | 1,325.0 | 1,325.0 |
-| Aquas (Blue-Marine) | hold, release 2 frames every 9 | hold | 192 / 151 | 1,015.7 | 1,015.8 |
-| Titania (Landmaster) | hold | boost 60 frames (1/3 meter) | 118 / 90 | 684.5 | 709.1 |
+| Mission              | Technique A                                      | Technique B                 | Average boost speed, A / B | Ground A gained | Predicted |
+| -------------------- | ------------------------------------------------ | --------------------------- | -------------------------- | --------------- | --------- |
+| Corneria (Arwing)    | boost 30 frames, let go until the meter is empty | hold                        | 432 / 379                  | 1,325.0         | 1,325.0   |
+| Aquas (Blue-Marine)  | hold, release 2 frames every 9                   | hold                        | 192 / 151                  | 1,015.7         | 1,015.8   |
+| Titania (Landmaster) | hold                                             | boost 60 frames (1/3 meter) | 118 / 90                   | 684.5           | 709.1     |
 
 - **Boost speed turns into ground one for one.** On the Arwing to a thousandth of a unit
   (1,325.0000 against 1,325.0006); on the Blue-Marine to 0.01%, which is the rounding of
@@ -441,7 +454,7 @@ up frame by frame.
   the road doesn't always follow (in places only 60% of the Landmaster's speed goes along
   it), so the gap comes out 3.5% below the prediction.
 - **The averages are lower than in the tables above**: each window starts from zero boost
-  speed (the Blue-Marine takes about 15 s to stack it), hits cut some boosts short (four
+  speed (the Blue-Marine takes about 18 s to stack it), hits cut some boosts short (four
   in Titania's run A, three in run B), and every scripted press reached the game one frame
   early (it reads each frame's buttons from two consecutive samples of the script, and
   either one held counts): the Arwing's first 30-frame boost came out as 31 frames, its
@@ -456,6 +469,16 @@ averaged 232.7 over the first 20 s and 298.3 after that, through 8 hits. The are
 148.7 s after the first boost (148.2 s predicted for the estimated 102,200 units); the
 same run with 2-frame boosts all along took 150.8 s. The 3:53 speedrun took 164.6 s over
 that stretch.
+
+**Watch it: [the frame-perfect Blue-Marine on Aquas](https://www.youtube.com/watch?v=4xGKIlfAu6g).**
+That is this run, filmed, with the game's own sound. The title card at the start gives the
+schedule. The sub doesn't steer and takes its hits; the game's Unkillable mode keeps it
+alive. At the bottom left, a readout gives the boost speed (out of 300) and the total speed
+(cruise 400 plus boost), both averaged over half a second (frame by frame, they would only
+show one moment of each cycle), and the time since the first boost. Watch the boost speed
+stack up through the long early boosts and, once every boost lasts a single frame, settle at
+about 298 a little after 19 s, then stay there all the way to the boss arena at 148.7 s: 16 s
+sooner than the 3:53 speedrun over the same stretch, with no steering at all.
 
 ## Not covered yet
 
@@ -502,8 +525,10 @@ repository.
 - **The tables and charts.** `python boost_math.py`, in this folder.
 - **The Aquas run of the frame-perfect schedule.** The script holds X and lets it go for one
   frame each time the schedule does. The game reads X at present p from the replay's
-  samples p + 777 and p + 778 (either one held counts as held, as on every frame of the six
-  runs above), so a one-frame release is two released samples; the update of present 7103
-  is the first that can boost. A
-  `--romfs-layer` folder serves a build settings file that keeps the retail build and turns
-  the game's Unkillable mode on, and `--video` films the run.
+  samples p + 777 and p + 778 (either one held counts as held, as on all 13,943 frames
+  compared in the six runs above), so a one-frame release is two released samples; the
+  update of present 7103 is the first that can boost. A `--romfs-layer` folder serves a
+  build settings file that keeps the retail build and turns the game's Unkillable mode on.
+  `--video` films the run and `--dump-audio` records its sound; the title card and the
+  readout are drawn afterwards from the trace
+  ([on YouTube](https://www.youtube.com/watch?v=4xGKIlfAu6g)).

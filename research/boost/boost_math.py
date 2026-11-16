@@ -144,11 +144,11 @@ def until_speed(limit):
     return lambda vehicle: vehicle.locked or vehicle.meter == 0 or vehicle.speed < limit
 
 
-def exact_rule(start=(68, 45, 34), rest=8):
-    """The Blue-Marine's rule played exactly, with boost held all along: the first boosts
-    last `start` frames (1/2, 1/3, then 1/4 of the meter), every later one `rest` frames
-    (a flick about 0.1 s after each restart, played without timing errors); each boost
-    restarts by itself the moment its cooldown ends."""
+def exact_rule(start=(68, 45, 34), rest=27):
+    """The Blue-Marine's human rule played exactly, with boost held all along: the first
+    boosts last `start` frames (1/2, 1/3, then 1/4 of the meter), every later one `rest`
+    frames (1/5 of the meter, 0.45 s); each boost restarts by itself the moment its
+    cooldown ends."""
     state = {"boost": 0, "frames": 0}
 
     def held(vehicle):
@@ -168,7 +168,8 @@ class Player:
     about `sigma` frames, a reaction takes `reaction` frames (12 = 0.2 s, give or take 2),
     and each button change reaches the game 1 or 2 frames late. The first boosts are let
     go when the meter shows `start` frames of boost (68, 45, 34: 1/2, 1/3, 1/4 of the
-    Blue-Marine's meter), never sooner than a reaction. Then, by `mode`:
+    Blue-Marine's meter; HUMAN_RULE goes on with 1/5 for every later boost), never sooner
+    than a reaction. After the last of `start`, by `mode`:
       "react":      let go when you see the boost restart;
       "anticipate": let go `aim` frames after the boost should restart (twice the last
                     boost after it ended); when a flick misses, react;
@@ -209,6 +210,11 @@ class Player:
         while self.flicks and self.flicks[0][1] <= t:
             self.flicks.pop(0)
         return not any(lo <= t < end for lo, end in self.flicks)
+
+
+# The Blue-Marine's human rule as boost lengths, for Player: three long boosts (1/2, 1/3 and
+# 1/4 of the meter), then 1/5 of the meter (27 frames) every time, for any race's length.
+HUMAN_RULE = (68, 45, 34) + (27,) * 999
 
 
 def run(v, pattern, seconds=60):
@@ -299,6 +305,7 @@ def aquas_chart(plt, file="bluemarine-aquas.png"):
     for y, text in [
         (aquas_time(until_speed(296)), "frame-perfect: let go once boost speed is 296"),
         (aquas_human("anticipate"), "by hand: long start, then flick 0.1 s after each restart"),
+        (aquas_human("react", start=HUMAN_RULE), "by hand: long start, then let go at 1/5 every time"),
         (164.6, "the 3:53 speedrun, measured on its video"),
     ]:
         ax.axhline(y, linestyle="--", linewidth=1.0, color="gray")
@@ -325,7 +332,7 @@ def levels(v):
 
     robot, human = {
         "Arwing": (("perfect robot: let go at 1/3 (30 frames)", lambda: boost_for(30)), ("perfect human: the same, 1/3", lambda: boost_for(30))),
-        "Blue-Marine": (("perfect robot: let go once boost speed is 296", lambda: until_speed(296)), ("perfect human: 1/2, 1/3, 1/4, then 8-frame flicks", lambda: exact_rule())),
+        "Blue-Marine": (("perfect robot: let go once boost speed is 296", lambda: until_speed(296)), ("perfect human: 1/2, 1/3, 1/4, then 1/5 every time", lambda: exact_rule())),
         "Landmaster": (("perfect robot: hold it (100%)", lambda: hold_always), ("perfect human: the same, hold it", lambda: hold_always)),
     }[v["name"]]
     return [
@@ -344,6 +351,7 @@ def levels_chart(plt, v, file, seconds):
     distance boosting gives over a minute (boost speed / 60 each frame, summed)."""
     fig, (left, right) = plt.subplots(1, 2, figsize=(13, 5.6))
     colors = plt.get_cmap("tab10").colors
+    ends = []
     for i, (label, pattern, style) in enumerate(levels(v)):
         trace = run(v, pattern(), 60)
         t = [k / FPS for k in range(len(trace))]
@@ -355,7 +363,13 @@ def levels_chart(plt, v, file, seconds):
             total += s / FPS
             ahead.append(total)
         right.plot(t, ahead, style, color=colors[i], linewidth=width)
-        right.annotate(f"{total:,.0f}", (60, total), textcoords="offset points", xytext=(4, 0), fontsize=8, color=colors[i], va="center")
+        ends.append((total, colors[i]))
+    # Each line's total at its end, the labels pushed apart (about a line of text) so that none
+    # hides another.
+    gap, y = 0.055 * (max(ends)[0] - min(ends)[0]), float("inf")
+    for total, color in sorted(ends, key=lambda e: -e[0]):
+        y = min(total, y - gap)
+        right.annotate(f"{total:,.0f}", (60, y), textcoords="offset points", xytext=(4, 0), fontsize=8, color=color, va="center")
     left.set(title=f"{v['name']}: boost speed over time", xlabel="time (s)", ylabel="boost speed (extra speed)")
     left.grid(alpha=0.3)
     right.set(title=f"{v['name']}: extra distance from boosting", xlabel="time (s)", ylabel="extra distance (units)")
@@ -384,9 +398,9 @@ def draw(plt):
         BLUE_MARINE,
         "bluemarine.png",
         30,
-        [("by hand: long start, then quick flicks", Player("anticipate")), ("let go at 1/3 meter", boost_for(45)), ("hold the whole time", hold_always)],
+        [("by hand: long start, then 1/5 every time", Player("react", start=HUMAN_RULE)), ("let go at 1/3 meter", boost_for(45)), ("hold the whole time", hold_always)],
         135,
-        [(3, "shortest"), (34, "25%"), (45, "33%"), (135, "100%")],
+        [(1, "1 frame"), (27, "20%"), (45, "33%"), (135, "100%")],
     )
     aquas_chart(plt)
     levels_chart(plt, ARWING, "arwing-levels.png", 10)
@@ -414,31 +428,37 @@ def aquas_table():
         print(f"  {name:62}: {aquas_time(pattern):6.1f} s")
     print("By hand, average of 16 players (long start: let go at 1/2, 1/3, then 1/4 of the meter):")
     for name, mode, player in [
+        ("the rule: long start, then let go at 1/5 every time", "react", dict(start=HUMAN_RULE)),
+        ("long start, then let go at 1/4 every time", "react", dict(start=(68, 45, 34) + (34,) * 999)),
+        ("no long start, let go at 1/5 every time", "react", dict(start=(27,) * 999)),
+        ("the rule, letting go 4 frames early (23-frame boosts)", "react", dict(start=(68, 45, 34) + (23,) * 999)),
+        ("the rule, letting go 4 frames late (31-frame boosts)", "react", dict(start=(68, 45, 34) + (31,) * 999)),
+        ("the rule, timing errors of 4 frames", "react", dict(start=HUMAN_RULE, sigma=4.0)),
+        ("the rule, each long boost 8 frames too short", "react", dict(start=(60, 37, 26) + (27,) * 999)),
+        ("the rule, first long boost at 2/3 of the meter", "react", dict(start=(90, 45, 34) + (27,) * 999)),
         ("long start, then flick 0.1 s after each boost restarts", "anticipate", {}),
         ("long start, then flick 5 times a second without looking", "rhythm", {}),
         ("long start, then flick 4 times a second without looking", "rhythm", dict(every=15)),
         ("long start, then flick when you see the boost restart", "react", {}),
-        ("no long start, flick 0.1 s after each boost restarts", "anticipate", dict(start=())),
-        ("no long start, flick when you see the boost restart", "react", dict(start=())),
         ("no long start, flick 2 frames every 9 (6.7 a second)", "rhythm", dict(start=(), every=9, flick=2)),
-        ("first rule, flicking 4 frames too early", "anticipate", dict(aim=2)),
-        ("first rule, flicking 4 frames too late", "anticipate", dict(aim=10)),
-        ("first rule, timing errors of 4 frames", "anticipate", dict(sigma=4.0)),
-        ("first rule, each long boost 8 frames too short", "anticipate", dict(start=(60, 37, 26))),
-        ("first rule, first long boost at 2/3 of the meter", "anticipate", dict(start=(90, 45, 34))),
-        ("long start, reacting in 0.28 s (17 frames)", "react", dict(reaction=17)),
-        ("long start, 6-frame flicks 4 times a second without looking", "rhythm", dict(every=15, flick=6)),
-        ("long start, 6-frame flicks 5 times a second without looking", "rhythm", dict(flick=6)),
+        ("flicks 0.1 s after each restart, each 4 frames too early", "anticipate", dict(aim=2)),
+        ("flicks 0.1 s after each restart, each 4 frames too late", "anticipate", dict(aim=10)),
     ]:
         print(f"  {name:62}: {aquas_human(mode, **player):6.1f} s")
-    stacked = sum(average(run(BLUE_MARINE, Player("anticipate", seed=seed))) for seed in range(16)) / 16
-    print(f"  once stacked, the first rule averages a boost speed of {stacked:.1f}")
+    stacked = sum(average(run(BLUE_MARINE, Player("react", start=HUMAN_RULE, seed=seed))) for seed in range(16)) / 16
+    print(f"  once stacked, the rule averages a boost speed of {stacked:.1f}")
 
 
 if __name__ == "__main__":
     table(ARWING, [10, 20, 25, 29, 30, 31, 33, 35, 45, 60, 90])
     table(LANDMASTER, [10, 30, 45, 60, 90, 120, 150, 180])
-    table(BLUE_MARINE, [2, 3, 6, 10, 15, 30, 34, 45, 135])
+    table(BLUE_MARINE, [2, 3, 6, 10, 15, 27, 30, 34, 45, 135])
+    robot = run(BLUE_MARINE, until_speed(296))
+    starts = [i for i, (_, _, b) in enumerate(robot) if b and (i == 0 or not robot[i - 1][2])]
+    lengths = [next((j for j in range(i, len(robot)) if not robot[j][2]), len(robot)) - i for i in starts]
+    one = lengths.index(1)
+    print(f"\nBlue-Marine, let go once boost speed is 296, from a standstill: boosts of {', '.join(map(str, lengths[:one]))} frames,")
+    print(f"  then 1-frame boosts from {starts[one] / FPS:.1f} s on")
     print("\nBlue-Marine techniques:")
     for name, pattern in [
         ("hold boost the whole time", hold_always),
