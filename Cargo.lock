@@ -1000,6 +1000,7 @@ dependencies = [
  "gyroship-runtime",
  "libloading",
  "mimalloc",
+ "windows",
  "winit",
 ]
 
