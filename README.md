@@ -274,8 +274,19 @@ TRAINING, which needs the `quit` hook (without it the line shows and does nothin
 shuts itself down and the process exits with code 0; the save is unchanged. Verified by
 deterministic replays in English, French and Japanese and by a real-time run without a window, then
 used in a window, in French: the title menu line twice and the pause menu choice three times, in
-two missions (not in the tutorial). The repository holds only the generic mechanism and no script that builds
-those entries: this is not packaged for other players yet.
+two missions (not in the tutorial). The repository holds only the generic mechanism and no script
+that builds those entries: this is not packaged for other players yet.
+
+### Another vehicle in a mission
+
+An experiment made the same way, with replaced archive entries built from the player's own dump: a
+mission can spawn another of the game's three vehicles than its own. Two entries per mission are
+rebuilt: its root level, whose player spawner then names the other vehicle, and its package list,
+which then loads the files that vehicle needs, inserted where the list's dependency order wants
+them. Tried without a window on seven pairs of mission and vehicle, among them each vehicle in a
+mission of each other kind: the vehicle is there, its code runs, the mission goes on and nothing is
+journaled as an anomaly. Not played in a window yet, and nothing was tried past the first seconds
+of flight. As for QUIT GAME, the repository holds no script that builds those entries.
 
 ## The launcher
 
