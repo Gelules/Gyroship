@@ -6,6 +6,7 @@
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+pub mod joycon;
 pub mod pads;
 pub mod sdl;
 
@@ -77,6 +78,8 @@ struct Shared {
     keys_pressed: [AtomicU64; 4],
     /// The gamepads' state, from SDL.
     pads: pads::Shared,
+    /// The Switch 2 Joy-Con's, from their own thread (`--joycon`).
+    joycon: Arc<joycon::Pair>,
 }
 
 impl Shared {
@@ -137,6 +140,9 @@ impl ApplicationHandler for App {
         };
         let audio = sdl.clone().and_then(|s| pads::audio(s, 2, 48_000));
         self.pads = sdl.map(pads::Pads::new);
+        if std::env::args().any(|a| a == "--joycon") {
+            joycon::start(self.shared.joycon.clone());
+        }
         let host = HostWindow { instance, surface, size: (size.width, size.height), pace: pace(self.shared.clone()), input: input(self.shared.clone()), audio };
         // The guest's own fibers carry its code; this thread only needs room for the HLE.
         std::thread::Builder::new().name("guest".into()).stack_size(64 << 20).spawn(move || gyroship_hle::boot::run(table, Some(host))).unwrap_or_else(|e| fail(&format!("cannot start the guest: {e}")));
@@ -364,7 +370,11 @@ fn input(shared: Arc<Shared>) -> gyroship_hle::LiveInput {
         }
         let p = &shared.pads;
         let (l, r) = p.sticks();
-        pads::merge(keys, p.held.load(Ordering::Relaxed) | p.pressed.swap(0, Ordering::Relaxed), l, r)
+        // The Joy-Con add their buttons; of a gamepad's stick and theirs, the one pushed
+        // farther counts (a gamepad's stick may rest a little outside its dead zone).
+        let (buttons, jl, jr) = joycon::sample(&shared.joycon, joycon::clock());
+        let far = |a: [i32; 2], b: [i32; 2]| if a[0].abs().max(a[1].abs()) >= b[0].abs().max(b[1].abs()) { a } else { b };
+        pads::merge(keys, p.held.load(Ordering::Relaxed) | p.pressed.swap(0, Ordering::Relaxed) | buttons, far(l, jl), far(r, jr))
     })
 }
 
@@ -405,6 +415,36 @@ mod tests {
         assert_eq!((p.buttons, p.keys), (1, [1 << 0x35, 0, 0, 0]));
         let p = sample();
         assert_eq!((p.buttons, p.keys), (0, [0; 4]));
+    }
+
+    /// The Joy-Con pair reaches the sample: its buttons, each side's stick, and of a
+    /// gamepad's stick and a Joy-Con's the one pushed farther.
+    #[test]
+    fn the_joy_con_pair_joins_the_gamepads() {
+        let shared = Arc::new(Shared::default());
+        let mut sample = input(shared.clone());
+        // 63 bytes: Up on the left Joy-Con (byte 6), A on the right (byte 4); the left
+        // stick at rest (2048, 2048), the right one fully to the left (848, 2048).
+        let mut report = [0u8; 63];
+        (report[4], report[6]) = (0x08, 0x02);
+        report[10..16].copy_from_slice(&[0x00, 0x08, 0x80, 0x50, 0x03, 0x80]);
+        for side in [0, 1] {
+            joycon::report(side, &report, &joycon::TYPICAL, &shared.joycon[side], joycon::clock());
+        }
+        // A gamepad's left stick, a little off its rest: it counts, the Joy-Con's rests.
+        shared.pads.sticks.store(pads::pack([300, 0], 0), Ordering::Relaxed);
+        let p = sample();
+        assert_eq!((p.buttons, p.l, p.r), (1 | 1 << 13 | 1 << 20, [300, 0], [-32767, 0]));
+        // Pushed farther than the Joy-Con's (now two thirds to the left: 1248, 2048), the
+        // gamepad's right stick counts; the Joy-Con's left stick, now fully up (2048,
+        // 3248), counts over the gamepad's, still a little off its rest.
+        shared.pads.sticks.store(pads::pack([300, 0], 0) | pads::pack([0, 32767], 1), Ordering::Relaxed);
+        report[10..16].copy_from_slice(&[0x00, 0x08, 0xcb, 0xe0, 0x04, 0x80]);
+        for side in [0, 1] {
+            joycon::report(side, &report, &joycon::TYPICAL, &shared.joycon[side], joycon::clock());
+        }
+        let p = sample();
+        assert_eq!((p.l, p.r), ([0, 32767], [0, 32767]));
     }
 
     /// The debug console's keys, and a few others, by their USB HID usages.

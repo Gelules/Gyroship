@@ -75,6 +75,11 @@ impl Shared {
     }
 }
 
+/// A stick as its part of `Shared::sticks`: 0 the left one, 1 the right one.
+pub fn pack(v: [i32; 2], i: u32) -> u64 {
+    u64::from(v[0] as i16 as u16) << (32 * i) | u64::from(v[1] as i16 as u16) << (32 * i + 16)
+}
+
 /// SDL and the gamepads it opened.
 pub struct Pads {
     pub sdl: Arc<Sdl>,
@@ -138,7 +143,6 @@ impl Pads {
             }
         }
         shared.held.store(held, Ordering::Relaxed);
-        let pack = |v: [i32; 2], i: u32| u64::from(v[0] as i16 as u16) << (32 * i) | u64::from(v[1] as i16 as u16) << (32 * i + 16);
         shared.sticks.store(pack(l, 0) | pack(r, 1), Ordering::Relaxed);
     }
 }

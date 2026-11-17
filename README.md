@@ -60,9 +60,11 @@ Known problems:
 - Rendering is compared with the console by eye only; a few defects reported in earlier builds were
   never re-checked one by one. Sound needs SDL3 and a window; in play mode a gap or a dropped tick
   every few minutes is expected, and the sound trails the picture by about 0.1 s.
-- No rumble, no motion sensors, no button remapping, no Joy-Con support, no amiibo (the reader never
-  finds a figure), no system applet. A gamepad missing from SDL3's database is not recognised. The
-  picture is stretched to the window, without 16:9 bars.
+- No rumble, no motion sensors, no button remapping, no amiibo (the reader never finds a figure),
+  no system applet: choosing mouse controls in the game opens the console's controller screen, which
+  ends the run. Switch 2 Joy-Con give their buttons and sticks only, through `--joycon`, tried on
+  one pair in the tutorial. A gamepad missing from SDL3's database is not recognised. The picture is
+  stretched to the window, without 16:9 bars.
 
 ## Requirements
 
@@ -118,7 +120,7 @@ when missing.
 
 Step 4's command is the one to play with; below, `harness` stands for
 `generated/game/target/release/harness`. It opens a window titled "Gyroship", 1920 x 1080 at start;
-closing it ends the run cleanly. `harness boot <exefs> --help` lists the 39 options by name; the
+closing it ends the run cleanly. `harness boot <exefs> --help` lists the 40 options by name; the
 developer options this file does not describe are documented, for most, on the fields of `Config`
 in `crates/hle/src/lib.rs`. A misspelt option, a valued option given twice, or one left without its
 value at the end of the line stops the start with exit code 2 (any next word is taken as the value).
@@ -134,6 +136,7 @@ value at the end of the line stops the start with exit code 2 (any next word is 
 | `--pipeline-cache DIR` | Keeps between runs the GPU driver's compiled pipelines (one file per GPU, Vulkan only) and, in `DIR/shaders`, the translated shaders. |
 | `--backend VALUE` | `auto` (the default: Vulkan and DX12 are both offered to wgpu, which took Vulkan on the test PC), `vulkan` or `dx12`. |
 | `--sdl FILE` | The SDL3 library to load, instead of `SDL3.dll` next to the harness executable. |
+| `--joycon` | Switch 2 Joy-Con over Bluetooth LE, without pairing (Windows 11): see below. |
 
 Without `--save`, every run starts from an empty save kept in memory, and progress is lost; `DIR`
 holds one sub-folder per save, with the game's save files as plain files. Under `--pipeline-cache
@@ -161,6 +164,23 @@ west is Y, so A is the button labelled B on an Xbox pad and Circle on a PlayStat
 shoulders are L and R, a trigger past half its travel is ZL or ZR, Start is Plus and Back is Minus.
 The game sees one controller: several gamepads and the keyboard act as one. An Xbox 360 pad was
 played by hand; a PS5 pad was only tried on the title screen.
+
+Switch 2 Joy-Con do not go through SDL3 nor through Windows' Bluetooth settings (never add them
+there: they refuse the standard pairing). With `--joycon`, Gyroship scans for them itself, connects
+without pairing and reads their reports; it stores nothing on them, and the only things it sends
+are player light 1 and a read of the factory stick calibration. Turn the console off, start the
+game, then hold the sync button of each Joy-Con (the small round one between SL and SR) until the
+terminal says it is connected: after a plain press a Joy-Con only calls its console and drops
+anyone else. Do it again after a loss. The pair acts as one more gamepad: its buttons where the
+console has them, Home as a gamepad's Guide; SL, SR, Capture and C do nothing; no mouse mode, no
+motion, no rumble. Windows 11 is needed for a fast link: Gyroship asks for Windows' 15 ms
+connection interval (60 ms otherwise) and prints each link's interval whenever it changes. A
+Joy-Con that is lost, or silent for 0.4 s, holds no button until its reports come back. With
+another gamepad plugged in, of its stick and the Joy-Con's the one pushed farther counts. The
+protocol is not public: this follows community research and measurements on one pair (firmware
+2.1.9), which then played the tutorial through `--joycon`, both links at 15 ms.
+`cargo run --release -p gyroship --example joycon_trial -- <L|R|scan> <log file>` is the read-only
+trial those measurements came from.
 
 ## Practice tools
 
@@ -335,7 +355,7 @@ shows in the first mission.
     crates/gpu        the console's GPU commands and shaders on wgpu; caches; asset archive reader
     crates/practice   the texts Gyroship adds in game, and the reader of the game's fonts
     crates/research   the three vehicles' boost, reimplemented and checked against the game
-    crates/gyroship   the host side, a library: window, pacing, keyboard, SDL3 controllers and sound
+    crates/gyroship   the host side, a library: window, pacing, keyboard, SDL3 controllers and sound, Joy-Con
     crates/tools      the gyroship-tools command line
     tools/ghidra      headless Ghidra scripts (not needed to play)
     research/         write-ups of the game's mechanics, with the code behind their numbers

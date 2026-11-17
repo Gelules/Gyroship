@@ -268,6 +268,7 @@ pub const OPTIONS: &[(&str, bool)] = &[
     ("--backend", true),
     ("--sdl", true),
     ("--fullscreen", false),
+    ("--joycon", false),
     // The run.
     ("--log", true),
     ("--all-svcs", false),
