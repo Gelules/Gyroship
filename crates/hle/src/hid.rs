@@ -41,6 +41,7 @@ const ENTRY: usize = 0x30;
 /// header as a button lifo, 17 entries of 0x28: the sequence, then 8 bytes nothing reads,
 /// the sampling number, the X and Y counts since the previous state, attributes.
 const JCMS_LIFO: u64 = 0x2c8;
+const MOUSE_ENTRY: usize = 0x28;
 #[cfg(test)]
 const LIFO_SIZE: usize = LIFO_ENTRIES + LIFO_LEN * ENTRY;
 /// The sample's lead on the vsync, in ticks (1 ms): the console's phase is
@@ -54,15 +55,25 @@ pub const BUTTONS: [&str; 28] = [
     "A", "B", "X", "Y", "LS", "RS", "L", "R", "ZL", "ZR", "Plus", "Minus", "Left", "Up", "Right", "Down", "LSLeft", "LSUp", "LSRight", "LSDown", "RSLeft", "RSUp", "RSRight", "RSDown", "LeftSL", "LeftSR", "RightSL", "RightSR",
 ];
 
-/// A controller's state: buttons and sticks (±0x7fff); and the keyboard's:
-/// the keys held, one bit per USB HID usage (0x35 the backquote key, 0x3a
-/// F1, 0xe0 left Ctrl).
+/// A Joy-Con's mouse at one sample: the X and Y counts since the previous sample, and
+/// whether its sensor rests on a surface.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Mouse {
+    pub dx: i32,
+    pub dy: i32,
+    pub contact: bool,
+}
+
+/// A controller's state: buttons and sticks (±0x7fff); the keyboard's: the keys held, one
+/// bit per USB HID usage (0x35 the backquote key, 0x3a F1, 0xe0 left Ctrl); and the mouse
+/// of its left and right Joy-Con, when it has one.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Pad {
     pub buttons: u64,
     pub l: [i32; 2],
     pub r: [i32; 2],
     pub keys: [u64; 4],
+    pub mouse: [Option<Mouse>; 2],
 }
 
 /// The usages of the keys held, in increasing order.
@@ -79,8 +90,9 @@ pub enum Step {
 }
 
 /// Parses a `--replay` script: `<sample> <buttons|-> [L=x,y] [R=x,y]
-/// [K=usage,...]` or `<sample> end`, buttons joined by `+`, keyboard keys as
-/// hex USB HID usages, samples increasing; `#` starts a comment.
+/// [K=usage,...] [ML=dx,dy,c] [MR=dx,dy,c]` or `<sample> end`, buttons joined by
+/// `+`, keyboard keys as hex USB HID usages, a Joy-Con mouse as its counts per
+/// sample and 1 when it touches a surface, samples increasing; `#` starts a comment.
 pub fn parse_script(text: &str) -> Result<Vec<(u64, Step)>, String> {
     let mut script: Vec<(u64, Step)> = Vec::new();
     for (n, line) in text.lines().enumerate() {
@@ -102,7 +114,13 @@ pub fn parse_script(text: &str) -> Result<Vec<(u64, Step)>, String> {
                     }
                 }
                 for w in words.by_ref() {
-                    let (stick, xy) = w.split_once('=').ok_or_else(|| bad("expected L=x,y, R=x,y or K=keys"))?;
+                    let (stick, xy) = w.split_once('=').ok_or_else(|| bad("expected L=x,y, R=x,y, K=keys, ML=dx,dy,c or MR=dx,dy,c"))?;
+                    if let Some(side) = ["ML", "MR"].iter().position(|&n| n == stick) {
+                        let v = xy.split(',').map(str::parse::<i32>).collect::<Result<Vec<_>, _>>().map_err(|_| bad("expected dx,dy,c"))?;
+                        let &[dx, dy, c @ (0 | 1)] = v.as_slice() else { return Err(bad("expected dx,dy,c with c 0 or 1")) };
+                        pad.mouse[side] = Some(Mouse { dx, dy, contact: c == 1 });
+                        continue;
+                    }
                     if stick == "K" {
                         for u in xy.split(',') {
                             let u = usize::from_str_radix(u, 16).ok().filter(|&u| u < 256).ok_or_else(|| bad("expected keys as hex USB HID usages below 0x100"))?;
@@ -134,17 +152,47 @@ pub fn parse_script(text: &str) -> Result<Vec<(u64, Step)>, String> {
 /// the previous entry's, the rest of the state (`state`), then the tail, then
 /// the count.
 fn push_entry(lifo: &mut [u8], size: usize, state: &[u8]) {
+    let e = next_entry(lifo, size, 8);
+    lifo[e + 0x10..e + size].copy_from_slice(state);
+}
+
+/// Makes the next entry of a lifo of `size`-byte entries, whose sampling number sits
+/// `number` bytes into an entry: zeroed but for its even sequence and its sampling number,
+/// one past the previous entry's; the tail and the count follow. Returns its offset.
+fn next_entry(lifo: &mut [u8], size: usize, number: usize) -> usize {
     let u64_at = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
     let tail = u64_at(lifo, LIFO_TAIL) as usize % LIFO_LEN;
-    let sample = u64_at(lifo, LIFO_ENTRIES + tail * size + 8) + 1;
+    let sample = u64_at(lifo, LIFO_ENTRIES + tail * size + number) + 1;
     let next = (tail + 1) % LIFO_LEN;
     let e = LIFO_ENTRIES + next * size;
+    lifo[e..e + size].fill(0);
     lifo[e..e + 8].copy_from_slice(&(sample << 1).to_le_bytes());
-    lifo[e + 8..e + 0x10].copy_from_slice(&sample.to_le_bytes());
-    lifo[e + 0x10..e + size].copy_from_slice(state);
+    lifo[e + number..e + number + 8].copy_from_slice(&sample.to_le_bytes());
     lifo[LIFO_TAIL..LIFO_TAIL + 8].copy_from_slice(&(next as u64).to_le_bytes());
     let count = (u64_at(lifo, LIFO_COUNT) + 1).min(LIFO_LEN as u64);
     lifo[LIFO_COUNT..LIFO_COUNT + 8].copy_from_slice(&count.to_le_bytes());
+    e
+}
+
+/// Appends a state to a Joy-Con mouse lifo (the bytes from its header on): the counts
+/// since the previous state and the attributes (bit 0: a mouse is there, which is what
+/// makes the game offer mouse aiming; bit 1: it touches a surface).
+pub fn push_mouse(lifo: &mut [u8], mouse: Option<Mouse>) {
+    let e = next_entry(lifo, MOUSE_ENTRY, 0x10);
+    if let Some(m) = mouse {
+        lifo[e + 0x18..e + 0x1c].copy_from_slice(&m.dx.to_le_bytes());
+        lifo[e + 0x1c..e + 0x20].copy_from_slice(&m.dy.to_le_bytes());
+        lifo[e + 0x20] = 1 | u8::from(m.contact) << 1;
+    }
+}
+
+/// The words a push changed in a lifo of `size`-byte entries, in the order the SDK's
+/// readers need them published: the new entry's sequence made odd ("write in progress"),
+/// its state, its even sequence, then the tail, then the count.
+fn published(lifo: &[u8], size: usize) -> Vec<(usize, u64)> {
+    let word = |o: usize| u64::from_le_bytes(lifo[o..o + 8].try_into().unwrap());
+    let e = LIFO_ENTRIES + word(LIFO_TAIL) as usize * size;
+    [(e, word(e) | 1)].into_iter().chain((e + 8..e + size).step_by(8).chain([e, LIFO_TAIL, LIFO_COUNT]).map(|o| (o, word(o)))).collect()
 }
 
 /// Appends `pad` to a button lifo (the bytes from its header on): buttons,
@@ -197,6 +245,11 @@ pub fn script_line(sample: u64, p: &Pad) -> String {
     }
     if p.keys != [0; 4] {
         line += &format!(" K={}", usages(&p.keys).map(|u| format!("{u:x}")).collect::<Vec<_>>().join(","));
+    }
+    for (name, mouse) in [("ML", p.mouse[0]), ("MR", p.mouse[1])] {
+        if let Some(m) = mouse {
+            line += &format!(" {name}={},{},{}", m.dx, m.dy, u8::from(m.contact));
+        }
     }
     line
 }
@@ -353,10 +406,16 @@ impl Kernel {
             input.current = live();
         }
         let first = self.journal.first("hid sampling");
-        if first || input.current != self.input.current {
+        let before = self.input.current;
+        if first || input.current != before {
             let p = input.current;
-            let keys = if p.keys == [0; 4] { String::new() } else { format!(" keys {:x?}", usages(&p.keys).collect::<Vec<_>>()) };
-            self.log(&format!("hid: sample {k} (present {}): buttons {:#x} L {:?} R {:?}{keys}", self.gs.presents, p.buttons, p.l, p.r));
+            let mut more = if p.keys == [0; 4] { String::new() } else { format!(" keys {:x?}", usages(&p.keys).collect::<Vec<_>>()) };
+            for (name, mouse) in [("ML", p.mouse[0]), ("MR", p.mouse[1])] {
+                if let Some(m) = mouse {
+                    more += &format!(" {name} [{}, {}, {}]", m.dx, m.dy, u8::from(m.contact));
+                }
+            }
+            self.log(&format!("hid: sample {k} (present {}): buttons {:#x} L {:?} R {:?}{more}", self.gs.presents, p.buttons, p.l, p.r));
             if let Some(lines) = self.recorded.as_mut() {
                 lines.push(script_line(k, &p));
             }
@@ -364,6 +423,7 @@ impl Kernel {
         input.last = k;
         self.input = input;
         self.push_sample(m, &input.current);
+        self.push_mice(&input.current, &before);
     }
 
     /// Appends `pad` to slot 0's FullKey lifo and its keys to the keyboard
@@ -371,6 +431,24 @@ impl Kernel {
     fn push_sample(&mut self, m: usize, pad: &Pad) {
         self.push_lifo(m, NPAD + 0x28, ENTRY, |l| push(l, pad));
         self.push_lifo(m, KEYBOARD, KEY_ENTRY, |l| push_keys(l, pad));
+    }
+
+    /// Appends each Joy-Con mouse of `pad` to its lifo of Npad 0 in the buffer the game
+    /// lent, with the ordered writes of `push_lifo`. A side without a mouse writes nothing,
+    /// but one null state when the sample before had one: the mouse is gone.
+    fn push_mice(&mut self, pad: &Pad, before: &Pad) {
+        let Some((addr, size)) = self.input.jcms else { return };
+        for side in 0..2 {
+            let at = addr + side as u64 * JCMS_LIFO;
+            let mut lifo = [0; JCMS_LIFO as usize];
+            if (pad.mouse[side].is_none() && before.mouse[side].is_none()) || at + JCMS_LIFO > addr + size || self.mem.read(at, &mut lifo).is_err() {
+                continue;
+            }
+            push_mouse(&mut lifo, pad.mouse[side]);
+            for (o, v) in published(&lifo, MOUSE_ENTRY) {
+                let _ = self.mem.publish_object(at + o as u64, 8, &[], |_| v);
+            }
+        }
     }
 
     /// Runs `push` on a copy of the lifo at `at` (entries of `size` bytes).
@@ -383,11 +461,8 @@ impl Kernel {
     fn push_lifo(&mut self, m: usize, at: usize, size: usize, push: impl FnOnce(&mut [u8])) {
         let mut lifo = self.shared[m].data[at..at + LIFO_ENTRIES + LIFO_LEN * size].to_vec();
         push(&mut lifo);
-        let word = |o: usize| u64::from_le_bytes(lifo[o..o + 8].try_into().unwrap());
-        let e = LIFO_ENTRIES + word(LIFO_TAIL) as usize * size;
-        self.store_shared(m, at + e, word(e) | 1);
-        for o in (e + 8..e + size).step_by(8).chain([e, LIFO_TAIL, LIFO_COUNT]) {
-            self.store_shared(m, at + o, word(o));
+        for (o, v) in published(&lifo, size) {
+            self.store_shared(m, at + o, v);
         }
     }
 
@@ -426,7 +501,7 @@ mod tests {
         }
         let e = entry(0);
         assert_eq!(u64_at(e + 0x28) as u32, CONNECTED);
-        Pad { buttons: u64_at(e + 0x10), l: [i32_at(e + 0x18), i32_at(e + 0x1c)], r: [i32_at(e + 0x20), i32_at(e + 0x24)], keys: [0; 4] }
+        Pad { buttons: u64_at(e + 0x10), l: [i32_at(e + 0x18), i32_at(e + 0x1c)], r: [i32_at(e + 0x20), i32_at(e + 0x24)], ..Pad::default() }
     }
 
     #[test]
@@ -436,7 +511,7 @@ mod tests {
         lifo[LIFO_COUNT] = 1;
         let mut last = Pad::default();
         for n in 1..=40 {
-            last = Pad { buttons: n % 3, l: [n as i32, -(n as i32)], r: [0x7fff, -0x7fff], keys: [0; 4] };
+            last = Pad { buttons: n % 3, l: [n as i32, -(n as i32)], r: [0x7fff, -0x7fff], ..Pad::default() };
             push(&mut lifo, &last);
             assert_eq!(read(&lifo), last, "sample {n}");
         }
@@ -475,14 +550,19 @@ mod tests {
     fn recorded_lines_replay_as_written() {
         let pads = [
             Pad::default(),
-            Pad { buttons: 1 | 1 << 13 | 1 << 27, l: [-0x7fff, 0x7fff], r: [0, 0], keys: [0; 4] },
-            Pad { buttons: 0, l: [0, 0], r: [3, -4], keys: [1 << 0x35, 0, 0, 1 << (0xe1 - 0xc0)] },
+            Pad { buttons: 1 | 1 << 13 | 1 << 27, l: [-0x7fff, 0x7fff], ..Pad::default() },
+            Pad { r: [3, -4], keys: [1 << 0x35, 0, 0, 1 << (0xe1 - 0xc0)], ..Pad::default() },
+            Pad { buttons: 4, mouse: [Some(Mouse { dx: -12, dy: 7, contact: true }), None], ..Pad::default() },
+            Pad { mouse: [Some(Mouse::default()), Some(Mouse { dx: 3, dy: 0, contact: false })], ..Pad::default() },
         ];
-        let text: String = pads.iter().enumerate().map(|(i, p)| script_line(10 * i as u64, p) + "\n").collect::<String>() + "40 end\n";
-        let expected: Vec<(u64, Step)> = pads.iter().enumerate().map(|(i, p)| (10 * i as u64, Step::Pad(*p))).chain([(40, Step::End)]).collect();
+        let text: String = pads.iter().enumerate().map(|(i, p)| script_line(10 * i as u64, p) + "\n").collect::<String>() + "60 end\n";
+        let expected: Vec<(u64, Step)> = pads.iter().enumerate().map(|(i, p)| (10 * i as u64, Step::Pad(*p))).chain([(60, Step::End)]).collect();
         assert_eq!(parse_script(&text).unwrap(), expected);
         assert_eq!(script_line(7, &pads[1]), "7 A+Up+RightSR L=-32767,32767");
         assert_eq!(script_line(9, &pads[2]), "9 - R=3,-4 K=35,e1");
+        // A Joy-Con mouse: its counts and whether it touches a surface, each side by itself.
+        assert_eq!(script_line(11, &pads[3]), "11 X ML=-12,7,1");
+        assert_eq!(script_line(13, &pads[4]), "13 - ML=0,0,0 MR=3,0,0");
     }
 
     #[test]
@@ -496,6 +576,13 @@ mod tests {
         assert_eq!(k, vec![(5, Step::Pad(Pad { keys: [1 << 0x3a, 0, 0, 1 << (0xe0 - 0xc0)], ..Pad::default() }))]);
         assert!(parse_script("5 - K=100").unwrap_err().contains("usages"));
         assert!(parse_script("5 - K=").is_err());
+        // A line without mouse words has no mouse; a mouse word wants two counts and 0 or 1.
+        assert_eq!(parse_script("5 A L=1,2\n").unwrap()[0].1, Step::Pad(Pad { buttons: 1, l: [1, 2], ..Pad::default() }));
+        let m = parse_script("5 - MR=-3,40,1\n").unwrap();
+        assert_eq!(m, vec![(5, Step::Pad(Pad { mouse: [None, Some(Mouse { dx: -3, dy: 40, contact: true })], ..Pad::default() }))]);
+        for bad in ["5 - ML=1,2", "5 - ML=1,2,2", "5 - ML=1,2,1,0", "5 - ML=a,2,1", "5 - MX=1,2,1"] {
+            assert!(parse_script(bad).is_err(), "{bad}");
+        }
     }
 
     use crate::Config;
@@ -518,7 +605,7 @@ mod tests {
 
     /// Sample n: buttons and sticks that say n, so that a torn entry shows.
     fn pad(n: u64) -> Pad {
-        Pad { buttons: n, l: [n as i32, -(n as i32)], r: [0, 0], keys: [n, 0, 0, n << 32] }
+        Pad { buttons: n, l: [n as i32, -(n as i32)], keys: [n, 0, 0, n << 32], ..Pad::default() }
     }
 
     /// The ordered writes leave the bytes of the whole copies they replace
@@ -536,6 +623,99 @@ mod tests {
             k.mem.read_object(addr, &mut guest).unwrap();
             assert!(guest == want && k.shared[m].data == want, "sample {n}");
         }
+    }
+
+    /// A Joy-Con mouse lifo, read as the SDK's GetJcmsStates does and used as the game
+    /// uses what comes back: states newest first, each under an even sequence, sampling
+    /// numbers one apart; the game adds the counts of the states newer than the last one
+    /// it saw, keeps the contact bit of the newest, and offers mouse aiming by bit 0 of the
+    /// newest state's attributes.
+    #[test]
+    fn mouse_states_read_back_as_the_game_adds_them() {
+        assert_eq!(JCMS_LIFO as usize, LIFO_ENTRIES + LIFO_LEN * MOUSE_ENTRY);
+        let u64_at = |l: &[u8], o: usize| u64::from_le_bytes(l[o..o + 8].try_into().unwrap());
+        let i32_at = |l: &[u8], o: usize| i32::from_le_bytes(l[o..o + 4].try_into().unwrap());
+        // (sampling number, dx, dy, attributes) of up to 16 states, newest first.
+        let read = |l: &[u8]| -> Vec<(u64, i32, i32, u8)> {
+            let (tail, count) = (u64_at(l, LIFO_TAIL) as usize, u64_at(l, LIFO_COUNT) as usize);
+            assert!(tail < LIFO_LEN && count <= LIFO_LEN);
+            let states: Vec<_> = (0..count.min(16))
+                .map(|back| {
+                    let e = LIFO_ENTRIES + (tail + LIFO_LEN - back) % LIFO_LEN * MOUSE_ENTRY;
+                    assert_eq!(u64_at(l, e) % 2, 0, "sequence even");
+                    (u64_at(l, e + 0x10), i32_at(l, e + 0x18), i32_at(l, e + 0x1c), l[e + 0x20])
+                })
+                .collect();
+            assert!(states.windows(2).all(|w| w[0].0 == w[1].0 + 1), "sampling numbers follow: {states:?}");
+            states
+        };
+        // As StartJcms leaves it: one null state, which says "no mouse".
+        let mut lifo = vec![0u8; JCMS_LIFO as usize];
+        lifo[LIFO_COUNT] = 1;
+        assert_eq!(read(&lifo), [(0, 0, 0, 0)]);
+        // The game's side: the last sampling number seen, the totals, the contact bit.
+        let (mut seen, mut total, mut contact) = (0, [0i64; 2], false);
+        let mut poll = |l: &[u8]| {
+            for &(n, dx, dy, attributes) in read(l).iter().rev() {
+                if n > seen {
+                    (seen, contact) = (n, attributes >> 1 & 1 != 0);
+                    total = [total[0] + i64::from(dx), total[1] + i64::from(dy)];
+                }
+            }
+            (total, contact, read(l)[0].3 & 1 != 0)
+        };
+        assert_eq!(poll(&lifo), ([0, 0], false, false));
+        // Forty samples, polled every third one: nothing is lost or counted twice.
+        let mut want = [0i64; 2];
+        for n in 1..=40i32 {
+            push_mouse(&mut lifo, Some(Mouse { dx: n, dy: -2 * n, contact: n % 2 == 1 }));
+            want = [want[0] + i64::from(n), want[1] - 2 * i64::from(n)];
+            if n % 3 == 0 {
+                assert_eq!(poll(&lifo), (want, n % 2 == 1, true), "sample {n}");
+            }
+        }
+        assert_eq!(lifo[LIFO_COUNT], 17);
+        assert_eq!(read(&lifo)[0], (40, 40, -80, 1), "the newest state: its number, its counts, a mouse, in the air");
+        // The mouse goes: one null state, and the game no longer offers mouse aiming.
+        push_mouse(&mut lifo, None);
+        assert_eq!(read(&lifo)[0], (41, 0, 0, 0));
+        assert!(!poll(&lifo).2);
+    }
+
+    /// Samples with a mouse reach the buffer the game lent (lifos 0 and 1: Npad 0, left
+    /// and right), a sample without one writes nothing, and a mouse that goes leaves one
+    /// null state behind it.
+    #[test]
+    fn a_mouse_is_written_where_the_game_reads_it() {
+        let mut k = Kernel::new(Memory::new().unwrap(), Journal::memory(), Config::default());
+        // The game's own memory: once lent it is read-only for the game, never for the host.
+        let addr = crate::layout::ALIAS.0;
+        k.mem.map(addr, 0x1000, gyroship_runtime::mem::Block::new(gyroship_runtime::mem::state::NORMAL, perm::RW)).unwrap();
+        k.input.jcms = Some((addr, 0x1000));
+        let lifo = |k: &Kernel, side: u64| {
+            let mut l = vec![0u8; JCMS_LIFO as usize];
+            k.mem.read(addr + side * JCMS_LIFO, &mut l).unwrap();
+            l
+        };
+        let left = Mouse { dx: 5, dy: -6, contact: true };
+        let (none, with) = (Pad::default(), Pad { mouse: [Some(left), None], ..Pad::default() });
+        k.push_mice(&none, &none);
+        assert_eq!(lifo(&k, 0), vec![0; JCMS_LIFO as usize], "no mouse, nothing written");
+        k.push_mice(&with, &none);
+        k.push_mice(&with, &with);
+        let mut want = vec![0u8; JCMS_LIFO as usize];
+        push_mouse(&mut want, Some(left));
+        push_mouse(&mut want, Some(left));
+        assert_eq!(lifo(&k, 0), want);
+        assert_eq!(lifo(&k, 1), vec![0; JCMS_LIFO as usize], "the right side has none");
+        k.push_mice(&none, &with);
+        k.push_mice(&none, &none);
+        push_mouse(&mut want, None);
+        assert_eq!(lifo(&k, 0), want, "one null state when the mouse goes, then nothing");
+        // A buffer too small for the right side's lifo: left alone.
+        k.input.jcms = Some((addr, JCMS_LIFO + 8));
+        k.push_mice(&Pad { mouse: [None, Some(left)], ..Pad::default() }, &none);
+        assert_eq!(lifo(&k, 1), vec![0; JCMS_LIFO as usize]);
     }
 
     /// GetNpadStates as another core runs it, on the guest's lifo at host

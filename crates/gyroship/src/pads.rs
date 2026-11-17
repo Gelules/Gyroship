@@ -55,7 +55,7 @@ fn directions([x, y]: [i32; 2], first: u32) -> u64 {
 pub fn merge(keys: Pad, buttons: u64, l: [i32; 2], r: [i32; 2]) -> Pad {
     let l = if l != [0, 0] { l } else { keys.l };
     let r = if r != [0, 0] { r } else { keys.r };
-    Pad { buttons: keys.buttons | buttons | directions(l, 16) | directions(r, 20), l, r, keys: keys.keys }
+    Pad { buttons: keys.buttons | buttons | directions(l, 16) | directions(r, 20), l, r, ..keys }
 }
 
 /// What the gamepads tell the guest thread: buttons held, buttons pressed
@@ -221,7 +221,7 @@ mod tests {
 
     #[test]
     fn gamepads_and_keys_merge() {
-        let keys = Pad { buttons: 1, l: [32767, 0], r: [0, 0], keys: [1 << 0x35, 0, 0, 0] };
+        let keys = Pad { buttons: 1, l: [32767, 0], keys: [1 << 0x35, 0, 0, 0], ..Pad::default() };
         let p = merge(keys, 1 << 1, [0, 0], [0, -32767]);
         assert_eq!(p.l, [32767, 0], "the keyboard's stick when the gamepad's rests");
         assert_eq!(p.buttons, 1 | 1 << 1 | 1 << 18 | 1 << 23);

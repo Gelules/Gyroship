@@ -64,9 +64,10 @@ Known problems:
   never re-checked one by one. Sound needs SDL3 and a window; in play mode a gap or a dropped tick
   every few minutes is expected, and the sound trails the picture by about 0.1 s.
 - No rumble, no motion sensors, no button remapping, no amiibo (the reader never finds a figure),
-  no system applet, no mouse aiming yet: its line in the game's options (Preferences) stays greyed
-  out, as seen in replays. Choosing it once ended a run, in the console's controller screen: that
-  screen is now answered as closed at once, which tests check and no run has reached since.
+  no system applet, no mouse aiming yet: its two lines in the game's options (Preferences) are
+  greyed out in every replay. A run once ended in the tutorial, when the game opened the console's
+  controller screen for its mouse mode: that screen is now answered as closed at once, which tests
+  check and no run has reached since.
   Switch 2 Joy-Con give their buttons and sticks only, through `--joycon`, played on
   one pair only: the tutorial, then sessions of 6 and 12 minutes. A gamepad missing from SDL3's database is not recognised. The picture is
   stretched to the window, without 16:9 bars.
@@ -349,11 +350,14 @@ A headless run with neither `--frames` nor `--seconds`, and no replay, stops aft
 folder that must exist (a file that cannot be written is reported only then, and the recording is
 lost). Recorded with `--play`, it does not replay that session exactly; its replay with the default
 engine repeats. The file has one line per change of state, `<sample> <buttons> [L=x,y] [R=x,y]
-[K=usage,...]`, then `<sample> end`, which stops the run. Samples are the game's input samples, 60
-per second; button names (`A`, `B`, `X`, `Y`, `L`, `R`, `ZL`, `ZR`, `LS`, `RS`, `Plus`, `Minus`,
-`Left`, `Up`, `Right`, `Down` and a few more that `--record` writes) are joined by `+`, and `-`
-stands for none; sticks go from -32767 to 32767; `K=` holds keyboard keys as hex USB HID usages; `#`
-starts a comment.
+[K=usage,...] [ML=dx,dy,c] [MR=dx,dy,c]`, then `<sample> end`, which stops the run. Samples are the
+game's input samples, 60 per second; button names (`A`, `B`, `X`, `Y`, `L`, `R`, `ZL`, `ZR`, `LS`,
+`RS`, `Plus`, `Minus`, `Left`, `Up`, `Right`, `Down` and a few more that `--record` writes) are
+joined by `+`, and `-` stands for none; sticks go from -32767 to 32767; `K=` holds keyboard keys as
+hex USB HID usages; `ML=` and `MR=` give the left and right Joy-Con a mouse: its counts in X and Y
+at each sample while the line holds, then 1 when it rests on a surface (0 in the air). They are
+written where the game's SDK reads a Joy-Con mouse; nothing in the game has been seen to react to
+them yet, and no live controller gives them. `#` starts a comment.
 
 Play mode is never a reference: its threads are scheduled by Windows on the real clock, so runs do
 not repeat; its journal is stamped with real time; a replay there follows the wall clock, so the
