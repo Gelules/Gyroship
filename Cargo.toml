@@ -1,6 +1,9 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# The launcher is a workspace of its own: Tauri's tree stays out of this lock file,
+# of these builds and of the proofs.
+exclude = ["crates/launcher"]
 
 [workspace.package]
 version = "0.1.0"

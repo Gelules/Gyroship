@@ -1,5 +1,8 @@
-# Build output
+# Build output (the launcher is a workspace of its own; its settings and its webview's
+# data stay next to its executable, in its target folder)
 /target/
+/crates/launcher/target/
+/crates/launcher/gen/
 
 # Generated from the player's own game files: never committed
 /generated/
