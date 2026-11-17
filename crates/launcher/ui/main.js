@@ -35,6 +35,9 @@ async function refreshBuilds() {
 }
 
 async function changed(field) {
+  // A path pasted from the file explorer ("Copy as path") comes inside quotes: without them.
+  const quoted = /^\s*"(.*)"\s*$/.exec(field.value);
+  if (quoted) field.value = quoted[1];
   settings[field.dataset.key] = field.type === 'checkbox' ? field.checked : field.value.trim();
   if (await save()) notice('');
   if (['repo', 'data'].includes(field.dataset.key)) await refreshBuilds();
@@ -53,9 +56,9 @@ async function usual() {
 
 async function lastSession() {
   const r = await invoke('last_session', { settings });
-  const rows = r
-    ? [['Session', r.session], ['Ended', `${r.outcome} (exit code ${r.code})`], ['Lasted', `${Math.floor(r.seconds / 60)} min ${r.seconds % 60} s`], ['Summary', r.summary || 'none in the journal'], ['Journals', r.folder]]
-    : [['Session', 'none yet']];
+  // A session whose end was not recorded has no exit code and no duration to show.
+  const end = r && r.ended ? [['Ended', `${r.outcome} (exit code ${r.code})`], ['Lasted', `${Math.floor(r.seconds / 60)} min ${r.seconds % 60} s`]] : [['Ended', r && r.outcome]];
+  const rows = r ? [['Session', r.session], ...end, ['Summary', r.summary || 'none in the journal'], ['Journals', r.folder]] : [['Session', 'none yet']];
   $('last').replaceChildren(...rows.flatMap(([k, v]) => [Object.assign(document.createElement('dt'), { textContent: k }), Object.assign(document.createElement('dd'), { textContent: v })]));
   $('messages').textContent = r ? r.messages || 'No message kept (the game ran in a console, or said nothing).' : '';
 }

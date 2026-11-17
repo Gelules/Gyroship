@@ -26,10 +26,33 @@ fn settings_file() -> PathBuf {
     folder().join("launcher.json")
 }
 
-/// No console for the programs started, unless the player wants the game's.
+/// A word for the player from a launcher that has no window to say it in.
+#[cfg(windows)]
+fn say(text: &str) {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn MessageBoxW(owner: *mut std::ffi::c_void, text: *const u16, caption: *const u16, kind: u32) -> i32;
+    }
+    let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
+    // 0x40: the information icon, and one OK button.
+    unsafe { MessageBoxW(std::ptr::null_mut(), wide(text).as_ptr(), wide("Gyroship launcher: already running").as_ptr(), 0x40) };
+}
+
+/// No console for the programs started, unless the player wants the game's: then a new
+/// one. The game writes to it only when the launcher hands it no standard handle of its
+/// own, and a launcher started from a terminal has some: it forgets them first.
 fn window_of(command: &mut Command, console: bool) {
     #[cfg(windows)]
-    std::os::windows::process::CommandExt::creation_flags(command, if console { 0x10 } else { 0x0800_0000 });
+    {
+        unsafe extern "system" {
+            fn SetStdHandle(id: u32, handle: *mut std::ffi::c_void) -> i32;
+        }
+        // The standard input, output and error handles' ids: -10, -11 and -12.
+        for id in [-10i32, -11, -12].into_iter().filter(|_| console) {
+            unsafe { SetStdHandle(id as u32, std::ptr::null_mut()) };
+        }
+        std::os::windows::process::CommandExt::creation_flags(command, if console { 0x10 } else { 0x0800_0000 });
+    }
     #[cfg(not(windows))]
     let _ = (command, console);
 }
@@ -57,16 +80,22 @@ fn list_builds(settings: Settings) -> Vec<String> {
     builds(&settings)
 }
 
-#[tauri::command]
-fn last_session(settings: Settings) -> Option<Report> {
-    report(&logs(&settings))
+/// The journals' folder, once the data folder is set: without it, `logs` would be
+/// looked for under wherever the launcher happens to run.
+fn journals(settings: &Settings) -> Result<PathBuf, String> {
+    if Path::new(&settings.data).is_absolute() { Ok(logs(settings)) } else { Err("the data folder (Setup tab) is not set, or is not a full path".into()) }
 }
 
-/// The journals' folder, in the file explorer (which wants a full path with
-/// backslashes, and opens another folder without a word when its own is missing).
+#[tauri::command]
+fn last_session(settings: Settings) -> Option<Report> {
+    report(&journals(&settings).ok()?)
+}
+
+/// The journals' folder, in the file explorer (which wants backslashes, and opens
+/// another folder without a word when its own is missing).
 #[tauri::command]
 fn open_logs(settings: Settings) -> Result<(), String> {
-    let folder = std::path::absolute(logs(&settings)).map_err(|e| e.to_string())?;
+    let folder = std::path::absolute(journals(&settings)?).map_err(|e| e.to_string())?;
     if !folder.is_dir() {
         return Err(format!("{} does not exist yet: it comes with the first game", folder.display()));
     }
@@ -75,12 +104,13 @@ fn open_logs(settings: Settings) -> Result<(), String> {
 
 #[tauri::command]
 fn play(app: AppHandle, settings: Settings) -> Result<(), String> {
-    start(&app, settings)
+    start(&app, settings, false)
 }
 
 /// Starts the game. The window goes while it runs, so that the webview's memory is the
-/// game's to use, and comes back with the session's end.
-fn start(app: &AppHandle, settings: Settings) -> Result<(), String> {
+/// game's to use, and comes back with the session's end. A `shortcut` start (`--play`)
+/// shows no window after a game that ended normally: the launcher ends with it.
+fn start(app: &AppHandle, settings: Settings, shortcut: bool) -> Result<(), String> {
     let busy = app.state::<Busy>();
     for (what, path) in [("build", &settings.build), ("dump's exefs folder", &settings.exefs), ("data folder (Setup tab)", &settings.data)] {
         if path.is_empty() {
@@ -129,6 +159,9 @@ fn start(app: &AppHandle, settings: Settings) -> Result<(), String> {
         let began = Instant::now();
         let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
         record(code, began.elapsed().as_secs());
+        if shortcut && code == 0 {
+            return app.exit(0);
+        }
         // A game that ends at once must not find the old window still closing: its
         // name must be free, and the launcher stays busy (so alive) until the new one is up.
         while app.get_webview_window("main").is_some() {
@@ -153,6 +186,10 @@ fn run_step(app: AppHandle, busy: State<Busy>, settings: Settings, kind: String)
     let (program, arguments, folder) = step(&settings, &kind)?;
     if !folder.is_dir() {
         return Err(format!("{} does not exist{}", folder.display(), if kind == "build" { ": recompile the game first" } else { "" }));
+    }
+    // The tools are the repository's own build, the one step the launcher does not do.
+    if kind == "recompile" && !program.is_file() {
+        return Err(format!("{} does not exist: build the tools first (cargo build --release, in the repository)", program.display()));
     }
     if busy.0.swap(true, Relaxed) {
         return Err("a game or a setup step is already running".into());
@@ -210,7 +247,7 @@ fn main() {
         use std::os::windows::fs::OpenOptionsExt;
         match std::fs::OpenOptions::new().write(true).create(true).truncate(false).share_mode(0).open(folder().join("launcher.lock")) {
             // 32: a sharing violation, the other launcher holds the file.
-            Err(e) if e.raw_os_error() == Some(32) => return,
+            Err(e) if e.raw_os_error() == Some(32) => return say("The launcher is already running: use its window, or close it first.\n\nWhile a game it started runs, it has no window: it comes back when the game ends."),
             lock => lock.ok(),
         }
     };
@@ -218,7 +255,7 @@ fn main() {
         .manage(Busy::default())
         .setup(|app| {
             // `--play` (a shortcut's argument): the game at once, with the saved settings.
-            let direct = std::env::args().any(|a| a == "--play").then(|| start(app.handle(), load(&settings_file()).0));
+            let direct = std::env::args().any(|a| a == "--play").then(|| start(app.handle(), load(&settings_file()).0, true));
             match direct {
                 Some(Ok(())) => {}
                 Some(Err(e)) => open_window(app.handle(), &format!("window.__NOTICE__ = {};", serde_json::Value::String(format!("The game did not start: {e}"))))?,

@@ -83,13 +83,16 @@ fn a_session_gets_the_next_number_and_its_end_is_reported() {
     fs::write(dir.join("play-10.err.txt"), "gyroship: play mode\ngyroship: window closed\n").unwrap();
     fs::write(dir.join("last.json"), serde_json::to_string(&Last { session: "play-10".into(), code: 72, seconds: 95 }).unwrap()).unwrap();
     let r = report(&dir).unwrap();
-    assert_eq!((r.session.as_str(), r.code, r.seconds), ("play-10", 72, 95));
+    assert_eq!((r.session.as_str(), r.ended, r.code, r.seconds), ("play-10", true, 72, 95));
     assert!(r.outcome.contains("emulation stopped"), "{}", r.outcome);
     assert!(outcome(2).contains("command line"));
     assert_eq!(r.summary, "1200 presents; anomalies: none");
     assert_eq!(r.messages, "gyroship: play mode\ngyroship: window closed\n");
     assert!(outcome(0).contains("normally") && outcome(3).contains("GPU") && outcome(71).contains("fault") && outcome(1234).contains("unexpected"));
-    assert!(outcome(gyroship_launcher::RUNNING).contains("not recorded"));
+    // A launcher that stopped before its game left the start's record: no end to show.
+    fs::write(dir.join("last.json"), serde_json::to_string(&Last { session: "play-10".into(), code: gyroship_launcher::RUNNING, seconds: 0 }).unwrap()).unwrap();
+    let r = report(&dir).unwrap();
+    assert!(!r.ended && r.outcome.contains("not recorded"), "{}", r.outcome);
     assert_eq!(logs(&Settings { data: "data".into(), ..Settings::default() }), Path::new("data").join("logs"));
 }
 
@@ -115,20 +118,27 @@ fn builds_are_the_generated_one_and_those_kept() {
     assert_eq!(builds(&Settings { repo: "repo".into(), data: "data".into(), ..Settings::default() }), Vec::<String>::new());
 }
 
-/// The setup steps' command lines; the build fetches nothing, and a missing path is said.
+/// The setup steps' command lines; the build fetches nothing; a path missing, or not a full
+/// one, is said.
 #[test]
 fn setup_steps_are_the_tools_command_lines() {
-    let s = Settings { repo: "repo".into(), exefs: "game/exefs".into(), probes: "probes.txt".into(), ..Settings::default() };
-    let tools = Path::new("repo").join("target/release/gyroship-tools.exe");
+    // Full paths, as the steps want them; nothing here touches the file system.
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let (repo, exefs) = (root.join("repo").to_string_lossy().into_owned(), root.join("exefs").to_string_lossy().into_owned());
+    let s = Settings { repo: repo.clone(), exefs: exefs.clone(), probes: "probes.txt".into(), ..Settings::default() };
+    let tools = Path::new(&repo).join("target/release/gyroship-tools.exe");
     // One kind of separator in what the player reads: the folder is also an argument, as text.
-    let out = ["repo", "generated", "game"].join(std::path::MAIN_SEPARATOR_STR);
-    let generated = std::path::PathBuf::from(&out);
+    let out = [repo.as_str(), "generated", "game"].join(std::path::MAIN_SEPARATOR_STR);
+    let generated = PathBuf::from(&out);
     let (program, line, folder) = step(&s, "recompile").unwrap();
-    assert_eq!((program.as_path(), words(&line), folder.as_path()), (tools.as_path(), vec!["recompile", "game/exefs", "--out", out.as_str(), "--probes", "probes.txt"], Path::new("repo")));
-    assert_eq!(words(&step(&Settings { probes: String::new(), ..s.clone() }, "recompile").unwrap().1), ["recompile", "game/exefs", "--out", out.as_str()]);
+    assert_eq!((program.as_path(), words(&line), folder.as_path()), (tools.as_path(), vec!["recompile", exefs.as_str(), "--out", out.as_str(), "--probes", "probes.txt"], Path::new(&repo)));
+    assert_eq!(words(&step(&Settings { probes: String::new(), ..s.clone() }, "recompile").unwrap().1), ["recompile", exefs.as_str(), "--out", out.as_str()]);
     let (program, line, folder) = step(&s, "build").unwrap();
     assert_eq!((program.as_path(), words(&line), folder), (Path::new("cargo"), vec!["build", "--release", "--offline", "-j", "4"], generated));
     assert!(step(&Settings { exefs: String::new(), ..s.clone() }, "recompile").unwrap_err().contains("the exefs folder is not set"));
     assert!(step(&Settings::default(), "build").unwrap_err().contains("the repository is not set"));
+    // The tools run in the repository, where a relative path would mean another place: refused.
+    assert!(step(&Settings { repo: "repo".into(), ..s.clone() }, "build").unwrap_err().contains("the repository is not a full path: repo"));
+    assert!(step(&Settings { exefs: "game/exefs".into(), ..s.clone() }, "recompile").unwrap_err().contains("the exefs folder is not a full path"));
     assert!(step(&s, "format-the-disk").unwrap_err().contains("no setup step"));
 }

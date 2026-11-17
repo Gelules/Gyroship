@@ -1,5 +1,5 @@
 {
   "identifier": "default",
   "windows": ["main"],
-  "permissions": ["core:event:default"]
+  "permissions": ["core:event:allow-listen"]
 }

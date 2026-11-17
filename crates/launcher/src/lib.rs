@@ -105,7 +105,12 @@ pub fn flags(s: &Settings, logs: &Path, session: &str) -> Vec<String> {
 /// crate (`--offline`).
 // ponytail: 4 build jobs, for 16 GB of RAM; a setting when another machine needs another.
 pub fn step(s: &Settings, kind: &str) -> Result<(PathBuf, Vec<String>, PathBuf), String> {
-    let need = |what: &str, value: &str| if value.is_empty() { Err(format!("{what} is not set")) } else { Ok(value.to_string()) };
+    // Full paths only: the tools run in the repository, where a relative one would mean another place.
+    let need = |what: &str, value: &str| match value {
+        "" => Err(format!("{what} is not set")),
+        v if !Path::new(v).is_absolute() => Err(format!("{what} is not a full path: {v}")),
+        v => Ok(v.to_string()),
+    };
     let repo = need("the repository", &s.repo)?;
     // Joined part by part: the player reads these paths, with one kind of separator.
     let (tools, generated) = (PathBuf::from_iter([repo.as_str(), "target", "release", "gyroship-tools.exe"]), PathBuf::from_iter([repo.as_str(), "generated", "game"]));
@@ -143,7 +148,7 @@ pub fn outcome(code: i32) -> &'static str {
         2 => "a bad command line, or a start that could not go on: see the messages",
         3 => "this GPU cannot run the game: see the messages",
         71 => "a fault in the recompiled game",
-        72 => "the emulation stopped the run (an unknown system call, an anomaly, the time limit or a deadlock)",
+        72 => "the emulation stopped the run (the game aborted, or something it asked for failed): see the messages",
         _ => "an unexpected end",
     }
 }
@@ -161,6 +166,8 @@ pub struct Last {
 #[derive(Debug, Default, PartialEq, Serialize)]
 pub struct Report {
     pub session: String,
+    /// False when the launcher stopped before the game: no exit code, no duration.
+    pub ended: bool,
     pub code: i32,
     pub outcome: &'static str,
     pub seconds: u64,
@@ -186,5 +193,5 @@ pub fn report(logs: &Path) -> Option<Report> {
     let journal = tail(&logs.join(format!("{}.log", last.session)), 1 << 16);
     let summary = journal.lines().rev().find_map(|l| l.split_once(" summary: ")).map_or(String::new(), |l| l.1.to_string());
     let messages = tail(&logs.join(format!("{}.err.txt", last.session)), 4096);
-    Some(Report { outcome: outcome(last.code), summary, messages, folder: logs.to_string_lossy().into_owned(), session: last.session, code: last.code, seconds: last.seconds })
+    Some(Report { ended: last.code != RUNNING, outcome: outcome(last.code), summary, messages, folder: logs.to_string_lossy().into_owned(), session: last.session, code: last.code, seconds: last.seconds })
 }

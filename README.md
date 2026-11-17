@@ -284,17 +284,21 @@ runtime, which Windows 11 has.
 
 - **Play**: the build to start (the generated one, or builds kept as
   `<data folder>/bin/<name>/harness.exe`), your dump's `exefs` folder, the save and cache folders,
-  the language and the options above, then Play. The window closes while the game runs, so that its
-  memory is the game's, and comes back with how the session ended. `gyroship-launcher --play` starts
-  the game at once with the saved settings.
-- **Setup**: steps 2 and 3 of the port, one at a time, their output on the page. The build step
-  never fetches a crate (`--offline`); it takes `<data folder>/cargo` as cargo's home when that
-  folder exists and `CARGO_HOME` is not set.
+  the language, full screen, the Joy-Con, the SDL3 library, the practice tools and the recording of
+  inputs, then Play. Paths are typed or pasted, as full paths. The window closes while the game
+  runs, so that its memory is the game's, and comes back with how the session ended.
+  `gyroship-launcher --play` starts the game at once with the saved settings, for a shortcut: after
+  a game that ended normally, the launcher ends too, without a window.
+- **Setup**: steps 2 and 3 of the port, one at a time, their output on the page; step 1, the tools,
+  stays yours. The build step never fetches a crate (`--offline`): its crates are those step 1
+  fetched. It takes `<data folder>/cargo` as cargo's home when that folder exists and `CARGO_HOME`
+  is not set.
 - **Last session**: the exit code and what it means, the journal's summary line and the game's last
   messages.
 
 Its settings (`launcher.json`), its lock file and its window's data stay next to its executable;
-journals and recordings go to `<data folder>/logs`. One launcher runs at a time. It opens no
+journals and recordings go to `<data folder>/logs`. One launcher runs at a time: a second one says
+so and ends. It opens no
 connection and downloads nothing itself; the WebView2 runtime is Microsoft's and makes requests of
 its own. Checked with stand-ins for the game, by a script clicking its buttons; not used for a real
 session yet.
