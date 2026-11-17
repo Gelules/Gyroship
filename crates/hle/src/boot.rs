@@ -29,6 +29,10 @@ pub fn read_modules(exefs: &Path) -> Result<Vec<(String, Module)>, String> {
             out.push((name.to_string(), Module::parse_nso(&file).map_err(|e| format!("{name}: {}", e.0))?));
         }
     }
+    // Nothing checks the dump before the game starts: a wrong folder is said here, in words.
+    if out.is_empty() {
+        return Err(format!("{}: no module here (main, rtld, sdk...): give the exefs folder of your dump, with its romfs folder next to it", exefs.display()));
+    }
     Ok(out)
 }
 
@@ -106,7 +110,7 @@ pub fn boot(exefs: &Path, journal: Journal, config: Config) -> Result<Kernel, St
     for line in k_lines {
         k.log(&line);
     }
-    let npdm = std::fs::read(exefs.join("main.npdm")).map_err(|e| format!("main.npdm: {e}"))?;
+    let npdm = std::fs::read(exefs.join("main.npdm")).map_err(|e| format!("{}: {e}", exefs.join("main.npdm").display()))?;
     k.allowed_services = npdm_services(&npdm).ok_or("main.npdm: no service access control")?;
     let services = format!("npdm: {} services granted: {}", k.allowed_services.len(), k.allowed_services.join(" "));
     k.log(&services);
@@ -608,6 +612,12 @@ pub fn run(mut table: Vec<rt::Entry>, window: Option<HostWindow>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_folder_without_modules_is_said() {
+        let said = super::read_modules(std::path::Path::new("no-such-folder")).err().unwrap();
+        assert!(said.starts_with("no-such-folder: no module here") && said.contains("exefs folder"), "{said}");
+    }
+
     #[test]
     fn options_are_known_and_valued_ones_come_once() {
         let line = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
