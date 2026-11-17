@@ -49,8 +49,9 @@ Known problems:
   failed at the game's frame 71 when last tried.
 - Memory: 16 GB is the only amount tried, and it is tight: 1.3 GB stayed free in the heaviest scene.
 - First runs stutter: each shader is translated and each pipeline compiled when first needed (63 to
-  125 ms per new material), and in play mode objects can be missing for a few frames when they first
-  appear. `--pipeline-cache` keeps both between runs; a first game with empty caches was not
+  125 ms per new material), and in play mode objects can be missing when they first appear: a few
+  frames as a rule, up to about two seconds for a material the GPU driver takes long to compile.
+  `--pipeline-cache` keeps both between runs; a first game with empty caches was not
   measured. Long frames remain anyway: about 50 frames of 100 ms or more in a session of two
   playthroughs of the first mission, menus and loadings included.
 - Play mode is experimental and says so at start; one memory fault was seen in it, once, cause
@@ -64,8 +65,8 @@ Known problems:
   every few minutes is expected, and the sound trails the picture by about 0.1 s.
 - No rumble, no motion sensors, no button remapping, no amiibo (the reader never finds a figure),
   no system applet: choosing mouse controls in the game opens the console's controller screen, which
-  ends the run. Switch 2 Joy-Con give their buttons and sticks only, through `--joycon`, tried on
-  one pair in the tutorial. A gamepad missing from SDL3's database is not recognised. The picture is
+  ends the run. Switch 2 Joy-Con give their buttons and sticks only, through `--joycon`, played on
+  one pair only: the tutorial, then sessions of 6 and 12 minutes. A gamepad missing from SDL3's database is not recognised. The picture is
   stretched to the window, without 16:9 bars.
 
 ## Requirements
@@ -180,7 +181,9 @@ connection interval (60 ms otherwise) and prints each link's interval whenever i
 Joy-Con that is lost, or silent for 0.4 s, holds no button until its reports come back. With
 another gamepad plugged in, of its stick and the Joy-Con's the one pushed farther counts. The
 protocol is not public: this follows community research and measurements on one pair (firmware
-2.1.9), which then played the tutorial through `--joycon`, both links at 15 ms.
+2.1.9), which then played through `--joycon`, both links at 15 ms: the tutorial, then sessions of 6
+and 12 minutes (the first mission twice, Macbeth, Bolse). The stick clicks and the right stick's full travel were not
+used, and no Joy-Con was switched off in flight.
 `cargo run --release -p gyroship --example joycon_trial -- <L|R|scan> <log file>` is the read-only
 trial those measurements came from.
 
@@ -219,7 +222,8 @@ start.
 
 - `--boost infinite`: as each boost update starts, the meter goes back to a full bar and the
   boost-and-brake lock is lifted, so Boost held never runs out. Verified by deterministic replays on
-  the three vehicles; played by hand in the Landmaster only. At rest its bar keeps its active look.
+  the three vehicles; played by hand in the Arwing and the Landmaster, not in the Blue-Marine. At
+  rest its bar keeps its active look.
 - `--boost perfect`: hold Boost, and Gyroship ends each boost at the moment the research found
   best. Arwing: 30 frames of boost, then 60 of cooldown. Blue-Marine: boosts of 68, 45 and 34 frames
   from rest, then 27 frames every time (1/2, 1/3, 1/4, then 1/5 of the meter): the rule a player can
@@ -268,8 +272,9 @@ the game's asset archive built from the player's own dump: a third choice in the
 of the pause menu (no hook: the game's own handler quits), and a sixth line of the title menu, under
 TRAINING, which needs the `quit` hook (without it the line shows and does nothing). The game then
 shuts itself down and the process exits with code 0; the save is unchanged. Verified by
-deterministic replays in English, French and Japanese and by a real-time run without a window; not
-played in a window yet. The repository holds only the generic mechanism and no script that builds
+deterministic replays in English, French and Japanese and by a real-time run without a window, then
+used in a window, in French: the title menu line twice and the pause menu choice three times, in
+two missions (not in the tutorial). The repository holds only the generic mechanism and no script that builds
 those entries: this is not packaged for other players yet.
 
 ## The launcher
@@ -300,8 +305,10 @@ Its settings (`launcher.json`), its lock file and its window's data stay next to
 journals and recordings go to `<data folder>/logs`. One launcher runs at a time: a second one says
 so and ends. It opens no
 connection and downloads nothing itself; the WebView2 runtime is Microsoft's and makes requests of
-its own. Checked with stand-ins for the game, by a script clicking its buttons; not used for a real
-session yet.
+its own. Checked with stand-ins for the game, by a script clicking its buttons, then used for one
+real session from its Play button: 12 minutes with both Joy-Con, ended by the game itself with exit
+code 0. `--play` and the Setup tab have not run on the real game. With the Joy-Con, tick "Show the
+game's messages in a console": the messages that say when each one is connected go there.
 
 ## Repeatable runs and verification
 
