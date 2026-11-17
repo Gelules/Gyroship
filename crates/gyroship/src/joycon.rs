@@ -3,18 +3,29 @@
 //! pairing), so a thread scans for them, connects without pairing, and their
 //! notified reports go straight into the state the hid samples read. Nothing is
 //! stored on a controller: the only frames ever written are player light 1 and a
-//! read of the factory stick calibration. Buttons and sticks only: no mouse, no
-//! motion, no rumble.
+//! read of the factory stick calibration, plus, with `--joycon-mouse` (D97), the
+//! console's feature mask and its enabling, for the mice and the accelerometers.
+//! No gyroscope (no script of the game reads it, and the game does not react to
+//! it), no rumble.
 
 use crate::pads;
+use gyroship_hle::hid::Mouse;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering::Relaxed};
 
 /// One Joy-Con's state, and when its last report came (ms on `clock`; 0: never).
+/// Under mask 37 also its mouse: the last counters (X | Y << 16, bit 32 once one
+/// came), the counts moved since the last sample, whether it rests on a surface;
+/// and its acceleration on the SDK's axes (`accel`, packed by `pack`).
 #[derive(Default)]
 pub struct Side {
     state: pads::Shared,
     heard: AtomicU64,
+    counters: AtomicU64,
+    dx: AtomicI32,
+    dy: AtomicI32,
+    contact: AtomicBool,
+    accel: AtomicU64,
 }
 
 /// Left, then right.
@@ -126,11 +137,38 @@ pub fn stick(raw: [u16; 2], c: &Calibration) -> [i32; 2] {
     pads::stick(axis(0), -axis(1))
 }
 
+/// The surface byte of the mouse block: 0xFF in the air, lower on a surface.
+// ponytail: the middle of the range, from two reports (0xFF in the air, 0x3F on a desk); the first session's journal can move it.
+const SURFACE: u8 = 0x80;
+
+/// The accelerometer's raw axes as the SDK's acceleration, in thousandths of g by
+/// steps of 50 (8 g for 32767). The controller gives the reaction to gravity
+/// (lying flat face up, about +1 g on its third axis, in both trial reports), the
+/// SDK gravity itself, so each axis changes sign.
+// ponytail: the same axes on both sides, a guess: the game takes a left Joy-Con with x above 0.9 g and a right one below -0.9 g for one lying on its side; the first session's journal tells.
+pub fn accel(raw: [i16; 3]) -> [i32; 3] {
+    raw.map(|r| ((-i32::from(r) * 8000) as f32 / 32767.0 / 50.0).round() as i32 * 50)
+}
+
+/// Three axes of thousandths of g (within ±8000) in one word, and back; bit 48
+/// says there is one.
+fn pack(a: [i32; 3]) -> u64 {
+    a.iter().enumerate().fold(1 << 48, |v, (i, &x)| v | u64::from(x as i16 as u16) << (16 * i))
+}
+fn unpack_accel(v: u64) -> Option<[i32; 3]> {
+    (v >> 48 != 0).then(|| [0, 16, 32].map(|s| i32::from((v >> s) as u16 as i16)))
+}
+
 /// One input report of the Joy-Con of `side`, at `now` (63 bytes: a clock, the
 /// buttons at 4, the left stick at 10 and the right one at 13), into its state:
 /// what is held, what went down since the last sample (a tap shorter than a
 /// sample counts once), and its own stick; the other stick's bytes are not its
-/// to say. True when Home goes down.
+/// to say. Under mask 37, also its mouse at 0x10: X and Y counters that wrap at
+/// 16 bits, whose difference from the last report is the move, then the surface
+/// byte and a distance; and at 0x2A the motion block's clock, then at 0x30 its
+/// accelerometer. Both blocks are zero without the mask (and in the first reports
+/// after it is set): a zero block is no data, not a mouse at rest on a surface.
+/// True when Home goes down.
 pub fn report(side: usize, b: &[u8], c: &Calibration, to: &Side, now: u64) -> bool {
     if b.len() < 16 {
         return false;
@@ -140,37 +178,74 @@ pub fn report(side: usize, b: &[u8], c: &Calibration, to: &Side, now: u64) -> bo
     to.state.pressed.fetch_or(down & NPAD, Relaxed);
     let at = 10 + 3 * side;
     to.state.sticks.store(pads::pack(stick(unpack(&b[at..at + 3]), c), side as u32), Relaxed);
+    let word = |i: usize| u16::from_le_bytes([b[i], b[i + 1]]);
+    if b.len() >= 0x36 && b[0x14..0x18] != [0; 4] {
+        let last = to.counters.swap(u64::from(word(0x10)) | u64::from(word(0x12)) << 16 | 1 << 32, Relaxed);
+        if last >> 32 != 0 {
+            to.dx.fetch_add(i32::from(word(0x10).wrapping_sub(last as u16) as i16), Relaxed);
+            to.dy.fetch_add(i32::from(word(0x12).wrapping_sub((last >> 16) as u16) as i16), Relaxed);
+        }
+        to.contact.store(b[0x14] < SURFACE, Relaxed);
+    }
+    if b.len() >= 0x36 && b[0x2a..0x2e] != [0; 4] {
+        to.accel.store(pack(accel([0x30, 0x32, 0x34].map(|i| word(i) as i16))), Relaxed);
+    }
     to.heard.store(now, Relaxed);
     down & HOME != 0
 }
 
-/// A lost Joy-Con holds nothing: no button stays down, its stick rests.
+/// A lost Joy-Con holds nothing: no button stays down, its stick rests, and its
+/// mouse starts again from its next report.
 pub fn release(side: &Side) {
     side.heard.store(0, Relaxed);
+    side.counters.store(0, Relaxed);
+    side.accel.store(0, Relaxed);
+}
+
+/// A side whose last report is recent enough at `now`.
+fn live(s: &Side, now: u64) -> bool {
+    let heard = s.heard.load(Relaxed);
+    heard != 0 && now.saturating_sub(heard) <= SILENCE
 }
 
 /// What the pair adds to a sample at `now`: its buttons, held or pressed since
 /// the last one, and each side's stick. A side that is lost or silent adds
 /// nothing, whatever its last report said: no button stays down.
 pub fn sample(pair: &Pair, now: u64) -> (u64, [i32; 2], [i32; 2]) {
-    let live = |s: &Side| {
-        let heard = s.heard.load(Relaxed);
-        heard != 0 && now.saturating_sub(heard) <= SILENCE
-    };
     let buttons = pair.iter().fold(0, |v, s| {
         let pressed = s.state.pressed.swap(0, Relaxed);
-        if live(s) { v | s.state.held.load(Relaxed) | pressed } else { v }
+        if live(s, now) { v | s.state.held.load(Relaxed) | pressed } else { v }
     });
-    let sticks = |s: &Side| if live(s) { s.state.sticks() } else { ([0, 0], [0, 0]) };
+    let sticks = |s: &Side| if live(s, now) { s.state.sticks() } else { ([0, 0], [0, 0]) };
     (buttons & NPAD, sticks(&pair[0]).0, sticks(&pair[1]).1)
 }
 
-/// The two frames Gyroship writes, and nothing else, ever: player light 1, and
-/// the read of 0x40 bytes of flash at 0x13080. A frame is a command, 0x91 (a
-/// request), 0x01 (over Bluetooth), a subcommand, 0, the data's length, 0, 0,
-/// then the data.
+/// What the pair's mice and accelerometers add to a sample at `now`
+/// (`--joycon-mouse`): each live side's mouse (the counts moved since the last
+/// sample, and whether it rests on a surface) and acceleration, each from its
+/// first report that carries it. A silent or lost side has neither, and what it
+/// moved is dropped.
+pub fn motion(pair: &Pair, now: u64) -> ([Option<Mouse>; 2], [Option<[i32; 3]>; 2]) {
+    let (mut mice, mut accel) = ([None; 2], [None; 2]);
+    for (i, s) in pair.iter().enumerate() {
+        let (dx, dy) = (s.dx.swap(0, Relaxed), s.dy.swap(0, Relaxed));
+        if live(s, now) {
+            mice[i] = (s.counters.load(Relaxed) >> 32 != 0).then(|| Mouse { dx, dy, contact: s.contact.load(Relaxed) });
+            accel[i] = unpack_accel(s.accel.load(Relaxed));
+        }
+    }
+    (mice, accel)
+}
+
+/// The frames Gyroship writes, and nothing else, ever: player light 1, and the
+/// read of 0x40 bytes of flash at 0x13080; with `--joycon-mouse` (D97), the
+/// console's own feature mask 37 (buttons, sticks, motion, mouse, battery
+/// current), then its enabling. A frame is a command, 0x91 (a request), 0x01
+/// (over Bluetooth), a subcommand, 0, the data's length, 0, 0, then the data.
 const LIGHT: [u8; 16] = [0x09, 0x91, 0x01, 0x07, 0, 8, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0];
 const READ: [u8; 16] = [0x02, 0x91, 0x01, 0x04, 0, 8, 0, 0, 0x40, 0x7e, 0, 0, 0x80, 0x30, 0x01, 0];
+const MASK: [u8; 12] = [0x0c, 0x91, 0x01, 0x02, 0, 4, 0, 0, 0x37, 0, 0, 0];
+const ENABLE: [u8; 12] = [0x0c, 0x91, 0x01, 0x04, 0, 4, 0, 0, 0x37, 0, 0, 0];
 
 /// The block of a notified answer to `READ`: after the answer's header (the
 /// command, 1, 1, the subcommand, four more bytes), the length and the address
@@ -180,15 +255,16 @@ pub fn block(answer: &[u8]) -> Option<&[u8]> {
     (answer.get(at + 12..at + 16)? == &READ[12..]).then(|| &answer[at + 16..])
 }
 
-/// Starts the thread that finds, connects and reads the pair.
-pub fn start(pair: Arc<Pair>) {
+/// Starts the thread that finds, connects and reads the pair; with `mouse`, each
+/// Joy-Con also gets mask 37 at its connection.
+pub fn start(pair: Arc<Pair>, mouse: bool) {
     #[cfg(windows)]
-    if let Err(e) = std::thread::Builder::new().name("joycon".into()).spawn(move || driver::run(&pair)) {
+    if let Err(e) = std::thread::Builder::new().name("joycon".into()).spawn(move || driver::run(&pair, mouse)) {
         eprintln!("gyroship: joycon: {e}");
     }
     #[cfg(not(windows))]
     {
-        let _ = (pair, SIDES, LIGHT);
+        let _ = (pair, mouse, SIDES, LIGHT, MASK, ENABLE);
         eprintln!("gyroship: --joycon: Windows only");
     }
 }
@@ -247,15 +323,16 @@ mod driver {
         reached(c.WriteClientCharacteristicConfigurationDescriptorAsync(Descriptor::Notify)?.join()?.0)
     }
 
-    /// Writes one of the two frames, without response.
-    fn write(c: &GattCharacteristic, frame: &'static [u8; 16]) -> Result<()> {
+    /// Writes one of the frames, without response.
+    fn write(c: &GattCharacteristic, frame: &'static [u8]) -> Result<()> {
         let w = DataWriter::new()?;
         w.WriteBytes(frame)?;
         reached(c.WriteValueWithOptionAsync(&w.DetachBuffer()?, GattWriteOption::WriteWithoutResponse)?.join()?.0)
     }
 
-    /// Connects to the Joy-Con of `side` at `address` and starts its reports.
-    fn connect(side: usize, address: u64, pair: &Arc<Pair>, events: &Sender<Event>) -> Result<Link> {
+    /// Connects to the Joy-Con of `side` at `address` and starts its reports; with
+    /// `mouse`, under mask 37.
+    fn connect(side: usize, address: u64, pair: &Arc<Pair>, events: &Sender<Event>, mouse: bool) -> Result<Link> {
         // A device Windows has not just seen comes back null: an error without a code.
         let device = BluetoothLEDevice::FromBluetoothAddressAsync(address)?.join().map_err(|e| if e.code().is_ok() { failed("Windows does not know it yet") } else { e })?;
         let s = events.clone();
@@ -327,6 +404,17 @@ mod driver {
         }
         if let Some(command) = &command {
             let _ = write(command, &LIGHT);
+            // The mouse and the accelerometer report only under the console's mask: set,
+            // then enabled, 100 ms apart, as the trial did (unspaced writes were seen dropped).
+            let spaced = |frame| {
+                std::thread::sleep(Duration::from_millis(100));
+                write(command, frame)
+            };
+            if mouse && let Err(e) = spaced(&MASK).and_then(|()| spaced(&ENABLE)) {
+                eprintln!("gyroship: joycon: the {} one's mouse did not start ({e})", SIDES[side]);
+            }
+        } else if mouse {
+            eprintln!("gyroship: joycon: the {} one takes no commands: no mouse", SIDES[side]);
         }
         // A link that fell during all this would never be told lost.
         if device.ConnectionStatus()?.0 == 0 {
@@ -338,7 +426,7 @@ mod driver {
 
     /// Scans while a side is missing and connects what shows up in sync mode; a
     /// lost side lets go of everything and is scanned for again.
-    pub fn run(pair: &Arc<Pair>) {
+    pub fn run(pair: &Arc<Pair>, mouse: bool) {
         let (tx, rx) = mpsc::channel();
         let watcher = (|| {
             let w = BluetoothLEAdvertisementWatcher::new()?;
@@ -380,7 +468,7 @@ mod driver {
                         }
                         continue;
                     }
-                    match connect(side, address, pair, &tx) {
+                    match connect(side, address, pair, &tx, mouse) {
                         Ok(link) => links[side] = Some(link),
                         Err(e) => {
                             eprintln!("gyroship: joycon: the {} one did not connect ({e}): keep holding its sync button", SIDES[side]);
@@ -521,6 +609,60 @@ mod tests {
         assert_eq!(sample(&pair, 1501 + SILENCE), (0, [0, 0], [0, 0]));
     }
 
+    /// A report under mask 37: the mouse counters at 0x10 and 0x12, the surface
+    /// byte at 0x14, the motion block's clock at 0x2A, the accelerometer at 0x30.
+    fn moved(x: u16, y: u16, surface: u8, raw: [i16; 3]) -> Vec<u8> {
+        let mut b = input([0; 3], REST, REST);
+        b[0x10..0x14].copy_from_slice(&[x.to_le_bytes(), y.to_le_bytes()].concat());
+        b[0x14] = surface;
+        b[0x2a] = 1;
+        for (i, a) in raw.iter().enumerate() {
+            b[0x30 + 2 * i..0x32 + 2 * i].copy_from_slice(&a.to_le_bytes());
+        }
+        b
+    }
+
+    /// Under mask 37 each side's mouse adds the counts moved since the last sample,
+    /// across the counters' wrap, from its second report on; it touches a surface
+    /// when the surface byte is low; the acceleration is gravity's, in thousandths
+    /// of g by steps of 50. Nothing before the first such report, nothing from a
+    /// silent side, and what a side moved while silent is dropped.
+    #[test]
+    fn a_mouse_adds_its_moves_and_the_acceleration_is_gravity() {
+        let pair = Pair::default();
+        assert_eq!(motion(&pair, 10), ([None; 2], [None; 2]));
+        // Reports without the blocks: buttons only, still nothing to add; a full report
+        // whose blocks are zero (no mask yet) is no mouse resting on a surface.
+        report(1, &input([0; 3], REST, REST)[..20], &TYPICAL, &pair[1], 10);
+        assert_eq!(motion(&pair, 10), ([None; 2], [None; 2]), "a short report");
+        report(1, &input([0; 3], REST, REST), &TYPICAL, &pair[1], 10);
+        assert_eq!(motion(&pair, 10), ([None; 2], [None; 2]), "zero blocks");
+        // The right Joy-Con lying on its side, in the air: its first report sets the counters.
+        let side = [4096, 0, 0];
+        report(1, &moved(0xfff0, 7, 0xff, side), &TYPICAL, &pair[1], 20);
+        assert_eq!(motion(&pair, 20), ([None, Some(Mouse { dx: 0, dy: 0, contact: false })], [None, Some([-1000, 0, 0])]));
+        // On a desk, two reports before the next sample: +0x20 across the wrap, then -3 and +5.
+        report(1, &moved(0x0010, 7, 0x3f, side), &TYPICAL, &pair[1], 30);
+        report(1, &moved(0x000d, 12, 0x3f, [4040, -99, 424]), &TYPICAL, &pair[1], 31);
+        assert_eq!(motion(&pair, 31), ([None, Some(Mouse { dx: 29, dy: 5, contact: true })], [None, Some([-1000, 0, -100])]));
+        assert_eq!(motion(&pair, 32).0[1], Some(Mouse { dx: 0, dy: 0, contact: true }), "moved once");
+        // The left one, flat face up (+1 g on its third axis as the controller says it).
+        report(0, &moved(0, 0, 0xff, [-99, 424, 4040]), &TYPICAL, &pair[0], 33);
+        assert_eq!(motion(&pair, 33).1[0], Some([0, -100, -1000]));
+        // Silent too long: no mouse, no acceleration, and its move is dropped.
+        report(1, &moved(0x0100, 12, 0x3f, side), &TYPICAL, &pair[1], 40);
+        assert_eq!(motion(&pair, 41 + SILENCE), ([None; 2], [None; 2]));
+        report(1, &moved(0x0100, 12, 0x3f, side), &TYPICAL, &pair[1], 50 + SILENCE);
+        assert_eq!(motion(&pair, 50 + SILENCE).0[1], Some(Mouse { dx: 0, dy: 0, contact: true }));
+        // Lost, then back: its counters start again from its next report.
+        release(&pair[1]);
+        report(1, &moved(0x2000, 0x2000, 0x3f, side), &TYPICAL, &pair[1], 60 + SILENCE);
+        assert_eq!(motion(&pair, 60 + SILENCE).0[1], Some(Mouse { dx: 0, dy: 0, contact: true }));
+        // The conversion's ends: 8 g either way, and the steps of 50.
+        assert_eq!(accel([32767, -32768, 0]), [-8000, 8000, 0]);
+        assert_eq!(accel([102, 103, -102]), [0, -50, 0]);
+    }
+
     #[test]
     fn only_a_joy_con_is_seen_and_only_sync_mode_is_answered() {
         let data = |product: u16, host: u8| [&CONTROLLER[..], &product.to_le_bytes(), &[0, 1, 0], &[host; 6], &[0x0f, 0, 0, 0, 0, 0, 0, 0]].concat();
@@ -536,13 +678,16 @@ mod tests {
         assert_eq!(advertising(NINTENDO, &data(0x2066, 0)[..15]), None);
     }
 
-    /// The two frames are the light and one flash read, byte for byte what the
-    /// controllers answered in the trial, and an answer counts only when it
-    /// repeats the address asked.
+    /// The frames are the light and one flash read, byte for byte what the
+    /// controllers answered in the trial, and with `--joycon-mouse` the console's
+    /// mask 37 then its enabling, as the trial sent them to both Joy-Con (D97); an
+    /// answer counts only when it repeats the address asked.
     #[test]
     fn the_frames_written_are_the_light_and_the_calibration_read() {
         assert_eq!(LIGHT, [0x09, 0x91, 0x01, 0x07, 0, 8, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(READ, [0x02, 0x91, 0x01, 0x04, 0, 8, 0, 0, 0x40, 0x7e, 0, 0, 0x80, 0x30, 0x01, 0]);
+        assert_eq!(MASK, [0x0c, 0x91, 0x01, 0x02, 0, 4, 0, 0, 0x37, 0, 0, 0]);
+        assert_eq!(ENABLE, [0x0c, 0x91, 0x01, 0x04, 0, 4, 0, 0, 0x37, 0, 0, 0]);
         let answer = |address: [u8; 4]| [&[0x02, 1, 1, 0x04, 0x10, 0x78, 0, 0, 0x40, 0, 0, 0][..], &address, &[0xab; 0x40]].concat();
         assert_eq!(block(&answer([0x80, 0x30, 1, 0])), Some(&[0xab; 0x40][..]));
         assert_eq!(block(&answer([0xc0, 0x30, 1, 0])), None, "another read's answer");

@@ -140,10 +140,12 @@ impl ApplicationHandler for App {
         };
         let audio = sdl.clone().and_then(|s| pads::audio(s, 2, 48_000));
         self.pads = sdl.map(pads::Pads::new);
-        if std::env::args().any(|a| a == "--joycon") {
-            joycon::start(self.shared.joycon.clone());
+        // --joycon-mouse: the pair with its mice and accelerometers (mask 37, D97).
+        let mouse = std::env::args().any(|a| a == "--joycon-mouse");
+        if mouse || std::env::args().any(|a| a == "--joycon") {
+            joycon::start(self.shared.joycon.clone(), mouse);
         }
-        let host = HostWindow { instance, surface, size: (size.width, size.height), pace: pace(self.shared.clone()), input: input(self.shared.clone()), audio };
+        let host = HostWindow { instance, surface, size: (size.width, size.height), pace: pace(self.shared.clone()), input: input(self.shared.clone(), mouse), audio };
         // The guest's own fibers carry its code; this thread only needs room for the HLE.
         std::thread::Builder::new().name("guest".into()).stack_size(64 << 20).spawn(move || gyroship_hle::boot::run(table, Some(host))).unwrap_or_else(|e| fail(&format!("cannot start the guest: {e}")));
         self.window = Some(window);
@@ -361,8 +363,8 @@ fn pad_of(bits: u64) -> gyroship_hle::hid::Pad {
 }
 
 /// The live state for each hid sample: what is held, plus what was pressed
-/// since the last sample.
-fn input(shared: Arc<Shared>) -> gyroship_hle::LiveInput {
+/// since the last sample; with `mouse`, the Joy-Con's mice and accelerations.
+fn input(shared: Arc<Shared>, mouse: bool) -> gyroship_hle::LiveInput {
     Box::new(move || {
         let mut keys = pad_of(shared.held.load(Ordering::Relaxed) | shared.pressed.swap(0, Ordering::Relaxed));
         for (w, (held, pressed)) in shared.keys_held.iter().zip(&shared.keys_pressed).enumerate() {
@@ -374,7 +376,11 @@ fn input(shared: Arc<Shared>) -> gyroship_hle::LiveInput {
         // farther counts (a gamepad's stick may rest a little outside its dead zone).
         let (buttons, jl, jr) = joycon::sample(&shared.joycon, joycon::clock());
         let far = |a: [i32; 2], b: [i32; 2]| if a[0].abs().max(a[1].abs()) >= b[0].abs().max(b[1].abs()) { a } else { b };
-        pads::merge(keys, p.held.load(Ordering::Relaxed) | p.pressed.swap(0, Ordering::Relaxed) | buttons, far(l, jl), far(r, jr))
+        let mut pad = pads::merge(keys, p.held.load(Ordering::Relaxed) | p.pressed.swap(0, Ordering::Relaxed) | buttons, far(l, jl), far(r, jr));
+        if mouse {
+            (pad.mouse, pad.accel) = joycon::motion(&shared.joycon, joycon::clock());
+        }
+        pad
     })
 }
 
@@ -406,7 +412,7 @@ mod tests {
     #[test]
     fn a_short_press_between_samples_counts_once() {
         let shared = Arc::new(Shared::default());
-        let mut sample = input(shared.clone());
+        let mut sample = input(shared.clone(), false);
         set(&shared.held, &shared.pressed, 0, true);
         set(&shared.held, &shared.pressed, 0, false);
         set(&shared.keys_held[0], &shared.keys_pressed[0], 0x35, true);
@@ -422,7 +428,7 @@ mod tests {
     #[test]
     fn the_joy_con_pair_joins_the_gamepads() {
         let shared = Arc::new(Shared::default());
-        let mut sample = input(shared.clone());
+        let mut sample = input(shared.clone(), false);
         // 63 bytes: Up on the left Joy-Con (byte 6), A on the right (byte 4); the left
         // stick at rest (2048, 2048), the right one fully to the left (848, 2048).
         let mut report = [0u8; 63];
@@ -445,6 +451,26 @@ mod tests {
         }
         let p = sample();
         assert_eq!((p.l, p.r), ([0, 32767], [0, 32767]));
+        // Without --joycon-mouse, no mouse and no acceleration reach the game.
+        assert_eq!((p.mouse, p.accel), ([None; 2], [None; 2]));
+    }
+
+    /// With --joycon-mouse, the pair's mice and accelerations reach the sample, each
+    /// side its own; a report under mask 37 carries them (here the right Joy-Con
+    /// lying on its side, on a desk, moved 3 counts to the right).
+    #[test]
+    fn with_its_mouse_the_pair_gives_its_moves_and_accelerations() {
+        let shared = Arc::new(Shared::default());
+        let mut sample = input(shared.clone(), true);
+        let mut report = [0u8; 63];
+        (report[0x14], report[0x2a]) = (0x3f, 1);
+        report[0x30..0x32].copy_from_slice(&4096i16.to_le_bytes());
+        joycon::report(1, &report, &joycon::TYPICAL, &shared.joycon[1], joycon::clock());
+        report[0x10] = 3;
+        joycon::report(1, &report, &joycon::TYPICAL, &shared.joycon[1], joycon::clock());
+        let p = sample();
+        assert_eq!(p.mouse, [None, Some(gyroship_hle::hid::Mouse { dx: 3, dy: 0, contact: true })]);
+        assert_eq!(p.accel, [None, Some([-1000, 0, 0])]);
     }
 
     /// The debug console's keys, and a few others, by their USB HID usages.

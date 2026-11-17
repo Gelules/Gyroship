@@ -273,6 +273,7 @@ pub const OPTIONS: &[(&str, bool)] = &[
     ("--sdl", true),
     ("--fullscreen", false),
     ("--joycon", false),
+    ("--joycon-mouse", false),
     // The run.
     ("--log", true),
     ("--all-svcs", false),

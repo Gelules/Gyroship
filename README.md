@@ -64,14 +64,15 @@ Known problems:
   never re-checked one by one. Sound needs SDL3 and a window; in play mode a gap or a dropped tick
   every few minutes is expected, and the sound trails the picture by about 0.1 s.
 - No rumble, no button remapping, no amiibo (the reader never finds a figure), no system applet;
-  no motion sensors and no mouse aiming from a live controller. A replay can give a Joy-Con pair
+  mouse aiming and motion from a live controller are untried (`--joycon-mouse`, below). A replay can give a Joy-Con pair
   mice and acceleration (`ML=`, `MR=`, `AL=`, `AR=`, below): one took the game into its mouse
   mode from the tutorial's question, through the console's controller screen (answered at once)
   and the lesson's posture screen, and the mouse then steered. That replay starts the tutorial at
   its mouse question through a layer of edited level files, which the repository does not
   contain. The two mouse lines of the game's options (Preferences) were greyed out in every replay
-  tried before; not checked since.
-  Switch 2 Joy-Con give their buttons and sticks only, through `--joycon`, played on
+  tried before; not checked since. `--joycon-mouse` gives the game the Joy-Con's mice and
+  accelerations: written, not yet tried on a controller.
+  Switch 2 Joy-Con give their buttons and sticks through `--joycon`, played on
   one pair only: the tutorial, then sessions of 6 and 12 minutes. A gamepad missing from SDL3's database is not recognised. The picture is
   stretched to the window, without 16:9 bars.
 
@@ -129,7 +130,7 @@ when missing.
 
 Step 4's command is the one to play with; below, `harness` stands for
 `generated/game/target/release/harness`. It opens a window titled "Gyroship", 1920 x 1080 at start;
-closing it ends the run cleanly. `harness boot <exefs> --help` lists the 40 options by name; the
+closing it ends the run cleanly. `harness boot <exefs> --help` lists the 41 options by name; the
 developer options this file does not describe are documented, for most, on the fields of `Config`
 in `crates/hle/src/lib.rs`. A misspelt option, a valued option given twice, or one left without its
 value at the end of the line stops the start with exit code 2 (any next word is taken as the value).
@@ -146,6 +147,7 @@ value at the end of the line stops the start with exit code 2 (any next word is 
 | `--backend VALUE` | `auto` (the default: Vulkan and DX12 are both offered to wgpu, which took Vulkan on the test PC), `vulkan` or `dx12`. |
 | `--sdl FILE` | The SDL3 library to load, instead of `SDL3.dll` next to the harness executable. |
 | `--joycon` | Switch 2 Joy-Con over Bluetooth LE, without pairing (Windows 11): see below. |
+| `--joycon-mouse` | `--joycon`, plus each Joy-Con's mouse and accelerometer, for the game's mouse mode: see below. |
 
 Without `--save`, every run starts from an empty save kept in memory, and progress is lost; `DIR`
 holds one sub-folder per save, with the game's save files as plain files. Under `--pipeline-cache
@@ -181,8 +183,13 @@ are player light 1 and a read of the factory stick calibration. Turn the console
 game, then hold the sync button of each Joy-Con (the small round one between SL and SR) until the
 terminal says it is connected: after a plain press a Joy-Con only calls its console and drops
 anyone else. Do it again after a loss. The pair acts as one more gamepad: its buttons where the
-console has them, Home as a gamepad's Guide; SL, SR, Capture and C do nothing; no mouse mode, no
-motion, no rumble. Windows 11 is needed for a fast link: Gyroship asks for Windows' 15 ms
+console has them, Home as a gamepad's Guide; SL, SR, Capture and C do nothing; no rumble, no
+gyroscope (no script of the game reads it). With `--joycon-mouse` instead, Gyroship also sends each Joy-Con
+the console's own feature mask and its enabling (two more fixed frames), and gives the game each
+Joy-Con's mouse (its moves, and whether it rests on a surface) and acceleration, as the `ML=`,
+`MR=`, `AL=` and `AR=` words of a replay do; `--record` writes them. Untried on a controller yet:
+the axes of the acceleration are a guess, and the mouse's counts go to the game unscaled. Windows
+11 is needed for a fast link: Gyroship asks for Windows' 15 ms
 connection interval (60 ms otherwise) and prints each link's interval whenever it changes. A
 Joy-Con that is lost, or silent for 0.4 s, holds no button until its reports come back. With
 another gamepad plugged in, of its stick and the Joy-Con's the one pushed farther counts. The
@@ -368,7 +375,8 @@ is the FullKey controller. The console's controller screen, when the game opens 
 once: confirmed with Npad 0 if the style Npad 0 shows is one the game supports, cancelled
 otherwise. The tutorial's mouse lesson then waits for exactly one Joy-Con lying on its side with
 its mouse moving: a replay passed with `AR=-1000,0,0` and `MR=` moving 120 counts per sample, not
-with 6. No live controller gives these words yet. `#` starts a comment.
+with 6. `--joycon-mouse` gives them from live Joy-Con (untried on a controller). `#` starts a
+comment.
 
 Play mode is never a reference: its threads are scheduled by Windows on the real clock, so runs do
 not repeat; its journal is stamped with real time; a replay there follows the wall clock, so the
