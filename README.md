@@ -10,8 +10,10 @@ write-up of the game's boost mechanics whose rules were checked against the runn
   dumped from your own console and already decrypted: its `exefs` folder (the executable's modules)
   and its `romfs` folder (the data). These files, the code generated from them and the outputs of
   its runs are never committed.
-- It never goes online. The emulated network services answer that there is no connection and no
-  host socket is ever opened, so rankings, downloads and online play do not work, by design.
+- The game never goes online. The emulated network services answer that there is no connection and
+  no host socket is ever opened, so rankings, downloads and online play do not work, by design. (The
+  optional launcher opens no connection either, but Microsoft's WebView2, which draws its window,
+  makes requests of its own: see The launcher.)
 - It is not for runs submitted to leaderboards: official runs are done on the console.
 
 ## Status (November 2026)
@@ -270,6 +272,33 @@ deterministic replays in English, French and Japanese and by a real-time run wit
 played in a window yet. The repository holds only the generic mechanism and no script that builds
 those entries: this is not packaged for other players yet.
 
+## The launcher
+
+`crates/launcher` is an optional window over the command line, built with Tauri 2: a workspace of
+its own, so that its dependencies stay out of everything else. It needs Microsoft's WebView2
+runtime, which Windows 11 has.
+
+    cd crates/launcher
+    cargo build --release
+    target/release/gyroship-launcher
+
+- **Play**: the build to start (the generated one, or builds kept as
+  `<data folder>/bin/<name>/harness.exe`), your dump's `exefs` folder, the save and cache folders,
+  the language and the options above, then Play. The window closes while the game runs, so that its
+  memory is the game's, and comes back with how the session ended. `gyroship-launcher --play` starts
+  the game at once with the saved settings.
+- **Setup**: steps 2 and 3 of the port, one at a time, their output on the page. The build step
+  never fetches a crate (`--offline`); it takes `<data folder>/cargo` as cargo's home when that
+  folder exists and `CARGO_HOME` is not set.
+- **Last session**: the exit code and what it means, the journal's summary line and the game's last
+  messages.
+
+Its settings (`launcher.json`), its lock file and its window's data stay next to its executable;
+journals and recordings go to `<data folder>/logs`. One launcher runs at a time. It opens no
+connection and downloads nothing itself; the WebView2 runtime is Microsoft's and makes requests of
+its own. Checked with stand-ins for the game, by a script clicking its buttons; not used for a real
+session yet.
+
 ## Repeatable runs and verification
 
 Without `--play`, the default engine runs every game thread as a fiber on one host thread, over six
@@ -357,6 +386,7 @@ shows in the first mission.
     crates/research   the three vehicles' boost, reimplemented and checked against the game
     crates/gyroship   the host side, a library: window, pacing, keyboard, SDL3 controllers and sound, Joy-Con
     crates/tools      the gyroship-tools command line
+    crates/launcher   the launcher: a Tauri window over the command line (a workspace of its own)
     tools/ghidra      headless Ghidra scripts (not needed to play)
     research/         write-ups of the game's mechanics, with the code behind their numbers
     vendor/naga       naga 30.0.1 with one performance patch

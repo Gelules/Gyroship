@@ -1,0 +1,18 @@
+[package]
+name = "gyroship-launcher"
+description = "Gyroship's launcher: picks a build and its options, starts the game, runs the setup steps"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[build-dependencies]
+tauri-build = "=2.7.5"
+
+[dependencies]
+# custom-protocol: a release build that serves its embedded page, not a development one.
+tauri = { version = "=2.12.6", features = ["custom-protocol"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# A workspace of its own: Tauri's tree stays out of Gyroship's lock file, builds and proofs.
+[workspace]

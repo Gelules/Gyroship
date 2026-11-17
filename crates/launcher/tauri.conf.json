@@ -1,0 +1,12 @@
+{
+  "productName": "Gyroship launcher",
+  "version": "0.1.0",
+  "identifier": "dev.gyroship.launcher",
+  "build": { "frontendDist": "ui" },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [],
+    "security": { "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost" }
+  },
+  "bundle": { "active": false }
+}

@@ -1,0 +1,22 @@
+:root { color-scheme: dark; }
+body { font: 15px system-ui, sans-serif; margin: 0; background: #101418; color: #e6edf3; }
+nav { display: flex; gap: 2px; background: #0b0e11; padding: 8px 16px 0; }
+nav button { border: 0; border-radius: 6px 6px 0 0; background: #1a2027; color: #9aa7b4; padding: 8px 18px; }
+nav button.on { background: #101418; color: #e6edf3; }
+section { padding: 8px 24px 24px; max-width: 880px; }
+h2 { font-size: 15px; color: #7ee787; margin: 20px 0 8px; }
+label { display: grid; grid-template-columns: 220px 1fr; align-items: center; gap: 12px; margin: 6px 0; }
+input:not([type=checkbox]), select { font: inherit; padding: 6px 8px; background: #0b0e11; color: inherit; border: 1px solid #2b3540; border-radius: 4px; min-width: 0; }
+.checks { margin: 8px 0 8px 232px; }
+.checks label { display: block; margin: 4px 0; }
+button { font: inherit; padding: 6px 14px; border: 1px solid #2b3540; border-radius: 4px; background: #1a2027; color: inherit; cursor: pointer; }
+button:disabled { opacity: .5; cursor: default; }
+button.main { background: #238636; border-color: #2ea043; padding: 10px 40px; font-weight: 600; }
+.hint { color: #9aa7b4; font-size: 13px; }
+/* At the bottom, over the page: showing or hiding it moves nothing under the pointer. */
+#notice { position: fixed; left: 0; right: 0; bottom: 0; margin: 0; padding: 8px 24px; background: #4d2d00; color: #ffd8a8; }
+#state { margin-left: 12px; color: #ffa198; }
+pre { background: #0b0e11; border: 1px solid #2b3540; border-radius: 4px; padding: 10px; height: 240px; overflow: auto; white-space: pre-wrap; font: 12px ui-monospace, Consolas, monospace; }
+dl { display: grid; grid-template-columns: 160px 1fr; gap: 6px 12px; }
+dt { color: #9aa7b4; }
+dd { margin: 0; }
