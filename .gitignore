@@ -17,9 +17,7 @@ romfs/
 *.nro
 *.nca
 *.nsp
-*.nsz
 *.xci
-*.xcz
 *.npdm
 *.keys
 

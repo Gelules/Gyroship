@@ -331,6 +331,9 @@ fn load(exefs: &Path) -> Result<gyroship_loader::link::Program> {
             modules.push((name.to_string(), m));
         }
     }
+    if modules.is_empty() {
+        return Err(format!("{}: no module here (main, rtld, sdk...): give the exefs folder of your dump", exefs.display()).into());
+    }
     Ok(Program::link(modules)?)
 }
 
@@ -556,3 +559,4 @@ fn nso_info(path: &Path, symbols: bool) -> Result<()> {
     }
     Ok(())
 }
+
