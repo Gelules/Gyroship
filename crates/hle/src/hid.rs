@@ -1,6 +1,7 @@
-//! `hid`: one controller (FullKey, slot 0) and a keyboard plugged in, in the
-//! shared memory layout the SDK reads (the Switch 1 one, our reading of the
-//! Switch 2 SDK's readers). Every lifo starts with one null entry: its
+//! `hid`: one controller in slot 0 (FullKey, or a Joy-Con pair used as mice
+//! while the game asks for one and a replay gives a mouse) and a keyboard
+//! plugged in, in the shared memory layout the SDK reads (the Switch 1 one,
+//! our reading of the Switch 2 SDK's readers). Every lifo starts with one null entry: its
 //! sequence is even (no write in progress), so the readers never spin. A
 //! virtual timer samples the controller and the keyboard once per frame, 1 ms
 //! before the vsync (D29), from the `--replay` script or at rest. The game
@@ -28,6 +29,18 @@ const CONDITION: usize = 0x3e200;
 /// FullKey style, and the attribute "connected" of a button state.
 const FULL_KEY: u32 = 1;
 const CONNECTED: u32 = 1;
+/// The style of a Joy-Con pair used as mice (bit 12; the game's "joycon-dual-ms"), read
+/// through the JoyDual lifo, whose attributes must say both Joy-Con are connected.
+pub const DUAL_MOUSE: u32 = 0x1000;
+const JOY_DUAL_LIFO: usize = 0x6c8;
+const BOTH_CONNECTED: u32 = CONNECTED | 1 << 2 | 1 << 4;
+/// The six-axis sensor lifos of a Joy-Con pair, left then right (the SDK gives the pair's
+/// style two handles, device 0 and 1). An entry: its sequence, then the state: time since
+/// the previous one (ns), sampling number, acceleration (g), angular velocity, angle,
+/// direction matrix (f32 each), attributes (bit 0: connected).
+const DUAL_MOTION_LIFOS: [usize; 2] = [0x2568, 0x2c70];
+const MOTION_ENTRY: usize = 0x68;
+const SAMPLE_NS: u64 = 1_000_000_000 / 60;
 /// A button lifo: tail at +0x10, count at +0x18, 17 entries of 0x30 from
 /// +0x20; an entry is its sequence, then the state: sampling number,
 /// buttons, stick L, stick R, attributes.
@@ -65,8 +78,9 @@ pub struct Mouse {
 }
 
 /// A controller's state: buttons and sticks (±0x7fff); the keyboard's: the keys held, one
-/// bit per USB HID usage (0x35 the backquote key, 0x3a F1, 0xe0 left Ctrl); and the mouse
-/// of its left and right Joy-Con, when it has one.
+/// bit per USB HID usage (0x35 the backquote key, 0x3a F1, 0xe0 left Ctrl); the mouse of
+/// its left and right Joy-Con, when it has one; and their acceleration, in thousandths of g
+/// on the SDK's axes, when it is known.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Pad {
     pub buttons: u64,
@@ -74,6 +88,7 @@ pub struct Pad {
     pub r: [i32; 2],
     pub keys: [u64; 4],
     pub mouse: [Option<Mouse>; 2],
+    pub accel: [Option<[i32; 3]>; 2],
 }
 
 /// The usages of the keys held, in increasing order.
@@ -90,9 +105,10 @@ pub enum Step {
 }
 
 /// Parses a `--replay` script: `<sample> <buttons|-> [L=x,y] [R=x,y]
-/// [K=usage,...] [ML=dx,dy,c] [MR=dx,dy,c]` or `<sample> end`, buttons joined by
-/// `+`, keyboard keys as hex USB HID usages, a Joy-Con mouse as its counts per
-/// sample and 1 when it touches a surface, samples increasing; `#` starts a comment.
+/// [K=usage,...] [ML=dx,dy,c] [MR=dx,dy,c] [AL=x,y,z] [AR=x,y,z]` or `<sample> end`,
+/// buttons joined by `+`, keyboard keys as hex USB HID usages, a Joy-Con mouse as its
+/// counts per sample and 1 when it touches a surface, a Joy-Con's acceleration in
+/// thousandths of g, samples increasing; `#` starts a comment.
 pub fn parse_script(text: &str) -> Result<Vec<(u64, Step)>, String> {
     let mut script: Vec<(u64, Step)> = Vec::new();
     for (n, line) in text.lines().enumerate() {
@@ -114,11 +130,17 @@ pub fn parse_script(text: &str) -> Result<Vec<(u64, Step)>, String> {
                     }
                 }
                 for w in words.by_ref() {
-                    let (stick, xy) = w.split_once('=').ok_or_else(|| bad("expected L=x,y, R=x,y, K=keys, ML=dx,dy,c or MR=dx,dy,c"))?;
+                    let (stick, xy) = w.split_once('=').ok_or_else(|| bad("expected L=x,y, R=x,y, K=keys, ML=dx,dy,c, MR=dx,dy,c, AL=x,y,z or AR=x,y,z"))?;
                     if let Some(side) = ["ML", "MR"].iter().position(|&n| n == stick) {
                         let v = xy.split(',').map(str::parse::<i32>).collect::<Result<Vec<_>, _>>().map_err(|_| bad("expected dx,dy,c"))?;
                         let &[dx, dy, c @ (0 | 1)] = v.as_slice() else { return Err(bad("expected dx,dy,c with c 0 or 1")) };
                         pad.mouse[side] = Some(Mouse { dx, dy, contact: c == 1 });
+                        continue;
+                    }
+                    if let Some(side) = ["AL", "AR"].iter().position(|&n| n == stick) {
+                        let v = xy.split(',').map(str::parse::<i32>).collect::<Result<Vec<_>, _>>().map_err(|_| bad("expected x,y,z"))?;
+                        let &[x, y, z] = v.as_slice() else { return Err(bad("expected x,y,z")) };
+                        pad.accel[side] = Some([x, y, z]);
                         continue;
                     }
                     if stick == "K" {
@@ -186,6 +208,30 @@ pub fn push_mouse(lifo: &mut [u8], mouse: Option<Mouse>) {
     }
 }
 
+/// Appends a state to a six-axis sensor lifo (the bytes from its header on): one sample's
+/// time, then, given an acceleration in thousandths of g, that acceleration, no rotation,
+/// the direction matrix at rest (identity), connected; without one, a null state (all
+/// zero, not connected), for a replay that stops giving it.
+pub fn push_motion(lifo: &mut [u8], accel: Option<[i32; 3]>) {
+    let e = next_entry(lifo, MOTION_ENTRY, 0x10);
+    lifo[e + 8..e + 0x10].copy_from_slice(&SAMPLE_NS.to_le_bytes());
+    // Acceleration, angular velocity, angle (3 each), then the 3×3 direction matrix.
+    let mut floats = [0f32; 18];
+    if let Some(accel) = accel {
+        for (i, a) in accel.iter().enumerate() {
+            floats[i] = *a as f32 / 1000.0;
+        }
+        for i in 0..3 {
+            floats[9 + 4 * i] = 1.0;
+        }
+    }
+    for (i, f) in floats.iter().enumerate() {
+        lifo[e + 0x18 + 4 * i..e + 0x1c + 4 * i].copy_from_slice(&f.to_le_bytes());
+    }
+    let attributes = if accel.is_some() { CONNECTED } else { 0 };
+    lifo[e + 0x60..e + 0x64].copy_from_slice(&attributes.to_le_bytes());
+}
+
 /// The words a push changed in a lifo of `size`-byte entries, in the order the SDK's
 /// readers need them published: the new entry's sequence made odd ("write in progress"),
 /// its state, its even sequence, then the tail, then the count.
@@ -196,15 +242,23 @@ fn published(lifo: &[u8], size: usize) -> Vec<(usize, u64)> {
 }
 
 /// Appends `pad` to a button lifo (the bytes from its header on): buttons,
-/// sticks, connected.
-pub fn push(lifo: &mut [u8], pad: &Pad) {
+/// sticks, attributes.
+pub fn push(lifo: &mut [u8], pad: &Pad, attributes: u32) {
     let mut state = [0u8; ENTRY - 0x10];
     state[0..8].copy_from_slice(&pad.buttons.to_le_bytes());
     for (i, v) in pad.l.iter().chain(&pad.r).enumerate() {
         state[8 + 4 * i..0xc + 4 * i].copy_from_slice(&v.to_le_bytes());
     }
-    state[0x18..0x1c].copy_from_slice(&CONNECTED.to_le_bytes());
+    state[0x18..0x1c].copy_from_slice(&attributes.to_le_bytes());
     push_entry(lifo, ENTRY, &state);
+}
+
+/// The style Npad 0 shows: a Joy-Con pair used as mice while the game supports that style
+/// but not FullKey's (it asked for mouse controls) and the controller has a mouse on either
+/// side; otherwise the FullKey controller. Gyroship's choice: a replay's mouse words stand
+/// for a pair of Joy-Con laid down as mice, shown only while the game wants one.
+pub fn style_to_show(supported: u32, pad: &Pad) -> u32 {
+    if supported & DUAL_MOUSE != 0 && supported & FULL_KEY == 0 && pad.mouse.iter().any(Option::is_some) { DUAL_MOUSE } else { FULL_KEY }
 }
 
 /// Appends the keys of `pad` to the keyboard lifo (the bytes from its header
@@ -232,6 +286,10 @@ pub struct Input {
     pub last: u64,
     /// The buffer of Joy-Con mouse lifos the game lent: address and size.
     pub jcms: Option<(u64, u64)>,
+    /// The style set the game supports (SetSupportedNpadStyleSet), and the style Npad 0
+    /// shows (0 until hid's shared memory exists).
+    pub supported: u32,
+    pub style: u32,
 }
 
 /// One line of a `--replay` script, as `--record` writes it.
@@ -249,6 +307,11 @@ pub fn script_line(sample: u64, p: &Pad) -> String {
     for (name, mouse) in [("ML", p.mouse[0]), ("MR", p.mouse[1])] {
         if let Some(m) = mouse {
             line += &format!(" {name}={},{},{}", m.dx, m.dy, u8::from(m.contact));
+        }
+    }
+    for (name, accel) in [("AL", p.accel[0]), ("AR", p.accel[1])] {
+        if let Some([x, y, z]) = accel {
+            line += &format!(" {name}={x},{y},{z}");
         }
     }
     line
@@ -322,13 +385,16 @@ impl Hid {
                 }
                 Reply::ok()
             }
-            // SetSupportedNpadStyleSet / GetSupportedNpadStyleSet.
+            // SetSupportedNpadStyleSet / GetSupportedNpadStyleSet. Npad 0's style follows at
+            // once: the game asks right after for the controller screen, or checks the style.
             (Hid::Service { styles, .. }, 100) => {
                 let s = req.u32_at(0)?;
                 if *styles != s {
                     k.log(&format!("hid: supported style set {s:#x}"));
                 }
                 *styles = s;
+                k.input.supported = s;
+                k.restyle();
                 Reply::ok()
             }
             (Hid::Service { styles, .. }, 101) => Reply::with(&styles.to_le_bytes()),
@@ -377,6 +443,7 @@ impl Kernel {
         // Slot 0: a FullKey controller, connected, nothing pressed.
         self.write_shared(m, NPAD, &FULL_KEY.to_le_bytes());
         self.write_shared(m, NPAD + 0x28 + 0x20 + 0x28, &CONNECTED.to_le_bytes());
+        self.input.style = FULL_KEY;
         self.npad_condition(1);
         // Sample k comes SAMPLE_LEAD before vsync k + 1 (to a tick, on the 60 Hz grid).
         let period = TICKS_PER_SECOND / 60;
@@ -386,8 +453,9 @@ impl Kernel {
     }
 
     /// Timer `HidSample`: the state of sample `k` (from the replay script, else
-    /// at rest) goes into slot 0's FullKey lifo. Logged when it changes; the
-    /// script's end stops the run.
+    /// at rest) sets the style slot 0 shows (`restyle`), then goes into slot 0's
+    /// lifos (`push_sample`) and the Joy-Con mouse lifos (`push_mice`). Logged
+    /// when it changes; the script's end stops the run.
     pub(crate) fn hid_sample(&mut self, m: usize, k: u64) {
         let mut input = self.input;
         while let Some(&(at, step)) = self.config.replay.as_ref().and_then(|s| s.get(input.next))
@@ -415,6 +483,11 @@ impl Kernel {
                     more += &format!(" {name} [{}, {}, {}]", m.dx, m.dy, u8::from(m.contact));
                 }
             }
+            for (name, accel) in [("AL", p.accel[0]), ("AR", p.accel[1])] {
+                if let Some(a) = accel {
+                    more += &format!(" {name} {a:?}");
+                }
+            }
             self.log(&format!("hid: sample {k} (present {}): buttons {:#x} L {:?} R {:?}{more}", self.gs.presents, p.buttons, p.l, p.r));
             if let Some(lines) = self.recorded.as_mut() {
                 lines.push(script_line(k, &p));
@@ -422,15 +495,47 @@ impl Kernel {
         }
         input.last = k;
         self.input = input;
-        self.push_sample(m, &input.current);
+        self.restyle();
+        self.push_sample(m, &input.current, &before);
         self.push_mice(&input.current, &before);
     }
 
-    /// Appends `pad` to slot 0's FullKey lifo and its keys to the keyboard
-    /// lifo, in the guest's copy too.
-    fn push_sample(&mut self, m: usize, pad: &Pad) {
-        self.push_lifo(m, NPAD + 0x28, ENTRY, |l| push(l, pad));
+    /// Appends `pad` to slot 0's FullKey lifo, to its JoyDual lifo while it shows a Joy-Con
+    /// pair used as mice, each Joy-Con's acceleration to the pair's six-axis lifos, and its
+    /// keys to the keyboard lifo, in the guest's copy too. A side without acceleration writes
+    /// nothing, but one null state when `before` (the sample before) had one: it is gone.
+    fn push_sample(&mut self, m: usize, pad: &Pad, before: &Pad) {
+        self.push_lifo(m, NPAD + 0x28, ENTRY, |l| push(l, pad, CONNECTED));
+        if self.input.style == DUAL_MOUSE {
+            self.push_lifo(m, NPAD + JOY_DUAL_LIFO, ENTRY, |l| push(l, pad, BOTH_CONNECTED));
+        }
+        for (side, at) in DUAL_MOTION_LIFOS.iter().enumerate() {
+            if pad.accel[side].is_some() || before.accel[side].is_some() {
+                self.push_lifo(m, NPAD + at, MOTION_ENTRY, |l| push_motion(l, pad.accel[side]));
+            }
+        }
         self.push_lifo(m, KEYBOARD, KEY_ENTRY, |l| push_keys(l, pad));
+    }
+
+    /// Makes Npad 0 show the style `style_to_show` gives. To a Joy-Con pair used as mice,
+    /// its JoyDual lifo first gets the controller's state with both Joy-Con connected, then
+    /// the style word changes: whoever reads the new style finds that state.
+    fn restyle(&mut self) {
+        let Some(m) = self.hid_shared else { return };
+        let style = style_to_show(self.input.supported, &self.input.current);
+        if style == self.input.style {
+            return;
+        }
+        if style == DUAL_MOUSE {
+            let pad = self.input.current;
+            self.push_lifo(m, NPAD + JOY_DUAL_LIFO, ENTRY, |l| push(l, &pad, BOTH_CONNECTED));
+        }
+        // The style word is the slot's first u32; the next one is left as it is.
+        let next = u32::from_le_bytes(self.shared[m].data[NPAD + 4..NPAD + 8].try_into().unwrap());
+        self.store_shared(m, NPAD, u64::from(style) | u64::from(next) << 32);
+        self.input.style = style;
+        let what = if style == DUAL_MOUSE { "a Joy-Con pair used as mice" } else { "the FullKey controller" };
+        self.log(&format!("hid: Npad 0 shows {what} (style {style:#x})"));
     }
 
     /// Appends each Joy-Con mouse of `pad` to its lifo of Npad 0 in the buffer the game
@@ -512,7 +617,7 @@ mod tests {
         let mut last = Pad::default();
         for n in 1..=40 {
             last = Pad { buttons: n % 3, l: [n as i32, -(n as i32)], r: [0x7fff, -0x7fff], ..Pad::default() };
-            push(&mut lifo, &last);
+            push(&mut lifo, &last, CONNECTED);
             assert_eq!(read(&lifo), last, "sample {n}");
         }
         assert_eq!(lifo[LIFO_COUNT], 17);
@@ -554,15 +659,18 @@ mod tests {
             Pad { r: [3, -4], keys: [1 << 0x35, 0, 0, 1 << (0xe1 - 0xc0)], ..Pad::default() },
             Pad { buttons: 4, mouse: [Some(Mouse { dx: -12, dy: 7, contact: true }), None], ..Pad::default() },
             Pad { mouse: [Some(Mouse::default()), Some(Mouse { dx: 3, dy: 0, contact: false })], ..Pad::default() },
+            Pad { accel: [Some([1000, -20, 3]), Some([-1000, 0, 0])], ..Pad::default() },
         ];
-        let text: String = pads.iter().enumerate().map(|(i, p)| script_line(10 * i as u64, p) + "\n").collect::<String>() + "60 end\n";
-        let expected: Vec<(u64, Step)> = pads.iter().enumerate().map(|(i, p)| (10 * i as u64, Step::Pad(*p))).chain([(60, Step::End)]).collect();
+        let text: String = pads.iter().enumerate().map(|(i, p)| script_line(10 * i as u64, p) + "\n").collect::<String>() + "70 end\n";
+        let expected: Vec<(u64, Step)> = pads.iter().enumerate().map(|(i, p)| (10 * i as u64, Step::Pad(*p))).chain([(70, Step::End)]).collect();
         assert_eq!(parse_script(&text).unwrap(), expected);
         assert_eq!(script_line(7, &pads[1]), "7 A+Up+RightSR L=-32767,32767");
         assert_eq!(script_line(9, &pads[2]), "9 - R=3,-4 K=35,e1");
         // A Joy-Con mouse: its counts and whether it touches a surface, each side by itself.
         assert_eq!(script_line(11, &pads[3]), "11 X ML=-12,7,1");
         assert_eq!(script_line(13, &pads[4]), "13 - ML=0,0,0 MR=3,0,0");
+        // A Joy-Con's acceleration, each side by itself.
+        assert_eq!(script_line(15, &pads[5]), "15 - AL=1000,-20,3 AR=-1000,0,0");
     }
 
     #[test]
@@ -581,6 +689,12 @@ mod tests {
         let m = parse_script("5 - MR=-3,40,1\n").unwrap();
         assert_eq!(m, vec![(5, Step::Pad(Pad { mouse: [None, Some(Mouse { dx: -3, dy: 40, contact: true })], ..Pad::default() }))]);
         for bad in ["5 - ML=1,2", "5 - ML=1,2,2", "5 - ML=1,2,1,0", "5 - ML=a,2,1", "5 - MX=1,2,1"] {
+            assert!(parse_script(bad).is_err(), "{bad}");
+        }
+        // An acceleration word wants three thousandths of g.
+        let a = parse_script("5 - AR=-1000,2,-3\n").unwrap();
+        assert_eq!(a, vec![(5, Step::Pad(Pad { accel: [None, Some([-1000, 2, -3])], ..Pad::default() }))]);
+        for bad in ["5 - AL=1,2", "5 - AL=1,2,3,4", "5 - AL=1.5,2,3", "5 - AX=1,2,3"] {
             assert!(parse_script(bad).is_err(), "{bad}");
         }
     }
@@ -609,20 +723,151 @@ mod tests {
     }
 
     /// The ordered writes leave the bytes of the whole copies they replace
-    /// (controller and keyboard), in the guest and in the kernel's copy.
+    /// (controller, the pair's six-axis lifos and keyboard), in the guest and in
+    /// the kernel's copy.
     #[test]
     fn samples_leave_the_bytes_of_a_whole_copy() {
         let (mut k, m, addr) = mapped();
         let at = NPAD + 0x28;
         let mut want = k.shared[m].data.clone();
         let mut guest = vec![0u8; SHARED_SIZE as usize];
+        // Acceleration on some samples only: the left side two in three, the right one in two.
+        let sample = |n: u64| Pad {
+            accel: [(n % 3 != 0).then_some([10 * n as i32, -1, 2]), (n % 2 == 0).then_some([-1000, 0, n as i32])],
+            ..pad(n)
+        };
+        let mut before = Pad::default();
         for n in 1..=40 {
-            push(&mut want[at..at + LIFO_SIZE], &pad(n));
-            push_keys(&mut want[KEYBOARD..KEYBOARD + LIFO_ENTRIES + LIFO_LEN * KEY_ENTRY], &pad(n));
-            k.push_sample(m, &pad(n));
+            let p = sample(n);
+            push(&mut want[at..at + LIFO_SIZE], &p, CONNECTED);
+            for (side, lifo) in DUAL_MOTION_LIFOS.iter().enumerate() {
+                if p.accel[side].is_some() || before.accel[side].is_some() {
+                    push_motion(&mut want[NPAD + lifo..NPAD + lifo + LIFO_ENTRIES + LIFO_LEN * MOTION_ENTRY], p.accel[side]);
+                }
+            }
+            push_keys(&mut want[KEYBOARD..KEYBOARD + LIFO_ENTRIES + LIFO_LEN * KEY_ENTRY], &p);
+            k.push_sample(m, &p, &before);
             k.mem.read_object(addr, &mut guest).unwrap();
             assert!(guest == want && k.shared[m].data == want, "sample {n}");
+            before = p;
         }
+    }
+
+    /// A six-axis lifo, read as the SDK's GetSixAxisSensorStates does: entries of 0x68, each
+    /// sequence even, sampling numbers (the state's second field) one apart; the newest state
+    /// gives one sample's time, the acceleration in g, no rotation, the direction matrix at
+    /// rest, connected; without acceleration, a null state. A sample writes the acceleration
+    /// of each side that has one, one null state on a side whose acceleration goes, and
+    /// nothing else.
+    #[test]
+    fn motion_states_read_back_as_the_sdk_reads_them() {
+        let mut lifo = vec![0u8; LIFO_ENTRIES + LIFO_LEN * MOTION_ENTRY];
+        lifo[LIFO_COUNT] = 1;
+        let u64_at = |l: &[u8], o: usize| u64::from_le_bytes(l[o..o + 8].try_into().unwrap());
+        let floats = |l: &[u8], e: usize| (0..18).map(|i| f32::from_le_bytes(l[e + 0x18 + 4 * i..e + 0x1c + 4 * i].try_into().unwrap())).collect::<Vec<_>>();
+        let attributes = |l: &[u8], e: usize| u32::from_le_bytes(l[e + 0x60..e + 0x64].try_into().unwrap());
+        for n in 1..=40 {
+            push_motion(&mut lifo, Some([1000 * n, -500, 250]));
+        }
+        let (tail, count) = (u64_at(&lifo, LIFO_TAIL) as usize, u64_at(&lifo, LIFO_COUNT) as usize);
+        assert_eq!(count, LIFO_LEN);
+        let entry = |back: usize| LIFO_ENTRIES + (tail + LIFO_LEN - back) % LIFO_LEN * MOTION_ENTRY;
+        for back in 0..count {
+            assert_eq!(u64_at(&lifo, entry(back)) % 2, 0, "sequence even");
+            if back + 1 < count {
+                assert_eq!(u64_at(&lifo, entry(back) + 0x10), u64_at(&lifo, entry(back + 1) + 0x10) + 1, "sampling numbers follow");
+            }
+        }
+        let e = entry(0);
+        assert_eq!((u64_at(&lifo, e + 8), u64_at(&lifo, e + 0x10)), (16_666_666, 40), "one sample's time in ns, sampling number");
+        let f = floats(&lifo, e);
+        assert_eq!(f[..3], [40.0, -0.5, 0.25], "acceleration in g");
+        assert_eq!(f[3..9], [0.0; 6], "no angular velocity, no angle");
+        assert_eq!(f[9..], [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], "direction at rest");
+        assert_eq!(attributes(&lifo, e), CONNECTED);
+        push_motion(&mut lifo, None);
+        let e = LIFO_ENTRIES + u64_at(&lifo, LIFO_TAIL) as usize * MOTION_ENTRY;
+        assert_eq!((u64_at(&lifo, e + 0x10), floats(&lifo, e), attributes(&lifo, e)), (41, vec![0.0; 18], 0), "a null state");
+        // In hid's shared memory: the left side only; when its word goes, one null state.
+        let (mut k, m, _) = mapped();
+        let count = |k: &Kernel, side: usize| u64_at(&k.shared[m].data, NPAD + DUAL_MOTION_LIFOS[side] + LIFO_COUNT);
+        let left = Pad { accel: [Some([1000, 0, 0]), None], ..Pad::default() };
+        k.push_sample(m, &left, &Pad::default());
+        assert_eq!((count(&k, 0), count(&k, 1)), (2, 1));
+        k.push_sample(m, &Pad::default(), &left);
+        assert_eq!((count(&k, 0), count(&k, 1)), (3, 1), "a null state");
+        k.push_sample(m, &Pad::default(), &Pad::default());
+        assert_eq!((count(&k, 0), count(&k, 1)), (3, 1), "then nothing");
+    }
+
+    /// Npad 0 shows a Joy-Con pair used as mice only while the game supports that style and
+    /// not FullKey's and the controller has a mouse, on either side. Once the style word says
+    /// so, the pair's JoyDual lifo holds a state that says both Joy-Con are connected
+    /// (`restyle` publishes it first, for readers on other threads: this test sees only the
+    /// end state), and it gets every sample while the pair is shown; the guest's copy stays
+    /// equal to the kernel's.
+    #[test]
+    fn npad_0_shows_a_mouse_pair_only_when_the_game_asks_and_there_is_a_mouse() {
+        let (mut k, m, addr) = mapped();
+        let word = |k: &Kernel, o: usize| u32::from_le_bytes(k.shared[m].data[o..o + 4].try_into().unwrap());
+        let mouse = Pad { buttons: 1, mouse: [Some(Mouse::default()), Some(Mouse::default())], ..Pad::default() };
+        // The supported set alone, or a mouse alone: still FullKey.
+        for (supported, pad) in [(0x407, mouse), (0x741f, mouse), (DUAL_MOUSE, Pad::default())] {
+            (k.input.supported, k.input.current) = (supported, pad);
+            k.restyle();
+            assert_eq!(word(&k, NPAD), FULL_KEY, "{supported:#x}");
+        }
+        // A mouse on either side is enough.
+        for side in 0..2 {
+            let mut one = Pad::default();
+            one.mouse[side] = Some(Mouse::default());
+            assert_eq!(style_to_show(DUAL_MOUSE, &one), DUAL_MOUSE, "side {side}");
+        }
+        // Both: the pair, with its JoyDual state.
+        let dual = NPAD + JOY_DUAL_LIFO;
+        let newest = |k: &Kernel| dual + LIFO_ENTRIES + word(k, dual + LIFO_TAIL) as usize * ENTRY;
+        (k.input.supported, k.input.current) = (DUAL_MOUSE, mouse);
+        k.restyle();
+        assert_eq!(word(&k, NPAD), DUAL_MOUSE);
+        assert_eq!(word(&k, dual + LIFO_COUNT), 2, "the null entry, then the pair's state");
+        // Attributes: connected, left connected (bit 2), right connected (bit 4); the game
+        // takes the pair for one used as mice only with bits 2 and 4.
+        assert_eq!((word(&k, newest(&k) + 0x10), word(&k, newest(&k) + 0x28)), (1, 0x15), "buttons, attributes");
+        // A sample feeds the pair: its buttons and sticks, both Joy-Con connected.
+        let moved = Pad { buttons: 2, l: [5, -6], ..mouse };
+        k.push_sample(m, &moved, &mouse);
+        assert_eq!(word(&k, dual + LIFO_COUNT), 3, "a sample feeds the pair");
+        let e = newest(&k);
+        assert_eq!([word(&k, e + 0x10), word(&k, e + 0x18), word(&k, e + 0x1c), word(&k, e + 0x28)], [2, 5, -6i32 as u32, 0x15], "buttons, stick, attributes");
+        let mut guest = vec![0u8; SHARED_SIZE as usize];
+        k.mem.read_object(addr, &mut guest).unwrap();
+        assert!(guest == k.shared[m].data);
+        // The game supports FullKey again: FullKey, and the pair's lifo is left alone.
+        k.input.supported = 0x407;
+        k.restyle();
+        assert_eq!(word(&k, NPAD), FULL_KEY);
+        k.push_sample(m, &mouse, &moved);
+        assert_eq!(word(&k, dual + LIFO_COUNT), 3);
+        let text = k.journal.text();
+        assert!(text.contains("hid: Npad 0 shows a Joy-Con pair used as mice (style 0x1000)") && text.contains("hid: Npad 0 shows the FullKey controller (style 0x1)"), "{text}");
+    }
+
+    /// Each sample sets the style first: with the mouse pair's style supported alone, Npad 0
+    /// shows the pair from the first sample whose replay line has a mouse, and FullKey again
+    /// from the first one without; each change is logged once.
+    #[test]
+    fn each_sample_shows_the_mouse_pair_while_the_replay_has_a_mouse() {
+        let (mut k, m, _) = mapped();
+        k.config.replay = Some(parse_script("0 -\n2 - MR=1,0,1\n4 -\n").unwrap());
+        k.input.supported = DUAL_MOUSE;
+        let styles: Vec<u32> = (0..6)
+            .map(|n| {
+                k.hid_sample(m, n);
+                u32::from_le_bytes(k.shared[m].data[NPAD..NPAD + 4].try_into().unwrap())
+            })
+            .collect();
+        assert_eq!(styles, [FULL_KEY, FULL_KEY, DUAL_MOUSE, DUAL_MOUSE, FULL_KEY, FULL_KEY]);
+        assert_eq!(k.journal.text().matches("hid: Npad 0 shows").count(), 2);
     }
 
     /// A Joy-Con mouse lifo, read as the SDK's GetJcmsStates does and used as the game
@@ -774,7 +1019,7 @@ mod tests {
                 })
             });
             for n in 1..=SAMPLES {
-                k.push_sample(m, &pad(n));
+                k.push_sample(m, &pad(n), &pad(n - 1));
             }
             done.store(true, Release);
             for r in readers {

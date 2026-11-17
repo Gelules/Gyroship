@@ -394,9 +394,9 @@ fn a_started_joy_con_mouse_has_a_null_state_to_read() {
 }
 
 /// There is no system applet here. The controller screen (`nn::hid::ShowControllerSupport`,
-/// library applet 0x0C) is created, takes an argument and starts, and has already closed,
-/// cancelled: the one answer the SDK hands back to the game, as any refusal on the way makes
-/// it abort.
+/// library applet 0x0C) is created, takes an argument and starts, and has already closed:
+/// cancelled when the controller Npad 0 shows has no style the game supports (here hid is
+/// not even open). Any refusal on the way would make the SDK abort.
 #[test]
 fn the_controller_screen_closes_at_once_cancelled() {
     let (mut k, mut cpu) = kernel();
@@ -435,7 +435,10 @@ fn the_controller_screen_closes_at_once_cancelled() {
     assert_eq!(cmif_result(&w, 2), SUCCESS);
     let (_, w) = send(&mut k, &mut cpu, screen, &cmif(&[4], 100, &[], None));
     assert_eq!(cmif_result(&w, 2), SUCCESS);
-    // Start; the state event is signaled (the screen has closed) and GetResult says cancelled.
+    // 90 (the SDK's first call in StartLibraryApplet), then Start; the state event is
+    // signaled (the screen has closed) and GetResult says cancelled.
+    let (_, w) = send(&mut k, &mut cpu, screen, &cmif(&[4], 90, &[0; 8], None));
+    assert_eq!(cmif_result(&w, 2), SUCCESS);
     let (_, w) = send(&mut k, &mut cpu, screen, &cmif(&[4], 10, &[], None));
     assert_eq!(cmif_result(&w, 2), SUCCESS);
     let (_, w) = send(&mut k, &mut cpu, screen, &cmif(&[4], 0, &[], None));
@@ -445,7 +448,111 @@ fn the_controller_screen_closes_at_once_cancelled() {
     assert_eq!(gyroship_hle::am::CANCELLED, 0x2C80, "module 128, description 22");
     assert_eq!(k.tally().counts["controller screens cancelled"], 1);
     let text = k.journal.text();
-    assert!(text.contains("am: the controller screen is asked (library applet 0x100000c, mode 0): none here, it closes at once, cancelled"), "{text}");
+    assert!(text.contains("am: the controller screen is asked (library applet 0x100000c, mode 0): Npad 0 shows style 0x0, the game supports 0x0: it closes at once, cancelled"), "{text}");
     assert!(text.contains("am: applet argument of 0x14 bytes: 1400000030040000010000000010000001000000"), "{text}");
     assert!(text.contains("ipc ILibraryAppletCreator command 3 is not implemented; arguments 11000000"), "{text}");
+}
+
+/// With hid open: while the game supports the mouse pair's style alone and no mouse is
+/// there, Npad 0 stays FullKey, which does not fit: the screen closes cancelled and hands
+/// out nothing. With FullKey supported again, the same controller fits: confirmed.
+#[test]
+fn the_controller_screen_follows_whether_npad_0_fits() {
+    let (mut k, mut cpu) = kernel();
+    k.config.explore = true;
+    k.allowed_services.extend(["appletOE".to_string(), "hid".to_string()]);
+    let sm = connect_sm(&mut k, &mut cpu);
+    let (_, hid) = get_service(&mut k, &mut cpu, sm, "hid");
+    let (_, w) = send(&mut k, &mut cpu, hid, &cmif(&[4], 0, &[0x51, 0], None));
+    let resource = moved(&w);
+    send(&mut k, &mut cpu, resource, &cmif(&[4], 0, &[], None));
+    let (_, oe) = get_service(&mut k, &mut cpu, sm, "appletOE");
+    let (_, w) = send(&mut k, &mut cpu, oe, &cmif(&[4], 10, &[0, 0], None));
+    let proxy = moved(&w);
+    let (_, w) = send(&mut k, &mut cpu, proxy, &cmif(&[4], 11, &[], None));
+    let creator = moved(&w);
+    // SetSupportedNpadStyleSet, then a screen created, started and closed: its GetResult.
+    let screen = |k: &mut Kernel, cpu: &mut Cpu, supported: u32| {
+        let (_, w) = send(k, cpu, hid, &cmif(&[4], 100, &[supported, 0, 0x51, 0], None));
+        assert_eq!(cmif_result(&w, 2), SUCCESS);
+        let (_, w) = send(k, cpu, creator, &cmif(&[4], 3, &[0x100_000C, 0, 7, 0], None));
+        let screen = moved(&w);
+        for command in [90, 10] {
+            let (_, w) = send(k, cpu, screen, &cmif(&[4], command, &[0; 8], None));
+            assert_eq!(cmif_result(&w, 2), SUCCESS, "command {command}");
+        }
+        let (_, w) = send(k, cpu, screen, &cmif(&[4], 30, &[], None));
+        (screen, cmif_result(&w, 2))
+    };
+    let (cancelled, result) = screen(&mut k, &mut cpu, 0x1000);
+    assert_eq!((k.input.style, result), (1, gyroship_hle::am::CANCELLED), "FullKey, cancelled");
+    let (_, w) = send(&mut k, &mut cpu, cancelled, &cmif(&[4], 101, &[], None));
+    assert_eq!(cmif_result(&w, 2), gyroship_hle::am::NO_DATA_IN_CHANNEL, "nothing to pop");
+    let (_, result) = screen(&mut k, &mut cpu, 0x407);
+    assert_eq!((k.input.style, result), (1, SUCCESS), "FullKey, confirmed");
+    let counts = {
+        let t = k.tally();
+        (t.counts["controller screens cancelled"], t.counts["controller screens confirmed"])
+    };
+    assert_eq!(counts, (1, 1));
+    let text = k.journal.text();
+    assert!(text.contains("Npad 0 shows style 0x1, the game supports 0x1000: it closes at once, cancelled"), "{text}");
+    assert!(text.contains("Npad 0 shows style 0x1, the game supports 0x407: it closes at once, confirmed with Npad 0"), "{text}");
+}
+
+/// When the controller Npad 0 shows has a style the game supports, the controller screen
+/// closes confirmed with it: GetResult succeeds and PopOutData hands out once the result the
+/// SDK reads (one player, Npad No1, result 0). A Joy-Con pair used as mice is what Npad 0
+/// shows once the game supports that style alone and the controller has a mouse.
+#[test]
+fn the_controller_screen_confirms_a_controller_that_fits() {
+    let (mut k, mut cpu) = kernel();
+    k.config.explore = true;
+    k.allowed_services.extend(["appletOE".to_string(), "hid".to_string()]);
+    let sm = connect_sm(&mut k, &mut cpu);
+    // hid: its shared memory (a FullKey Npad 0), a controller with a mouse, then
+    // SetSupportedNpadStyleSet with the mouse pair's style alone.
+    let (_, hid) = get_service(&mut k, &mut cpu, sm, "hid");
+    let (_, w) = send(&mut k, &mut cpu, hid, &cmif(&[4], 0, &[0x51, 0], None));
+    let resource = moved(&w);
+    send(&mut k, &mut cpu, resource, &cmif(&[4], 0, &[], None));
+    k.input.current.mouse = [Some(Default::default()), None];
+    let (_, w) = send(&mut k, &mut cpu, hid, &cmif(&[4], 100, &[0x1000, 0, 0x51, 0], None));
+    assert_eq!(cmif_result(&w, 2), SUCCESS);
+    assert_eq!(k.input.style, gyroship_hle::hid::DUAL_MOUSE);
+    // The controller screen, created, started, closed.
+    let (_, oe) = get_service(&mut k, &mut cpu, sm, "appletOE");
+    let (_, w) = send(&mut k, &mut cpu, oe, &cmif(&[4], 10, &[0, 0], None));
+    let proxy = moved(&w);
+    let (_, w) = send(&mut k, &mut cpu, proxy, &cmif(&[4], 11, &[], None));
+    let creator = moved(&w);
+    let (_, w) = send(&mut k, &mut cpu, creator, &cmif(&[4], 3, &[0x100_000C, 0, 7, 0], None));
+    let screen = moved(&w);
+    for command in [90, 10] {
+        let (_, w) = send(&mut k, &mut cpu, screen, &cmif(&[4], command, &[0; 8], None));
+        assert_eq!(cmif_result(&w, 2), SUCCESS, "command {command}");
+    }
+    let (_, w) = send(&mut k, &mut cpu, screen, &cmif(&[4], 30, &[], None));
+    assert_eq!(cmif_result(&w, 2), SUCCESS);
+    // PopOutData: a storage of 0xC bytes, read through its accessor; then nothing more.
+    let (_, w) = send(&mut k, &mut cpu, screen, &cmif(&[4], 101, &[], None));
+    let storage = moved(&w);
+    let (_, w) = send(&mut k, &mut cpu, storage, &cmif(&[4], 0, &[], None));
+    let accessor = moved(&w);
+    let (_, w) = send(&mut k, &mut cpu, accessor, &cmif(&[4], 0, &[], None));
+    assert_eq!((cmif_result(&w, 2), w[8]), (SUCCESS, 0xC), "GetSize: {w:x?}");
+    let at = DATA + 0x400;
+    k.mem.write(at, &[0xff; 0xC]).unwrap();
+    let b = [0xC, at as u32, ((at >> 32 & 0xF) << 28 | (at >> 36 & 7) << 2) as u32];
+    let (_, w) = send(&mut k, &mut cpu, accessor, &cmif(&[4 | 1 << 24, b[0], b[1], b[2]], 11, &[0, 0], None));
+    assert_eq!(cmif_result(&w, 2), SUCCESS);
+    let mut result = [0xff; 0xC];
+    k.mem.read(at, &mut result).unwrap();
+    assert_eq!(result, [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], "one player, Npad No1, result 0");
+    let (_, w) = send(&mut k, &mut cpu, screen, &cmif(&[4], 101, &[], None));
+    assert_eq!(cmif_result(&w, 2), gyroship_hle::am::NO_DATA_IN_CHANNEL);
+    assert_eq!(k.tally().counts["controller screens confirmed"], 1);
+    let text = k.journal.text();
+    assert!(text.contains("hid: Npad 0 shows a Joy-Con pair used as mice (style 0x1000)"), "{text}");
+    assert!(text.contains("Npad 0 shows style 0x1000, the game supports 0x1000: it closes at once, confirmed with Npad 0"), "{text}");
 }

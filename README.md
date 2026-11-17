@@ -63,11 +63,14 @@ Known problems:
 - Rendering is compared with the console by eye only; a few defects reported in earlier builds were
   never re-checked one by one. Sound needs SDL3 and a window; in play mode a gap or a dropped tick
   every few minutes is expected, and the sound trails the picture by about 0.1 s.
-- No rumble, no motion sensors, no button remapping, no amiibo (the reader never finds a figure),
-  no system applet, no mouse aiming yet: its two lines in the game's options (Preferences) are
-  greyed out in every replay. A run once ended in the tutorial, when the game opened the console's
-  controller screen for its mouse mode: that screen is now answered as closed at once, which tests
-  check and no run has reached since.
+- No rumble, no button remapping, no amiibo (the reader never finds a figure), no system applet;
+  no motion sensors and no mouse aiming from a live controller. A replay can give a Joy-Con pair
+  mice and acceleration (`ML=`, `MR=`, `AL=`, `AR=`, below): one took the game into its mouse
+  mode from the tutorial's question, through the console's controller screen (answered at once)
+  and the lesson's posture screen, and the mouse then steered. That replay starts the tutorial at
+  its mouse question through a layer of edited level files, which the repository does not
+  contain. The two mouse lines of the game's options (Preferences) were greyed out in every replay
+  tried before; not checked since.
   Switch 2 Joy-Con give their buttons and sticks only, through `--joycon`, played on
   one pair only: the tutorial, then sessions of 6 and 12 minutes. A gamepad missing from SDL3's database is not recognised. The picture is
   stretched to the window, without 16:9 bars.
@@ -350,14 +353,22 @@ A headless run with neither `--frames` nor `--seconds`, and no replay, stops aft
 folder that must exist (a file that cannot be written is reported only then, and the recording is
 lost). Recorded with `--play`, it does not replay that session exactly; its replay with the default
 engine repeats. The file has one line per change of state, `<sample> <buttons> [L=x,y] [R=x,y]
-[K=usage,...] [ML=dx,dy,c] [MR=dx,dy,c]`, then `<sample> end`, which stops the run. Samples are the
-game's input samples, 60 per second; button names (`A`, `B`, `X`, `Y`, `L`, `R`, `ZL`, `ZR`, `LS`,
-`RS`, `Plus`, `Minus`, `Left`, `Up`, `Right`, `Down` and a few more that `--record` writes) are
-joined by `+`, and `-` stands for none; sticks go from -32767 to 32767; `K=` holds keyboard keys as
-hex USB HID usages; `ML=` and `MR=` give the left and right Joy-Con a mouse: its counts in X and Y
-at each sample while the line holds, then 1 when it rests on a surface (0 in the air). They are
-written where the game's SDK reads a Joy-Con mouse; nothing in the game has been seen to react to
-them yet, and no live controller gives them. `#` starts a comment.
+[K=usage,...] [ML=dx,dy,c] [MR=dx,dy,c] [AL=x,y,z] [AR=x,y,z]`, then `<sample> end`, which stops
+the run. Samples are the game's input samples, 60 per second; button names (`A`, `B`, `X`, `Y`,
+`L`, `R`, `ZL`, `ZR`, `LS`, `RS`, `Plus`, `Minus`, `Left`, `Up`, `Right`, `Down` and a few more
+that `--record` writes) are joined by `+`, and `-` stands for none; sticks go from -32767 to
+32767; `K=` holds keyboard keys as hex USB HID usages; `ML=` and `MR=` give the left and right
+Joy-Con a mouse: its counts in X and Y at each sample while the line holds, then 1 when it rests
+on a surface (0 in the air); `AL=` and `AR=` give their acceleration, in thousandths of g (the
+game takes a left Joy-Con whose x is above 0.9 g, or a right one whose x is below -0.9 g, for one
+lying on its side). A mouse or an acceleration that a line drops is gone: its Joy-Con gets one
+null state. While a line has a mouse and the game supports the mouse pair's style but not
+FullKey's (it asked for mouse controls), Npad 0 shows a Joy-Con pair used as mice; otherwise it
+is the FullKey controller. The console's controller screen, when the game opens it, closes at
+once: confirmed with Npad 0 if the style Npad 0 shows is one the game supports, cancelled
+otherwise. The tutorial's mouse lesson then waits for exactly one Joy-Con lying on its side with
+its mouse moving: a replay passed with `AR=-1000,0,0` and `MR=` moving 120 counts per sample, not
+with 6. No live controller gives these words yet. `#` starts a comment.
 
 Play mode is never a reference: its threads are scheduled by Windows on the real clock, so runs do
 not repeat; its journal is stamped with real time; a replay there follows the wall clock, so the

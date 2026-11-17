@@ -43,8 +43,10 @@ pub enum Applet {
     Display,
     LibraryAppletCreator,
     /// ILibraryAppletAccessor of the controller screen. There is no system applet here: it
-    /// has already closed, cancelled.
-    ControllerScreen,
+    /// has already closed, confirmed with Npad 0 when the controller Npad 0 shows fits the
+    /// style set the game supports (its user pressed confirm), else cancelled; `popped` once
+    /// its result was handed out.
+    ControllerScreen { confirmed: bool, popped: bool },
     ProcessWinding,
     /// IApplicationFunctions; the preselected user is handed out once.
     Functions { popped: bool },
@@ -67,7 +69,7 @@ impl Applet {
             Applet::Audio => "IAudioController".into(),
             Applet::Display => "IDisplayController".into(),
             Applet::LibraryAppletCreator => "ILibraryAppletCreator".into(),
-            Applet::ControllerScreen => "ILibraryAppletAccessor".into(),
+            Applet::ControllerScreen { .. } => "ILibraryAppletAccessor".into(),
             Applet::ProcessWinding => "IProcessWindingController".into(),
             Applet::Functions { .. } => "IApplicationFunctions".into(),
             Applet::Storage(_) => "am IStorage".into(),
@@ -137,24 +139,47 @@ impl Applet {
             (Applet::SelfController, 9) => Reply { copy_handles: vec![k.signaled_event_handle()?], ..Reply::ok() },
             // CreateLibraryApplet, and CreateLibraryAppletEx with a thread id (the one this SDK
             // sends): the controller screen only. A failure here aborts the game in
-            // ShowControllerSupport, and a success is only true with a controller of the style
-            // the game asks for, so the screen opens and its user closes it at once.
+            // ShowControllerSupport. The screen opens and closes at once: confirmed with Npad 0
+            // when the controller it shows has a style the game supports (the game restricted
+            // the set just before), else cancelled.
             (Applet::LibraryAppletCreator, 0 | 3) if req.u32_at(0)? & 0xFF == CONTROLLER_SCREEN => {
-                k.count("controller screens cancelled");
+                let confirmed = k.input.style & k.input.supported != 0;
+                k.count(if confirmed { "controller screens confirmed" } else { "controller screens cancelled" });
                 if k.journal.few("controller screen", 4) {
                     let (id, mode) = (req.u32_at(0)?, req.u32_at(4)?);
-                    k.log(&format!("am: the controller screen is asked (library applet {id:#x}, mode {mode}): none here, it closes at once, cancelled"));
+                    let outcome = if confirmed { "confirmed with Npad 0" } else { "cancelled" };
+                    k.log(&format!("am: the controller screen is asked (library applet {id:#x}, mode {mode}): Npad 0 shows style {:#x}, the game supports {:#x}: it closes at once, {outcome}", k.input.style, k.input.supported));
                 }
-                return applet(Applet::ControllerScreen);
+                return applet(Applet::ControllerScreen { confirmed, popped: false });
             }
             // CreateStorage: an applet argument to fill.
             (Applet::LibraryAppletCreator, 10) if req.u64_at(0)? <= MAX_STORAGE => return applet(Applet::Storage(vec![0; req.u64_at(0)? as usize])),
             // GetAppletStateChangedEvent: signaled, the screen has closed.
-            (Applet::ControllerScreen, 0) => Reply { copy_handles: vec![k.signaled_event_handle()?], ..Reply::ok() },
-            // Start, PushInData: nothing to run, nothing reads the arguments.
-            (Applet::ControllerScreen, 10 | 100) => Reply::ok(),
-            // GetResult.
-            (Applet::ControllerScreen, 30) => Reply::error(CANCELLED),
+            (Applet::ControllerScreen { .. }, 0) => Reply { copy_handles: vec![k.signaled_event_handle()?], ..Reply::ok() },
+            // Start, PushInData, and 90, which the SDK's StartLibraryApplet sends first with 0x20
+            // bytes of its handle (zeros here; Switch 2, not in the public lists): nothing to
+            // run, nothing reads them. Any error there makes the SDK abort.
+            (Applet::ControllerScreen { .. }, 10 | 90 | 100) => Reply::ok(),
+            // GetResult: a normal exit, or its user closed it.
+            (Applet::ControllerScreen { confirmed, .. }, 30) => {
+                if *confirmed {
+                    Reply::ok()
+                } else {
+                    Reply::error(CANCELLED)
+                }
+            }
+            // PopOutData: once confirmed, the result the SDK reads (ControllerSupportResultInfo
+            // and its result code, 0xC bytes): one player, Npad No1 (id 0), result 0; then
+            // nothing more.
+            (Applet::ControllerScreen { confirmed, popped }, 101) => {
+                if !*confirmed || *popped {
+                    return Some(Reply::error(NO_DATA_IN_CHANNEL));
+                }
+                *popped = true;
+                let mut result = vec![0; 0xC];
+                result[0] = 1;
+                return applet(Applet::Storage(result));
+            }
             // GetAppletResourceUserId, AcquireForegroundRights.
             (Applet::Window, 1) => Reply::with(&ARUID.to_le_bytes()),
             (Applet::Window, 10) => Reply::ok(),
