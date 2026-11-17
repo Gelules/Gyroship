@@ -120,8 +120,9 @@ fn builds_are_the_generated_one_and_those_kept() {
 fn setup_steps_are_the_tools_command_lines() {
     let s = Settings { repo: "repo".into(), exefs: "game/exefs".into(), probes: "probes.txt".into(), ..Settings::default() };
     let tools = Path::new("repo").join("target/release/gyroship-tools.exe");
-    let generated = Path::new("repo").join("generated/game");
-    let out = generated.to_string_lossy().into_owned();
+    // One kind of separator in what the player reads: the folder is also an argument, as text.
+    let out = ["repo", "generated", "game"].join(std::path::MAIN_SEPARATOR_STR);
+    let generated = std::path::PathBuf::from(&out);
     let (program, line, folder) = step(&s, "recompile").unwrap();
     assert_eq!((program.as_path(), words(&line), folder.as_path()), (tools.as_path(), vec!["recompile", "game/exefs", "--out", out.as_str(), "--probes", "probes.txt"], Path::new("repo")));
     assert_eq!(words(&step(&Settings { probes: String::new(), ..s.clone() }, "recompile").unwrap().1), ["recompile", "game/exefs", "--out", out.as_str()]);

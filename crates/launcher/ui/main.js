@@ -80,6 +80,8 @@ async function main() {
   await listen('done', (e) => {
     $('output').textContent += `\nended with exit code ${e.payload}\n`;
     busy(false);
+    // A close refused while the step ran was said in the notice: no longer true.
+    notice('');
     refreshBuilds();
   });
   await listen('notice', (e) => notice(e.payload));

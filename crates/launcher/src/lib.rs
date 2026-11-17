@@ -106,15 +106,16 @@ pub fn flags(s: &Settings, logs: &Path, session: &str) -> Vec<String> {
 // ponytail: 4 build jobs, for 16 GB of RAM; a setting when another machine needs another.
 pub fn step(s: &Settings, kind: &str) -> Result<(PathBuf, Vec<String>, PathBuf), String> {
     let need = |what: &str, value: &str| if value.is_empty() { Err(format!("{what} is not set")) } else { Ok(value.to_string()) };
-    let repo = PathBuf::from(need("the repository", &s.repo)?);
-    let (tools, generated) = (repo.join("target/release/gyroship-tools.exe"), repo.join("generated/game"));
+    let repo = need("the repository", &s.repo)?;
+    // Joined part by part: the player reads these paths, with one kind of separator.
+    let (tools, generated) = (PathBuf::from_iter([repo.as_str(), "target", "release", "gyroship-tools.exe"]), PathBuf::from_iter([repo.as_str(), "generated", "game"]));
     Ok(match kind {
         "recompile" => {
             let mut line = vec!["recompile".to_string(), need("the exefs folder", &s.exefs)?, "--out".into(), generated.to_string_lossy().into_owned()];
             if !s.probes.is_empty() {
                 line.extend(["--probes".to_string(), s.probes.clone()]);
             }
-            (tools, line, repo)
+            (tools, line, repo.into())
         }
         "build" => ("cargo".into(), ["build", "--release", "--offline", "-j", "4"].map(String::from).to_vec(), generated),
         _ => return Err(format!("{kind} is no setup step")),
@@ -127,7 +128,7 @@ pub fn step(s: &Settings, kind: &str) -> Result<(PathBuf, Vec<String>, PathBuf),
 pub fn builds(s: &Settings) -> Vec<String> {
     let mut kept: Vec<PathBuf> = fs::read_dir(Path::new(&s.data).join("bin")).into_iter().flatten().flatten().map(|e| e.path().join("harness.exe")).collect();
     kept.sort();
-    let generated = Path::new(&s.repo).join("generated/game/target/release/harness.exe");
+    let generated = PathBuf::from_iter([s.repo.as_str(), "generated", "game", "target", "release", "harness.exe"]);
     std::iter::once(generated).chain(kept).filter(|p| p.is_absolute() && p.is_file()).map(|p| p.to_string_lossy().into_owned()).collect()
 }
 
