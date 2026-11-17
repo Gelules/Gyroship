@@ -36,6 +36,11 @@ const LIFO_COUNT: usize = 0x18;
 const LIFO_ENTRIES: usize = 0x20;
 const LIFO_LEN: usize = 17;
 const ENTRY: usize = 0x30;
+/// The Joy-Con mouse lifos, in the buffer the game lends (InitializeJcms): one per Npad id
+/// (0..8) and side, at (2 × id + side) × 0x2c8, read by the SDK's GetJcmsStates. Same
+/// header as a button lifo, 17 entries of 0x28: the sequence, then 8 bytes nothing reads,
+/// the sampling number, the X and Y counts since the previous state, attributes.
+const JCMS_LIFO: u64 = 0x2c8;
 #[cfg(test)]
 const LIFO_SIZE: usize = LIFO_ENTRIES + LIFO_LEN * ENTRY;
 /// The sample's lead on the vsync, in ticks (1 ms): the console's phase is
@@ -177,6 +182,8 @@ pub struct Input {
     pub current: Pad,
     /// The last sample taken.
     pub last: u64,
+    /// The buffer of Joy-Con mouse lifos the game lent: address and size.
+    pub jcms: Option<(u64, u64)>,
 }
 
 /// One line of a `--replay` script, as `--record` writes it.
@@ -219,8 +226,32 @@ impl Hid {
                 let m = k.hid_memory();
                 Reply { copy_handles: vec![k.handles.add(Object::SharedMemory(m))?], ..Reply::ok() }
             }
-            // Activations, touch screen size, six-axis and Jcms start; 3111 when the game exits.
-            (Hid::Service { .. }, 11 | 21 | 31 | 66 | 1004 | 3111 | 3112 | 3150) => Reply::ok(),
+            // Activations, touch screen size, six-axis start.
+            (Hid::Service { .. }, 11 | 21 | 31 | 66 | 1004 | 3150) => Reply::ok(),
+            // FinalizeJcms, when the game exits: the buffer is the game's again.
+            (Hid::Service { .. }, 3111) => {
+                k.input.jcms = None;
+                Reply::ok()
+            }
+            // StartJcms(handle: an Npad id, then a side): that mouse's lifo gets a first, null
+            // state (no mouse there, nothing moved). The game reads the newest state without
+            // looking at how many came: from an empty lifo it read its own stack instead, and
+            // offered mouse aiming or not by what lay there.
+            (Hid::Service { .. }, 3112) => {
+                let h = u64::from(req.u32_at(0)?);
+                let lifo = (2 * (h & 0xFF) + (h >> 8 & 0xFF)) * JCMS_LIFO;
+                let mut count = [0; 8];
+                if let Some((addr, size)) = k.input.jcms
+                    && h & 0xFF < 8
+                    && h >> 8 & 0xFF < 2
+                    && lifo + JCMS_LIFO <= size
+                    && k.mem.read(addr + lifo + LIFO_COUNT as u64, &mut count).is_ok()
+                    && count == [0; 8]
+                {
+                    let _ = k.mem.write_object(addr + lifo + LIFO_COUNT as u64, &1u64.to_le_bytes());
+                }
+                Reply::ok()
+            }
             // ActivateNpadWithRevision: the condition becomes "initialized".
             (Hid::Service { .. }, 109) => {
                 k.npad_condition(1);
@@ -233,6 +264,7 @@ impl Hid {
                 {
                     k.retain_transfer(h);
                     let _ = k.mem.write_object(addr, &vec![0; size as usize]);
+                    k.input.jcms = Some((addr, size));
                     k.log(&format!("hid 3110: jcms buffer {addr:#x}+{size:#x} zeroed"));
                 }
                 Reply::ok()

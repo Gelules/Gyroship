@@ -16,6 +16,13 @@ pub const NO_MESSAGE: u32 = 128 | 3 << 9;
 pub const FOCUS_STATE_CHANGED: u32 = 15;
 /// am's result for an empty channel (module 128, description 2).
 pub const NO_DATA_IN_CHANNEL: u32 = 128 | 2 << 9;
+/// am's result of a library applet its user closed (module 128, description 22): the SDK's
+/// JoinLibraryApplet reads it as "cancelled", which the game is then told.
+pub const CANCELLED: u32 = 128 | 22 << 9;
+/// The controller screen's applet id (`nn::hid::ShowControllerSupport`), in the low byte.
+const CONTROLLER_SCREEN: u32 = 0x0C;
+/// The largest applet argument accepted (the controller screen's are 0x20, 0x14 and 0x430).
+const MAX_STORAGE: u64 = 0x10000;
 /// The launch parameter that names the preselected user.
 const PRESELECTED_USER_MAGIC: u32 = 0xC794_97CA;
 /// GetCurrentFocusState: in focus.
@@ -35,6 +42,9 @@ pub enum Applet {
     Audio,
     Display,
     LibraryAppletCreator,
+    /// ILibraryAppletAccessor of the controller screen. There is no system applet here: it
+    /// has already closed, cancelled.
+    ControllerScreen,
     ProcessWinding,
     /// IApplicationFunctions; the preselected user is handed out once.
     Functions { popped: bool },
@@ -57,6 +67,7 @@ impl Applet {
             Applet::Audio => "IAudioController".into(),
             Applet::Display => "IDisplayController".into(),
             Applet::LibraryAppletCreator => "ILibraryAppletCreator".into(),
+            Applet::ControllerScreen => "ILibraryAppletAccessor".into(),
             Applet::ProcessWinding => "IProcessWindingController".into(),
             Applet::Functions { .. } => "IApplicationFunctions".into(),
             Applet::Storage(_) => "am IStorage".into(),
@@ -121,6 +132,29 @@ impl Applet {
             },
             // GetAccumulatedSuspendedTickChangedEvent.
             (Applet::SelfController, 91) => Reply { copy_handles: vec![k.new_event_handle()?], ..Reply::ok() },
+            // GetLibraryAppletLaunchableEvent: a library applet may start. The SDK asks once,
+            // waits on it before each step and never clears it; any error makes it abort.
+            (Applet::SelfController, 9) => Reply { copy_handles: vec![k.signaled_event_handle()?], ..Reply::ok() },
+            // CreateLibraryApplet, and CreateLibraryAppletEx with a thread id (the one this SDK
+            // sends): the controller screen only. A failure here aborts the game in
+            // ShowControllerSupport, and a success is only true with a controller of the style
+            // the game asks for, so the screen opens and its user closes it at once.
+            (Applet::LibraryAppletCreator, 0 | 3) if req.u32_at(0)? & 0xFF == CONTROLLER_SCREEN => {
+                k.count("controller screens cancelled");
+                if k.journal.few("controller screen", 4) {
+                    let (id, mode) = (req.u32_at(0)?, req.u32_at(4)?);
+                    k.log(&format!("am: the controller screen is asked (library applet {id:#x}, mode {mode}): none here, it closes at once, cancelled"));
+                }
+                return applet(Applet::ControllerScreen);
+            }
+            // CreateStorage: an applet argument to fill.
+            (Applet::LibraryAppletCreator, 10) if req.u64_at(0)? <= MAX_STORAGE => return applet(Applet::Storage(vec![0; req.u64_at(0)? as usize])),
+            // GetAppletStateChangedEvent: signaled, the screen has closed.
+            (Applet::ControllerScreen, 0) => Reply { copy_handles: vec![k.signaled_event_handle()?], ..Reply::ok() },
+            // Start, PushInData: nothing to run, nothing reads the arguments.
+            (Applet::ControllerScreen, 10 | 100) => Reply::ok(),
+            // GetResult.
+            (Applet::ControllerScreen, 30) => Reply::error(CANCELLED),
             // GetAppletResourceUserId, AcquireForegroundRights.
             (Applet::Window, 1) => Reply::with(&ARUID.to_le_bytes()),
             (Applet::Window, 10) => Reply::ok(),
@@ -154,6 +188,19 @@ impl Applet {
                 if let Some(b) = req.out_buffer(0) {
                     let chunk = bytes.get(offset..).unwrap_or(&[]);
                     let _ = k.mem.write(b.addr, &chunk[..chunk.len().min(b.size as usize)]);
+                }
+                Reply::ok()
+            }
+            // IStorageAccessor Write(offset) from the send buffer: an applet argument, journaled.
+            // ponytail: the accessor's copy takes the bytes, not the storage it was opened from;
+            // share them the day an applet reads its arguments.
+            (Applet::StorageAccessor(bytes), 10) => {
+                let (offset, b) = (req.u64_at(0)? as usize, req.send_buffer(0)?);
+                let to = bytes.get_mut(offset..)?.get_mut(..b.size as usize)?;
+                k.mem.read(b.addr, to).ok()?;
+                if k.journal.few("applet argument", 12) {
+                    let head: String = to.iter().take(0x20).map(|x| format!("{x:02x}")).collect();
+                    k.log(&format!("am: applet argument of {:#x} bytes: {head}", to.len()));
                 }
                 Reply::ok()
             }
@@ -200,5 +247,13 @@ impl Kernel {
     /// A new event that nothing signals yet; returns its readable handle.
     pub fn new_event_handle(&mut self) -> Option<u32> {
         self.create_event().ok().map(|(_, r)| r)
+    }
+
+    /// A new event, signaled for good; returns its readable handle.
+    pub fn signaled_event_handle(&mut self) -> Option<u32> {
+        let h = self.new_event_handle()?;
+        let e = self.event_of(h)?;
+        self.signal_event(e);
+        Some(h)
     }
 }

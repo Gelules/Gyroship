@@ -345,3 +345,107 @@ fn a_romfs_read_is_checked_at_once_and_lands_after_the_svc() {
     assert_eq!(read(&mut k, &mut cpu, TLS + 0x80), SUCCESS);
     assert_eq!(k.tally().anomalies["romfs read buffer"], 2);
 }
+
+/// The Joy-Con mouse: the game lends a buffer of lifos (InitializeJcms), then starts the two
+/// sides of a controller (StartJcms). Each started lifo holds one null state from then on,
+/// so the game, which reads the newest state whatever their count, reads "no mouse" and not
+/// what its own stack held.
+#[test]
+fn a_started_joy_con_mouse_has_a_null_state_to_read() {
+    let (mut k, mut cpu) = kernel();
+    k.allowed_services.push("hid".to_string());
+    let sm = connect_sm(&mut k, &mut cpu);
+    let (_, hid) = get_service(&mut k, &mut cpu, sm, "hid");
+    // The game's buffer: one page, lent as a transfer memory the game may still read.
+    k.mem.write(DATA, &[0xff; 0x1000]).unwrap();
+    (cpu.x[1], cpu.x[2], cpu.x[3]) = (DATA, 0x1000, u64::from(perm::R));
+    k.svc(&mut cpu, PC, 0x15);
+    assert_eq!(cpu.x[0], 0, "CreateTransferMemory");
+    let lent = cpu.x[1] as u32;
+    // InitializeJcms: the PID, one copied handle, the applet resource user id and the size.
+    let init: Vec<u32> = cmif(&[4, 1 | 1 << 1, 0, 0, lent], 3110, &[0x51, 0, 0x1000, 0], None).iter().enumerate().map(|(i, &x)| if i == 1 { x | 0x8000_0000 } else { x }).collect();
+    let (_, w) = send(&mut k, &mut cpu, hid, &init);
+    assert_eq!(cmif_result(&w, 2), SUCCESS);
+    let count = |k: &Kernel, lifo: u64| {
+        let mut b = [0; 8];
+        k.mem.read(DATA + lifo * 0x2c8 + 0x18, &mut b).unwrap();
+        u64::from_le_bytes(b)
+    };
+    assert_eq!([count(&k, 0), count(&k, 1), count(&k, 5)], [0; 3], "the buffer starts empty");
+    // StartJcms for Npad 0, side 0 then side 1 (the handle: id, then side), then for a lifo
+    // that ends past the buffer (Npad 2, side 1): nothing written, no error.
+    for (handle, counts) in [(0x000, [1, 0, 0]), (0x100, [1, 1, 0]), (0x102, [1, 1, 0])] {
+        let (_, w) = send(&mut k, &mut cpu, hid, &cmif(&[4], 3112, &[handle, 0, 0x51, 0], None));
+        assert_eq!(cmif_result(&w, 2), SUCCESS);
+        assert_eq!([count(&k, 0), count(&k, 1), count(&k, 5)], counts, "after handle {handle:#x}");
+    }
+    // The state itself: sequence, sampling number, counts and attributes all zero.
+    let mut state = [0xff; 0x28];
+    k.mem.read(DATA + 0x2c8 + 0x20, &mut state).unwrap();
+    assert_eq!(state, [0; 0x28]);
+    // A lifo that already holds states keeps them when it is started again.
+    k.mem.write_object(DATA + 0x18, &5u64.to_le_bytes()).unwrap();
+    send(&mut k, &mut cpu, hid, &cmif(&[4], 3112, &[0x000, 0, 0x51, 0], None));
+    assert_eq!(count(&k, 0), 5);
+    // FinalizeJcms: the buffer is the game's again, a later start writes nothing.
+    send(&mut k, &mut cpu, hid, &cmif(&[4], 3111, &[0x51, 0], None));
+    send(&mut k, &mut cpu, hid, &cmif(&[4], 3112, &[0x001, 0, 0x51, 0], None));
+    assert_eq!(count(&k, 2), 0);
+}
+
+/// There is no system applet here. The controller screen (`nn::hid::ShowControllerSupport`,
+/// library applet 0x0C) is created, takes an argument and starts, and has already closed,
+/// cancelled: the one answer the SDK hands back to the game, as any refusal on the way makes
+/// it abort.
+#[test]
+fn the_controller_screen_closes_at_once_cancelled() {
+    let (mut k, mut cpu) = kernel();
+    k.config.explore = true;
+    k.allowed_services.push("appletOE".to_string());
+    let sm = connect_sm(&mut k, &mut cpu);
+    let (_, oe) = get_service(&mut k, &mut cpu, sm, "appletOE");
+    let (_, w) = send(&mut k, &mut cpu, oe, &cmif(&[4], 10, &[0, 0], None));
+    let proxy = moved(&w);
+    let signaled = |k: &Kernel, w: &[u32]| {
+        assert_eq!((w[1] >> 31, w[2]), (1, 0x2), "one copied handle: {w:x?}");
+        k.events[k.event_of(w[3]).expect("a readable event")].signaled
+    };
+    // GetSelfController, GetLibraryAppletLaunchableEvent: the SDK waits on it before anything.
+    let (_, w) = send(&mut k, &mut cpu, proxy, &cmif(&[4], 1, &[], None));
+    let controller = moved(&w);
+    let (_, w) = send(&mut k, &mut cpu, controller, &cmif(&[4], 9, &[], None));
+    assert!(signaled(&k, &w));
+    // GetLibraryAppletCreator; another applet (the keyboard, 0x11) is not answered.
+    let (_, w) = send(&mut k, &mut cpu, proxy, &cmif(&[4], 11, &[], None));
+    let creator = moved(&w);
+    let (_, w) = send(&mut k, &mut cpu, creator, &cmif(&[4], 3, &[0x11, 0, 7, 0], None));
+    assert_eq!(cmif_result(&w, 2), NOT_IMPLEMENTED);
+    // CreateLibraryAppletEx(the controller screen, mode 0, a thread id).
+    let (_, w) = send(&mut k, &mut cpu, creator, &cmif(&[4], 3, &[0x100_000C, 0, 7, 0], None));
+    let screen = moved(&w);
+    // One argument: CreateStorage(0x14), Open, Write(0) from an A buffer, PushInData.
+    let (_, w) = send(&mut k, &mut cpu, creator, &cmif(&[4], 10, &[0x14, 0], None));
+    let storage = moved(&w);
+    let (_, w) = send(&mut k, &mut cpu, storage, &cmif(&[4], 0, &[], None));
+    let accessor = moved(&w);
+    let at = DATA + 0x300;
+    k.mem.write(at, &[0x14, 0, 0, 0, 0x30, 4, 0, 0, 1, 0, 0, 0, 0, 0x10, 0, 0, 1, 0, 0, 0]).unwrap();
+    let a = [0x14, at as u32, ((at >> 32 & 0xF) << 28 | (at >> 36 & 7) << 2) as u32];
+    let (_, w) = send(&mut k, &mut cpu, accessor, &cmif(&[4 | 1 << 20, a[0], a[1], a[2]], 10, &[0, 0], None));
+    assert_eq!(cmif_result(&w, 2), SUCCESS);
+    let (_, w) = send(&mut k, &mut cpu, screen, &cmif(&[4], 100, &[], None));
+    assert_eq!(cmif_result(&w, 2), SUCCESS);
+    // Start; the state event is signaled (the screen has closed) and GetResult says cancelled.
+    let (_, w) = send(&mut k, &mut cpu, screen, &cmif(&[4], 10, &[], None));
+    assert_eq!(cmif_result(&w, 2), SUCCESS);
+    let (_, w) = send(&mut k, &mut cpu, screen, &cmif(&[4], 0, &[], None));
+    assert!(signaled(&k, &w));
+    let (_, w) = send(&mut k, &mut cpu, screen, &cmif(&[4], 30, &[], None));
+    assert_eq!(cmif_result(&w, 2), gyroship_hle::am::CANCELLED);
+    assert_eq!(gyroship_hle::am::CANCELLED, 0x2C80, "module 128, description 22");
+    assert_eq!(k.tally().counts["controller screens cancelled"], 1);
+    let text = k.journal.text();
+    assert!(text.contains("am: the controller screen is asked (library applet 0x100000c, mode 0): none here, it closes at once, cancelled"), "{text}");
+    assert!(text.contains("am: applet argument of 0x14 bytes: 1400000030040000010000000010000001000000"), "{text}");
+    assert!(text.contains("ipc ILibraryAppletCreator command 3 is not implemented; arguments 11000000"), "{text}");
+}

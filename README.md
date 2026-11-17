@@ -64,8 +64,10 @@ Known problems:
   never re-checked one by one. Sound needs SDL3 and a window; in play mode a gap or a dropped tick
   every few minutes is expected, and the sound trails the picture by about 0.1 s.
 - No rumble, no motion sensors, no button remapping, no amiibo (the reader never finds a figure),
-  no system applet: choosing mouse controls in the game opens the console's controller screen, which
-  ends the run. Switch 2 Joy-Con give their buttons and sticks only, through `--joycon`, played on
+  no system applet, no mouse aiming yet: its line in the game's options (Preferences) stays greyed
+  out, as seen in replays. Choosing it once ended a run, in the console's controller screen: that
+  screen is now answered as closed at once, which tests check and no run has reached since.
+  Switch 2 Joy-Con give their buttons and sticks only, through `--joycon`, played on
   one pair only: the tutorial, then sessions of 6 and 12 minutes. A gamepad missing from SDL3's database is not recognised. The picture is
   stretched to the window, without 16:9 bars.
 
