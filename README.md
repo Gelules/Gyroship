@@ -107,12 +107,13 @@ when missing.
        cargo build --release
 
 2. Recompile the game's `exefs` folder: Cranelift compiles every function into native object files,
-   next to a Cargo project, `harness`, that links them with Gyroship's runtime. The untranslated
+   next to a Cargo project, `harness`, that links them with Gyroship's runtime into the game's
+   executable, `gyroship`. The untranslated
    instructions that `recompile` counts are not an error: a fallback interpreter runs them.
 
        target/release/gyroship-tools recompile <exefs> --out generated/game
 
-3. Build the generated project, in its folder: `generated/game/target/release/harness` is the game's
+3. Build the generated project, in its folder: `generated/game/target/release/gyroship` is the game's
    executable. The project holds absolute paths: after moving `generated/game`, redo steps 2 and 3;
    after moving the repository, rebuild the tools first (step 1), which carry its path.
 
@@ -124,15 +125,15 @@ when missing.
    `romfs` folder next to it. Each run rewrites its journal: `boot.log` in the current folder, or
    the file `--log FILE` names, in a folder that must exist. Git ignores `artifacts/`, not
    `boot.log`, and the journal is derived from your game: create `artifacts/logs` first. For
-   controllers and sound, put `SDL3.dll` next to the harness executable.
+   controllers and sound, put `SDL3.dll` next to the game's executable.
 
-       generated/game/target/release/harness boot <exefs> --play --explore --save <save dir> --pipeline-cache <cache dir> --log artifacts/logs/play.log
+       generated/game/target/release/gyroship boot <exefs> --play --explore --save <save dir> --pipeline-cache <cache dir> --log artifacts/logs/play.log
 
 ## Playing
 
-Step 4's command is the one to play with; below, `harness` stands for
-`generated/game/target/release/harness`. It opens a window titled "Gyroship", 1920 x 1080 at start;
-closing it ends the run cleanly. `harness boot <exefs> --help` lists the 41 options by name; the
+Step 4's command is the one to play with; below, `gyroship` stands for
+`generated/game/target/release/gyroship`. It opens a window titled "Gyroship", 1920 x 1080 at start;
+closing it ends the run cleanly. `gyroship boot <exefs> --help` lists the 41 options by name; the
 developer options this file does not describe are documented, for most, on the fields of `Config`
 in `crates/hle/src/lib.rs`. A misspelt option, a valued option given twice, or one left without its
 value at the end of the line stops the start with exit code 2 (any next word is taken as the value).
@@ -147,7 +148,7 @@ value at the end of the line stops the start with exit code 2 (any next word is 
 | `--language CODE` | The console language the game reads at boot to pick one of its 14 text regions; default `en-US`. |
 | `--pipeline-cache DIR` | Keeps between runs the GPU driver's compiled pipelines (one file per GPU, Vulkan only) and, in `DIR/shaders`, the translated shaders. |
 | `--backend VALUE` | `auto` (the default: Vulkan and DX12 are both offered to wgpu, which took Vulkan on the test PC), `vulkan` or `dx12`. |
-| `--sdl FILE` | The SDL3 library to load, instead of `SDL3.dll` next to the harness executable. |
+| `--sdl FILE` | The SDL3 library to load, instead of `SDL3.dll` next to the game's executable. |
 | `--joycon` | Switch 2 Joy-Con over Bluetooth LE, without pairing (Windows 11): see below. |
 | `--joycon-mouse` | `--joycon`, plus each Joy-Con's mouse and accelerometer, for the game's mouse mode: see below. |
 
@@ -227,7 +228,7 @@ practice line can name. A changed list means steps 2 and 3 again. `--practice FI
     ms-keep <pc> ms=wN                          with the next line: the level time's milliseconds
     ms <pc> out=xN
 
-`<pc>` is the address, in hex without `0x`, of a `trace:` probe compiled into the harness;
+`<pc>` is the address, in hex without `0x`, of a `trace:` probe compiled into the game;
 `<vehicle>` is `arwing`, `blue-marine` or `landmaster`. EXPR is a register `xN`, a hex number
 written with `0x`, or `[EXPR]`, followed by `+0xHEX` or `-0xHEX` offsets; an ITEM of `hud-speed` is
 `sN` (a float register) or `f32@EXPR`. Boost fields are `gauge`, `speed`, `lock`, `boosting` and the
@@ -317,9 +318,15 @@ runtime, which Windows 11 has.
     target/release/gyroship-launcher
 
 - **Play**: the build to start (the generated one, or builds kept as
-  `<data folder>/bin/<name>/harness.exe`), your dump's `exefs` folder, the save and cache folders,
-  the language, full screen, the Joy-Con, the SDL3 library, the practice tools and the recording of
-  inputs, then Play. Paths are typed or pasted, as full paths. The window closes while the game
+  `<data folder>/bin/<name>/gyroship.exe`, or `harness.exe` for those from before its renaming;
+  a chosen build that is gone gives way to the first one found), your dump's `exefs` folder, the
+  save and cache folders, the language, full screen, the Joy-Con and their mice, the SDL3 library,
+  the practice tools and the recording of inputs, then Play. Paths are typed or pasted, as full
+  paths. The game plays on the save folder itself, or on a copy of it that the launcher makes
+  again at each start (`<data folder>/save-copy`: the folder itself is never written), or on a new,
+  empty save at each start (`<data folder>/save-new`). The replacement files are one layer folder
+  of `<data folder>/practice` (a folder whose name starts with `layer`), shown by the first line of
+  its `about.txt`; the repository holds no layer. The window closes while the game
   runs, so that its memory is the game's, and comes back with how the session ended.
   `gyroship-launcher --play` starts the game at once with the saved settings, for a shortcut: after
   a game that ended normally, the launcher ends too, without a window.
@@ -336,7 +343,8 @@ so and ends. It opens no
 connection and downloads nothing itself; the WebView2 runtime is Microsoft's and makes requests of
 its own. Checked with stand-ins for the game, by a script clicking its buttons, then used for one
 real session from its Play button: 12 minutes with both Joy-Con, ended by the game itself with exit
-code 0. `--play` and the Setup tab have not run on the real game. With the Joy-Con, tick "Show the
+code 0. `--play`, the Setup tab, the save copies, the layer list and the mice box have not run on
+the real game. With the Joy-Con, tick "Show the
 game's messages in a console": the messages that say when each one is connected go there.
 
 ## Repeatable runs and verification
@@ -348,7 +356,7 @@ journal is stamped with virtual time, never with wall-clock time or a host addre
 compare byte for byte. Such a run can serve as a reference: a later run is compared with its journal
 and its hashes.
 
-    harness boot <exefs> --headless --explore --replay <inputs.txt> --hashes <hashes.csv> --log <run.log>
+    gyroship boot <exefs> --headless --explore --replay <inputs.txt> --hashes <hashes.csv> --log <run.log>
 
 | Option | Effect |
 | --- | --- |
@@ -388,7 +396,7 @@ not repeat; its journal is stamped with real time; a replay there follows the wa
 game sees the inputs at other moments than in the recorded run. Play in play mode, prove with the
 default engine. `--dump-frames` in play mode without a window is known to crash.
 
-Exit codes of the harness: 0 a normal end (the game exited by itself, `--frames` reached, a replay's
+Exit codes of the game's executable: 0 a normal end (the game exited by itself, `--frames` reached, a replay's
 `end`, the window closed); 2 a bad command line or a start that cannot go on; 3 a GPU that cannot
 run the game; 71 a fault in the recompiled game (a memory fault, or an instruction that cannot be
 executed); 72 a run the emulation stopped (an unknown
@@ -401,7 +409,7 @@ system call or an anomaly, which `--explore` lets pass; the time limit; a deadlo
     link <exefs>                         loads, relocates and links the modules; unresolved imports
     discover <exefs>                     functions, control-flow graphs and jump tables, counted
     functions <module>                   function ranges from the unwind tables; --compare FILE
-    recompile <exefs> --out <dir>        every function through Cranelift, and the harness project
+    recompile <exefs> --out <dir>        every function through Cranelift, and the game's project
     experiment <exefs> --out <dir>       a sample of functions as a project to build and measure
     measure <program> [args...]          wall time and peak memory of a process tree (Windows)
     capture --title <text> --out <png>   one frame of a window found by its title (Windows)

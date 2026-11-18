@@ -24,14 +24,23 @@ function save() {
 }
 
 async function refreshBuilds() {
+  // The chosen build is among those found while it exists; one that is gone (renamed by
+  // a new port, deleted) gives way to the first one found.
   const found = await invoke('list_builds', { settings });
-  // The chosen build stays in the list even when it is not one of those found.
-  const all = [...new Set([settings.build, ...found].filter(Boolean))];
-  $('builds').replaceChildren(...all.map((b) => new Option(b, b, false, b === settings.build)));
-  if (!settings.build && found.length) {
+  if (found.length && !found.includes(settings.build)) {
+    if (settings.build) notice(`The chosen build is gone (${settings.build}): ${found[0]} takes its place.`);
     settings.build = found[0];
     await save();
   }
+  const all = found.length ? found : [settings.build].filter(Boolean);
+  $('builds').replaceChildren(...all.map((b) => new Option(b, b, false, b === settings.build)));
+}
+
+async function refreshLayers() {
+  const found = await invoke('list_layers', { settings });
+  // A layer chosen elsewhere (in the settings file, by hand) stays offered.
+  if (settings.layer && !found.some(([path]) => path === settings.layer)) found.push([settings.layer, settings.layer]);
+  $('layers').replaceChildren(new Option("none: the game's own files", ''), ...found.map(([path, about]) => new Option(about, path, false, path === settings.layer)));
 }
 
 async function changed(field) {
@@ -40,7 +49,7 @@ async function changed(field) {
   if (quoted) field.value = quoted[1];
   settings[field.dataset.key] = field.type === 'checkbox' ? field.checked : field.value.trim();
   if (await save()) notice('');
-  if (['repo', 'data'].includes(field.dataset.key)) await refreshBuilds();
+  if (['repo', 'data'].includes(field.dataset.key)) await Promise.all([refreshBuilds(), refreshLayers()]);
 }
 
 // The usual places under the data folder, for the fields still empty.
@@ -51,7 +60,7 @@ async function usual() {
   const defaults = { save: under('save'), cache: under('pipeline-cache') };
   for (const [key, value] of Object.entries(defaults)) if (!settings[key]) settings[key] = value;
   show();
-  if (await save()) await refreshBuilds();
+  if (await save()) await Promise.all([refreshBuilds(), refreshLayers()]);
 }
 
 async function lastSession() {
@@ -117,7 +126,7 @@ async function main() {
       }
     });
   }
-  await refreshBuilds();
+  await Promise.all([refreshBuilds(), refreshLayers()]);
   // Back from a game (the launcher says so when it opens this window): how it ended comes first.
   if (window.__AFTER_GAME__) tab('logs');
 }

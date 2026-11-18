@@ -505,8 +505,8 @@ repository.
   (`player_arwing`, `player_bluemarine`) override some of them.
 - **The frame logs.** A `trace:` probe names a guest address and the values to log at
   each pass (registers, and memory read through pointers, such as the boost script's
-  settings and the vehicle's meter and boost speed). The harness is regenerated with
-  `gyroship-tools recompile --probes <list>`, then `harness boot <exefs> --headless
+  settings and the vehicle's meter and boost speed). The game is regenerated with
+  `gyroship-tools recompile --probes <list>`, then `gyroship boot <exefs> --headless
   --replay <inputs> --trace <file>` writes one line per pass. The run's deterministic
   journal does not change, so these runs still compare with the reference runs.
 - **The missions.** Aquas and Titania were reached from the Challenge Mode menu, from a

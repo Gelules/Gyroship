@@ -336,7 +336,7 @@ pub fn check_options(args: &[String]) -> Result<(), String> {
 
 /// `--help`: the options, one per line.
 pub fn usage() -> String {
-    let mut s = String::from("usage: harness boot <exefs> [options]\noptions:\n");
+    let mut s = String::from("usage: gyroship boot <exefs> [options]\noptions:\n");
     for (o, valued) in OPTIONS {
         s += &format!("  {o}{}\n", if *valued { " VALUE" } else { "" });
     }
@@ -391,7 +391,7 @@ pub fn run(mut table: Vec<rt::Entry>, window: Option<HostWindow>) {
         return rt::harness::main(table);
     }
     let Some(exefs) = args.get(1) else {
-        eprintln!("usage: harness boot <exefs> [--log FILE] [--explore] [--all-svcs]");
+        eprintln!("usage: gyroship boot <exefs> [--log FILE] [--explore] [--all-svcs]");
         std::process::exit(2);
     };
     let flag = |f: &str| args.iter().any(|a| a == f);

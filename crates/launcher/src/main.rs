@@ -4,7 +4,7 @@
 //! and its webview's data live next to its executable.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use gyroship_launcher::{Last, RUNNING, Report, Settings, builds, flags, load, logs, report, save, session, step};
+use gyroship_launcher::{Last, RUNNING, Report, Settings, builds, flags, layers, load, logs, prepare_save, report, save, session, step};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -80,6 +80,11 @@ fn list_builds(settings: Settings) -> Vec<String> {
     builds(&settings)
 }
 
+#[tauri::command]
+fn list_layers(settings: Settings) -> Vec<(String, String)> {
+    layers(&settings)
+}
+
 /// The journals' folder, once the data folder is set: without it, `logs` would be
 /// looked for under wherever the launcher happens to run.
 fn journals(settings: &Settings) -> Result<PathBuf, String> {
@@ -127,8 +132,10 @@ fn start(app: &AppHandle, settings: Settings, shortcut: bool) -> Result<(), Stri
         let logs = logs(&settings);
         std::fs::create_dir_all(&logs).map_err(|e| format!("{}: {e}", logs.display()))?;
         let name = session(&logs);
+        // The save the game gets: the chosen folder, a copy of it, or an empty one.
+        let played = Settings { save: prepare_save(&settings)?, ..settings.clone() };
         let mut game = Command::new(&settings.build);
-        game.args(flags(&settings, &logs, &name));
+        game.args(flags(&played, &logs, &name));
         if !settings.console {
             let messages = std::fs::File::create(logs.join(format!("{name}.err.txt"))).map_err(|e| e.to_string())?;
             game.stderr(messages).stdout(Stdio::null());
@@ -273,7 +280,7 @@ fn main() {
                 let _ = window.emit("notice", "A setup step is running: the window can close when it ends.");
             }
         })
-        .invoke_handler(tauri::generate_handler![get_settings, set_settings, list_builds, last_session, open_logs, play, run_step])
+        .invoke_handler(tauri::generate_handler![get_settings, set_settings, list_builds, list_layers, last_session, open_logs, play, run_step])
         .build(tauri::generate_context!())
         .expect("the launcher could not start");
     app.run(|app, event| {

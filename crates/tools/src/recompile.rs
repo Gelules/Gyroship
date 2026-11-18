@@ -1,6 +1,7 @@
 //! Recompiles every discovered function of an exefs with Cranelift: one
 //! object per thread, each with its part of the dispatch table, and a
-//! `harness` crate that links them all with the runtime.
+//! `harness` crate that links them all with the runtime into the game's
+//! executable, `gyroship`.
 //!
 //! PLT stubs and each module's PLT0 are compiled too, as small functions of
 //! their own: direct calls skip them (resolved at generation), but an
@@ -164,7 +165,7 @@ pub fn run(exefs: &Path, out: &Path, threads: usize, verify: bool, probes: Optio
     std::fs::write(
         out.join("harness/Cargo.toml"),
         format!(
-            "[package]\nname = \"harness\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n[dependencies]\ngyroship-runtime = {{ path = \"{}\" }}\ngyroship = {{ path = \"{}\" }}\n",
+            "[package]\nname = \"harness\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n[[bin]]\nname = \"gyroship\"\npath = \"src/main.rs\"\n\n[dependencies]\ngyroship-runtime = {{ path = \"{}\" }}\ngyroship = {{ path = \"{}\" }}\n",
             runtime_path(),
             crate_path("gyroship")
         ),

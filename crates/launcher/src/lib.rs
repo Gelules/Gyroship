@@ -20,11 +20,16 @@ pub struct Settings {
     pub build: String,
     pub exefs: String,
     pub save: String,
+    /// "" (the save folder itself), "copy" (a copy of it at each start) or "new" (an
+    /// empty save at each start): see `prepare_save`.
+    pub save_mode: String,
     pub cache: String,
     /// A console language code, or nothing for the game's default.
     pub language: String,
     pub fullscreen: bool,
     pub joycon: bool,
+    /// The Joy-Con's mice too, for the game's mouse mode (which brings the pair itself).
+    pub joycon_mouse: bool,
     pub sdl: String,
     /// The game's debug menu and Gyroship's practice tools.
     pub hooks: String,
@@ -50,8 +55,16 @@ pub fn load(file: &Path) -> (Settings, Option<String>) {
         Err(e) => return (Settings::default(), Some(format!("{}: {e}", file.display()))),
     };
     // Bytes, not text: a file saved in another encoding fails here and is kept aside too.
-    match serde_json::from_slice(&text) {
-        Ok(s) => (s, None),
+    match serde_json::from_slice::<Settings>(&text) {
+        Ok(mut s) => {
+            // The generated build was harness.exe until 2026-11-18: the same build is now
+            // gyroship.exe, and a new port leaves the old file behind, never updated again.
+            let old = PathBuf::from_iter([s.repo.as_str(), "generated", "game", "target", "release", "harness.exe"]);
+            if !s.repo.is_empty() && Path::new(&s.build) == old {
+                s.build = old.with_file_name("gyroship.exe").to_string_lossy().into_owned();
+            }
+            (s, None)
+        }
         Err(e) => {
             let bad = PathBuf::from(format!("{}.bad", file.display()));
             let kept = if fs::copy(file, &bad).is_ok() { format!("kept as {}", bad.display()) } else { "which could not be kept aside".into() };
@@ -93,7 +106,7 @@ pub fn flags(s: &Settings, logs: &Path, session: &str) -> Vec<String> {
         ("--log", file("log")),
         ("--record", if s.record { file("txt") } else { String::new() }),
     ];
-    let switches = [("--fullscreen", s.fullscreen), ("--joycon", s.joycon), ("--hud", s.hud && practice)];
+    let switches = [("--fullscreen", s.fullscreen), ("--joycon", s.joycon), ("--joycon-mouse", s.joycon_mouse), ("--hud", s.hud && practice)];
     let mut line = vec!["boot".to_string(), s.exefs.clone(), "--play".into(), "--explore".into()];
     line.extend(valued.into_iter().filter(|v| !v.1.is_empty()).flat_map(|(name, value)| [name.to_string(), value]));
     line.extend(switches.into_iter().filter(|v| v.1).map(|v| v.0.to_string()));
@@ -127,14 +140,93 @@ pub fn step(s: &Settings, kind: &str) -> Result<(PathBuf, Vec<String>, PathBuf),
     })
 }
 
-/// The game's executables to choose from: the generated build, then those kept
-/// under the data folder's `bin`. Full paths only: with a folder not set yet, nothing
-/// is looked for under wherever the launcher happens to run.
+/// The game's executables to choose from: the generated build, those kept under the
+/// data folder's `bin` (`gyroship.exe`, or `harness.exe` from before its renaming),
+/// then the chosen one, wherever it is. Existing files only, so a chosen build that
+/// is gone is not among them. Full paths only: with a folder not set yet, nothing is
+/// looked for under wherever the launcher happens to run.
 pub fn builds(s: &Settings) -> Vec<String> {
-    let mut kept: Vec<PathBuf> = fs::read_dir(Path::new(&s.data).join("bin")).into_iter().flatten().flatten().map(|e| e.path().join("harness.exe")).collect();
+    let mut kept: Vec<PathBuf> = fs::read_dir(Path::new(&s.data).join("bin")).into_iter().flatten().flatten().flat_map(|e| ["gyroship.exe", "harness.exe"].map(|n| e.path().join(n))).collect();
     kept.sort();
-    let generated = PathBuf::from_iter([s.repo.as_str(), "generated", "game", "target", "release", "harness.exe"]);
-    std::iter::once(generated).chain(kept).filter(|p| p.is_absolute() && p.is_file()).map(|p| p.to_string_lossy().into_owned()).collect()
+    let generated = PathBuf::from_iter([s.repo.as_str(), "generated", "game", "target", "release", "gyroship.exe"]);
+    let mut found: Vec<String> = Vec::new();
+    for p in std::iter::once(generated).chain(kept).chain([PathBuf::from(&s.build)]).filter(|p| p.is_absolute() && p.is_file()) {
+        let p = p.to_string_lossy().into_owned();
+        if !found.contains(&p) {
+            found.push(p);
+        }
+    }
+    found
+}
+
+/// The replacement-file layers to choose from: each folder `layer…` of the data folder's
+/// `practice`, by path, with the first line of its `about.txt` to show (else its name).
+/// Full paths only, as for the builds.
+pub fn layers(s: &Settings) -> Vec<(String, String)> {
+    let mut found: Vec<(String, String)> = fs::read_dir(Path::new(&s.data).join("practice"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("layer") && e.path().is_absolute() && e.path().is_dir())
+        .map(|e| {
+            let about = fs::read_to_string(e.path().join("about.txt")).ok().and_then(|t| Some(t.lines().next()?.trim().to_string())).filter(|l| !l.is_empty());
+            (e.path().to_string_lossy().into_owned(), about.unwrap_or_else(|| e.file_name().to_string_lossy().into_owned()))
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+/// The save folder the game gets. With `save_mode` "copy" or "new", a folder of the data
+/// folder's own, made again at each start: `save-copy`, a copy of the save folder, or
+/// `save-new`, empty. The save folder itself is then never written.
+pub fn prepare_save(s: &Settings) -> Result<String, String> {
+    let (name, copy) = match s.save_mode.as_str() {
+        "" => return Ok(s.save.clone()),
+        "copy" => ("save-copy", true),
+        "new" => ("save-new", false),
+        other => return Err(format!("{other} is no save mode")),
+    };
+    if copy && !Path::new(&s.save).is_dir() {
+        return Err(if s.save.is_empty() { "the save folder to copy is not set".into() } else { format!("the save folder to copy does not exist: {}", s.save) });
+    }
+    let to = Path::new(&s.data).join(name);
+    // The folder about to be emptied must neither hold the save folder nor lie in it, however
+    // either is written: as typed, and where it really is (a mapped drive, a junction, \\?\).
+    if !s.save.is_empty() {
+        let lower = |p: PathBuf| PathBuf::from(p.to_string_lossy().to_lowercase());
+        let typed = |p: &Path| std::path::absolute(p).map(lower).map_err(|e| format!("{}: {e}", p.display()));
+        let mut pairs = vec![(typed(Path::new(&s.save))?, typed(&to)?)];
+        if let (Ok(save), Ok(data)) = (fs::canonicalize(&s.save), fs::canonicalize(&s.data)) {
+            pairs.push((lower(save), lower(data.join(name))));
+        }
+        if pairs.iter().any(|(save, fresh)| save.starts_with(fresh) || fresh.starts_with(save)) {
+            return Err(format!("the save folder {} is where the launcher makes its {name} folder: choose another save folder", s.save));
+        }
+    }
+    match fs::remove_dir_all(&to) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(format!("{}: {e}", to.display())),
+        _ => {}
+    }
+    fs::create_dir_all(&to).map_err(|e| format!("{}: {e}", to.display()))?;
+    if copy {
+        copy_folder(Path::new(&s.save), &to).map_err(|e| format!("copying {} to {}: {e}", s.save, to.display()))?;
+    }
+    Ok(to.to_string_lossy().into_owned())
+}
+
+fn copy_folder(from: &Path, to: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(to)?;
+    for e in fs::read_dir(from)? {
+        let e = e?;
+        let target = to.join(e.file_name());
+        if e.file_type()?.is_dir() {
+            copy_folder(&e.path(), &target)?;
+        } else {
+            fs::copy(e.path(), target)?;
+        }
+    }
+    Ok(())
 }
 
 /// The code recorded when a game starts, until its end replaces it.

@@ -18,6 +18,11 @@
   <label>Build <select data-key="build" id="builds"></select></label>
   <label>Dump's exefs folder <input data-key="exefs" placeholder="the exefs folder of your dump, with its romfs folder next to it"></label>
   <label>Save folder <input data-key="save" placeholder="empty: nothing is kept between sessions"></label>
+  <label>The game plays on <select data-key="save_mode">
+    <option value="">this save folder, which it writes</option>
+    <option value="copy">a copy of it, made again at each start (the folder itself is never written)</option>
+    <option value="new">a new, empty save at each start (the game begins with its tutorial)</option>
+  </select></label>
   <label>Shader cache folder <input data-key="cache" placeholder="empty: every session compiles its shaders again"></label>
   <label>Language <select data-key="language">
     <option value="">the game's default (US English)</option>
@@ -29,6 +34,7 @@
   <div class="checks">
     <label><input type="checkbox" data-key="fullscreen"> Fullscreen</label>
     <label><input type="checkbox" data-key="joycon"> Switch 2 Joy-Con (hold each one's sync button at start)</label>
+    <label><input type="checkbox" data-key="joycon_mouse"> The Joy-Con's mice too, for the game's mouse mode (connects the Joy-Con by itself)</label>
     <label><input type="checkbox" data-key="record"> Record the inputs</label>
     <label><input type="checkbox" data-key="console"> Show the game's messages in a console (they say when each Joy-Con is connected)</label>
   </div>
@@ -44,7 +50,8 @@
   <div class="checks">
     <label><input type="checkbox" data-key="hud"> Speed, frame rate and release markers on screen</label>
   </div>
-  <label>Replacement files (layer folder) <input data-key="layer" placeholder="empty: the game's own files"></label>
+  <label>Replacement files <select data-key="layer" id="layers"></select></label>
+  <p class="hint">The layers of the data folder's practice folder, one at a time: a forced vehicle, the store demo's lines in the main menu, the tutorial from its mouse question.</p>
   <label>Hooks file <input data-key="hooks" placeholder="empty: the game's own functions"></label>
 
   <p><button id="go" class="main">Play</button> <span id="state"></span></p>
