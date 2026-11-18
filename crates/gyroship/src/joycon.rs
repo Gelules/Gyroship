@@ -4,9 +4,9 @@
 //! notified reports go straight into the state the hid samples read. Nothing is
 //! stored on a controller: the only frames ever written are player light 1 and a
 //! read of the factory stick calibration, plus, with `--joycon-mouse` (D97), the
-//! console's feature mask and its enabling, for the mice and the accelerometers.
-//! No gyroscope (no script of the game reads it, and the game does not react to
-//! it), no rumble.
+//! console's feature mask and its enabling, for the mice and the accelerometers;
+//! each once the last one is answered (D99). No gyroscope (no script of the game
+//! reads it, and the game does not react to it), no rumble.
 
 use crate::pads;
 use gyroship_hle::hid::Mouse;
@@ -247,11 +247,16 @@ const READ: [u8; 16] = [0x02, 0x91, 0x01, 0x04, 0, 8, 0, 0, 0x40, 0x7e, 0, 0, 0x
 const MASK: [u8; 12] = [0x0c, 0x91, 0x01, 0x02, 0, 4, 0, 0, 0x37, 0, 0, 0];
 const ENABLE: [u8; 12] = [0x0c, 0x91, 0x01, 0x04, 0, 4, 0, 0, 0x37, 0, 0, 0];
 
-/// The block of a notified answer to `READ`: after the answer's header (the
-/// command, 1, 1, the subcommand, four more bytes), the length and the address
-/// asked, which it must repeat.
+/// Where a notified answer to `frame` starts: its header repeats the command and
+/// the subcommand (the command, 1, 1, the subcommand, four more bytes).
+pub fn answer_at(frame: &[u8], answer: &[u8]) -> Option<usize> {
+    answer.windows(4).position(|w| w == [frame[0], 1, 1, frame[3]])
+}
+
+/// The block of a notified answer to `READ`: after the answer's header, the
+/// length and the address asked, which it must repeat.
 pub fn block(answer: &[u8]) -> Option<&[u8]> {
-    let at = answer.windows(4).position(|w| w == [READ[0], 1, 1, READ[3]])?;
+    let at = answer_at(&READ, answer)?;
     (answer.get(at + 12..at + 16)? == &READ[12..]).then(|| &answer[at + 16..])
 }
 
@@ -359,30 +364,45 @@ mod driver {
             }
         }
         let [Some(input), command, answers] = found else { return Err(failed("it has no input report")) };
-        // The factory calibration, when the controller answers within a second.
-        let mut c = TYPICAL;
-        if let (Some(command), Some(answers)) = (&command, &answers) {
-            let (tx, rx) = mpsc::channel();
-            let token = answers.ValueChanged(&TypedEventHandler::<GattCharacteristic, GattValueChangedEventArgs>::new(move |_, a| {
-                let _ = tx.send(bytes(&a.ok()?.CharacteristicValue()?)?);
-                Ok(())
-            }))?;
-            if notify(answers).and_then(|()| write(command, &READ)).is_ok() {
-                let end = Instant::now() + Duration::from_secs(1);
-                while let Ok(answer) = rx.recv_timeout(end.saturating_duration_since(Instant::now())) {
-                    if let Some(b) = block(&answer) {
-                        c = calibration(b);
-                        break;
-                    }
+        // One command at a time, as the trial sent them: each waits for its answer (the
+        // trial's came within 6 to 323 ms), then 100 ms. Sent 100 ms apart without
+        // waiting, the mask and its enabling never took on either Joy-Con (D99).
+        let (tx, rx) = mpsc::channel();
+        let commands = match (&command, &answers) {
+            (Some(command), Some(answers)) => {
+                let token = answers.ValueChanged(&TypedEventHandler::<GattCharacteristic, GattValueChangedEventArgs>::new(move |_, a| {
+                    let _ = tx.send(bytes(&a.ok()?.CharacteristicValue()?)?);
+                    Ok(())
+                }))?;
+                notify(answers).is_ok().then_some((command, answers, token))
+            }
+            _ => None,
+        };
+        let send = |frame: &'static [u8]| -> Result<Vec<u8>> {
+            let Some((command, ..)) = &commands else { return Err(failed("it takes no commands")) };
+            write(command, frame)?;
+            let end = Instant::now() + Duration::from_secs(1);
+            loop {
+                let answer = rx.recv_timeout(end.saturating_duration_since(Instant::now())).map_err(|_| failed(&format!("no answer to {:02x}/{:02x} within 1 s", frame[0], frame[3])))?;
+                if answer_at(frame, &answer).is_some() {
+                    std::thread::sleep(Duration::from_millis(100));
+                    return Ok(answer);
                 }
             }
-            let _ = answers.RemoveValueChanged(token);
-        }
+        };
+        // The factory calibration, when the controller answers.
+        let c = send(&READ).ok().and_then(|a| block(&a).map(calibration)).unwrap_or(TYPICAL);
         // The handler first, then the descriptor: reports flow without any command.
         let to = pair.clone();
         input.ValueChanged(&TypedEventHandler::<GattCharacteristic, GattValueChangedEventArgs>::new(move |_, a| {
-            if report(side, &bytes(&a.ok()?.CharacteristicValue()?)?, &c, &to[side], clock()) {
+            let s = &to[side];
+            let had = s.counters.load(Relaxed) >> 32 != 0;
+            if report(side, &bytes(&a.ok()?.CharacteristicValue()?)?, &c, s, clock()) {
                 gyroship_hle::practice::toggle_perfect();
+            }
+            // The proof that the mask took, once per link.
+            if !had && s.counters.load(Relaxed) >> 32 != 0 {
+                eprintln!("gyroship: joycon: the {} one's mouse reports", SIDES[side]);
             }
             Ok(())
         }))?;
@@ -402,19 +422,13 @@ mod driver {
             Ok(status) => eprintln!("gyroship: joycon: Windows refused a fast link to the {} one (status {status}): expect input lag", SIDES[side]),
             Err(e) => eprintln!("gyroship: joycon: no fast link to the {} one ({e}): Windows 11 is needed, expect input lag", SIDES[side]),
         }
-        if let Some(command) = &command {
-            let _ = write(command, &LIGHT);
-            // The mouse and the accelerometer report only under the console's mask: set,
-            // then enabled, 100 ms apart, as the trial did (unspaced writes were seen dropped).
-            let spaced = |frame| {
-                std::thread::sleep(Duration::from_millis(100));
-                write(command, frame)
-            };
-            if mouse && let Err(e) = spaced(&MASK).and_then(|()| spaced(&ENABLE)) {
-                eprintln!("gyroship: joycon: the {} one's mouse did not start ({e})", SIDES[side]);
-            }
-        } else if mouse {
-            eprintln!("gyroship: joycon: the {} one takes no commands: no mouse", SIDES[side]);
+        let _ = send(&LIGHT);
+        // The mouse and the accelerometer report only under the console's mask: set, then enabled.
+        if mouse && let Err(e) = send(&MASK).and_then(|_| send(&ENABLE)) {
+            eprintln!("gyroship: joycon: the {} one's mouse did not start ({e})", SIDES[side]);
+        }
+        if let Some((_, answers, token)) = &commands {
+            let _ = answers.RemoveValueChanged(*token);
         }
         // A link that fell during all this would never be told lost.
         if device.ConnectionStatus()?.0 == 0 {
@@ -688,6 +702,10 @@ mod tests {
         assert_eq!(READ, [0x02, 0x91, 0x01, 0x04, 0, 8, 0, 0, 0x40, 0x7e, 0, 0, 0x80, 0x30, 0x01, 0]);
         assert_eq!(MASK, [0x0c, 0x91, 0x01, 0x02, 0, 4, 0, 0, 0x37, 0, 0, 0]);
         assert_eq!(ENABLE, [0x0c, 0x91, 0x01, 0x04, 0, 4, 0, 0, 0x37, 0, 0, 0]);
+        // Each frame waits for its own answer, as the controllers gave them in the trial.
+        let (mask, enabled) = ([0x0c, 1, 1, 0x02, 0x10, 0x78, 0, 0, 0, 0, 0, 0], [0x0c, 1, 1, 0x04, 0x10, 0x78, 0, 0, 0, 0, 0, 0]);
+        assert_eq!([answer_at(&MASK, &mask), answer_at(&ENABLE, &enabled), answer_at(&LIGHT, &[9, 1, 1, 7, 0x10, 0x78, 0, 0])], [Some(0); 3]);
+        assert_eq!(answer_at(&ENABLE, &mask), None, "the mask's answer is not its enabling's");
         let answer = |address: [u8; 4]| [&[0x02, 1, 1, 0x04, 0x10, 0x78, 0, 0, 0x40, 0, 0, 0][..], &address, &[0xab; 0x40]].concat();
         assert_eq!(block(&answer([0x80, 0x30, 1, 0])), Some(&[0xab; 0x40][..]));
         assert_eq!(block(&answer([0xc0, 0x30, 1, 0])), None, "another read's answer");
