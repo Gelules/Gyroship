@@ -12,6 +12,15 @@ use crate::ipc::{Reply, Request};
 /// does not grant.
 pub const SM_NOT_ALLOWED: u32 = 21 | 8 << 9;
 
+/// streamplay's result "internet not available" (module 287, description 20).
+pub const STREAMPLAY_NO_INTERNET: u32 = 287 | 20 << 9;
+/// Size of stpl:u's hid shared memory, where GameShare guests' controllers would be: the
+/// SDK's readers stay below 0x9a800 (the last mouse slot, by Lichii's count); one page more.
+const STPL_HID_SIZE: u64 = 0x9b000;
+/// The work buffer stpl:u asks for: a global part, then three parts per guest.
+const STPL_GLOBAL: u64 = 0x1000;
+const STPL_PER_PART: u64 = 0x1000;
+
 /// Services granted although the NPDM's list does not name them. `bsd:s`:
 /// the SDK's socket layer asks for it (Lichii sees it too) and aborts when
 /// it is refused, so the console must grant it; its rule is not known.
@@ -73,6 +82,9 @@ pub enum Service {
     /// `nfp:user` and its IUser: one NFC reader (the right controller's), which
     /// never finds a tag: no amiibo on the host. `detecting` once asked to look.
     Nfp { user: bool, detecting: bool },
+    /// `stpl:u` (GameShare) and the IUserService its command 0 opens. Offline (rule 9):
+    /// Initialize fails, and the game shows its error and gives up.
+    Stpl { user: bool },
 }
 
 #[derive(Debug, Default)]
@@ -113,6 +125,8 @@ impl Service {
             Service::Ectx => "ectx:aw".to_string(),
             Service::Nfp { user: false, .. } => "nfp:user".to_string(),
             Service::Nfp { user: true, .. } => "nfp:user IUser".to_string(),
+            Service::Stpl { user: false } => "stpl:u".to_string(),
+            Service::Stpl { user: true } => "stpl:u IUserService".to_string(),
         }
     }
 
@@ -203,6 +217,35 @@ impl Service {
             (Service::Nfp { user: true, .. }, 19) => Reply::with(&1u32.to_le_bytes()),
             (Service::Nfp { user: true, detecting }, 20) => Reply::with(&u32::from(*detecting).to_le_bytes()),
             (Service::Nfp { user: true, .. }, 21) => Reply::with(&0u32.to_le_bytes()),
+            // stpl:u (GameShare). The SDK's GetUserService aborts unless CreateUserService (0)
+            // gives the user service and 300 the guests' hid shared memory (a copied handle,
+            // then its size and offset; zeroed: no guest). GetRequiredMemorySize (1) and
+            // CalculateRequiredWorkBufferSize (9) must leave room for one guest at least. Then
+            // Initialize (2) fails: no network of any kind here. The SDK hands that result
+            // (streamplay's, under 5000) back to the game, which shows the error screen and
+            // gives up.
+            (Service::Stpl { user: false }, 0) => Reply::object(Service::Stpl { user: true }),
+            (Service::Stpl { user: true }, 300) => {
+                let m = k.create_shared_memory(STPL_HID_SIZE);
+                match k.handles.add(crate::thread::Object::SharedMemory(m)) {
+                    Some(h) => Reply { copy_handles: vec![h], ..Reply::with(&[STPL_HID_SIZE, 0].map(u64::to_le_bytes).concat()) },
+                    None => Reply::error(crate::result::OUT_OF_HANDLES),
+                }
+            }
+            (Service::Stpl { user: true }, 1) => {
+                let guests = u64::from(req.u32_at(4).unwrap_or(1).clamp(1, 3));
+                Reply::with(&((STPL_GLOBAL + guests * 3 * STPL_PER_PART) as u32).to_le_bytes())
+            }
+            (Service::Stpl { user: true }, 9) => Reply::with(&[STPL_GLOBAL, STPL_PER_PART, STPL_PER_PART, STPL_PER_PART].map(u64::to_le_bytes).concat()),
+            (Service::Stpl { user: true }, 2) => {
+                let (kind, mode, guests) = (req.data.first().copied().unwrap_or(0), req.data.get(1).copied().unwrap_or(0), req.u32_at(4).unwrap_or(0));
+                k.log(&format!("stpl:u: GameShare refused: Initialize (type {kind}, mode {mode}, {guests} guests) answers {STREAMPLAY_NO_INTERNET:#x}, internet not available (offline)"));
+                Reply::error(STREAMPLAY_NO_INTERNET)
+            }
+            // GetSupportedHidFeatureSet: none, for SetSupportedHidFeatureSet only follows a
+            // successful Initialize. The game's input loop asks at every frame once GameShare was
+            // tried, and reads its guests from the shared memory: none there.
+            (Service::Stpl { user: true }, 161) => Reply::with(&0u32.to_le_bytes()),
             (Service::Sm(sm), 0) => {
                 sm.registered = true;
                 Reply::ok()
@@ -278,6 +321,7 @@ impl Kernel {
             "chat:u" => Service::Chat { session: false },
             "ectx:aw" => Service::Ectx,
             "nfp:user" => Service::Nfp { user: false, detecting: false },
+            "stpl:u" => Service::Stpl { user: false },
             _ if self.config.explore => Service::Stub(name.clone()),
             _ => self.stop(crate::STOP_EXIT, &format!("sm: service {name:?} is not implemented")),
         };

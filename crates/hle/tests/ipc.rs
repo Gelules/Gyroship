@@ -556,3 +556,73 @@ fn the_controller_screen_confirms_a_controller_that_fits() {
     assert!(text.contains("hid: Npad 0 shows a Joy-Con pair used as mice (style 0x1000)"), "{text}");
     assert!(text.contains("Npad 0 shows style 0x1000, the game supports 0x1000: it closes at once, confirmed with Npad 0"), "{text}");
 }
+
+/// GameShare offline (rule 9). stpl:u hands out what the SDK's GetUserService requires: the
+/// user service, and the guests' hid shared memory, which maps read-only at the size given.
+/// The work buffer it then asks for holds three guests, as the SDK counts them, and Initialize
+/// fails with "internet not available": a streamplay result under 5000, which the SDK hands
+/// back to the game instead of aborting.
+#[test]
+fn gameshare_is_refused_offline() {
+    let (mut k, mut cpu) = kernel();
+    k.allowed_services.push("stpl:u".to_string());
+    let sm = connect_sm(&mut k, &mut cpu);
+    let (_, stpl) = get_service(&mut k, &mut cpu, sm, "stpl:u");
+    let (_, w) = send(&mut k, &mut cpu, stpl, &cmif(&[4], 0, &[0x10400], None));
+    let user = moved(&w);
+    let (_, w) = send(&mut k, &mut cpu, user, &cmif(&[4], 300, &[], None));
+    assert_eq!((w[1] >> 31, w[2], cmif_result(&w, 4)), (1, 0x2, SUCCESS), "one copied handle: {w:x?}");
+    let (size, offset) = (u64::from(w[8]) | u64::from(w[9]) << 32, u64::from(w[10]) | u64::from(w[11]) << 32);
+    assert_eq!(offset, 0);
+    let at = 0x50_0000_0000;
+    (cpu.x[0], cpu.x[1], cpu.x[2], cpu.x[3]) = (u64::from(w[3]), at, size, 1);
+    k.svc(&mut cpu, PC, 0x13);
+    assert_eq!(cpu.x[0], 0, "MapSharedMemory");
+    assert_eq!(k.mem.query(at).block, Block::new(state::SHARED, perm::R));
+    // GetRequiredMemorySize (internet, mode 1, three guests), then CalculateRequiredWorkBufferSize:
+    // a global part and three parts per guest.
+    let (_, w) = send(&mut k, &mut cpu, user, &cmif(&[4], 1, &[1 | 1 << 8, 3], None));
+    let memory = u64::from(w[8]);
+    let (_, w) = send(&mut k, &mut cpu, user, &cmif(&[4], 9, &[1 | 1 << 8, 0], None));
+    let part = |i: usize| u64::from(w[8 + 2 * i]) | u64::from(w[9 + 2 * i]) << 32;
+    assert_eq!((memory - part(0)) / (part(1) + part(2) + part(3)), 3);
+    let (_, w) = send(&mut k, &mut cpu, user, &cmif(&[4], 2, &[1 | 1 << 8, 3, 0, 0], None));
+    let result = cmif_result(&w, 2);
+    assert_eq!(result, gyroship_hle::service::STREAMPLAY_NO_INTERNET);
+    assert_eq!((result & 0x1FF, result >> 9), (287, 20), "under 5000: handed back to the game");
+    // GetSupportedHidFeatureSet, which the game's input loop then asks at every frame: none.
+    let (_, w) = send(&mut k, &mut cpu, user, &cmif(&[4], 161, &[0, 0], None));
+    assert_eq!((cmif_result(&w, 2), w[8]), (SUCCESS, 0));
+    let text = k.journal.text();
+    assert!(text.contains("stpl:u: GameShare refused: Initialize (type 1, mode 1, 3 guests) answers 0x291f, internet not available (offline)"), "{text}");
+}
+
+/// The error screen (`nn::err::ShowError`, library applet 0x0E), which the game shows when
+/// GameShare is refused: created, given its arguments, started, and already closed with OK,
+/// the exit the SDK reads as normal. Nothing comes out of it.
+#[test]
+fn the_error_screen_closes_at_once_with_ok() {
+    let (mut k, mut cpu) = kernel();
+    k.allowed_services.push("appletOE".to_string());
+    let sm = connect_sm(&mut k, &mut cpu);
+    let (_, oe) = get_service(&mut k, &mut cpu, sm, "appletOE");
+    let (_, w) = send(&mut k, &mut cpu, oe, &cmif(&[4], 10, &[0, 0], None));
+    let proxy = moved(&w);
+    let (_, w) = send(&mut k, &mut cpu, proxy, &cmif(&[4], 11, &[], None));
+    let creator = moved(&w);
+    let (_, w) = send(&mut k, &mut cpu, creator, &cmif(&[4], 3, &[0x100_000E, 0, 7, 0], None));
+    let screen = moved(&w);
+    for command in [100, 90, 10] {
+        let (_, w) = send(&mut k, &mut cpu, screen, &cmif(&[4], command, &[0; 8], None));
+        assert_eq!(cmif_result(&w, 2), SUCCESS, "command {command}");
+    }
+    let (_, w) = send(&mut k, &mut cpu, screen, &cmif(&[4], 0, &[], None));
+    assert_eq!((w[1] >> 31, w[2]), (1, 0x2), "one copied handle: {w:x?}");
+    assert!(k.events[k.event_of(w[3]).expect("a readable event")].signaled, "already closed");
+    let (_, w) = send(&mut k, &mut cpu, screen, &cmif(&[4], 30, &[], None));
+    assert_eq!(cmif_result(&w, 2), SUCCESS);
+    let (_, w) = send(&mut k, &mut cpu, screen, &cmif(&[4], 101, &[], None));
+    assert_eq!(cmif_result(&w, 2), gyroship_hle::am::NO_DATA_IN_CHANNEL);
+    let text = k.journal.text();
+    assert!(text.contains("am: the error screen is asked (library applet 0x100000e): it closes at once, as if its user pressed OK"), "{text}");
+}
