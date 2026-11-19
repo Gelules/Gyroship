@@ -52,6 +52,11 @@ fn show(s: &State) -> String {
     format!("g={} b={} lock={} boosting={} braking={} state={}", s.gauge, s.speed, s.locked as u8, s.boosting as u8, s.braking as u8, s.gauge_state)
 }
 
+/// A count and its noun, singular for one: "1 pause", "2 pauses".
+fn count(n: usize, noun: &str) -> String {
+    format!("{n} {noun}{}", if n == 1 { "" } else { "s" })
+}
+
 /// Presents between two updates that still follow each other (2 at 30 Hz);
 /// a longer gap is a pause (cutscene, transition) where other scripts may
 /// reset the boost, so the chain restarts after it.
@@ -227,7 +232,7 @@ fn check_text(text: &str, apply: Option<Apply>) -> crate::Result<bool> {
         }
     }
     for (_, r) in &runs {
-        println!("  {:12} {} frames, {} exact; {} hits, {} forced a cooldown; {} pauses; {} perfect releases", r.name, r.frames, r.exact, r.hits_seen, r.forced, r.pauses, r.fired);
+        println!("  {:12} {}, {} exact; {}, {} forced a cooldown; {}; {}", r.name, count(r.frames, "frame"), r.exact, count(r.hits_seen, "hit"), r.forced, count(r.pauses, "pause"), count(r.fired, "perfect release"));
     }
     if !lm.is_empty() {
         let (mut n, mut settings, mut calc, mut speed, mut carried, mut gauge, mut gating, mut pauses, mut inputs, mut decided, mut hits, mut forced) = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
@@ -262,7 +267,7 @@ fn check_text(text: &str, apply: Option<Apply>) -> crate::Result<bool> {
                 if e.boosting as u32 + e.braking as u32 == actions {
                     decided += 1;
                 } else {
-                    bad.push(format!("{at}: boost={} brake={} lock={}: model {} actions, game {actions}", boost as u8, brake as u8, g.locked as u8, e.boosting as u32 + e.braking as u32));
+                    bad.push(format!("{at}: actions from boost={} brake={} lock={}: model {}, game {actions}", boost as u8, brake as u8, g.locked as u8, e.boosting as u32 + e.braking as u32));
                 }
             }
             if next.calc_in.is_some_and(|i2| i2[0].to_bits() == out.to_bits()) {
@@ -282,7 +287,7 @@ fn check_text(text: &str, apply: Option<Apply>) -> crate::Result<bool> {
             if (m.gauge.to_bits(), m.locked, m.gauge_state) == (g2.gauge.to_bits(), g2.locked, g2.gauge_state) {
                 gauge += 1;
             } else {
-                bad.push(format!("{at}, {actions} actions, hits {:?}, dt={dt}: gauge from {}: model {}, game {}", f.hits, show(&g), show(&m), show(&g2)));
+                bad.push(format!("{at}, actions={actions}, hits {:?}, dt={dt}: gauge from {}: model {}, game {}", f.hits, show(&g), show(&m), show(&g2)));
             }
             // Boost and brake are refused while locked, and each counts as an action.
             if if g.locked { actions == 0 && i[1] == 0.0 } else { i[1] == 0.0 || actions >= 1 } {
@@ -291,15 +296,25 @@ fn check_text(text: &str, apply: Option<Apply>) -> crate::Result<bool> {
                 bad.push(format!("{at}: lock={} target={} actions={actions}", g.locked as u8, i[1]));
             }
         }
-        println!("  landmaster   {n} frames: settings {settings}, add_calc {calc}, speed {speed}, carried {carried}, gauge {gauge}, gating {gating} exact; inputs traced on {inputs}, {decided} actions exact; {hits} hits, {forced} forced a cooldown; {pauses} pauses");
+        println!("  landmaster   {}: settings {settings}, add_calc {calc}, speed {speed}, carried {carried}, gauge {gauge}, gating {gating} exact; inputs traced on {inputs}, {} exact; {}, {forced} forced a cooldown; {}", count(n, "frame"), count(decided, "action"), count(hits, "hit"), count(pauses, "pause"));
     }
     if bad.is_empty() {
         println!("  every frame matches");
     } else {
-        println!("  {} differences, the first {}:", bad.len(), bad.len().min(SHOWN));
+        println!("  {}, the first {}:", count(bad.len(), "difference"), bad.len().min(SHOWN));
         for b in bad.iter().take(SHOWN) {
             println!("    {b}");
         }
     }
     Ok(bad.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_count_agrees_with_its_number() {
+        assert_eq!(super::count(0, "pause"), "0 pauses");
+        assert_eq!(super::count(1, "pause"), "1 pause");
+        assert_eq!(super::count(2, "perfect release"), "2 perfect releases");
+    }
 }
