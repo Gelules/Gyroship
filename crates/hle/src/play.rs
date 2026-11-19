@@ -172,12 +172,13 @@ fn wait(me: usize) {
             let kind = *kind.get_or_insert(match th.wait {
                 Wait::None => ("none", None),
                 Wait::Sleep => ("sleep", None),
+                Wait::Vsync => ("vsync", None),
                 Wait::Sync(_) => ("sync", None),
                 Wait::Lock { .. } => ("lock", None),
                 Wait::CondVar { .. } => ("condvar", None),
                 Wait::Address(a) => ("address", Some(a)),
             });
-            let (state, sleep, deadline, cpu, on_timeout) = (th.state, th.wait == Wait::Sleep, th.deadline, th.cpu, th.on_timeout);
+            let (state, sleep, deadline, cpu, on_timeout) = (th.state, matches!(th.wait, Wait::Sleep | Wait::Vsync), th.deadline, th.cpu, th.on_timeout);
             if state != State::Waiting {
                 k.parked(me, kind, since.elapsed());
                 return Then::Run;

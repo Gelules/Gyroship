@@ -64,6 +64,8 @@ pub enum Wait {
     #[default]
     None,
     Sleep,
+    /// The display's next vsync after a present: a Sleep the census counts apart.
+    Vsync,
     /// WaitSynchronization: the first of these objects to be signaled.
     Sync(Vec<Object>),
     /// ArbitrateLock: the mutex word at `addr`, to be handed over with `tag`.

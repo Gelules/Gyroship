@@ -671,9 +671,10 @@ struct Frame {
 /// before the frame's commands (the submit thread's; inline, `encoder` wrote
 /// it, so the span then leaves out the barriers and first-use clears wgpu puts
 /// at the head of the frame's commands: microseconds). Returns the arena
-/// bytes, emptied.
+/// bytes, emptied, and the submission, if anything was submitted.
 #[allow(clippy::too_many_arguments)]
-fn submit_frame(device: &wgpu::Device, queue: &wgpu::Queue, belt: &mut wgpu::util::StagingBelt, mut clock: Option<&mut crate::timing::FrameClock>, timing: Option<&mut crate::timing::Timing>, stamp: bool, f: Frame) -> Vec<u8> {
+fn submit_frame(device: &wgpu::Device, queue: &wgpu::Queue, belt: &mut wgpu::util::StagingBelt, mut clock: Option<&mut crate::timing::FrameClock>, timing: Option<&mut crate::timing::Timing>, stamp: bool, f: Frame) -> (Vec<u8>, Option<wgpu::SubmissionIndex>) {
+    let mut index = None;
     let mut buffers = Vec::with_capacity(4);
     if let Some(uploads) = f.uploads {
         buffers.push(uploads.finish());
@@ -699,7 +700,7 @@ fn submit_frame(device: &wgpu::Device, queue: &wgpu::Queue, belt: &mut wgpu::uti
             c.close(device, &mut e);
         }
         buffers.push(e.finish());
-        queue.submit(buffers);
+        index = Some(queue.submit(buffers));
         if let Some(t) = timing {
             t.collect(device);
         }
@@ -707,11 +708,23 @@ fn submit_frame(device: &wgpu::Device, queue: &wgpu::Queue, belt: &mut wgpu::uti
             c.submitted(device, f.present);
         }
     } else if !buffers.is_empty() {
-        queue.submit(buffers);
+        index = Some(queue.submit(buffers));
     }
     // Chunks whose copies were submitted come back once the GPU is done.
     belt.recall();
-    bytes
+    (bytes, index)
+}
+
+/// Headless play: frames queued for the GPU at most, as a window's swapchain
+/// (frame latency 1) holds them. Without a window nothing else waits for the
+/// GPU: it fell behind in the menus until the frame clock's full ring waited
+/// for all of it (about 300 ms, 48 times in a Corneria run).
+const IN_FLIGHT: usize = 2;
+
+/// The submission to wait for before the next one, so that at most
+/// `IN_FLIGHT` stay queued.
+fn due<T>(queue: &mut std::collections::VecDeque<T>) -> Option<T> {
+    if queue.len() >= IN_FLIGHT { queue.pop_front() } else { None }
 }
 
 /// A job for the submit thread.
@@ -726,6 +739,8 @@ struct Submitter {
     window: Option<Window>,
     /// Each frame's arena bytes, emptied, back to the recording thread.
     spare: std::sync::mpsc::Sender<Vec<u8>>,
+    /// The last frames submitted, oldest first: headless, the next waits for the oldest (`due`).
+    in_flight: std::collections::VecDeque<wgpu::SubmissionIndex>,
 }
 
 /// The way to the submit thread: its jobs (one running and one waiting at
@@ -1306,7 +1321,7 @@ impl Surfaces {
             // The texture staging is closed even with no upload: a refresh may have used it.
             self.texture_belt.finish();
             let f = Frame { uploads: self.uploads.take(), arena: (self.arena.0.clone(), std::mem::take(&mut self.arena.1)), pending: self.pending.take(), present: self.present };
-            self.arena.1 = submit_frame(&self.device, &self.queue, &mut self.belt, self.clock.as_mut(), self.timing.as_mut(), false, f);
+            self.arena.1 = submit_frame(&self.device, &self.queue, &mut self.belt, self.clock.as_mut(), self.timing.as_mut(), false, f).0;
             self.texture_belt.recall();
         }
         if let Some(t) = &self.submit {
@@ -1331,7 +1346,14 @@ impl Surfaces {
         let spare = self.submit.as_ref().and_then(|t| t.spare.try_recv().ok()).unwrap_or_else(|| Vec::with_capacity(len));
         let f = Frame { uploads: self.uploads.take(), arena: (self.arena.0.clone(), std::mem::replace(&mut self.arena.1, spare)), pending: self.pending.take(), present: self.present };
         self.send(Box::new(move |s: &mut Submitter| {
-            let bytes = submit_frame(&s.device, &s.queue, &mut s.belt, s.clock.as_mut(), None, true, f);
+            // A window's swapchain already waits for the GPU (`Window::show`).
+            if let Some(i) = due(&mut s.in_flight)
+                && s.window.is_none()
+            {
+                let _ = s.device.poll(wgpu::PollType::Wait { submission_index: Some(i), timeout: None });
+            }
+            let (bytes, index) = submit_frame(&s.device, &s.queue, &mut s.belt, s.clock.as_mut(), None, true, f);
+            s.in_flight.extend(index);
             let _ = s.spare.send(bytes);
         }));
     }
@@ -1349,7 +1371,7 @@ impl Surfaces {
         let busy = Arc::new(std::sync::atomic::AtomicU64::new(0));
         // The arena's staging is the thread's now; this one serves only if the thread ends.
         let belt = std::mem::replace(&mut self.belt, wgpu::util::StagingBelt::new(self.device.clone(), 16 << 20));
-        let mut s = Submitter { device: self.device.clone(), queue: self.queue.clone(), belt, clock: self.clock.take(), window: self.window.take(), spare: back };
+        let mut s = Submitter { device: self.device.clone(), queue: self.queue.clone(), belt, clock: self.clock.take(), window: self.window.take(), spare: back, in_flight: Default::default() };
         let took = busy.clone();
         let thread = std::thread::Builder::new().name("gpu submit".into()).spawn(move || {
             for job in rx {
@@ -1947,6 +1969,20 @@ impl Surfaces {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Headless, each frame waits for the one submitted two before it: never
+    /// more than two queued for the GPU, and the GPU never starved of the next.
+    #[test]
+    fn a_headless_frame_waits_for_the_one_two_before() {
+        let mut queue = std::collections::VecDeque::new();
+        let mut waits = Vec::new();
+        for frame in 0..5 {
+            waits.push(due(&mut queue));
+            queue.push_back(frame);
+            assert!(queue.len() <= 2, "frame {frame}: {queue:?} queued");
+        }
+        assert_eq!(waits, [None, None, Some(0), Some(1), Some(2)]);
+    }
 
     /// How fast the queue takes a heavy Corneria frame's arena (10 MiB), by
     /// `write_buffer` and by `write_buffer_with`: `cargo test --release -p

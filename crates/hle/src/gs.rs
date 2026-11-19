@@ -687,7 +687,7 @@ impl Kernel {
             let (next, wait) = next_vsync(self.gs.vsync, interval, first, self.config.play && self.config.late_frames);
             self.gs.vsync = next;
             if wait {
-                self.block(crate::thread::Wait::Sleep, Some(vsync(next)), crate::result::SUCCESS);
+                self.block(crate::thread::Wait::Vsync, Some(vsync(next)), crate::result::SUCCESS);
             }
         }
     }
@@ -1039,6 +1039,19 @@ mod tests {
         assert_eq!(super::next_vsync(10, 1, 14, true), (13, false));
         // Interval 2: due at 12, now before it: wait for 12.
         assert_eq!(super::next_vsync(10, 2, 12, true), (12, true));
+    }
+
+    /// A present waits for its vsync as Vsync, not as the game's own Sleep:
+    /// the play census counts the two apart.
+    #[test]
+    fn a_present_waits_for_its_vsync_as_vsync() {
+        use crate::thread::{State, Wait};
+        let mut k = Kernel::new(gyroship_runtime::mem::Memory::new().unwrap(), crate::journal::Journal::memory(), crate::Config::default());
+        k.create_main(0, 0);
+        k.sched.current = Some(0);
+        k.present_end(1, 1, 0);
+        let th = &k.sched.threads[0];
+        assert_eq!((th.state, &th.wait, th.deadline), (State::Waiting, &Wait::Vsync, Some(vsync(1))));
     }
 
     /// The client names notification ids when it opens a display (one) and creates a
