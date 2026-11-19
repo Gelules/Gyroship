@@ -7,7 +7,7 @@
 //! normalized storage formats only; image contents stay on the host (never
 //! written back to guest memory).
 
-use crate::draw::{Bank, Bindings, Mem};
+use crate::draw::{Bank, Banks, Bindings, Mem};
 use crate::pushbuf::Pools;
 use crate::shader::{self, Handle, IMAGE_BINDING, Options, Translation};
 use crate::sass::memory::ImageDim;
@@ -92,19 +92,23 @@ impl Surfaces {
         if l.shared > self.device.limits().max_compute_workgroup_storage_size {
             return Err(format!("{:#x} bytes of shared memory", l.shared));
         }
-        let mut banks = BTreeMap::new();
+        let mut banks = Banks::new();
         for &(bank, addr, size) in &l.cbufs {
             let data = self.read_guest(crate::surfaces::Read::ComputeBank, addr, (size as usize).min(CBUF_BYTES), mem).ok_or_else(|| format!("compute constant bank {bank} at {addr:#x} not readable"))?;
-            banks.insert(bank, (addr, data));
+            // In bank order; a bank given twice keeps its last binding.
+            match banks.binary_search_by_key(&bank, |(k, _)| *k) {
+                Ok(i) => banks[i].1 = (addr, data),
+                Err(i) => banks.insert(i, (bank, (addr, data))),
+            }
         }
-        let word = |banks: &BTreeMap<u8, Bank>, h: &Handle| -> Option<u32> {
+        let word = |banks: &[(u8, Bank)], h: &Handle| -> Option<u32> {
             let Handle::CBuf { bank, offset } = h else { return None };
             let at = usize::from(*offset);
-            let w = banks.get(bank)?.1.get(at..at + 4)?;
+            let w = crate::draw::bank(banks, *bank)?.1.get(at..at + 4)?;
             Some(u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
         };
         let mut tic_of = |h: &Handle| -> Result<textures::Tic, String> {
-            let handle = TexHandle::new(word(&banks, h).ok_or_else(|| format!("image handle {h:?}"))?);
+            let handle = TexHandle::new(word(&banks[..], h).ok_or_else(|| format!("image handle {h:?}"))?);
             let mut header = [0u8; 32];
             if !mem(pools.headers.entry(handle.header).ok_or("image index past the pool")?, &mut header) {
                 return Err("image header not readable".into());
@@ -134,7 +138,7 @@ impl Surfaces {
         }
         let compiled = self.compute_program(key, l, images.iter().map(|i| i.2.clone()).collect(), queried)?;
         let (t, module) = (&compiled.0, &compiled.1);
-        if let Some(b) = t.interface.cbufs.iter().chain(&t.interface.handle_banks).find(|b| !banks.contains_key(b)) {
+        if let Some(b) = t.interface.cbufs.iter().chain(&t.interface.handle_banks).find(|b| crate::draw::bank(&banks, **b).is_none()) {
             return Err(format!("compute constant bank {b} not bound"));
         }
 
@@ -200,7 +204,7 @@ impl Surfaces {
         // ponytail: read again at every dispatch; cache by address if it shows in profiles.
         let mut globals = Vec::new();
         for &(bank, at) in &t.interface.buffers {
-            let word = |o: usize| banks.get(&bank).and_then(|b| b.1.get(o..o + 4)).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]));
+            let word = |o: usize| crate::draw::bank(&banks, bank).and_then(|b| b.1.get(o..o + 4)).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]));
             let at = usize::from(at);
             let (Some(lo), Some(hi), Some(size)) = (word(at), word(at + 4), word(at + 8)) else { return Err("global memory descriptor out of its bank".into()) };
             // The word after the pointer is not proved to be a size: at least 1 MiB is read
@@ -234,7 +238,7 @@ impl Surfaces {
 
         // Bindings: constant banks, textures and swizzles as for draws, then the images.
         let (textures, swizzles) = self.texture_slots(t, &banks, pools.headers, pools.samplers, pools.sampler_binding, &[], mem)?;
-        banks.retain(|b, _| t.interface.cbufs.contains(b));
+        banks.retain(|(b, _)| t.interface.cbufs.contains(b));
         let bindings = Bindings { cbufs: banks, textures, swizzles: t.interface.swizzles.then_some(swizzles), sizes: &t.interface.cbuf_sizes };
         let mut layout_entries = bindings.layout(wgpu::ShaderStages::COMPUTE);
         for (i, (img, (_, format, _, _))) in t.interface.images.iter().zip(&images).enumerate() {

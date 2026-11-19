@@ -1023,6 +1023,7 @@ dependencies = [
  "pollster",
  "postcard",
  "serde",
+ "smallvec",
  "wgpu",
 ]
 

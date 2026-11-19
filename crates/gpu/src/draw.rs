@@ -18,7 +18,12 @@ use crate::state::resources::{Pool, SamplerBinding, TexHandle};
 use crate::state::textures::{self, Layout, TextureType};
 use crate::state::vertex::{AttrKind, wgpu_vertex_format};
 use crate::surfaces::{FxMap, Surfaces, color_format, depth_format};
+use smallvec::{SmallVec, smallvec};
 use std::collections::{BTreeMap, BTreeSet};
+
+// A draw's small lists live on the stack (`SmallVec`): a heavy frame makes about 3,000
+// draws, and their twenty-odd heap allocations each cost as much as the rest of a draw's
+// bookkeeping. A longer list than the inline room still works, from the heap.
 
 /// Reads guest memory at a GPU address; false if a byte is not readable.
 pub type Mem<'a> = &'a mut dyn FnMut(u64, &mut [u8]) -> bool;
@@ -26,10 +31,24 @@ pub type Mem<'a> = &'a mut dyn FnMut(u64, &mut [u8]) -> bool;
 /// A constant bank as read: its guest address and bytes (shared by the draws of a submit).
 pub(crate) type Bank = (u64, std::sync::Arc<Vec<u8>>);
 
+/// A stage's constant banks by bank, in bank order, each once.
+pub(crate) type Banks = SmallVec<[(u8, Bank); 16]>;
+
+/// Bank `b` of `banks`.
+pub(crate) fn bank(banks: &[(u8, Bank)], b: u8) -> Option<&Bank> {
+    banks.iter().find(|(k, _)| *k == b).map(|(_, v)| v)
+}
+
+/// A draw's color targets with their formats, by location (8 at most).
+type Colors = SmallVec<[Option<(Surface, wgpu::TextureFormat)>; 8]>;
+
 /// What a draw's render pass is opened on: the color targets with their formats,
 /// the depth target with its format, and whether colors are attached (not
 /// without a pixel program). Draws with the same key share the open pass.
-pub(crate) type PassKey = (Vec<Option<(Surface, wgpu::TextureFormat)>>, Option<(Surface, wgpu::TextureFormat)>, bool);
+pub(crate) type PassKey = (Colors, Option<(Surface, wgpu::TextureFormat)>, bool);
+
+/// The vertex buffer layouts of a pipeline: stream, step, stride and attributes.
+type VertexLayouts = SmallVec<[(u8, wgpu::VertexStepMode, u64, SmallVec<[wgpu::VertexAttribute; 4]>); 4]>;
 
 /// What the open pass was last given: a draw sets only what changed (wgpu
 /// validates and encodes each call again, and consecutive draws mostly repeat).
@@ -289,16 +308,25 @@ fn jump_targets(tables: &[shader::JumpTable], bytes: &[Vec<u8>], code_len: usize
 
 /// `ranges` (start, end) sorted and merged where they touch or overlap.
 fn merged(ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
-    let mut sorted = ranges.to_vec();
-    sorted.sort_unstable();
-    let mut out: Vec<(u64, u64)> = Vec::with_capacity(sorted.len());
-    for (start, end) in sorted {
-        match out.last_mut() {
-            Some(last) if start <= last.1 => last.1 = last.1.max(end),
-            _ => out.push((start, end)),
+    let mut out = ranges.to_vec();
+    merge(&mut out);
+    out
+}
+
+/// [`merged`] in place, with no allocation.
+fn merge(ranges: &mut Vec<(u64, u64)>) {
+    ranges.sort_unstable();
+    let mut n = 0;
+    for i in 0..ranges.len() {
+        let (start, end) = ranges[i];
+        if n > 0 && start <= ranges[n - 1].1 {
+            ranges[n - 1].1 = ranges[n - 1].1.max(end);
+        } else {
+            ranges[n] = (start, end);
+            n += 1;
         }
     }
-    out
+    ranges.truncate(n);
 }
 
 /// Whether `[a, b)` overlaps one of the sorted, merged `ranges` (the test
@@ -355,10 +383,10 @@ fn hits(spans: &[(u64, u64)], s: u64, e: u64) -> bool {
 /// offsets, given each group's uniform count and the device's limit for a pipeline:
 /// all when they fit; over the limit, the pixel group first (it holds the textures,
 /// dozens of entries made again otherwise), else the vertex group alone.
-fn dynamic_groups(uniforms: &[usize], limit: usize) -> Vec<bool> {
+fn dynamic_groups(uniforms: &[usize], limit: usize) -> SmallVec<[bool; 2]> {
     match uniforms {
-        [v, p] if v + p > limit => vec![*p > limit && *v <= limit, *p <= limit],
-        all => vec![all.iter().sum::<usize>() <= limit; all.len()],
+        [v, p] if v + p > limit => smallvec![*p > limit && *v <= limit, *p <= limit],
+        all => smallvec![all.iter().sum::<usize>() <= limit; all.len()],
     }
 }
 
@@ -409,9 +437,9 @@ type ModuleId = (u64, Option<u64>, u64, u64, u8);
 type PipelineKey = (
     (u64, usize),
     Option<(u64, usize)>,
-    Vec<(u8, wgpu::VertexStepMode, u64, Vec<wgpu::VertexAttribute>)>,
+    VertexLayouts,
     wgpu::PrimitiveState,
-    Vec<Option<wgpu::ColorTargetState>>,
+    SmallVec<[Option<wgpu::ColorTargetState>; 8]>,
     Option<wgpu::DepthStencilState>,
     [u32; 2],
 );
@@ -419,7 +447,7 @@ type PipelineKey = (
 /// A stage's bindings.
 pub(crate) struct Bindings<'t> {
     /// Constant buffers by bank.
-    pub(crate) cbufs: BTreeMap<u8, Bank>,
+    pub(crate) cbufs: Banks,
     pub(crate) textures: Vec<Slot>,
     /// Each slot's header swizzle, when the program reads them.
     pub(crate) swizzles: Option<Vec<u32>>,
@@ -480,7 +508,7 @@ impl Bindings<'_> {
             ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: wgpu::BufferSize::new(size) },
             count: None,
         };
-        let mut entries: Vec<_> = self.cbufs.keys().map(|bank| buffer(u32::from(*bank), CBUF_BYTES as u64)).collect();
+        let mut entries: Vec<_> = self.cbufs.iter().map(|(bank, _)| buffer(u32::from(*bank), CBUF_BYTES as u64)).collect();
         if let Some(codes) = &self.swizzles {
             entries.push(buffer(shader::SWIZZLE_BINDING, 4 * codes.len() as u64));
         }
@@ -608,7 +636,7 @@ impl Surfaces {
         // Attachments: the locations the pixel program writes, and depth when tested.
         let none = BTreeMap::new();
         let written = ps.as_ref().map_or(&none, |p| &p.0.interface.targets);
-        let mut colors: Vec<Option<(Surface, wgpu::TextureFormat)>> = Vec::new();
+        let mut colors = Colors::new();
         for (location, s) in d.targets.iter().enumerate() {
             let used = written.contains_key(&(location as u8)) && d.render.outputs.get(location).is_some_and(|o| o.write_mask != 0);
             colors.push(match used {
@@ -621,11 +649,11 @@ impl Surfaces {
             Some(s) if ds.depth_test || ds.stencil_test => Some((s, depth_format(s.format).filter(|f| self.renderable(*f)).ok_or_else(|| format!("depth target format {:#x}", s.format))?)),
             _ => None,
         };
-        let sizes: BTreeSet<(u32, u32)> = colors.iter().flatten().chain(&depth).map(|(s, _)| (s.width, s.height)).collect();
-        let (width, height) = match sizes.len() {
-            0 => return Err("no attachment".into()),
-            1 => sizes.into_iter().next().unwrap_or_default(),
-            _ => return Err("attachments of different sizes".into()),
+        let mut sizes = colors.iter().flatten().chain(&depth).map(|(s, _)| (s.width, s.height));
+        let (width, height) = match sizes.next() {
+            None => return Err("no attachment".into()),
+            Some(first) if sizes.all(|s| s == first) => first,
+            Some(_) => return Err("attachments of different sizes".into()),
         };
 
         let v = d.render.viewport.to_wgpu()?;
@@ -639,7 +667,7 @@ impl Surfaces {
         }
 
         // Vertex input, by stream.
-        let mut layouts: Vec<(u8, wgpu::VertexStepMode, u64, Vec<wgpu::VertexAttribute>)> = Vec::new();
+        let mut layouts = VertexLayouts::new();
         for &location in vs.0.interface.attributes.keys() {
             let a = d.attributes.iter().find(|a| a.location == location).ok_or_else(|| format!("vertex attribute {location} not programmed"))?;
             if a.constant {
@@ -652,8 +680,8 @@ impl Surfaces {
             // instance (stride 0); an instanced draw comes as one draw per instance.
             match layouts.iter_mut().find(|l| l.0 == s.index) {
                 Some(l) => l.3.push(attribute),
-                None if s.per_instance => layouts.push((s.index, wgpu::VertexStepMode::Instance, 0, vec![attribute])),
-                None => layouts.push((s.index, wgpu::VertexStepMode::Vertex, u64::from(s.stride), vec![attribute])),
+                None if s.per_instance => layouts.push((s.index, wgpu::VertexStepMode::Instance, 0, smallvec![attribute])),
+                None => layouts.push((s.index, wgpu::VertexStepMode::Vertex, u64::from(s.stride), smallvec![attribute])),
             }
         }
 
@@ -693,7 +721,7 @@ impl Surfaces {
             }
             None => (None, u64::from(d.first) + u64::from(d.count) - 1),
         };
-        let mut vertex_buffers = Vec::new();
+        let mut vertex_buffers: SmallVec<[crate::surfaces::Slice; 8]> = SmallVec::new();
         for (index, step, stride, attributes) in &layouts {
             let s = d.streams.iter().find(|s| s.index == *index).ok_or("stream")?;
             let per_instance = *step == wgpu::VertexStepMode::Instance;
@@ -720,15 +748,15 @@ impl Surfaces {
         }
 
         // Constant buffers and textures, per stage (bind group 0 vertex, 1 pixel).
-        let attached: Vec<u64> = colors.iter().flatten().chain(&depth).map(|(s, _)| s.addr).collect();
-        let mut stages = vec![self.stage_bindings(d, 0, &vs.0, &attached, mem)?];
+        let attached: SmallVec<[u64; 9]> = colors.iter().flatten().chain(&depth).map(|(s, _)| s.addr).collect();
+        let mut stages: SmallVec<[Bindings; 2]> = smallvec![self.stage_bindings(d, 0, &vs.0, &attached, mem)?];
         if let Some(p) = &ps {
             stages.push(self.stage_bindings(d, 4, &p.0, &attached, mem)?);
         }
 
         // The pipeline.
         let r = &d.render;
-        let color_states: Vec<Option<wgpu::ColorTargetState>> = colors
+        let color_states: SmallVec<[Option<wgpu::ColorTargetState>; 8]> = colors
             .iter()
             .enumerate()
             .map(|(location, c)| -> Result<_, String> {
@@ -770,7 +798,7 @@ impl Surfaces {
         // banks' place in the arena (which moves at every flush). Over the limit for the pair, the
         // pixel group (the textures: dozens of entries) keeps them and the vertex group's are
         // baked into it, so that only that small group is made again.
-        let uniforms: Vec<usize> = stages.iter().map(|b| b.cbufs.len() + usize::from(b.swizzles.is_some())).collect();
+        let uniforms: SmallVec<[usize; 2]> = stages.iter().map(|b| b.cbufs.len() + usize::from(b.swizzles.is_some())).collect();
         let dynamic = dynamic_groups(&uniforms, self.dynamic_max as usize);
         let translations = [Some(&vs.0), ps.as_ref().map(|p| &p.0)];
         let mut groups = [u32::MAX; 2];
@@ -799,9 +827,9 @@ impl Surfaces {
                 let refs: Vec<Option<&wgpu::BindGroupLayout>> = bind_layouts.iter().flatten().map(Some).collect();
                 let layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &refs, ..Default::default() });
                 // Owned: a worker thread may make it.
-                let buffers: Vec<(u64, wgpu::VertexStepMode, Vec<wgpu::VertexAttribute>)> = layouts.iter().map(|(_, step, stride, attributes)| (*stride, *step, attributes.clone())).collect();
+                let buffers: Vec<(u64, wgpu::VertexStepMode, Vec<wgpu::VertexAttribute>)> = layouts.iter().map(|(_, step, stride, attributes)| (*stride, *step, attributes.to_vec())).collect();
                 let (device, vertex, pixel) = (self.device.clone(), vs.1.clone(), ps.as_ref().map(|p| p.1.clone()));
-                let (primitive, targets, depth_stencil) = (*primitive, color_states.clone(), depth_state.clone());
+                let (primitive, targets, depth_stencil) = (*primitive, color_states.to_vec(), depth_state.clone());
                 let cache = self.disk_cache.as_ref().map(|d| d.cache.clone());
                 let make = move || {
                     let buffers: Vec<Option<wgpu::VertexBufferLayout>> = buffers.iter().map(|(stride, step, attributes)| Some(wgpu::VertexBufferLayout { array_stride: *stride, step_mode: *step, attributes })).collect();
@@ -837,10 +865,10 @@ impl Surfaces {
             return Ok(());
         };
 
-        let mut bind_groups = Vec::with_capacity(2);
+        let mut bind_groups: SmallVec<[(wgpu::BindGroup, SmallVec<[u32; 16]>); 2]> = SmallVec::new();
         for (g, layout) in bind_layouts.iter().flatten().enumerate() {
             let Bindings { cbufs, textures, swizzles, .. } = &stages[g];
-            let mut buffers: Vec<(u32, (wgpu::Buffer, u64, u64))> = cbufs
+            let mut buffers: SmallVec<[(u32, crate::surfaces::Slice); 16]> = cbufs
                 .iter()
                 .map(|(b, (addr, data))| {
                     let (len, zeros) = stages[g].staged(*b, data);
@@ -848,11 +876,11 @@ impl Surfaces {
                 })
                 .collect();
             if let Some(codes) = swizzles {
-                let bytes: Vec<u8> = codes.iter().flat_map(|c| c.to_le_bytes()).collect();
+                let bytes: SmallVec<[u8; 256]> = codes.iter().flat_map(|c| c.to_le_bytes()).collect();
                 buffers.push((shader::SWIZZLE_BINDING, self.stage(&bytes)));
             }
             // In binding order, as wgpu takes them: the banks', then the swizzles' (binding 999).
-            let offsets: Vec<u32> = if dynamic[g] { buffers.iter().map(|(_, (_, at, _))| u32::try_from(*at).unwrap_or(u32::MAX)).collect() } else { Vec::new() };
+            let offsets: SmallVec<[u32; 16]> = if dynamic[g] { buffers.iter().map(|(_, (_, at, _))| u32::try_from(*at).unwrap_or(u32::MAX)).collect() } else { SmallVec::new() };
             bind_groups.push((self.bind_group(layout, &buffers, textures, dynamic[g]), offsets));
         }
         let index_buffer = indices;
@@ -1074,16 +1102,18 @@ impl Surfaces {
 
     /// A stage's constant banks (64 KiB each, as bound) and textures.
     fn stage_bindings<'t>(&mut self, d: &Draw, stage: usize, t: &'t Translation, attached: &[u64], mem: Mem) -> Result<Bindings<'t>, String> {
-        let mut banks = BTreeMap::new();
+        let mut banks = Banks::new();
         for b in t.interface.cbufs.iter().chain(&t.interface.handle_banks).copied() {
+            // Each bank once, in bank order: the order of the bindings and of the arena.
+            let Err(at) = banks.binary_search_by_key(&b, |(k, _)| *k) else { continue };
             let (addr, size) = d.cbufs[stage].get(usize::from(b)).copied().flatten().ok_or_else(|| format!("constant bank {b} not bound"))?;
             // Its bound size only: binding it as 64 KiB is `stage_window`'s.
             let data = self.read_guest(crate::surfaces::Read::Bank, addr, (size as usize).min(CBUF_BYTES), mem).ok_or_else(|| format!("constant bank {b} at {addr:#x} not readable"))?;
-            banks.insert(b, (addr, data));
+            banks.insert(at, (b, (addr, data)));
         }
         let (textures, swizzles) = self.texture_slots(t, &banks, d.headers, d.samplers, d.sampler_binding, attached, mem)?;
         // The handle banks were for the textures; the program reads the others.
-        banks.retain(|b, _| t.interface.cbufs.contains(b));
+        banks.retain(|(b, _)| t.interface.cbufs.contains(b));
         Ok(Bindings { cbufs: banks, textures, swizzles: t.interface.swizzles.then_some(swizzles), sizes: &t.interface.cbuf_sizes })
     }
 
@@ -1123,13 +1153,13 @@ impl Surfaces {
     /// A program's texture slots (view, sampler) and swizzle codes, from its
     /// handles in `banks` and the header and sampler pools.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn texture_slots(&mut self, t: &Translation, banks: &BTreeMap<u8, Bank>, headers: Pool, samplers: Pool, binding: SamplerBinding, attached: &[u64], mem: Mem) -> Result<(Vec<Slot>, Vec<u32>), String> {
+    pub(crate) fn texture_slots(&mut self, t: &Translation, banks: &[(u8, Bank)], headers: Pool, samplers: Pool, binding: SamplerBinding, attached: &[u64], mem: Mem) -> Result<(Vec<Slot>, Vec<u32>), String> {
         let mut textures = Vec::with_capacity(t.interface.textures.len());
         let mut swizzles = vec![0u32; t.interface.textures.len().next_multiple_of(4)];
         for (slot, x) in t.interface.textures.iter().enumerate() {
-            let word = |bank: u8, offset: u16| -> Option<u32> {
+            let word = |b: u8, offset: u16| -> Option<u32> {
                 let at = usize::from(offset);
-                let w = banks.get(&bank)?.1.get(at..at + 4)?;
+                let w = bank(banks, b)?.1.get(at..at + 4)?;
                 Some(u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
             };
             let handle = TexHandle::new(
@@ -1618,11 +1648,24 @@ impl Surfaces {
             return;
         }
         let c = &mut self.cache;
-        let written = merged(&c.pending);
-        c.marked.extend_from_slice(&c.pending);
-        let dirty = merged(&c.marked);
-        c.pending.clear();
-        c.marked.clear();
+        // Merged in place, then emptied with their room kept: nearly every draw comes here.
+        let (mut written, mut dirty) = (std::mem::take(&mut c.pending), std::mem::take(&mut c.marked));
+        dirty.extend_from_slice(&written);
+        merge(&mut written);
+        merge(&mut dirty);
+        let dropped = Self::drop_written(c, &written, &dirty);
+        written.clear();
+        dirty.clear();
+        (c.pending, c.marked) = (written, dirty);
+        if dropped {
+            // Their slots upload them afresh.
+            self.memo.slots.clear();
+        }
+    }
+
+    /// [`Surfaces::drain_invalidations`]' pass, over the merged ranges `written`
+    /// (these writes) and `dirty` (with those marked since): whether a texture left.
+    fn drop_written(c: &mut Cache, written: &[(u64, u64)], dirty: &[(u64, u64)]) -> bool {
         let reaching = |a: u64, b: u64| dirty.iter().filter(move |r| r.0 < b && r.1 > a).copied();
         for (&(addr, _), (_, end, ranges)) in &mut c.aside {
             ranges.extend(reaching(addr, *end));
@@ -1633,24 +1676,24 @@ impl Surfaces {
         // texture: checked against the spans index before passing over them all.
         let spans = c.spans.get_or_insert_with(|| spans(c.textures.iter().map(|((a, _), (_, b))| (*a, *b))));
         if !written.iter().any(|&(s, e)| hits(spans, s, e)) {
-            return;
+            return false;
         }
         let before = c.textures.len();
         let (partial, aside) = (c.partial, &mut c.aside);
         c.textures.retain(|&key, (texture, last)| {
-            let dropped = overlaps(&written, key.0, *last);
+            let dropped = overlaps(written, key.0, *last);
             if dropped && partial && !overlaps(&unverified, key.0, *last) {
                 aside.insert(key, (texture.clone(), *last, reaching(key.0, *last).collect()));
             }
             !dropped
         });
-        if c.textures.len() != before {
-            c.spans = None;
-            let textures = &c.textures;
-            c.compare_depths.retain(|k, _| textures.contains_key(k));
-            // Their slots upload them afresh.
-            self.memo.slots.clear();
+        if c.textures.len() == before {
+            return false;
         }
+        c.spans = None;
+        let textures = &c.textures;
+        c.compare_depths.retain(|k, _| textures.contains_key(k));
+        true
     }
 
     /// The sampler of a header; a non-filtering one (nearest everywhere) for
@@ -1733,10 +1776,10 @@ mod tests {
             0x1560 => SAMPLERS as u32,
             _ => 0,
         };
-        let banks = BTreeMap::from([(0u8, (0, std::sync::Arc::new(vec![0u8; 16])))]);
+        let banks: Banks = smallvec![(0u8, (0, std::sync::Arc::new(vec![0u8; 16])))];
         let (slots, _) = s.texture_slots(&t, &banks, resources::header_pool(&reg), resources::sampler_pool(&reg), resources::sampler_binding(&reg), &[], &mut mem).unwrap_or_else(|e| panic!("{e}"));
         let none = BTreeMap::new();
-        let bindings = Bindings { cbufs: BTreeMap::new(), textures: slots, swizzles: None, sizes: &none };
+        let bindings = Bindings { cbufs: Banks::new(), textures: slots, swizzles: None, sizes: &none };
         let mut entries = bindings.layout(wgpu::ShaderStages::COMPUTE);
         let storage = wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None };
         entries.push(wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::COMPUTE, ty: storage, count: None });
@@ -1823,11 +1866,11 @@ mod tests {
     #[test]
     fn the_pixel_group_keeps_dynamic_offsets_over_the_limit() {
         // Corneria's main pass: 3 vertex banks and 13 pixel banks plus swizzles, over 15.
-        assert_eq!(dynamic_groups(&[3, 14], 15), [false, true]);
-        assert_eq!(dynamic_groups(&[4, 11], 15), [true, true]);
-        assert_eq!(dynamic_groups(&[3, 16], 15), [true, false]);
-        assert_eq!(dynamic_groups(&[16, 16], 15), [false, false]);
-        assert_eq!(dynamic_groups(&[9], 15), [true]);
+        assert_eq!(dynamic_groups(&[3, 14], 15)[..], [false, true]);
+        assert_eq!(dynamic_groups(&[4, 11], 15)[..], [true, true]);
+        assert_eq!(dynamic_groups(&[3, 16], 15)[..], [true, false]);
+        assert_eq!(dynamic_groups(&[16, 16], 15)[..], [false, false]);
+        assert_eq!(dynamic_groups(&[9], 15)[..], [true]);
     }
 
     /// A draw's group layout id stands for `Bindings::layout`'s entries, buffers at
@@ -1847,7 +1890,7 @@ mod tests {
         let slot = |depth: bool, sampled: bool| Slot { view: view.clone(), sampler: sampled.then(|| sampler.clone()), depth, compare: false, dimension: wgpu::TextureViewDimension::D2 };
         let sizes = BTreeMap::new();
         let bank: Bank = (0, std::sync::Arc::new(Vec::new()));
-        let bindings = |slots: Vec<Slot>| Bindings { cbufs: BTreeMap::from([(0, bank.clone()), (3, bank.clone())]), textures: slots, swizzles: Some(vec![0; 4]), sizes: &sizes };
+        let bindings = |slots: Vec<Slot>| Bindings { cbufs: smallvec![(0, bank.clone()), (3, bank.clone())], textures: slots, swizzles: Some(vec![0; 4]), sizes: &sizes };
         let translation = |key| Translation { key, stage: Stage::Pixel, wgsl: String::new(), interface: Interface::default() };
         let (t1, t2) = (translation(1), translation(2));
         let b = bindings(vec![slot(false, true), slot(false, false)]);
@@ -1932,7 +1975,7 @@ mod tests {
             0x1560 => SAMPLERS as u32,
             _ => 0,
         };
-        let banks = BTreeMap::from([(0u8, (0, std::sync::Arc::new(vec![0u8; 16])))]);
+        let banks: Banks = smallvec![(0u8, (0, std::sync::Arc::new(vec![0u8; 16])))];
         let mut resolve = |s: &mut Surfaces| s.texture_slots(&t, &banks, resources::header_pool(&reg), resources::sampler_pool(&reg), resources::sampler_binding(&reg), &[], &mut mem).unwrap_or_else(|e| panic!("{e}")).0.remove(0).view;
         let first = resolve(&mut s);
         assert_eq!(reads.get(), 1);
