@@ -63,17 +63,18 @@ Known problems:
 - Rendering is compared with the console by eye only; a few defects reported in earlier builds were
   never re-checked one by one. Sound needs SDL3 and a window; in play mode a gap or a dropped tick
   every few minutes is expected, and the sound trails the picture by about 0.1 s.
-- No rumble, no button remapping, no amiibo (the reader never finds a figure), no system applet;
-  mouse aiming and motion from a live controller are not working yet (`--joycon-mouse`, below). A replay can give a Joy-Con pair
-  mice and acceleration (`ML=`, `MR=`, `AL=`, `AR=`, below): one took the game into its mouse
-  mode from the tutorial's question, through the console's controller screen (answered at once)
-  and the lesson's posture screen, and the mouse then steered. That replay starts the tutorial at
-  its mouse question through a layer of edited level files, which the repository does not
-  contain. The two mouse lines of the game's options (Preferences) were greyed out in every replay
-  tried before; not checked since. `--joycon-mouse` gives the game the Joy-Con's mice and
-  accelerations: in its one try, neither Joy-Con's mouse ever reported, so the game cancelled
-  the controller screen at once. Its commands then went 100 ms apart without waiting for the answers;
-  they wait now, untried yet.
+- No rumble, no button remapping, no amiibo (the reader never finds a figure), no system applet.
+  Mouse aiming from live Joy-Con (`--joycon-mouse`, below) was tried on one pair: both mice
+  report, and the tutorial's mouse mode works, its posture screen passed with the right Joy-Con
+  on its side (the left one's posture is untried). Showing the game that pair outside its mouse
+  mode, which its options need, has run in replays only. A replay can give a Joy-Con pair mice and
+  acceleration (`ML=`, `MR=`, `AL=`, `AR=`, below): one took the game into its mouse mode from the
+  tutorial's question, through the console's controller screen (answered at once) and the
+  lesson's posture screen, and the mouse then steered. That replay starts the tutorial at its
+  mouse question through a layer of edited level files, which the repository does not contain.
+  The two mouse lines of the game's options (Preferences) behave as on the console, by replay:
+  offered from the main menu with a save while a mouse is there, greyed in a new game's
+  tutorial and without a mouse.
   Switch 2 Joy-Con give their buttons and sticks through `--joycon`, played on
   one pair only: the tutorial, then sessions of 6 and 12 minutes. A gamepad missing from SDL3's database is not recognised. The picture is
   stretched to the window, without 16:9 bars.
@@ -192,9 +193,9 @@ the console's own feature mask and its enabling (two more fixed frames, each sen
 controller has answered the one before), and gives the game each Joy-Con's mouse (its moves, and
 whether it rests on a surface) and acceleration, as the `ML=`, `MR=`, `AL=` and `AR=` words of a
 replay do; `--record` writes them. The terminal says when a Joy-Con's mouse first reports, or why
-it did not start. Not working yet: in the one try, which did not wait for the answers, neither mouse
-reported; untried since. The axes of the acceleration are a guess, and the mouse's counts go to
-the game unscaled. Windows
+it did not start. While a mouse is there, the game sees a Joy-Con pair instead of the gamepad
+(below). Tried on one pair (see "Known problems"); the mouse's counts go to the game unscaled.
+Windows
 11 is needed for a fast link: Gyroship asks for Windows' 15 ms
 connection interval (60 ms otherwise) and prints each link's interval whenever it changes. A
 Joy-Con that is lost, or silent for 0.4 s, holds no button until its reports come back. With
@@ -382,13 +383,14 @@ Joy-Con a mouse: its counts in X and Y at each sample while the line holds, then
 on a surface (0 in the air); `AL=` and `AR=` give their acceleration, in thousandths of g (the
 game takes a left Joy-Con whose x is above 0.9 g, or a right one whose x is below -0.9 g, for one
 lying on its side). A mouse or an acceleration that a line drops is gone: its Joy-Con gets one
-null state. While a line has a mouse and the game supports the mouse pair's style but not
-FullKey's (it asked for mouse controls), Npad 0 shows a Joy-Con pair used as mice; otherwise it
-is the FullKey controller. The console's controller screen, when the game opens it, closes at
+null state. While a line has a mouse, Npad 0 shows a Joy-Con pair: used as mice when the game
+supports that style but not FullKey's (it asked for mouse controls), else a plain pair when the
+game supports one, as the console shows a pair held apart (the game's options offer mouse aiming
+only then); otherwise (no mouse, or neither pair style supported) the FullKey controller. The console's controller screen, when the game opens it, closes at
 once: confirmed with Npad 0 if the style Npad 0 shows is one the game supports, cancelled
 otherwise. The tutorial's mouse lesson then waits for exactly one Joy-Con lying on its side with
 its mouse moving: a replay passed with `AR=-1000,0,0` and `MR=` moving 120 counts per sample, not
-with 6. `--joycon-mouse` gives them from live Joy-Con (not working yet, see above). `#` starts a
+with 6. `--joycon-mouse` gives them from live Joy-Con. `#` starts a
 comment.
 
 Play mode is never a reference: its threads are scheduled by Windows on the real clock, so runs do

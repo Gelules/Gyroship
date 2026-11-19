@@ -1,10 +1,11 @@
-//! `hid`: one controller in slot 0 (FullKey, or a Joy-Con pair used as mice
-//! while the game asks for one and a replay gives a mouse) and a keyboard
+//! `hid`: one controller in slot 0 (FullKey; or, while a Joy-Con mouse is there,
+//! a Joy-Con pair, used as mice while the game asks for that) and a keyboard
 //! plugged in, in the shared memory layout the SDK reads (the Switch 1 one,
 //! our reading of the Switch 2 SDK's readers). Every lifo starts with one null entry: its
 //! sequence is even (no write in progress), so the readers never spin. A
 //! virtual timer samples the controller and the keyboard once per frame, 1 ms
-//! before the vsync (D29), from the `--replay` script or at rest. The game
+//! before the vsync (D29), from the `--replay` script, else from the host's live
+//! input (keyboard, controllers, Joy-Con), else at rest. The game
 //! only reads the keyboard when its own keyboard setting is on (debug tools).
 
 use crate::Kernel;
@@ -29,8 +30,11 @@ const CONDITION: usize = 0x3e200;
 /// FullKey style, and the attribute "connected" of a button state.
 const FULL_KEY: u32 = 1;
 const CONNECTED: u32 = 1;
+/// The style of a Joy-Con pair (JoyDual, bit 2), read through the JoyDual lifo.
+const JOY_DUAL: u32 = 4;
 /// The style of a Joy-Con pair used as mice (bit 12; the game's "joycon-dual-ms"), read
-/// through the JoyDual lifo, whose attributes must say both Joy-Con are connected.
+/// through the JoyDual lifo too, whose attributes must then say both Joy-Con are connected
+/// (Gyroship writes them so for both pair styles).
 pub const DUAL_MOUSE: u32 = 0x1000;
 const JOY_DUAL_LIFO: usize = 0x6c8;
 const BOTH_CONNECTED: u32 = CONNECTED | 1 << 2 | 1 << 4;
@@ -197,8 +201,9 @@ fn next_entry(lifo: &mut [u8], size: usize, number: usize) -> usize {
 }
 
 /// Appends a state to a Joy-Con mouse lifo (the bytes from its header on): the counts
-/// since the previous state and the attributes (bit 0: a mouse is there, which is what
-/// makes the game offer mouse aiming; bit 1: it touches a surface).
+/// since the previous state and the attributes (bit 0: a mouse is there, which the game
+/// reads as its controller supporting a mouse; its options offer mouse aiming only with
+/// that and a Joy-Con pair shown, see `style_to_show`; bit 1: it touches a surface).
 pub fn push_mouse(lifo: &mut [u8], mouse: Option<Mouse>) {
     let e = next_entry(lifo, MOUSE_ENTRY, 0x10);
     if let Some(m) = mouse {
@@ -253,12 +258,20 @@ pub fn push(lifo: &mut [u8], pad: &Pad, attributes: u32) {
     push_entry(lifo, ENTRY, &state);
 }
 
-/// The style Npad 0 shows: a Joy-Con pair used as mice while the game supports that style
-/// but not FullKey's (it asked for mouse controls) and the controller has a mouse on either
-/// side; otherwise the FullKey controller. Gyroship's choice: a replay's mouse words stand
-/// for a pair of Joy-Con laid down as mice, shown only while the game wants one.
+/// The style Npad 0 shows. With a mouse on either side (Joy-Con under `--joycon-mouse`, or
+/// a replay's mouse words): a Joy-Con pair used as mice while the game supports that style
+/// but not FullKey's (it asked for mouse controls), else a Joy-Con pair while the game
+/// supports that style, as the console shows a pair held apart. Otherwise, and without a
+/// mouse, the FullKey controller.
 pub fn style_to_show(supported: u32, pad: &Pad) -> u32 {
-    if supported & DUAL_MOUSE != 0 && supported & FULL_KEY == 0 && pad.mouse.iter().any(Option::is_some) { DUAL_MOUSE } else { FULL_KEY }
+    let mice = pad.mouse.iter().any(Option::is_some);
+    if mice && supported & DUAL_MOUSE != 0 && supported & FULL_KEY == 0 {
+        DUAL_MOUSE
+    } else if mice && supported & JOY_DUAL != 0 {
+        JOY_DUAL
+    } else {
+        FULL_KEY
+    }
 }
 
 /// Appends the keys of `pad` to the keyboard lifo (the bytes from its header
@@ -352,7 +365,7 @@ impl Hid {
             // StartJcms(handle: an Npad id, then a side): that mouse's lifo gets a first, null
             // state (no mouse there, nothing moved). The game reads the newest state without
             // looking at how many came: from an empty lifo it read its own stack instead, and
-            // offered mouse aiming or not by what lay there.
+            // took its controller for one with a mouse or not by what lay there.
             (Hid::Service { .. }, 3112) => {
                 let h = u64::from(req.u32_at(0)?);
                 let lifo = (2 * (h & 0xFF) + (h >> 8 & 0xFF)) * JCMS_LIFO;
@@ -501,12 +514,12 @@ impl Kernel {
     }
 
     /// Appends `pad` to slot 0's FullKey lifo, to its JoyDual lifo while it shows a Joy-Con
-    /// pair used as mice, each Joy-Con's acceleration to the pair's six-axis lifos, and its
+    /// pair, each Joy-Con's acceleration to the pair's six-axis lifos, and its
     /// keys to the keyboard lifo, in the guest's copy too. A side without acceleration writes
     /// nothing, but one null state when `before` (the sample before) had one: it is gone.
     fn push_sample(&mut self, m: usize, pad: &Pad, before: &Pad) {
         self.push_lifo(m, NPAD + 0x28, ENTRY, |l| push(l, pad, CONNECTED));
-        if self.input.style == DUAL_MOUSE {
+        if matches!(self.input.style, JOY_DUAL | DUAL_MOUSE) {
             self.push_lifo(m, NPAD + JOY_DUAL_LIFO, ENTRY, |l| push(l, pad, BOTH_CONNECTED));
         }
         for (side, at) in DUAL_MOTION_LIFOS.iter().enumerate() {
@@ -517,16 +530,16 @@ impl Kernel {
         self.push_lifo(m, KEYBOARD, KEY_ENTRY, |l| push_keys(l, pad));
     }
 
-    /// Makes Npad 0 show the style `style_to_show` gives. To a Joy-Con pair used as mice,
-    /// its JoyDual lifo first gets the controller's state with both Joy-Con connected, then
-    /// the style word changes: whoever reads the new style finds that state.
+    /// Makes Npad 0 show the style `style_to_show` gives. To a Joy-Con pair, its JoyDual
+    /// lifo first gets the controller's state with both Joy-Con connected, then the style
+    /// word changes: whoever reads the new style finds that state.
     fn restyle(&mut self) {
         let Some(m) = self.hid_shared else { return };
         let style = style_to_show(self.input.supported, &self.input.current);
         if style == self.input.style {
             return;
         }
-        if style == DUAL_MOUSE {
+        if matches!(style, JOY_DUAL | DUAL_MOUSE) {
             let pad = self.input.current;
             self.push_lifo(m, NPAD + JOY_DUAL_LIFO, ENTRY, |l| push(l, &pad, BOTH_CONNECTED));
         }
@@ -534,7 +547,11 @@ impl Kernel {
         let next = u32::from_le_bytes(self.shared[m].data[NPAD + 4..NPAD + 8].try_into().unwrap());
         self.store_shared(m, NPAD, u64::from(style) | u64::from(next) << 32);
         self.input.style = style;
-        let what = if style == DUAL_MOUSE { "a Joy-Con pair used as mice" } else { "the FullKey controller" };
+        let what = match style {
+            DUAL_MOUSE => "a Joy-Con pair used as mice",
+            JOY_DUAL => "a Joy-Con pair",
+            _ => "the FullKey controller",
+        };
         self.log(&format!("hid: Npad 0 shows {what} (style {style:#x})"));
     }
 
@@ -800,28 +817,28 @@ mod tests {
         assert_eq!((count(&k, 0), count(&k, 1)), (3, 1), "then nothing");
     }
 
-    /// Npad 0 shows a Joy-Con pair used as mice only while the game supports that style and
-    /// not FullKey's and the controller has a mouse, on either side. Once the style word says
-    /// so, the pair's JoyDual lifo holds a state that says both Joy-Con are connected
-    /// (`restyle` publishes it first, for readers on other threads: this test sees only the
-    /// end state), and it gets every sample while the pair is shown; the guest's copy stays
-    /// equal to the kernel's.
+    /// With a mouse on either side, Npad 0 shows a Joy-Con pair used as mice while the game
+    /// supports that style and not FullKey's, else a Joy-Con pair while it supports that
+    /// style; without a mouse, FullKey. Once the style word says a pair, the pair's JoyDual
+    /// lifo holds a state that says both Joy-Con are connected (`restyle` publishes it first,
+    /// for readers on other threads: this test sees only the end state), and it gets every
+    /// sample while a pair is shown; the guest's copy stays equal to the kernel's.
     #[test]
-    fn npad_0_shows_a_mouse_pair_only_when_the_game_asks_and_there_is_a_mouse() {
+    fn npad_0_shows_a_joy_con_pair_while_there_is_a_mouse_used_as_mice_when_the_game_asks() {
         let (mut k, m, addr) = mapped();
         let word = |k: &Kernel, o: usize| u32::from_le_bytes(k.shared[m].data[o..o + 4].try_into().unwrap());
         let mouse = Pad { buttons: 1, mouse: [Some(Mouse::default()), Some(Mouse::default())], ..Pad::default() };
-        // The supported set alone, or a mouse alone: still FullKey.
-        for (supported, pad) in [(0x407, mouse), (0x741f, mouse), (DUAL_MOUSE, Pad::default())] {
+        // No mouse, or no Joy-Con style supported: FullKey.
+        for (supported, pad) in [(0x407, Pad::default()), (DUAL_MOUSE, Pad::default()), (FULL_KEY, mouse)] {
             (k.input.supported, k.input.current) = (supported, pad);
             k.restyle();
             assert_eq!(word(&k, NPAD), FULL_KEY, "{supported:#x}");
         }
-        // A mouse on either side is enough.
+        // A mouse on either side is enough, for either pair.
         for side in 0..2 {
             let mut one = Pad::default();
             one.mouse[side] = Some(Mouse::default());
-            assert_eq!(style_to_show(DUAL_MOUSE, &one), DUAL_MOUSE, "side {side}");
+            assert_eq!([style_to_show(DUAL_MOUSE, &one), style_to_show(0x407, &one), style_to_show(0x741f, &one)], [DUAL_MOUSE, JOY_DUAL, JOY_DUAL], "side {side}");
         }
         // Both: the pair, with its JoyDual state.
         let dual = NPAD + JOY_DUAL_LIFO;
@@ -842,39 +859,49 @@ mod tests {
         let mut guest = vec![0u8; SHARED_SIZE as usize];
         k.mem.read_object(addr, &mut guest).unwrap();
         assert!(guest == k.shared[m].data);
-        // The game supports FullKey again: FullKey, and the pair's lifo is left alone.
+        // The game's default styles again: the pair, no longer as mice, still fed.
         k.input.supported = 0x407;
         k.restyle();
-        assert_eq!(word(&k, NPAD), FULL_KEY);
+        assert_eq!(word(&k, NPAD), JOY_DUAL);
         k.push_sample(m, &mouse, &moved);
-        assert_eq!(word(&k, dual + LIFO_COUNT), 3);
+        assert_eq!(word(&k, dual + LIFO_COUNT), 5, "the new style's state, then the sample's");
+        // The mice gone: FullKey, and the pair's lifo is left alone.
+        k.input.current = Pad::default();
+        k.restyle();
+        assert_eq!(word(&k, NPAD), FULL_KEY);
+        k.push_sample(m, &Pad::default(), &mouse);
+        assert_eq!(word(&k, dual + LIFO_COUNT), 5);
         let text = k.journal.text();
-        assert!(text.contains("hid: Npad 0 shows a Joy-Con pair used as mice (style 0x1000)") && text.contains("hid: Npad 0 shows the FullKey controller (style 0x1)"), "{text}");
+        for shown in ["a Joy-Con pair used as mice (style 0x1000)", "a Joy-Con pair (style 0x4)", "the FullKey controller (style 0x1)"] {
+            assert!(text.contains(&format!("hid: Npad 0 shows {shown}")), "{text}");
+        }
     }
 
-    /// Each sample sets the style first: with the mouse pair's style supported alone, Npad 0
-    /// shows the pair from the first sample whose replay line has a mouse, and FullKey again
-    /// from the first one without; each change is logged once.
+    /// Each sample sets the style first: Npad 0 shows the pair (used as mice when the game
+    /// supports that style alone) from the first sample whose replay line has a mouse, and
+    /// FullKey again from the first one without; each change is logged once.
     #[test]
-    fn each_sample_shows_the_mouse_pair_while_the_replay_has_a_mouse() {
-        let (mut k, m, _) = mapped();
-        k.config.replay = Some(parse_script("0 -\n2 - MR=1,0,1\n4 -\n").unwrap());
-        k.input.supported = DUAL_MOUSE;
-        let styles: Vec<u32> = (0..6)
-            .map(|n| {
-                k.hid_sample(m, n);
-                u32::from_le_bytes(k.shared[m].data[NPAD..NPAD + 4].try_into().unwrap())
-            })
-            .collect();
-        assert_eq!(styles, [FULL_KEY, FULL_KEY, DUAL_MOUSE, DUAL_MOUSE, FULL_KEY, FULL_KEY]);
-        assert_eq!(k.journal.text().matches("hid: Npad 0 shows").count(), 2);
+    fn each_sample_shows_the_pair_while_the_replay_has_a_mouse() {
+        for (supported, pair) in [(DUAL_MOUSE, DUAL_MOUSE), (0x407, JOY_DUAL)] {
+            let (mut k, m, _) = mapped();
+            k.config.replay = Some(parse_script("0 -\n2 - MR=1,0,1\n4 -\n").unwrap());
+            k.input.supported = supported;
+            let styles: Vec<u32> = (0..6)
+                .map(|n| {
+                    k.hid_sample(m, n);
+                    u32::from_le_bytes(k.shared[m].data[NPAD..NPAD + 4].try_into().unwrap())
+                })
+                .collect();
+            assert_eq!(styles, [FULL_KEY, FULL_KEY, pair, pair, FULL_KEY, FULL_KEY], "{supported:#x}");
+            assert_eq!(k.journal.text().matches("hid: Npad 0 shows").count(), 2);
+        }
     }
 
     /// A Joy-Con mouse lifo, read as the SDK's GetJcmsStates does and used as the game
     /// uses what comes back: states newest first, each under an even sequence, sampling
     /// numbers one apart; the game adds the counts of the states newer than the last one
-    /// it saw, keeps the contact bit of the newest, and offers mouse aiming by bit 0 of the
-    /// newest state's attributes.
+    /// it saw, keeps the contact bit of the newest, and takes bit 0 of the newest state's
+    /// attributes for its controller having a mouse.
     #[test]
     fn mouse_states_read_back_as_the_game_adds_them() {
         assert_eq!(JCMS_LIFO as usize, LIFO_ENTRIES + LIFO_LEN * MOUSE_ENTRY);
@@ -921,7 +948,7 @@ mod tests {
         }
         assert_eq!(lifo[LIFO_COUNT], 17);
         assert_eq!(read(&lifo)[0], (40, 40, -80, 1), "the newest state: its number, its counts, a mouse, in the air");
-        // The mouse goes: one null state, and the game no longer offers mouse aiming.
+        // The mouse goes: one null state, and the game no longer sees a mouse.
         push_mouse(&mut lifo, None);
         assert_eq!(read(&lifo)[0], (41, 0, 0, 0));
         assert!(!poll(&lifo).2);
