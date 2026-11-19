@@ -194,9 +194,15 @@ pub struct Cache {
     /// same options (a vertex program with pixel programs of the same varyings)
     /// share one (D72).
     shared: FxMap<(u64, Options), std::sync::Arc<(Translation, wgpu::ShaderModule)>>,
-    pipelines: FxMap<PipelineKey, (Made<wgpu::RenderPipeline>, Vec<wgpu::BindGroupLayout>)>,
+    pipelines: FxMap<PipelineKey, (Made<wgpu::RenderPipeline>, [Option<wgpu::BindGroupLayout>; 2])>,
     /// Bind group layouts by their entries, shared by the pipelines.
     layouts: FxMap<Vec<wgpu::BindGroupLayoutEntry>, wgpu::BindGroupLayout>,
+    /// A draw's bind group layout entries by id (`group_id`), and the ids by entries.
+    group_entries: Vec<Vec<wgpu::BindGroupLayoutEntry>>,
+    group_index: FxMap<Vec<wgpu::BindGroupLayoutEntry>, u32>,
+    /// Group ids by (translation, group, dynamic offsets, mask of the slots holding
+    /// depth): all that `Bindings::layout`'s entries vary with for a translation.
+    group_ids: FxMap<(usize, usize, bool, u64), u32>,
     /// Uploaded textures by address and header, with the end of the memory they came from.
     textures: FxMap<(u64, [u8; 32]), (wgpu::Texture, u64)>,
     /// Samplers by header, filtering and compare.
@@ -397,7 +403,8 @@ type ModuleId = (u64, Option<u64>, u64, u64, u8);
 /// What a render pipeline is made from, as a hashable key: the vertex program
 /// (key, WGSL length), the pixel program's, the vertex buffer layouts (stream,
 /// step, stride, attributes), the primitive, color and depth states, and the
-/// bind group layouts. The WGSL lengths tell a program's module with exact
+/// bind group layouts' ids (`Surfaces::group_id`; u32::MAX past the last
+/// non-empty group). The WGSL lengths tell a program's module with exact
 /// jump-table blocks from its first one.
 type PipelineKey = (
     (u64, usize),
@@ -406,7 +413,7 @@ type PipelineKey = (
     wgpu::PrimitiveState,
     Vec<Option<wgpu::ColorTargetState>>,
     Option<wgpu::DepthStencilState>,
-    Vec<Vec<wgpu::BindGroupLayoutEntry>>,
+    [u32; 2],
 );
 
 /// A stage's bindings.
@@ -765,18 +772,15 @@ impl Surfaces {
         // baked into it, so that only that small group is made again.
         let uniforms: Vec<usize> = stages.iter().map(|b| b.cbufs.len() + usize::from(b.swizzles.is_some())).collect();
         let dynamic = dynamic_groups(&uniforms, self.dynamic_max as usize);
-        let visibility = [wgpu::ShaderStages::VERTEX, wgpu::ShaderStages::FRAGMENT];
-        let mut group_layouts: Vec<Vec<wgpu::BindGroupLayoutEntry>> = stages.iter().zip(visibility).map(|(b, v)| b.layout(v)).collect();
-        for (entries, _) in group_layouts.iter_mut().zip(&dynamic).filter(|(_, d)| **d) {
-            for e in entries {
-                if let wgpu::BindingType::Buffer { has_dynamic_offset, .. } = &mut e.ty {
-                    *has_dynamic_offset = true;
-                }
-            }
+        let translations = [Some(&vs.0), ps.as_ref().map(|p| &p.0)];
+        let mut groups = [u32::MAX; 2];
+        for (g, (b, t)) in stages.iter().zip(translations.into_iter().flatten()).enumerate() {
+            groups[g] = self.group_id(t, g, dynamic[g], b);
         }
-        let groups = group_layouts.iter().rposition(|e| !e.is_empty()).map_or(0, |g| g + 1);
-        group_layouts.truncate(groups);
-        let key: PipelineKey = ((vs.0.key, vs.0.wgsl.len()), ps.as_ref().map(|p| (p.0.key, p.0.wgsl.len())), layouts, primitive, color_states, depth_state, group_layouts);
+        // Trailing empty groups are left out of the pipeline layout.
+        let used = groups.iter().rposition(|&id| id != u32::MAX && !self.cache.group_entries[id as usize].is_empty()).map_or(0, |g| g + 1);
+        groups[used..].fill(u32::MAX);
+        let key: PipelineKey = ((vs.0.key, vs.0.wgsl.len()), ps.as_ref().map(|p| (p.0.key, p.0.wgsl.len())), layouts, primitive, color_states, depth_state, groups);
         // Play mode: a pending pipeline is waited for within the frame's budget.
         let waiting = std::time::Instant::now();
         let until = waiting + if self.background { self.wait_left } else { std::time::Duration::ZERO };
@@ -785,13 +789,14 @@ impl Surfaces {
             Some(found) => found,
             None => {
                 let since = std::time::Instant::now();
-                let (_, _, layouts, primitive, color_states, depth_state, group_layouts) = &key;
+                let (_, _, layouts, primitive, color_states, depth_state, groups) = &key;
                 // Pipelines with the same group layouts share them, and so their bind groups.
-                let bind_layouts: Vec<wgpu::BindGroupLayout> = group_layouts
-                    .iter()
-                    .map(|entries| self.cache.layouts.entry(entries.clone()).or_insert_with(|| self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries })).clone())
-                    .collect();
-                let refs: Vec<Option<&wgpu::BindGroupLayout>> = bind_layouts.iter().map(Some).collect();
+                let mut bind_layouts: [Option<wgpu::BindGroupLayout>; 2] = Default::default();
+                for (made, &id) in bind_layouts.iter_mut().zip(groups).filter(|(_, id)| **id != u32::MAX) {
+                    let entries = &self.cache.group_entries[id as usize];
+                    *made = Some(self.cache.layouts.entry(entries.clone()).or_insert_with(|| self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries })).clone());
+                }
+                let refs: Vec<Option<&wgpu::BindGroupLayout>> = bind_layouts.iter().flatten().map(Some).collect();
                 let layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &refs, ..Default::default() });
                 // Owned: a worker thread may make it.
                 let buffers: Vec<(u64, wgpu::VertexStepMode, Vec<wgpu::VertexAttribute>)> = layouts.iter().map(|(_, step, stride, attributes)| (*stride, *step, attributes.clone())).collect();
@@ -832,8 +837,8 @@ impl Surfaces {
             return Ok(());
         };
 
-        let mut bind_groups = Vec::with_capacity(bind_layouts.len());
-        for (g, layout) in bind_layouts.iter().enumerate() {
+        let mut bind_groups = Vec::with_capacity(2);
+        for (g, layout) in bind_layouts.iter().flatten().enumerate() {
             let Bindings { cbufs, textures, swizzles, .. } = &stages[g];
             let mut buffers: Vec<(u32, (wgpu::Buffer, u64, u64))> = cbufs
                 .iter()
@@ -1080,6 +1085,39 @@ impl Surfaces {
         // The handle banks were for the textures; the program reads the others.
         banks.retain(|b, _| t.interface.cbufs.contains(b));
         Ok(Bindings { cbufs: banks, textures, swizzles: t.interface.swizzles.then_some(swizzles), sizes: &t.interface.cbuf_sizes })
+    }
+
+    /// The id of the bind group layout that bindings `b` of translation `t` take in
+    /// group `g` (0 vertex, 1 pixel): `Bindings::layout`'s entries, their buffers at
+    /// dynamic offsets when `dynamic`, interned. For one translation the entries vary
+    /// only with that flag and with which slots hold depth textures: a draw finds
+    /// them in `Cache::group_ids` instead of building, hashing and comparing them
+    /// (about 90 entries in a main-pass pixel group). A stage of more than 64 slots
+    /// is interned by its entries every time.
+    fn group_id(&mut self, t: &Translation, g: usize, dynamic: bool, b: &Bindings) -> u32 {
+        let depth = (b.textures.len() <= 64).then(|| b.textures.iter().enumerate().fold(0u64, |m, (i, s)| m | u64::from(s.depth) << i));
+        // A translation never leaves the module cache: its address names it for the run.
+        let memo = depth.map(|mask| (std::ptr::from_ref(t) as usize, g, dynamic, mask));
+        if let Some(&id) = memo.as_ref().and_then(|k| self.cache.group_ids.get(k)) {
+            return id;
+        }
+        let mut entries = b.layout([wgpu::ShaderStages::VERTEX, wgpu::ShaderStages::FRAGMENT][g]);
+        if dynamic {
+            for e in &mut entries {
+                if let wgpu::BindingType::Buffer { has_dynamic_offset, .. } = &mut e.ty {
+                    *has_dynamic_offset = true;
+                }
+            }
+        }
+        let next = self.cache.group_entries.len() as u32;
+        let id = *self.cache.group_index.entry(entries.clone()).or_insert(next);
+        if id == next {
+            self.cache.group_entries.push(entries);
+        }
+        if let Some(k) = memo {
+            self.cache.group_ids.insert(k, id);
+        }
+        id
     }
 
     /// A program's texture slots (view, sampler) and swizzle codes, from its
@@ -1790,6 +1828,54 @@ mod tests {
         assert_eq!(dynamic_groups(&[3, 16], 15), [true, false]);
         assert_eq!(dynamic_groups(&[16, 16], 15), [false, false]);
         assert_eq!(dynamic_groups(&[9], 15), [true]);
+    }
+
+    /// A draw's group layout id stands for `Bindings::layout`'s entries, buffers at
+    /// dynamic offsets when asked: equal entries share an id whatever the translation,
+    /// the dynamic flag and a slot turned depth each give another, the memo answers a
+    /// translation's next draws, and a stage past 64 slots is interned by content.
+    #[test]
+    fn a_group_layout_id_stands_for_its_entries() {
+        let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
+            eprintln!("no GPU adapter: test skipped");
+            return;
+        };
+        let size = wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 };
+        let texture = s.device.create_texture(&wgpu::TextureDescriptor { label: None, size, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::R8Unorm, usage: wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[] });
+        let view = texture.create_view(&Default::default());
+        let sampler = s.device.create_sampler(&Default::default());
+        let slot = |depth: bool, sampled: bool| Slot { view: view.clone(), sampler: sampled.then(|| sampler.clone()), depth, compare: false, dimension: wgpu::TextureViewDimension::D2 };
+        let sizes = BTreeMap::new();
+        let bank: Bank = (0, std::sync::Arc::new(Vec::new()));
+        let bindings = |slots: Vec<Slot>| Bindings { cbufs: BTreeMap::from([(0, bank.clone()), (3, bank.clone())]), textures: slots, swizzles: Some(vec![0; 4]), sizes: &sizes };
+        let translation = |key| Translation { key, stage: Stage::Pixel, wgsl: String::new(), interface: Interface::default() };
+        let (t1, t2) = (translation(1), translation(2));
+        let b = bindings(vec![slot(false, true), slot(false, false)]);
+        let id = s.group_id(&t1, 1, true, &b);
+        let mut want = b.layout(wgpu::ShaderStages::FRAGMENT);
+        for e in &mut want {
+            if let wgpu::BindingType::Buffer { has_dynamic_offset, .. } = &mut e.ty {
+                *has_dynamic_offset = true;
+            }
+        }
+        assert_eq!(s.cache.group_entries[id as usize], want);
+        assert_eq!(s.group_id(&t2, 1, true, &b), id, "another translation, the same entries");
+        let memos = s.cache.group_ids.len();
+        assert_eq!(s.group_id(&t1, 1, true, &b), id);
+        assert_eq!(s.cache.group_ids.len(), memos, "the memo answered");
+        let fixed = s.group_id(&t1, 1, false, &b);
+        assert_ne!(fixed, id, "no dynamic offsets");
+        assert_eq!(s.cache.group_entries[fixed as usize], b.layout(wgpu::ShaderStages::FRAGMENT));
+        let depth = bindings(vec![slot(true, true), slot(false, false)]);
+        let deep = s.group_id(&t1, 1, true, &depth);
+        assert_ne!(deep, id, "a slot turned depth");
+        assert_eq!(s.cache.group_entries[deep as usize].len(), want.len());
+        let wide = bindings((0..65).map(|_| slot(false, true)).collect());
+        let memos = s.cache.group_ids.len();
+        let many = s.group_id(&t1, 1, false, &wide);
+        assert_eq!(s.group_id(&t2, 1, false, &wide), many);
+        assert_eq!(s.cache.group_ids.len(), memos, "no memo past 64 slots");
+        assert_eq!(s.cache.group_entries[many as usize], wide.layout(wgpu::ShaderStages::FRAGMENT));
     }
 
     /// A texture of 32 MiB or more uploaded while a draw resolves its slots no
