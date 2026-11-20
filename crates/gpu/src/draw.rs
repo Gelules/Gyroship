@@ -444,13 +444,14 @@ type PipelineKey = (
     [u32; 2],
 );
 
-/// A stage's bindings.
+/// A stage's bindings. The slots and swizzles are shared with the submit's
+/// memo of stages (`Memo::stages`): a stage found there is one count each.
 pub(crate) struct Bindings<'t> {
     /// Constant buffers by bank.
     pub(crate) cbufs: Banks,
-    pub(crate) textures: Vec<Slot>,
+    pub(crate) textures: std::sync::Arc<[Slot]>,
     /// Each slot's header swizzle, when the program reads them.
-    pub(crate) swizzles: Option<Vec<u32>>,
+    pub(crate) swizzles: Option<std::sync::Arc<[u32]>>,
     /// The program's `Interface::cbuf_sizes`, the bytes of each bank it may
     /// read (all 64 KiB of a bank it has no entry for): staged as bound, then
     /// zeros up to there, as the console reads past a bank's size. The binding
@@ -461,6 +462,39 @@ pub(crate) struct Bindings<'t> {
 /// A texture slot's inputs within a submit: its texture header, its sampler
 /// header (None when fetched), its view dimension, compare and fetch.
 pub(crate) type SlotKey = ([u8; 32], Option<[u8; 32]>, wgpu::TextureViewDimension, bool, bool);
+
+/// What a stage's bindings are resolved from besides guest memory: its
+/// translation (by address, as `group_id`), the banks it reads as bound (bank,
+/// address, size), the header and sampler pools, the sampler binding, and the
+/// draw's attachments (a slot may not read one).
+pub(crate) type StageKey = (usize, SmallVec<[(u8, u64, u32); 16]>, Pool, Pool, SamplerBinding, SmallVec<[u64; 9]>);
+
+/// A stage's bindings resolved in this submit (`Memo::stages`), with what tells
+/// whether they still hold (`Surfaces::holds`): the write epoch they were made
+/// at and what their slots read; and the textures they read, for the journal.
+pub(crate) struct StageMemo {
+    banks: Banks,
+    textures: std::sync::Arc<[Slot]>,
+    swizzles: Option<std::sync::Arc<[u32]>>,
+    epoch: u64,
+    read: SlotsRead,
+    journal: Vec<(u64, &'static str)>,
+}
+
+/// What `texture_slots` read besides the banks: the spans of the texture and
+/// sampler headers (start, end), and the render targets its slots came from
+/// (address, target, write stamp then, depth).
+#[derive(Default)]
+pub(crate) struct SlotsRead {
+    headers: Option<(u64, u64)>,
+    samplers: Option<(u64, u64)>,
+    targets: SmallVec<[(u64, (u64, u32), u64, bool); 4]>,
+}
+
+/// `span` widened to the 32-byte header at `at`.
+fn widen(span: &mut Option<(u64, u64)>, at: u64) {
+    *span = Some(span.map_or((at, at + 32), |(a, b)| (a.min(at), b.max(at + 32))));
+}
 
 /// A texture slot resolved in this submit (`Memo::slots`), replayed while its
 /// inputs hold: the slot, its swizzle code, the address and source it read (for
@@ -749,9 +783,9 @@ impl Surfaces {
 
         // Constant buffers and textures, per stage (bind group 0 vertex, 1 pixel).
         let attached: SmallVec<[u64; 9]> = colors.iter().flatten().chain(&depth).map(|(s, _)| s.addr).collect();
-        let mut stages: SmallVec<[Bindings; 2]> = smallvec![self.stage_bindings(d, 0, &vs.0, &attached, mem)?];
+        let mut stages: SmallVec<[Bindings; 2]> = smallvec![self.stage_bindings(&d.cbufs[0], d.headers, d.samplers, d.sampler_binding, &vs.0, &attached, mem)?];
         if let Some(p) = &ps {
-            stages.push(self.stage_bindings(d, 4, &p.0, &attached, mem)?);
+            stages.push(self.stage_bindings(&d.cbufs[4], d.headers, d.samplers, d.sampler_binding, &p.0, &attached, mem)?);
         }
 
         // The pipeline.
@@ -1100,21 +1134,72 @@ impl Surfaces {
         }
     }
 
-    /// A stage's constant banks (64 KiB each, as bound) and textures.
-    fn stage_bindings<'t>(&mut self, d: &Draw, stage: usize, t: &'t Translation, attached: &[u64], mem: Mem) -> Result<Bindings<'t>, String> {
+    /// A stage's constant banks (64 KiB each, as bound in `cbufs`) and textures,
+    /// through the header and sampler pools. A stage resolved earlier in this
+    /// submit from the same inputs (`StageKey`) is taken as it was while they hold
+    /// (`holds`): its bank reads and texture slots are skipped, and the textures it
+    /// read are journaled again.
+    #[allow(clippy::too_many_arguments)]
+    fn stage_bindings<'t>(&mut self, cbufs: &[Option<(u64, u32)>], headers: Pool, samplers: Pool, binding: SamplerBinding, t: &'t Translation, attached: &[u64], mem: Mem) -> Result<Bindings<'t>, String> {
+        // The banks it reads, as bound; with one unbound, the full path below gives the errors in order.
+        let mut bound: SmallVec<[(u8, u64, u32); 16]> = SmallVec::new();
+        let mut unbound = false;
+        for b in t.interface.cbufs.iter().chain(&t.interface.handle_banks).copied() {
+            match cbufs.get(usize::from(b)).copied().flatten() {
+                Some((addr, size)) => {
+                    if let Err(at) = bound.binary_search_by_key(&b, |x| x.0) {
+                        bound.insert(at, (b, addr, size));
+                    }
+                }
+                None => unbound = true,
+            }
+        }
+        let key: Option<StageKey> = (!unbound).then(|| (std::ptr::from_ref(t) as usize, bound, headers, samplers, binding, SmallVec::from_slice(attached)));
+        if let Some(k) = &key {
+            self.staging.stages[0] += 1;
+            if let Some(s) = self.memo.stages.get(k)
+                && self.holds(&k.1, s)
+            {
+                self.staging.stages[1] += 1;
+                self.textures_read.extend_from_slice(&s.journal);
+                for &(_, target, _, depth) in &s.read.targets {
+                    if !depth {
+                        self.touched.insert(target);
+                    }
+                }
+                return Ok(Bindings { cbufs: s.banks.clone(), textures: s.textures.clone(), swizzles: s.swizzles.clone(), sizes: &t.interface.cbuf_sizes });
+            }
+        }
+        let (epoch, journaled) = (self.memo.epoch(), self.textures_read.len());
         let mut banks = Banks::new();
         for b in t.interface.cbufs.iter().chain(&t.interface.handle_banks).copied() {
             // Each bank once, in bank order: the order of the bindings and of the arena.
             let Err(at) = banks.binary_search_by_key(&b, |(k, _)| *k) else { continue };
-            let (addr, size) = d.cbufs[stage].get(usize::from(b)).copied().flatten().ok_or_else(|| format!("constant bank {b} not bound"))?;
+            let (addr, size) = cbufs.get(usize::from(b)).copied().flatten().ok_or_else(|| format!("constant bank {b} not bound"))?;
             // Its bound size only: binding it as 64 KiB is `stage_window`'s.
             let data = self.read_guest(crate::surfaces::Read::Bank, addr, (size as usize).min(CBUF_BYTES), mem).ok_or_else(|| format!("constant bank {b} at {addr:#x} not readable"))?;
             banks.insert(at, (b, (addr, data)));
         }
-        let (textures, swizzles) = self.texture_slots(t, &banks, d.headers, d.samplers, d.sampler_binding, attached, mem)?;
+        let (textures, swizzles, read) = self.texture_slots(t, &banks, headers, samplers, binding, attached, mem)?;
         // The handle banks were for the textures; the program reads the others.
         banks.retain(|(b, _)| t.interface.cbufs.contains(b));
-        Ok(Bindings { cbufs: banks, textures, swizzles: t.interface.swizzles.then_some(swizzles), sizes: &t.interface.cbuf_sizes })
+        let textures: std::sync::Arc<[Slot]> = textures.into();
+        let swizzles = t.interface.swizzles.then(|| std::sync::Arc::<[u32]>::from(swizzles));
+        if let Some(k) = key {
+            let journal = self.textures_read[journaled..].to_vec();
+            self.memo.stages.insert(k, StageMemo { banks: banks.clone(), textures: textures.clone(), swizzles: swizzles.clone(), epoch, read, journal });
+        }
+        Ok(Bindings { cbufs: banks, textures, swizzles, sizes: &t.interface.cbuf_sizes })
+    }
+
+    /// Whether stage `s`, resolved earlier in this submit from banks `bound`,
+    /// still holds: no GPU write since on those banks or on the span of its
+    /// slots' headers, and no write since on a render target its slots read.
+    fn holds(&self, bound: &[(u8, u64, u32)], s: &StageMemo) -> bool {
+        let fresh = |addr: u64, len: usize| self.memo.fresh(addr, len, s.epoch);
+        bound.iter().all(|&(_, addr, size)| fresh(addr, (size as usize).min(CBUF_BYTES)))
+            && [s.read.headers, s.read.samplers].into_iter().flatten().all(|(a, b)| fresh(a, (b - a) as usize))
+            && s.read.targets.iter().all(|&(address, target, stamp, _)| Self::latest_at(&self.map, address).is_some_and(|e| (e.surface.addr, e.surface.format) == target && e.written == stamp))
     }
 
     /// The id of the bind group layout that bindings `b` of translation `t` take in
@@ -1151,11 +1236,12 @@ impl Surfaces {
     }
 
     /// A program's texture slots (view, sampler) and swizzle codes, from its
-    /// handles in `banks` and the header and sampler pools.
+    /// handles in `banks` and the header and sampler pools; and what they read.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn texture_slots(&mut self, t: &Translation, banks: &[(u8, Bank)], headers: Pool, samplers: Pool, binding: SamplerBinding, attached: &[u64], mem: Mem) -> Result<(Vec<Slot>, Vec<u32>), String> {
+    pub(crate) fn texture_slots(&mut self, t: &Translation, banks: &[(u8, Bank)], headers: Pool, samplers: Pool, binding: SamplerBinding, attached: &[u64], mem: Mem) -> Result<(Vec<Slot>, Vec<u32>, SlotsRead), String> {
         let mut textures = Vec::with_capacity(t.interface.textures.len());
         let mut swizzles = vec![0u32; t.interface.textures.len().next_multiple_of(4)];
+        let mut read = SlotsRead::default();
         for (slot, x) in t.interface.textures.iter().enumerate() {
             let word = |b: u8, offset: u16| -> Option<u32> {
                 let at = usize::from(offset);
@@ -1179,7 +1265,9 @@ impl Surfaces {
                 TexDim::ArrayCube => (V::CubeArray, &[TextureType::CubemapArray]),
                 other => return Err(format!("texture {other:?} (compare {})", x.compare)),
             };
-            let header = self.descriptor(headers.entry(handle.header).ok_or("texture index past the pool")?, mem).ok_or("texture header not readable")?;
+            let at = headers.entry(handle.header).ok_or("texture index past the pool")?;
+            widen(&mut read.headers, at);
+            let header = self.descriptor(at, mem).ok_or("texture header not readable")?;
             // A slot already resolved in this submit with the same headers and use: replayed,
             // unless it read a render target written since. The sampler header is read here
             // for the key; when it cannot be, the full path below gives its error in order.
@@ -1187,7 +1275,14 @@ impl Surfaces {
                 SamplerBinding::Independently => handle.sampler,
                 SamplerBinding::ViaHeaderBinding => handle.header,
             };
-            let sampler_bytes = if x.fetch { None } else { samplers.entry(sampler_index).and_then(|at| self.descriptor(at, mem)) };
+            let sampler_bytes = if x.fetch {
+                None
+            } else {
+                samplers.entry(sampler_index).and_then(|at| {
+                    widen(&mut read.samplers, at);
+                    self.descriptor(at, mem)
+                })
+            };
             let key: Option<SlotKey> = (!x.query && (x.fetch || sampler_bytes.is_some())).then_some((header, sampler_bytes, dimension, x.compare, x.fetch));
             if let Some(r) = key.as_ref().and_then(|k| self.memo.slots.get(k))
                 && r.target.is_none_or(|(target, stamp)| Self::latest_at(&self.map, r.address).is_some_and(|e| (e.surface.addr, e.surface.format) == target && e.written == stamp))
@@ -1196,10 +1291,11 @@ impl Surfaces {
                 if attached.contains(&r.address) {
                     return Err("texture is a target of the same draw".into());
                 }
-                if let Some((target, _)) = r.target
-                    && !r.slot.depth
-                {
-                    self.touched.insert(target);
+                if let Some((target, stamp)) = r.target {
+                    read.targets.push((r.address, target, stamp, r.slot.depth));
+                    if !r.slot.depth {
+                        self.touched.insert(target);
+                    }
                 }
                 swizzles[slot] = r.swizzle;
                 self.textures_read.push((r.address, r.source));
@@ -1306,6 +1402,9 @@ impl Surfaces {
             if x.compare && !depth {
                 return Err(format!("depth-compare texture in a color {source}"));
             }
+            if let Some((key, stamp)) = target {
+                read.targets.push((tic.address, key, stamp, depth));
+            }
             swizzles[slot] = textures::swizzle_code(&tic);
             self.textures_read.push((tic.address, source));
             let sampler = match x.fetch {
@@ -1326,7 +1425,7 @@ impl Surfaces {
             }
             textures.push(resolved);
         }
-        Ok((textures, swizzles))
+        Ok((textures, swizzles, read))
     }
 
     /// A 2D, 3D, 2D array or cube texture from guest memory: the level the view
@@ -1659,7 +1758,7 @@ impl Surfaces {
         (c.pending, c.marked) = (written, dirty);
         if dropped {
             // Their slots upload them afresh.
-            self.memo.slots.clear();
+            self.memo.forget_slots();
         }
     }
 
@@ -1777,9 +1876,9 @@ mod tests {
             _ => 0,
         };
         let banks: Banks = smallvec![(0u8, (0, std::sync::Arc::new(vec![0u8; 16])))];
-        let (slots, _) = s.texture_slots(&t, &banks, resources::header_pool(&reg), resources::sampler_pool(&reg), resources::sampler_binding(&reg), &[], &mut mem).unwrap_or_else(|e| panic!("{e}"));
+        let (slots, _, _) = s.texture_slots(&t, &banks, resources::header_pool(&reg), resources::sampler_pool(&reg), resources::sampler_binding(&reg), &[], &mut mem).unwrap_or_else(|e| panic!("{e}"));
         let none = BTreeMap::new();
-        let bindings = Bindings { cbufs: Banks::new(), textures: slots, swizzles: None, sizes: &none };
+        let bindings = Bindings { cbufs: Banks::new(), textures: slots.into(), swizzles: None, sizes: &none };
         let mut entries = bindings.layout(wgpu::ShaderStages::COMPUTE);
         let storage = wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None };
         entries.push(wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::COMPUTE, ty: storage, count: None });
@@ -1890,7 +1989,7 @@ mod tests {
         let slot = |depth: bool, sampled: bool| Slot { view: view.clone(), sampler: sampled.then(|| sampler.clone()), depth, compare: false, dimension: wgpu::TextureViewDimension::D2 };
         let sizes = BTreeMap::new();
         let bank: Bank = (0, std::sync::Arc::new(Vec::new()));
-        let bindings = |slots: Vec<Slot>| Bindings { cbufs: smallvec![(0, bank.clone()), (3, bank.clone())], textures: slots, swizzles: Some(vec![0; 4]), sizes: &sizes };
+        let bindings = |slots: Vec<Slot>| Bindings { cbufs: smallvec![(0, bank.clone()), (3, bank.clone())], textures: slots.into(), swizzles: Some(vec![0u32; 4].into()), sizes: &sizes };
         let translation = |key| Translation { key, stage: Stage::Pixel, wgsl: String::new(), interface: Interface::default() };
         let (t1, t2) = (translation(1), translation(2));
         let b = bindings(vec![slot(false, true), slot(false, false)]);
@@ -1992,6 +2091,65 @@ mod tests {
         s.new_submit(true);
         let next = resolve(&mut s);
         assert_eq!((next == fresh, reads.get()), (true, 2));
+    }
+
+    /// A stage resolved in a submit is taken again while its inputs hold, its
+    /// bank unread and the texture it read journaled again; a GPU write on its
+    /// bank or on its texture headers, a forgotten slots memo or a new submit
+    /// resolves it afresh.
+    #[test]
+    fn a_stage_is_resolved_once_while_its_inputs_hold() {
+        let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
+            eprintln!("no GPU adapter: test skipped");
+            return;
+        };
+        // The slot test's texture, its handle read from bank 0 at BANK.
+        const TEX: u64 = 0x50_0000;
+        const BANK: u64 = 0x60_0000;
+        let mut tic = [0u8; 32];
+        put(&mut tic, &[(6, 0, 0x08), (9, 7, 2), (12, 10, 2), (15, 13, 2), (18, 16, 2), (21, 19, 2), (24, 22, 3), (27, 25, 4), (30, 28, 5)]);
+        put(&mut tic, &[(63, 41, (TEX >> 9) as u32), (87, 85, 3), (144, 128, 7), (175, 160, 7), (154, 151, 1), (191, 191, 1)]);
+        let x = Texture { handle: Handle::CBuf { bank: 0, offset: 0 }, dim: TexDim::D2, compare: false, fetch: false, query: false };
+        let t = Translation { key: 0, stage: Stage::Pixel, wgsl: String::new(), interface: Interface { textures: vec![x], handle_banks: [0].into(), ..Default::default() } };
+        let regions = [(TEX, vec![7u8; 512]), (HEADERS, tic.to_vec()), (SAMPLERS, vec![0u8; 32]), (BANK, vec![0u8; 16])];
+        let reads = std::cell::Cell::new(0);
+        let mut mem = |addr: u64, out: &mut [u8]| {
+            reads.set(reads.get() + u32::from(addr == BANK));
+            regions.iter().any(|(at, data)| {
+                let Some(src) = addr.checked_sub(*at).and_then(|o| data.get(o as usize..o as usize + out.len())) else { return false };
+                out.copy_from_slice(src);
+                true
+            })
+        };
+        let reg = |m: u32| match m {
+            0x1578 => HEADERS as u32,
+            0x1560 => SAMPLERS as u32,
+            _ => 0,
+        };
+        let mut cbufs = [None; resources::BANKS];
+        cbufs[0] = Some((BANK, 16));
+        let pools = (resources::header_pool(&reg), resources::sampler_pool(&reg), resources::sampler_binding(&reg));
+        // Resolves the stage; its view, the bank reads so far, and (lookups, finds) in the stage memo.
+        let mut stage = |s: &mut Surfaces| {
+            s.textures_read.clear();
+            let b = s.stage_bindings(&cbufs, pools.0, pools.1, pools.2, &t, &[], &mut mem).unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(s.textures_read, [(TEX, "memory")], "journaled as read");
+            (b.textures[0].view.clone(), reads.get(), s.staging.stages)
+        };
+        let (first, ..) = stage(&mut s);
+        let (again, read, memo) = stage(&mut s);
+        assert_eq!((again == first, read, memo), (true, 1, [2, 1]), "taken again, the bank unread");
+        s.memo.wrote(BANK, 4);
+        let (_, read, memo) = stage(&mut s);
+        assert_eq!((read, memo), (2, [3, 1]), "a bank written: resolved afresh");
+        assert_eq!(stage(&mut s).2, [4, 2], "then taken again");
+        s.memo.wrote(HEADERS, 4);
+        assert_eq!(stage(&mut s).2, [5, 2], "the headers written");
+        assert_eq!(stage(&mut s).2, [6, 3]);
+        s.memo.forget_slots();
+        assert_eq!(stage(&mut s).2, [7, 3], "the slots forgotten");
+        s.new_submit(true);
+        assert_eq!(stage(&mut s).2, [8, 3], "a new submit");
     }
 
     /// Level `level` of `t`, every slice, as rows of `pitch` bytes (`t` needs COPY_SRC).

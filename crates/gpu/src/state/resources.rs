@@ -93,7 +93,7 @@ pub enum Unsupported {
 }
 
 /// A texture header pool or sampler pool.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Pool {
     /// SET_TEX_HEADER_POOL_A_OFFSET_UPPER (7:0) / _B_OFFSET_LOWER, or the
     /// SET_TEX_SAMPLER_POOL_A/B equivalents.
@@ -135,7 +135,7 @@ pub fn sampler_pool(r: Reg) -> Pool {
 }
 
 /// SET_SAMPLER_BINDING_V (0:0).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SamplerBinding {
     /// V_INDEPENDENTLY: the sampler index is the handle's own (bits 31:20).
     Independently,

@@ -774,6 +774,8 @@ pub struct Staging {
     /// Texture views and bind groups made, then asked for (the rest came from their caches).
     pub views: [u64; 2],
     pub bind_groups: [u64; 2],
+    /// Stages looked up in the submit's memo (`Memo::stages`), then found there.
+    pub stages: [u64; 2],
     /// Textures uploaded from guest memory: bytes, and host nanoseconds (read,
     /// deswizzle, copy, and the wait after a large one).
     pub uploads: [u64; 2],
@@ -868,9 +870,13 @@ pub(crate) struct Memo {
     descriptors: FxMap<u64, Dated<[u8; 32]>>,
     /// Texture slots resolved this submit, by their inputs (`draw::SlotKey`): about
     /// 17 a draw for a few hundred distinct ones. Also emptied when a texture is
-    /// dropped, a target made, or a dispatch starts; a target's slot is checked
-    /// against the target's last write at each use.
+    /// dropped, a target made, or a dispatch starts (`forget_slots`); a target's
+    /// slot is checked against the target's last write at each use.
     pub(crate) slots: FxMap<crate::draw::SlotKey, crate::draw::Resolved>,
+    /// Stages' bindings resolved this submit, by what they were resolved from
+    /// (`draw::StageKey`): a draw that repeats a stage's inputs, while they hold,
+    /// skips its bank reads and texture slots. Emptied with `slots`.
+    pub(crate) stages: FxMap<crate::draw::StageKey, crate::draw::StageMemo>,
     /// The epoch of each page written by the GPU in this submit, in page order:
     /// an entry's check visits only the written pages inside it.
     pages: BTreeMap<u64, u64>,
@@ -883,8 +889,20 @@ impl Memo {
         self.staged.clear();
         self.indices.clear();
         self.descriptors.clear();
-        self.slots.clear();
+        self.forget_slots();
         self.pages.clear();
+    }
+
+    /// The texture slots resolved this submit are stale (a texture dropped, a
+    /// target made, a dispatch), and so are the stages made of them.
+    pub(crate) fn forget_slots(&mut self) {
+        self.slots.clear();
+        self.stages.clear();
+    }
+
+    /// The write epoch now: a GPU write after this makes a newer one.
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     /// The GPU wrote `[start, start + len)`.
@@ -899,7 +917,7 @@ impl Memo {
     }
 
     /// No GPU write on `[addr, addr + len)`'s pages since `epoch`.
-    fn fresh(&self, addr: u64, len: usize, epoch: u64) -> bool {
+    pub(crate) fn fresh(&self, addr: u64, len: usize, epoch: u64) -> bool {
         let (first, last) = (addr >> 12, addr.saturating_add(len.max(1) as u64 - 1) >> 12);
         self.pages.range(first..=last).all(|(_, e)| *e <= epoch)
     }
@@ -1736,7 +1754,7 @@ impl Surfaces {
             });
             self.map.insert(key, Entry { surface: *s, texture, written: 0 });
             // A slot that read guest memory, or another target, at this address reads this one now.
-            self.memo.slots.clear();
+            self.memo.forget_slots();
         }
         let texture = self.map[&key].texture.clone();
         self.view_as(&texture, Some(format), wgpu::TextureUsages::RENDER_ATTACHMENT, wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2), array_layer_count: Some(1), ..Default::default() })

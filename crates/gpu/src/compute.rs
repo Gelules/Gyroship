@@ -76,7 +76,7 @@ impl Surfaces {
         // A dispatch may write the images: their float twins are stale.
         self.cache.twins.clear();
         // The dispatch may make, drop or write images: slots resolved to one are stale.
-        self.memo.slots.clear();
+        self.memo.forget_slots();
         if l.grid.contains(&0) || l.program == 0 {
             return Ok(());
         }
@@ -237,9 +237,9 @@ impl Surfaces {
         }
 
         // Bindings: constant banks, textures and swizzles as for draws, then the images.
-        let (textures, swizzles) = self.texture_slots(t, &banks, pools.headers, pools.samplers, pools.sampler_binding, &[], mem)?;
+        let (textures, swizzles, _) = self.texture_slots(t, &banks, pools.headers, pools.samplers, pools.sampler_binding, &[], mem)?;
         banks.retain(|(b, _)| t.interface.cbufs.contains(b));
-        let bindings = Bindings { cbufs: banks, textures, swizzles: t.interface.swizzles.then_some(swizzles), sizes: &t.interface.cbuf_sizes };
+        let bindings = Bindings { cbufs: banks, textures: textures.into(), swizzles: t.interface.swizzles.then(|| swizzles.into()), sizes: &t.interface.cbuf_sizes };
         let mut layout_entries = bindings.layout(wgpu::ShaderStages::COMPUTE);
         for (i, (img, (_, format, _, _))) in t.interface.images.iter().zip(&images).enumerate() {
             let view_dimension = match img.dim {
