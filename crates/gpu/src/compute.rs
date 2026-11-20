@@ -7,7 +7,7 @@
 //! normalized storage formats only; image contents stay on the host (never
 //! written back to guest memory).
 
-use crate::draw::{Bank, Banks, Bindings, Mem};
+use crate::draw::{BankIds, Bindings, Mem};
 use crate::pushbuf::Pools;
 use crate::shader::{self, Handle, IMAGE_BINDING, Options, Translation};
 use crate::sass::memory::ImageDim;
@@ -16,6 +16,7 @@ use crate::state::qmd::Launch;
 use crate::state::resources::TexHandle;
 use crate::state::textures::{self, TextureType};
 use crate::surfaces::Surfaces;
+use smallvec::SmallVec;
 use std::collections::BTreeMap;
 
 /// The bytes of a constant bank as the translated programs declare it.
@@ -92,23 +93,27 @@ impl Surfaces {
         if l.shared > self.device.limits().max_compute_workgroup_storage_size {
             return Err(format!("{:#x} bytes of shared memory", l.shared));
         }
-        let mut banks = Banks::new();
+        let mut banks = BankIds::new();
         for &(bank, addr, size) in &l.cbufs {
-            let read = self.read_guest(crate::surfaces::Read::ComputeBank, addr, (size as usize).min(CBUF_BYTES), mem).ok_or_else(|| format!("compute constant bank {bank} at {addr:#x} not readable"))?;
+            let id = self.read_guest(crate::surfaces::Read::ComputeBank, addr, (size as usize).min(CBUF_BYTES), mem).ok_or_else(|| format!("compute constant bank {bank} at {addr:#x} not readable"))?;
             // In bank order; a bank given twice keeps its last binding.
             match banks.binary_search_by_key(&bank, |(k, _)| *k) {
-                Ok(i) => banks[i].1 = read,
-                Err(i) => banks.insert(i, (bank, read)),
+                Ok(i) => banks[i].1 = id,
+                Err(i) => banks.insert(i, (bank, id)),
             }
         }
-        let word = |banks: &[(u8, Bank)], h: &Handle| -> Option<u32> {
-            let Handle::CBuf { bank, offset } = h else { return None };
-            let at = usize::from(*offset);
-            let w = crate::draw::bank(banks, *bank)?.1.get(at..at + 4)?;
+        // Their bytes, held for this dispatch (images and globals read them between calls that change `self`).
+        let bytes: SmallVec<[(u8, std::sync::Arc<Vec<u8>>); 16]> = banks.iter().map(|&(b, id)| (b, self.memo.blocks[id as usize].clone())).collect();
+        let bank_word = |bank: u8, at: usize| -> Option<u32> {
+            let w = bytes.iter().find(|(k, _)| *k == bank)?.1.get(at..at + 4)?;
             Some(u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
         };
+        let word = |h: &Handle| -> Option<u32> {
+            let Handle::CBuf { bank, offset } = h else { return None };
+            bank_word(*bank, usize::from(*offset))
+        };
         let mut tic_of = |h: &Handle| -> Result<textures::Tic, String> {
-            let handle = TexHandle::new(word(&banks[..], h).ok_or_else(|| format!("image handle {h:?}"))?);
+            let handle = TexHandle::new(word(h).ok_or_else(|| format!("image handle {h:?}"))?);
             let mut header = [0u8; 32];
             if !mem(pools.headers.entry(handle.header).ok_or("image index past the pool")?, &mut header) {
                 return Err("image header not readable".into());
@@ -204,7 +209,7 @@ impl Surfaces {
         // ponytail: read again at every dispatch; cache by address if it shows in profiles.
         let mut globals = Vec::new();
         for &(bank, at) in &t.interface.buffers {
-            let word = |o: usize| crate::draw::bank(&banks, bank).and_then(|b| b.1.get(o..o + 4)).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]));
+            let word = |o: usize| bank_word(bank, o);
             let at = usize::from(at);
             let (Some(lo), Some(hi), Some(size)) = (word(at), word(at + 4), word(at + 8)) else { return Err("global memory descriptor out of its bank".into()) };
             // The word after the pointer is not proved to be a size: at least 1 MiB is read
@@ -238,7 +243,7 @@ impl Surfaces {
 
         // Bindings: constant banks, textures and swizzles as for draws, then the images.
         let (textures, swizzles, set) = self.texture_slots(t, &banks, pools.headers, pools.samplers, pools.sampler_binding, &[], mem)?;
-        let cbufs = banks.iter().filter(|(b, _)| t.interface.cbufs.contains(b)).map(|&(b, (id, _))| (b, id)).collect();
+        let cbufs = banks.iter().filter(|(b, _)| t.interface.cbufs.contains(b)).copied().collect();
         let bindings = Bindings { cbufs, textures, swizzles: t.interface.swizzles.then_some(swizzles), set, sizes: &t.interface.cbuf_sizes };
         let mut layout_entries = bindings.layout(wgpu::ShaderStages::COMPUTE);
         for (i, (img, (_, format, _, _))) in t.interface.images.iter().zip(&images).enumerate() {

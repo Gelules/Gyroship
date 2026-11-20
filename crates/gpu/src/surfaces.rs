@@ -905,7 +905,7 @@ pub(crate) struct Memo {
     /// and the recorder, which has them too (`Rec::Block`), stages a block by
     /// its id. A read made again after a GPU write takes a new id. Ids last
     /// the frame: kept at a new submit, dropped at a flush.
-    blocks: Vec<Bytes>,
+    pub(crate) blocks: Vec<Bytes>,
     /// (address, index size, count, restart index) -> the indices read.
     indices: FxMap<(u64, usize, u32, Option<u32>), Dated<Indices>>,
     /// Address -> a texture or sampler header (two guest reads per texture slot of every draw).
@@ -1343,17 +1343,17 @@ impl Surfaces {
         self.begin_job(verified);
     }
 
-    /// `len` bytes of guest memory at `addr` and the read's id (see
-    /// [`Memo::blocks`]), read through `mem` unless this submit read them
+    /// The id of the read of `len` bytes of guest memory at `addr` (its bytes
+    /// in [`Memo::blocks`]), read through `mem` unless this submit read them
     /// already and the GPU has not written them since; None if they are not
     /// readable.
-    pub(crate) fn read_guest(&mut self, kind: Read, addr: u64, len: usize, mem: crate::draw::Mem) -> Option<(u32, Arc<Vec<u8>>)> {
+    pub(crate) fn read_guest(&mut self, kind: Read, addr: u64, len: usize, mem: crate::draw::Mem) -> Option<u32> {
         let key = (kind as u8, addr, len);
         if let Some(&(id, epoch)) = self.memo.reads.get(&key)
             && self.memo.fresh(addr, len, epoch)
         {
             self.note_read(kind, len, true);
-            return Some((id, self.memo.blocks[id as usize].clone()));
+            return Some(id);
         }
         self.note_read(kind, len, false);
         let mut bytes = vec![0u8; len];
@@ -1369,7 +1369,7 @@ impl Surfaces {
         }
         let id = self.block(bytes);
         self.memo.reads.insert(key, (id, self.memo.epoch));
-        Some((id, self.memo.blocks[id as usize].clone()))
+        Some(id)
     }
 
     /// `len` bytes of guest memory at `addr`, every one readable, then zeros up
@@ -2309,7 +2309,7 @@ mod tests {
             buf.fill(7);
             true
         };
-        let mut read = |s: &mut Surfaces| s.read_guest(Read::Bank, 0x1000, 16, &mut mem).map(|(_, b)| b.to_vec());
+        let mut read = |s: &mut Surfaces| s.read_guest(Read::Bank, 0x1000, 16, &mut mem).map(|id| s.memo.blocks[id as usize].to_vec());
         assert_eq!(read(&mut s), Some(vec![7; 16]));
         assert_eq!(read(&mut s), Some(vec![7; 16]));
         s.invalidate(0x3000, 4);
@@ -2344,7 +2344,7 @@ mod tests {
             buf.fill(value.get());
             true
         };
-        let (id, _) = s.read_guest(Read::Bank, 0x1000, 64, &mut mem).unwrap();
+        let id = s.read_guest(Read::Bank, 0x1000, 64, &mut mem).unwrap();
         let mut r = s.rec();
         let first = r.stage_bank(id, 64);
         let calls = r.staging.calls;
@@ -2353,7 +2353,7 @@ mod tests {
         drop(r);
         s.invalidate(0x1000, 4);
         value.set(2);
-        let (again, _) = s.read_guest(Read::Bank, 0x1000, 64, &mut mem).unwrap();
+        let again = s.read_guest(Read::Bank, 0x1000, 64, &mut mem).unwrap();
         assert_ne!(again, id, "read again: a new id");
         let fresh = s.rec().stage_bank(again, 64);
         assert_eq!(s.arena_bytes(&fresh, 64), [2u8; 64], "its new bytes");

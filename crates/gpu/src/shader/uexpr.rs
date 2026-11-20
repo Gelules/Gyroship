@@ -24,15 +24,16 @@ pub enum UExpr {
 
 impl UExpr {
     /// The value, given the constant banks' words; None if one is unknown.
-    pub fn eval(&self, word: &dyn Fn(u8, u16) -> Option<u32>) -> Option<u32> {
+    /// Generic over the word reader: a draw's handles evaluate without calls
+    /// through a vtable.
+    pub fn eval<W: Fn(u8, u16) -> Option<u32> + ?Sized>(&self, word: &W) -> Option<u32> {
         let all = |x: &[UExpr; 3]| -> Option<[u32; 3]> { Some([x[0].eval(word)?, x[1].eval(word)?, x[2].eval(word)?]) };
         Some(match self {
             UExpr::Imm(v) => *v,
             UExpr::CBuf(bank, offset) => word(*bank, *offset)?,
             UExpr::Lop3(lut, x) => {
                 let [a, b, c] = all(x)?;
-                let pick = |v: u32, on: bool| if on { v } else { !v };
-                (0..8).filter(|k| lut >> k & 1 != 0).fold(0, |r, k| r | pick(a, k & 4 != 0) & pick(b, k & 2 != 0) & pick(c, k & 1 != 0))
+                lop3(*lut, a, b, c)
             }
             UExpr::Add(x) => {
                 let [a, b, c] = all(x)?;
@@ -68,9 +69,39 @@ impl UExpr {
     }
 }
 
+/// LOP3: each result bit is bit `4a + 2b + c` of `lut` (a 0xf0, b 0xcc, c 0xaa),
+/// as eight minterms without a branch.
+fn lop3(lut: u8, a: u32, b: u32, c: u32) -> u32 {
+    let on = |k: u8| 0u32.wrapping_sub(u32::from(lut >> k & 1));
+    let (na, nb, nc) = (!a, !b, !c);
+    on(0) & na & nb & nc | on(1) & na & nb & c | on(2) & na & b & nc | on(3) & na & b & c | on(4) & a & nb & nc | on(5) & a & nb & c | on(6) & a & b & nc | on(7) & a & b & c
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every truth table gives what the minterm fold it replaced gave (kept
+    /// here, frozen), on random operands.
+    #[test]
+    fn lop3_matches_the_fold_it_replaced() {
+        let fold = |lut: u8, a: u32, b: u32, c: u32| {
+            let pick = |v: u32, on: bool| if on { v } else { !v };
+            (0..8).filter(|k| lut >> k & 1 != 0).fold(0, |r, k| r | pick(a, k & 4 != 0) & pick(b, k & 2 != 0) & pick(c, k & 1 != 0))
+        };
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        for lut in 0..=255u8 {
+            for _ in 0..16 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let (a, b, c) = (x as u32, (x >> 32) as u32, (x as u32).rotate_left(11) ^ (x >> 17) as u32);
+                assert_eq!(lop3(lut, a, b, c), fold(lut, a, b, c), "lut {lut:#04x}");
+            }
+        }
+        // The named tables: a | b (0xfc), a & b (0xc0), a ^ b ^ c (0x96).
+        assert_eq!((lop3(0xfc, 0b1100, 0b1010, 0), lop3(0xc0, 0b1100, 0b1010, 0), lop3(0x96, 0b1100, 0b1010, 0b0110)), (0b1110, 0b1000, 0));
+    }
 
     /// A texture handle or'ed with a sampler handle, and the sampler index
     /// taken from it (ULOP3 0xfc, then USHF.R.U32.HI by 20 of URZ:UR).

@@ -29,20 +29,14 @@ use std::collections::{BTreeMap, BTreeSet};
 /// Reads guest memory at a GPU address; false if a byte is not readable.
 pub type Mem<'a> = &'a mut dyn FnMut(u64, &mut [u8]) -> bool;
 
-/// A constant bank as read: the read's id in the submit's memo (`Memo::blocks`)
-/// and its bytes (shared by the draws of a submit).
-pub(crate) type Bank = (u32, std::sync::Arc<Vec<u8>>);
-
-/// A stage's constant banks by bank, in bank order, each once.
-pub(crate) type Banks = SmallVec<[(u8, Bank); 16]>;
-
-/// A stage's constant banks by bank, in bank order: each read's id, which
-/// tells its bytes and stages them (`Surfaces::stage_bank`).
+/// A stage's constant banks by bank, in bank order, each once: each read's id,
+/// which tells its bytes (`Memo::blocks`, no reference count taken per draw)
+/// and stages them (`Surfaces::stage_bank`).
 pub(crate) type BankIds = SmallVec<[(u8, u32); 16]>;
 
-/// Bank `b` of `banks`.
-pub(crate) fn bank(banks: &[(u8, Bank)], b: u8) -> Option<&Bank> {
-    banks.iter().find(|(k, _)| *k == b).map(|(_, v)| v)
+/// The read id of bank `b` in `banks`.
+pub(crate) fn bank(banks: &[(u8, u32)], b: u8) -> Option<u32> {
+    banks.iter().find(|(k, _)| *k == b).map(|&(_, id)| id)
 }
 
 /// A draw's color targets with their formats, by location (8 at most).
@@ -1111,18 +1105,18 @@ impl Surfaces {
     /// again (`texture_slots`), so a repeated stage costs its lookups only.
     #[allow(clippy::too_many_arguments)]
     fn stage_bindings<'t>(&mut self, cbufs: &[Option<(u64, u32)>], headers: Pool, samplers: Pool, binding: SamplerBinding, t: &'t Translation, attached: &[u64], mem: Mem) -> Result<Bindings<'t>, String> {
-        let mut banks = Banks::new();
+        let mut banks = BankIds::new();
         for b in t.interface.cbufs.iter().chain(&t.interface.handle_banks).copied() {
             // Each bank once, in bank order: the order of the bindings and of the arena.
             let Err(at) = banks.binary_search_by_key(&b, |(k, _)| *k) else { continue };
             let (addr, size) = cbufs.get(usize::from(b)).copied().flatten().ok_or_else(|| format!("constant bank {b} not bound"))?;
             // Its bound size only: binding it as 64 KiB is `stage_window`'s.
-            let read = self.read_guest(crate::surfaces::Read::Bank, addr, (size as usize).min(CBUF_BYTES), mem).ok_or_else(|| format!("constant bank {b} at {addr:#x} not readable"))?;
-            banks.insert(at, (b, read));
+            let id = self.read_guest(crate::surfaces::Read::Bank, addr, (size as usize).min(CBUF_BYTES), mem).ok_or_else(|| format!("constant bank {b} at {addr:#x} not readable"))?;
+            banks.insert(at, (b, id));
         }
         let (textures, swizzles, set) = self.texture_slots(t, &banks, headers, samplers, binding, attached, mem)?;
         // The handle banks were for the textures; the program reads the others.
-        let ids: BankIds = banks.iter().filter(|(b, _)| t.interface.cbufs.contains(b)).map(|&(b, (id, _))| (b, id)).collect();
+        let ids: BankIds = banks.iter().filter(|(b, _)| t.interface.cbufs.contains(b)).copied().collect();
         let swizzles = t.interface.swizzles.then_some(swizzles);
         Ok(Bindings { cbufs: ids, textures, swizzles, set, sizes: &t.interface.cbuf_sizes })
     }
@@ -1175,23 +1169,33 @@ impl Surfaces {
     /// handles, skips its headers and slots. Last, the id the recorder knows the
     /// slots and swizzles by (a set made here is announced: `Rec::Set`).
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-    pub(crate) fn texture_slots(&mut self, t: &Translation, banks: &[(u8, Bank)], headers: Pool, samplers: Pool, binding: SamplerBinding, attached: &[u64], mem: Mem) -> Result<(std::sync::Arc<[Slot]>, std::sync::Arc<[u32]>, u32), String> {
-        let word = |b: u8, offset: u16| -> Option<u32> {
-            let at = usize::from(offset);
-            let w = bank(banks, b)?.1.get(at..at + 4)?;
-            Some(u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+    pub(crate) fn texture_slots(&mut self, t: &Translation, banks: &[(u8, u32)], headers: Pool, samplers: Pool, binding: SamplerBinding, attached: &[u64], mem: Mem) -> Result<(std::sync::Arc<[Slot]>, std::sync::Arc<[u32]>, u32), String> {
+        // Each slot's handle, from the banks' bytes in this submit's blocks (by bank,
+        // no search per word); None when it cannot be read, its error left to the loop
+        // below, in slot order (computing them first changes nothing: no side effect).
+        let per_slot: SmallVec<[Option<u32>; 64]> = {
+            let mut by_bank: [Option<&[u8]>; 32] = [None; 32];
+            for &(b, id) in banks {
+                if let Some(at) = by_bank.get_mut(usize::from(b)) {
+                    *at = Some(&self.memo.blocks[id as usize][..]);
+                }
+            }
+            let word = |b: u8, offset: u16| -> Option<u32> {
+                let at = usize::from(offset);
+                let w = by_bank.get(usize::from(b)).copied().flatten()?.get(at..at + 4)?;
+                Some(u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+            };
+            t.interface
+                .textures
+                .iter()
+                .map(|x| match &x.handle {
+                    Handle::CBuf { bank, offset } => word(*bank, *offset),
+                    Handle::Uniform(e) => e.eval(&word),
+                    _ => None,
+                })
+                .collect()
         };
-        // The handles; one that cannot be read leaves the errors, in slot order, to the loop below.
-        let handles: Option<SmallVec<[u32; 64]>> = t
-            .interface
-            .textures
-            .iter()
-            .map(|x| match &x.handle {
-                Handle::CBuf { bank, offset } => word(*bank, *offset),
-                Handle::Uniform(e) => e.eval(&word),
-                _ => None,
-            })
-            .collect();
+        let handles: Option<SmallVec<[u32; 64]>> = per_slot.iter().copied().collect();
         let key: Option<SlotSetKey> = handles.map(|h| (std::ptr::from_ref(t) as usize, h, headers, samplers, binding, SmallVec::from_slice(attached)));
         if let Some(k) = &key {
             self.staging.slot_sets[0] += 1;
@@ -1213,14 +1217,12 @@ impl Surfaces {
         let mut swizzles = vec![0u32; t.interface.textures.len().next_multiple_of(4)];
         let mut read = SlotsRead::default();
         for (slot, x) in t.interface.textures.iter().enumerate() {
-            let handle = TexHandle::new(match &key {
-                Some(k) => k.1[slot],
+            let handle = TexHandle::new(match per_slot[slot] {
+                Some(h) => h,
                 None => match &x.handle {
-                    Handle::CBuf { bank, offset } => word(*bank, *offset),
-                    Handle::Uniform(e) => e.eval(&word),
+                    Handle::CBuf { .. } | Handle::Uniform(_) => return Err("texture handle offset".into()),
                     other => return Err(format!("texture handle {other:?}")),
-                }
-                .ok_or("texture handle offset")?,
+                },
             });
             use wgpu::TextureViewDimension as V;
             let (dimension, types): (V, &[TextureType]) = match x.dim {
@@ -1866,7 +1868,7 @@ mod tests {
             0x1560 => SAMPLERS as u32,
             _ => 0,
         };
-        let banks: Banks = smallvec![(0u8, (0, std::sync::Arc::new(vec![0u8; 16])))];
+        let banks: BankIds = smallvec![(0u8, s.block(vec![0u8; 16]))];
         let (slots, ..) = s.texture_slots(&t, &banks, resources::header_pool(&reg), resources::sampler_pool(&reg), resources::sampler_binding(&reg), &[], &mut mem).unwrap_or_else(|e| panic!("{e}"));
         let none = BTreeMap::new();
         let bindings = Bindings { cbufs: BankIds::new(), textures: slots, swizzles: None, set: 0, sizes: &none };
@@ -2064,7 +2066,7 @@ mod tests {
             0x1560 => SAMPLERS as u32,
             _ => 0,
         };
-        let banks: Banks = smallvec![(0u8, (0, std::sync::Arc::new(vec![0u8; 16])))];
+        let banks: BankIds = smallvec![(0u8, s.block(vec![0u8; 16]))];
         let mut resolve = |s: &mut Surfaces| s.texture_slots(&t, &banks, resources::header_pool(&reg), resources::sampler_pool(&reg), resources::sampler_binding(&reg), &[], &mut mem).unwrap_or_else(|e| panic!("{e}")).0[0].view.clone();
         let first = resolve(&mut s);
         assert_eq!(reads.get(), 1);
@@ -2175,24 +2177,54 @@ mod tests {
         let mut headers = resources::header_pool(&reg);
         headers.maximum_index = 1;
         let (samplers, binding) = (resources::sampler_pool(&reg), resources::sampler_binding(&reg));
-        // Bank 0 as read `id`, holding handle `h` (header h, sampler 0).
-        let bank = |id: u32, h: u32| -> Banks { smallvec![(0u8, (id, std::sync::Arc::new(h.to_le_bytes().to_vec())))] };
-        // The slot's view, and (lookups, finds) by handles.
-        let mut slots = |s: &mut Surfaces, banks: Banks| {
+        // The slot's view, and (lookups, finds) by handles, bank 0 holding handle `h` (header
+        // h, sampler 0) as a new read each time: another bank's id.
+        let mut slots = |s: &mut Surfaces, h: u32| {
+            let banks: BankIds = smallvec![(0u8, s.block(h.to_le_bytes().to_vec()))];
             s.textures_read.clear();
             let (textures, ..) = s.texture_slots(&t, &banks, headers, samplers, binding, &[], &mut mem).unwrap_or_else(|e| panic!("{e}"));
             assert_eq!(s.textures_read, [(TEX, "memory")], "journaled as read");
             (textures[0].view.clone(), s.staging.slot_sets)
         };
-        let (first, _) = slots(&mut s, bank(1, 0));
-        let (again, memo) = slots(&mut s, bank(2, 0));
+        let (first, _) = slots(&mut s, 0);
+        let (again, memo) = slots(&mut s, 0);
         assert_eq!((again == first, memo), (true, [2, 1]), "the same handle from another bank");
-        assert_eq!(slots(&mut s, bank(2, 1)).1, [3, 1], "another handle");
+        assert_eq!(slots(&mut s, 1).1, [3, 1], "another handle");
         s.memo.wrote(HEADERS, 4);
-        assert_eq!(slots(&mut s, bank(1, 0)).1, [4, 1], "the headers written");
-        assert_eq!(slots(&mut s, bank(1, 0)).1, [5, 2]);
+        assert_eq!(slots(&mut s, 0).1, [4, 1], "the headers written");
+        assert_eq!(slots(&mut s, 0).1, [5, 2]);
         s.memo.forget_slots();
-        assert_eq!(slots(&mut s, bank(1, 0)).1, [6, 2], "the slots forgotten");
+        assert_eq!(slots(&mut s, 0).1, [6, 2], "the slots forgotten");
+    }
+
+    /// A handle that cannot be read stops the slots with its error in slot
+    /// order: a slot before it fails first on its own header; a handle of
+    /// another kind names itself.
+    #[test]
+    fn unreadable_handles_fail_in_slot_order() {
+        let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
+            eprintln!("no GPU adapter: test skipped");
+            return;
+        };
+        let reg = |m: u32| match m {
+            0x1578 => HEADERS as u32,
+            0x1560 => SAMPLERS as u32,
+            _ => 0,
+        };
+        let pools = (resources::header_pool(&reg), resources::sampler_pool(&reg), resources::sampler_binding(&reg));
+        // Bank 0 holds handle 0 at offset 0 only: offset 0x40 is past its 4 bytes.
+        let banks: BankIds = smallvec![(0u8, s.block(vec![0u8; 4]))];
+        let x = |handle| Texture { handle, dim: TexDim::D2, compare: false, fetch: false, query: false };
+        let t = |textures| Translation { key: 0, stage: Stage::Pixel, wgsl: String::new(), interface: Interface { textures, ..Default::default() } };
+        let mut nothing = |_: u64, _: &mut [u8]| false;
+        let mut first_error = |s: &mut Surfaces, t: &Translation| s.texture_slots(t, &banks, pools.0, pools.1, pools.2, &[], &mut nothing).err();
+        // Slot 0's header is unreadable (no memory): its error comes before slot 1's handle.
+        let readable_then_not = t(vec![x(Handle::CBuf { bank: 0, offset: 0 }), x(Handle::CBuf { bank: 0, offset: 0x40 })]);
+        assert_eq!(first_error(&mut s, &readable_then_not).as_deref(), Some("texture header not readable"));
+        let unreadable = t(vec![x(Handle::CBuf { bank: 0, offset: 0x40 })]);
+        assert_eq!(first_error(&mut s, &unreadable).as_deref(), Some("texture handle offset"));
+        let uniform = t(vec![x(Handle::Uniform(crate::shader::uexpr::UExpr::CBuf(1, 0)))]);
+        assert_eq!(first_error(&mut s, &uniform).as_deref(), Some("texture handle offset"), "bank 1 not read");
     }
 
     /// Level `level` of `t`, every slice, as rows of `pitch` bytes (`t` needs COPY_SRC).
