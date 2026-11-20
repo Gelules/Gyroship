@@ -273,6 +273,10 @@ pub enum GpuOp {
     /// with the GPU thread, the entry's pushbuffer read: the ops applied when
     /// it was read, and its CPU range (the read-ahead check).
     Effects { space: u32, effects: Vec<Effect>, read: Option<PushRead> },
+    /// With the decoder thread: the next entry met a semaphore acquire once the
+    /// GPU thread may have started its submit's `Begin`, whose take may then
+    /// have missed what the CPU wrote before releasing it.
+    Acquired,
     /// Present `n` starts (`GpuSide::begin_present`): its resumed channels' ops follow.
     PresentBegin { n: u64 },
     /// The rest of present `n`, after its frame's ops (`GpuSide::finish_present`).
@@ -425,6 +429,10 @@ impl GpuSide {
                     // After the take: textures written in part may be refreshed in place.
                     s.new_submit(true);
                 }
+                Ok(())
+            }
+            GpuOp::Acquired => {
+                crate::lock(&self.tally).count("acquires after the take");
                 Ok(())
             }
             GpuOp::Effects { space, effects, read } => self.check_read(read).and_then(|()| {
@@ -624,13 +632,24 @@ impl Decoder {
 
     /// Play mode: a submit's ops, decoded here while the GPU thread applies them.
     fn submit_ops(&mut self, phase: &Phase, fd: u32, space: u32, entries: &[u8]) -> Result<(), Stop> {
+        // `Begin`'s op number: the GPU thread starts it once the ops before it are applied.
+        let begin = self.gpu.as_ref().map_or(0, |t| t.sent);
         self.send(phase, GpuOp::Begin { space })?;
         for (rank, e) in entries.as_chunks::<8>().0.iter().map(|e| u64::from_le_bytes(*e)).enumerate() {
+            let acquired = self.acquired(fd);
             if let Some((effects, read)) = self.decode(fd, space, rank, e)? {
+                if self.acquired(fd) > acquired && self.gpu.as_ref().is_some_and(|t| crate::lock(&t.progress.state).ops >= begin) {
+                    self.send(phase, GpuOp::Acquired)?;
+                }
                 self.send_effects(phase, space, effects, read)?;
             }
         }
         Ok(())
+    }
+
+    /// The acquires channel `fd` met so far.
+    fn acquired(&self, fd: u32) -> u64 {
+        self.channels.get(&fd).map_or(0, |(c, _)| c.acquired)
     }
 
     /// Play mode: present `n`'s ops. The channels waiting for the CPU go on
@@ -2171,6 +2190,44 @@ mod tests {
         assert_eq!(k.drain_gpu(), None);
         assert_eq!(word(&k, WORDS + 8), 2, "the acquire was met: the release after it ran");
         assert!(crate::lock(&k.decoder).waiting().is_empty());
+    }
+
+    /// An acquire met once the GPU thread may have started its submit's `Begin`
+    /// (here it waits for the release before it, sent after `Begin`) is told to
+    /// the GPU thread, which counts it; one thread never tells it.
+    #[test]
+    fn an_acquire_met_after_the_take_is_told() {
+        let segments = [semaphore(WORDS, 1, true), [semaphore(WORDS, 1, false), semaphore(WORDS + 8, 2, true)].concat()];
+        for (threaded, sync, told) in [(false, false, None), (true, false, Some(1)), (true, true, Some(1))] {
+            let mut k = play_kernel(threaded, false, sync);
+            let job = hand_over(&mut k, 1, PUSHBUFFERS, &segments);
+            assert!(job.run().is_ok());
+            assert_eq!(k.drain_gpu(), None);
+            assert_eq!(k.tally().counts.get("acquires after the take").copied(), told, "threaded: {threaded}, sync: {sync}");
+        }
+    }
+
+    /// An acquire met before the GPU thread can start its submit's `Begin` (it
+    /// is held on a submit before) is not told.
+    #[test]
+    fn an_acquire_met_before_the_take_is_not_told() {
+        let mut k = play_kernel(true, false, false);
+        let side = k.gpu_side.clone();
+        let held = crate::lock(&side);
+        let first = hand_over(&mut k, 1, PUSHBUFFERS, &[semaphore(WORDS + 8, 2, true)]);
+        assert!(first.run().is_ok());
+        k.mem.write(WORDS, &1u32.to_le_bytes()).unwrap();
+        let second = hand_over(&mut k, 1, PUSHBUFFERS + 0x100, &[[semaphore(WORDS, 1, false), semaphore(WORDS + 8, 3, true)].concat()]);
+        assert!(second.run().is_ok());
+        // Both decoded (Begin, Effects, End each) while the GPU thread waits.
+        let since = Instant::now();
+        while crate::lock(&k.decoder).gpu.as_ref().map_or(0, |t| t.sent) < 6 && since.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        drop(held);
+        assert_eq!(k.drain_gpu(), None);
+        assert_eq!(word(&k, WORDS + 8), 3, "the acquire was met");
+        assert_eq!(k.tally().counts.get("acquires after the take"), None);
     }
 
     /// In strict mode an anomaly on the GPU thread ends the submit there: the

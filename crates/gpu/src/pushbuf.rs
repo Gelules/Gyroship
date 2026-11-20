@@ -344,6 +344,9 @@ pub struct Channel {
     queue: VecDeque<(Vec<u32>, usize)>,
     /// The acquire the channel waits for.
     wait: Option<Acquire>,
+    /// Acquires met so far: what the CPU wrote before releasing one is new to
+    /// the GPU work after it (the HLE's kept reads).
+    pub acquired: u64,
     /// Every method executed, when set (for study tools).
     pub trace: Option<Vec<Traced>>,
     /// Per subchannel: the instance the next draw draws (BEGIN's INSTANCE_ID).
@@ -388,6 +391,7 @@ impl Default for Channel {
             uploads: Default::default(),
             queue: VecDeque::new(),
             wait: None,
+            acquired: 0,
             trace: None,
             instance: [0; 8],
             #[cfg(test)]
@@ -490,6 +494,7 @@ impl Channel {
                     break;
                 }
                 self.wait = None;
+                self.acquired += 1;
             }
             if let Some(next) = self.segment(&words, at, &mut effects, &mut *read) {
                 self.queue.push_front((words, next));
@@ -988,6 +993,7 @@ mod tests {
         assert_eq!(c.waiting().map(|a| (a.value, a.op)), Some((5, AcquireOp::CircGeq)));
         // A later segment queues behind the wait.
         assert!(c.run_with(&release, &mut read).is_empty());
+        assert_eq!(c.acquired, 0, "not met yet");
         memory = 5;
         let mut read = |_: u64, buf: &mut [u8]| {
             buf.copy_from_slice(&memory.to_le_bytes()[..buf.len()]);
@@ -996,6 +1002,7 @@ mod tests {
         let r = Effect::Release(Release { method: SEMAPHORE_D, addr: 0x2000, value: 7, width: 4, timestamp: false });
         assert_eq!(c.resume(&mut read), vec![r.clone(), r]);
         assert_eq!(c.waiting(), None);
+        assert_eq!(c.acquired, 1, "met once");
         // Wrap-around: 0xffff_fffe is not yet at 2, 3 is.
         let a = Acquire { addr: 0, value: 2, wide: false, op: AcquireOp::CircGeq };
         assert!(!a.met(0xffff_fffe) && a.met(3) && a.met(2));
