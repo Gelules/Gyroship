@@ -198,6 +198,18 @@ pub type Bindings = [[Option<(u64, u32)>; BANKS]; STAGES];
 /// `try_draw` refuses a program on another stage before it reads a bank.
 pub type DrawBanks = [[Option<(u64, u32)>; BANKS]; 2];
 
+/// The methods [`Resources::method`] acts on, as (first, last, step): any other
+/// only sets its register, and the command processor skips it (`pushbuf::ACTED`).
+pub(crate) const ACTED: [(u32, u32, u32); 5] = [
+    (LAUNCH_DMA, LOAD_INLINE_DATA, 4),
+    (SET_ROOT_TABLE_SELECTOR, LOAD_ROOT_TABLE, 4),
+    (UNBIND_ALL, UNBIND_ALL, 4),
+    (LOAD_CONSTANT_BUFFER_OFFSET, LOAD_CONSTANT_BUFFER.end - 4, 4),
+    (BIND_GROUP_CONSTANT_BUFFER, BIND_GROUP_END - 1, 32),
+];
+/// BIND_GROUP_CONSTANT_BUFFER(j) for j = 0..15 (stages 5 and up are reported).
+const BIND_GROUP_END: u32 = 0x25f8;
+
 impl Resources {
     /// Feeds one 3D method; `r` reads the register file after this write, and
     /// `write` receives each guest write it makes (address, bytes), in order.
@@ -205,7 +217,7 @@ impl Resources {
         match method {
             LOAD_CONSTANT_BUFFER_OFFSET => self.cbuf_offset = value & 0xffff,
             m if LOAD_CONSTANT_BUFFER.contains(&m) => self.load_cbuf(value, r, write),
-            m if (BIND_GROUP_CONSTANT_BUFFER..0x25f8).contains(&m) && (m - BIND_GROUP_CONSTANT_BUFFER).is_multiple_of(32) => {
+            m if (BIND_GROUP_CONSTANT_BUFFER..BIND_GROUP_END).contains(&m) && (m - BIND_GROUP_CONSTANT_BUFFER).is_multiple_of(32) => {
                 let stage = ((m - BIND_GROUP_CONSTANT_BUFFER) / 32) as usize;
                 if stage >= STAGES {
                     self.unsupported.push(Unsupported::Method { method, value });

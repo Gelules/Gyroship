@@ -276,6 +276,45 @@ const PIPELINE_SHADER: u32 = 0x2000; // + 64 j; PROGRAM_ADDRESS_A/B at + 0x14/0x
 /// Draw methods not executed yet: reported, not silently dropped.
 const OTHER_DRAWS: [u32; 9] = [0x26c, 0x274, 0x304, 0x1214, 0x1218, 0x17e4, 0x17e8, 0x17ec, 0x17f0];
 
+/// The engine methods `write` acts on past their store, for any class, by
+/// method / 4: the macro unit's loads, BEGIN, the uploads of compute and I2M
+/// subchannels, inline QMDs, and those of `Resources::method` and
+/// `engine_effect`. Any other method (most of them) is stored and done. One
+/// missing here would lose its effect: `plain_stores_skip_only_methods_that_do_nothing`
+/// runs every method both ways.
+const ACTED: [u64; 64] = {
+    let own = [
+        (LOAD_MME_INSTRUCTION_RAM_POINTER, LOAD_MME_START_ADDRESS_RAM, 4),
+        (*I2M_METHODS.start(), *I2M_METHODS.end(), 4),
+        (SEND_SIGNALING_PCAS_B, SEND_SIGNALING_PCAS2_B, 4),
+        (DMA_LAUNCH, DMA_LAUNCH, 4),
+        (LOAD_INLINE_QMD_DATA, LOAD_INLINE_QMD_DATA + 0xfc, 4),
+        (DRAW_VERTEX_ARRAY, DRAW_VERTEX_ARRAY, 4),
+        (BEGIN, BEGIN, 4),
+        (DRAW_INDEX_BUFFER, DRAW_INDEX_BUFFER, 4),
+        (CLEAR_SURFACE, CLEAR_SURFACE, 4),
+        (REPORT_SEMAPHORE_D, REPORT_SEMAPHORE_D, 4),
+    ];
+    let mut t = [0u64; 64];
+    let mut i = 0;
+    while i < own.len() + resources::ACTED.len() + OTHER_DRAWS.len() {
+        let (mut m, last, step) = if i < own.len() {
+            own[i]
+        } else if i < own.len() + resources::ACTED.len() {
+            resources::ACTED[i - own.len()]
+        } else {
+            let m = OTHER_DRAWS[i - own.len() - resources::ACTED.len()];
+            (m, m, 4)
+        };
+        while m <= last {
+            t[(m / 4 / 64) as usize] |= 1 << (m / 4 % 64);
+            m += step;
+        }
+        i += 1;
+    }
+    t
+};
+
 /// A channel's state between submits.
 #[derive(Clone, Debug)]
 pub struct Channel {
@@ -309,6 +348,9 @@ pub struct Channel {
     pub trace: Option<Vec<Traced>>,
     /// Per subchannel: the instance the next draw draws (BEGIN's INSTANCE_ID).
     instance: [u32; 8],
+    /// Tests: every method takes the full path (`ACTED` skipped).
+    #[cfg(test)]
+    full: bool,
 }
 
 /// One executed method, for tracing.
@@ -348,6 +390,8 @@ impl Default for Channel {
             wait: None,
             trace: None,
             instance: [0; 8],
+            #[cfg(test)]
+            full: false,
         }
     }
 }
@@ -583,6 +627,14 @@ impl Channel {
             }
         }
         self.engine[i] = value;
+        // Most methods only set their register (`ACTED`): done.
+        #[cfg(test)]
+        let full = self.full;
+        #[cfg(not(test))]
+        let full = false;
+        if !full && ACTED[(method / 4 / 64) as usize] >> (method / 4 % 64) & 1 == 0 {
+            return;
+        }
         // BEGIN's INSTANCE_ID (27:26): FIRST, SUBSEQUENT (the next instance), UNCHANGED.
         if three_d && method == BEGIN {
             match value >> 26 & 3 {
@@ -1091,6 +1143,33 @@ mod tests {
         assert_eq!((d.cbufs[0][1], d.cbufs[0][2]), (Some((0x12_3456_7800, 0x100)), None));
         assert_eq!((d.cbufs[1][1], d.cbufs[1][2]), (None, Some((0x12_3456_7800, 0x100))));
         assert!(d.index.is_none());
+    }
+
+    /// The fast path skips only methods that do nothing past their store: every
+    /// engine method outside CALL_MME, on each class the game binds and on an
+    /// unbound subchannel, with values that set and clear fields (BEGIN's
+    /// SUBSEQUENT among them), gives the same effects and leaves the same state
+    /// as the full path.
+    #[test]
+    fn plain_stores_skip_only_methods_that_do_nothing() {
+        let state = |c: &Channel| format!("{:?} {:?} {:?} {:?} {:?} {:?}", c.resources, c.uploads, c.instance, c.wait, c.call, c.pending);
+        for class in [0xc797u32, 0xc7c0, 0xc7b5, 0xa140, 0] {
+            let (mut fast, mut full) = (Channel::default(), Channel { full: true, ..Channel::default() });
+            (fast.classes[0], full.classes[0]) = (class, class);
+            let mut skipped = 0;
+            for value in [0u32, 1, 0x5a5a_5a5a, 0xffff_ffff, 0x0400_0000] {
+                for method in (HOST_METHODS..0x4000).step_by(4).filter(|m| !CALL_MME.contains(m)) {
+                    let (mut a, mut b) = (Vec::new(), Vec::new());
+                    fast.write(0, method, value, &mut a, &mut |_, _| false);
+                    full.write(0, method, value, &mut b, &mut |_, _| false);
+                    assert_eq!(format!("{a:?}"), format!("{b:?}"), "class {class:#x} method {method:#x} = {value:#x}: effects");
+                    assert_eq!(state(&fast), state(&full), "class {class:#x} method {method:#x} = {value:#x}: state");
+                    skipped += usize::from(ACTED[(method / 4 / 64) as usize] >> (method / 4 % 64) & 1 == 0);
+                }
+            }
+            assert!(fast.engine == full.engine && fast.shadow == full.shadow && format!("{:?}", fast.mme) == format!("{:?}", full.mme), "class {class:#x}");
+            assert!(skipped > 5 * 3500, "most methods take the fast path: {skipped}");
+        }
     }
 
     #[test]
