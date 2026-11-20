@@ -1195,27 +1195,44 @@ impl Surfaces {
         // Each slot's handle, from the banks' bytes in this submit's blocks (by bank,
         // no search per word); None when it cannot be read, its error left to the loop
         // below, in slot order (computing them first changes nothing: no side effect).
-        let per_slot: SmallVec<[Option<u32>; 64]> = {
-            let mut by_bank: [Option<&[u8]>; 32] = [None; 32];
-            for &(b, id) in banks {
-                if let Some(at) = by_bank.get_mut(usize::from(b)) {
-                    *at = Some(&self.memo.blocks[id as usize][..]);
+        // Taken again for the same handle banks' read ids (`Memo::handles`); with one
+        // of them missing, or none listed, evaluated every time.
+        let ids: Option<SmallVec<[(u8, u32); 4]>> = (!t.interface.handle_banks.is_empty()).then(|| t.interface.handle_banks.iter().map(|&b| Some((b, bank(banks, b)?))).collect()).flatten();
+        let memo = ids.map(|ids| (std::ptr::from_ref(t) as usize, ids));
+        let found = memo.as_ref().and_then(|k| self.memo.handles.get(k)).cloned();
+        self.staging.handles[0] += u64::from(memo.is_some());
+        self.staging.handles[1] += u64::from(found.is_some());
+        let per_slot: SmallVec<[Option<u32>; 64]> = match found {
+            Some(per_slot) => per_slot,
+            None => {
+                // Keyed, only the banks the key names: what it keeps is what their bytes give.
+                let named: &[(u8, u32)] = memo.as_ref().map_or(banks, |k| &k.1[..]);
+                let mut by_bank: [Option<&[u8]>; 32] = [None; 32];
+                for &(b, id) in named {
+                    if let Some(at) = by_bank.get_mut(usize::from(b)) {
+                        *at = Some(&self.memo.blocks[id as usize][..]);
+                    }
                 }
+                let word = |b: u8, offset: u16| -> Option<u32> {
+                    let at = usize::from(offset);
+                    let w = by_bank.get(usize::from(b)).copied().flatten()?.get(at..at + 4)?;
+                    Some(u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+                };
+                let per_slot: SmallVec<[Option<u32>; 64]> = t
+                    .interface
+                    .textures
+                    .iter()
+                    .map(|x| match &x.handle {
+                        Handle::CBuf { bank, offset } => word(*bank, *offset),
+                        Handle::Uniform(e) => e.eval(&word),
+                        _ => None,
+                    })
+                    .collect();
+                if let Some(k) = memo {
+                    self.memo.handles.insert(k, per_slot.clone());
+                }
+                per_slot
             }
-            let word = |b: u8, offset: u16| -> Option<u32> {
-                let at = usize::from(offset);
-                let w = by_bank.get(usize::from(b)).copied().flatten()?.get(at..at + 4)?;
-                Some(u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
-            };
-            t.interface
-                .textures
-                .iter()
-                .map(|x| match &x.handle {
-                    Handle::CBuf { bank, offset } => word(*bank, *offset),
-                    Handle::Uniform(e) => e.eval(&word),
-                    _ => None,
-                })
-                .collect()
         };
         let handles: Option<SmallVec<[u32; 64]>> = per_slot.iter().copied().collect();
         let key: Option<SlotSetKey> = handles.map(|h| (std::ptr::from_ref(t) as usize, h, headers, samplers, binding, SmallVec::from_slice(attached)));
@@ -2153,20 +2170,23 @@ mod tests {
             assert_eq!(s.textures_read, [(TEX, "memory")], "journaled as read");
             (b.textures[0].view.clone(), reads.get(), s.staging.slot_sets, b.cbufs.clone())
         };
+        // Handles (lookups, finds) by the handle bank's read id follow: found while the id holds.
         let (first, _, _, banks) = stage(&mut s);
         let (again, read, sets, same) = stage(&mut s);
-        assert_eq!((again == first, read, sets, same == banks), (true, 1, [2, 1], true), "taken again, the bank unread");
+        assert_eq!((again == first, read, sets, same == banks, s.staging.handles), (true, 1, [2, 1], true, [2, 1]), "taken again, the bank unread");
         s.memo.wrote(BANK, 4);
         let (again, read, sets, fresh) = stage(&mut s);
-        assert_eq!((again == first, read, sets, fresh != banks), (true, 2, [3, 2], true), "a bank written: read under a new id, the same slots");
+        assert_eq!((again == first, read, sets, fresh != banks, s.staging.handles), (true, 2, [3, 2], true, [3, 1]), "a bank written: read under a new id, the same slots");
         s.memo.wrote(HEADERS, 4);
-        assert_eq!(stage(&mut s).2, [4, 2], "the headers written");
+        assert_eq!((stage(&mut s).2, s.staging.handles), ([4, 2], [4, 2]), "the headers written");
         assert_eq!(stage(&mut s).2, [5, 3]);
         s.memo.forget_slots();
-        assert_eq!(stage(&mut s).2, [6, 3], "the slots forgotten");
+        assert_eq!((stage(&mut s).2, s.staging.handles), ([6, 3], [6, 4]), "the slots forgotten, not the handles");
         s.new_submit(true);
         let (_, read, sets, _) = stage(&mut s);
-        assert_eq!((read, sets), (3, [7, 3]), "a new submit: the bank read again, the slots afresh");
+        assert_eq!((read, sets, s.staging.handles), (3, [7, 3], [7, 4]), "a new submit: the bank read again, the slots and handles afresh");
+        s.flush();
+        assert!(s.memo.handles.is_empty(), "a flush empties them: the ids restart");
     }
 
     /// A stage's texture slots are taken again for the same handles, read from
@@ -2184,7 +2204,8 @@ mod tests {
         put(&mut tic, &[(6, 0, 0x08), (9, 7, 2), (12, 10, 2), (15, 13, 2), (18, 16, 2), (21, 19, 2), (24, 22, 3), (27, 25, 4), (30, 28, 5)]);
         put(&mut tic, &[(63, 41, (TEX >> 9) as u32), (87, 85, 3), (144, 128, 7), (175, 160, 7), (154, 151, 1), (191, 191, 1)]);
         let x = Texture { handle: Handle::CBuf { bank: 0, offset: 0 }, dim: TexDim::D2, compare: false, fetch: false, query: false };
-        let t = Translation { key: 0, stage: Stage::Pixel, wgsl: String::new(), interface: Interface { textures: vec![x], ..Default::default() } };
+        // The handle's bank listed as the translator lists it.
+        let t = Translation { key: 0, stage: Stage::Pixel, wgsl: String::new(), interface: Interface { textures: vec![x], handle_banks: [0].into(), ..Default::default() } };
         let regions = [(TEX, vec![7u8; 512]), (HEADERS, [tic, tic].concat()), (SAMPLERS, vec![0u8; 32])];
         let mut mem = |addr: u64, out: &mut [u8]| {
             regions.iter().any(|(at, data)| {
@@ -2249,6 +2270,11 @@ mod tests {
         assert_eq!(first_error(&mut s, &unreadable).as_deref(), Some("texture handle offset"));
         let uniform = t(vec![x(Handle::Uniform(crate::shader::uexpr::UExpr::CBuf(1, 0)))]);
         assert_eq!(first_error(&mut s, &uniform).as_deref(), Some("texture handle offset"), "bank 1 not read");
+        // A handle read from a bank its translation does not list among its handle banks is
+        // not evaluated: the handles are kept under a key that names those banks' bytes only.
+        let both: BankIds = smallvec![(0u8, s.block(vec![0u8; 4])), (1u8, s.block(vec![0u8; 4]))];
+        let unlisted = Translation { key: 0, stage: Stage::Pixel, wgsl: String::new(), interface: Interface { textures: vec![x(Handle::CBuf { bank: 1, offset: 0 })], handle_banks: [0].into(), ..Default::default() } };
+        assert_eq!(s.texture_slots(&unlisted, &both, pools.0, pools.1, pools.2, &[], &mut nothing).err().as_deref(), Some("texture handle offset"), "bank 1 not listed");
     }
 
     /// Level `level` of `t`, every slice, as rows of `pitch` bytes (`t` needs COPY_SRC).

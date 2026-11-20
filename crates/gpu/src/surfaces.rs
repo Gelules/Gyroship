@@ -795,6 +795,8 @@ pub struct Staging {
     pub bind_groups: [u64; 2],
     /// Stages' texture slots looked up by their handles (`Memo::slot_sets`), then found there.
     pub slot_sets: [u64; 2],
+    /// Stages' handles looked up by their banks' read ids (`Memo::handles`), then found there.
+    pub handles: [u64; 2],
     /// Textures uploaded from guest memory: bytes, and host nanoseconds (read,
     /// deswizzle, copy, and the wait after a large one).
     pub uploads: [u64; 2],
@@ -922,6 +924,11 @@ pub(crate) struct Memo {
     /// (`draw::SlotSetKey`): the same handles from banks rewritten or moved give
     /// the same slots while their headers and targets hold. Emptied with `slots`.
     pub(crate) slot_sets: FxMap<crate::draw::SlotSetKey, crate::draw::SlotSet>,
+    /// Stages' texture handles by translation (its address) and the read ids
+    /// of the banks they come from: the same ids hold the same bytes, so give
+    /// the same handles, unevaluated. Ids restart at a flush: emptied with the
+    /// rest, at each submit and flush.
+    pub(crate) handles: FxMap<(usize, smallvec::SmallVec<[(u8, u32); 4]>), smallvec::SmallVec<[Option<u32>; 64]>>,
     /// The epoch of each page written by the GPU in this submit, in page order:
     /// an entry's check visits only the written pages inside it. Sorted by page
     /// (30 to 60 pages a submit in heavy Corneria frames: a binary search).
@@ -935,6 +942,7 @@ impl Memo {
         self.indices.clear();
         self.descriptors.clear();
         self.forget_slots();
+        self.handles.clear();
         self.pages.clear();
     }
 
