@@ -574,6 +574,15 @@ pub fn run(mut table: Vec<rt::Entry>, window: Option<HostWindow>) {
                     eprintln!("gyroship: cannot start the GPU submit thread: {e}");
                     std::process::exit(2);
                 }
+                // S12c: and recorded on another while the GPU thread resolves the next draws.
+                // GYROSHIP_RECORDER=thread: in a deterministic run too, which proves it bit for bit
+                // while wgpu raises no error (the two threads' errors may come in either order).
+                if (k.config.play || std::env::var_os("GYROSHIP_RECORDER").is_some_and(|v| v == "thread"))
+                    && let Err(e) = s.start_recorder_thread()
+                {
+                    eprintln!("gyroship: cannot start the GPU recorder thread: {e}");
+                    std::process::exit(2);
+                }
                 k.gpu_side().surfaces = Some(s);
             }
             Err(e) => {

@@ -733,6 +733,9 @@ impl GpuSide {
             if s.submit_ended {
                 return Err((crate::STOP_EXIT, "the GPU submit thread ended: frames were lost".into()));
             }
+            if s.recorder_ended {
+                return Err((crate::STOP_EXIT, "the GPU recorder thread ended: frames were lost".into()));
+            }
             s.next_frame();
             let skipped = std::mem::take(&mut s.skipped);
             if let Some(p) = &perf {
@@ -747,9 +750,19 @@ impl GpuSide {
                 });
                 #[cfg(not(windows))]
                 let submit_cpu: Option<std::time::Duration> = None;
+                // The recorder thread's CPU time and this thread's waits for it (S12c), 0 without it.
+                let recorder = s.recorder_thread();
+                #[cfg(windows)]
+                let recorder_cpu = recorder.and_then(|(h, _)| {
+                    use std::os::windows::io::AsRawHandle;
+                    gyroship_runtime::profile::cpu_time(h.as_raw_handle() as usize)
+                });
+                #[cfg(not(windows))]
+                let recorder_cpu: Option<std::time::Duration> = None;
+                let recorder_wait = recorder.map(|(_, w)| w).unwrap_or_default();
                 let (st, calls) = (&s.staging, p.macro_calls);
                 let row = format!(
-                    "{n},{cpu:.1},{},{},{},{},{},{},{:.1},{calls},{},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{},{:016x}\n",
+                    "{n},{cpu:.1},{},{},{},{},{},{},{:.1},{calls},{},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{},{:016x},{:.1},{:.1}\n",
                     s.drawn,
                     skipped.values().sum::<u64>(),
                     st.views[0],
@@ -768,7 +781,9 @@ impl GpuSide {
                     p.queue_wait_ns as f64 / 1e6,
                     p.decoder_cpu.as_secs_f64() * 1e3,
                     st.recordings,
-                    st.layout
+                    st.layout,
+                    recorder_cpu.unwrap_or_default().as_secs_f64() * 1e3,
+                    recorder_wait.as_secs_f64() * 1e3
                 );
                 self.frames += &row;
             }

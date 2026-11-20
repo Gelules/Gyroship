@@ -926,7 +926,7 @@ impl Surfaces {
         // one. Anything else recorded ends it (`Surfaces::push`). Timed draws
         // each keep a pass of their own.
         let key: PassKey = (colors.clone(), depth, ps.is_some());
-        let timed = self.rec.timing.is_some();
+        let timed = self.timed;
         let pass = if timed || self.open.as_ref() != Some(&key) {
             let color_views: Vec<Option<wgpu::TextureView>> = colors.iter().map(|c| c.map(|(s, f)| self.texture(&s, f))).collect();
             let depth_view = depth.map(|(s, f)| (self.texture(&s, f), f));
@@ -2055,7 +2055,7 @@ mod tests {
         put(&mut h, &[(63, 41, (TEX >> 9) as u32), (87, 85, 3), (144, 128, 7), (175, 160, 7), (154, 151, 1), (191, 191, 1)]);
         // RGBA8 4096x2048, one level: 32 MiB.
         let tic = textures::Tic { width: 4096, height: 2048, max_mip_level: 0, view_levels: Some((0, 0)), ..textures::tic(&h).unwrap() };
-        let staged = s.rec.stage(&[1, 2, 3, 4]);
+        let staged = s.rec().stage(&[1, 2, 3, 4]);
         let guest = vec![7u8; textures::layer_stride(&tic).unwrap() as usize];
         let mut mem = |addr: u64, out: &mut [u8]| guest.get((addr - TEX) as usize..(addr - TEX) as usize + out.len()).map(|src| out.copy_from_slice(src)).is_some();
         s.upload(&tic, h, &mut mem).unwrap_or_else(|e| panic!("{e}"));
@@ -2260,6 +2260,7 @@ mod tests {
         };
         if threaded {
             s.start_submit_thread().unwrap();
+            s.start_recorder_thread().unwrap();
         }
         const TEX: u64 = 0x50_0000;
         let mut h = [0u8; 32];
@@ -2414,6 +2415,7 @@ mod tests {
         };
         if threaded {
             s.start_submit_thread().unwrap();
+            s.start_recorder_thread().unwrap();
         }
         let (tic, h, slice) = dxt1_array();
         let mut guest: Vec<u8> = (0..slice(2, 2).end).map(|i| (i * 3 + 1) as u8).collect();

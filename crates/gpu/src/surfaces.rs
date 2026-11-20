@@ -213,8 +213,17 @@ pub struct Surfaces {
     pub errors: Arc<Mutex<Vec<String>>>,
     /// What the recording side keeps and does (S12): the frame's encoder and its
     /// open pass, the upload arena, the bind groups. It is sent commands
-    /// ([`Surfaces::push`]) and read only at a flush.
-    pub(crate) rec: crate::record::Recorder,
+    /// ([`Surfaces::push`]), in batches, and read only once it has applied them
+    /// all ([`Surfaces::rec`]). Play mode: on a thread of its own (S12c).
+    rec: Arc<Mutex<crate::record::Recorder>>,
+    /// The commands not sent yet, and the recorder thread they go to (else applied here).
+    batch: Vec<crate::record::Rec>,
+    recorder: Option<RecorderThread>,
+    /// Play mode: the recorder thread ended (its panic is on stderr), losing the
+    /// frames it held: the run must stop.
+    pub recorder_ended: bool,
+    /// Whether draws are timed (`timing.rs`), known here without the recorder.
+    pub(crate) timed: bool,
     /// The targets of the pass the recorder holds open for the next draws: a
     /// draw to the same ones records into it (a pass per draw cost a begin and
     /// an end each, ~585 a frame); anything else recorded ends it first.
@@ -735,6 +744,21 @@ pub(crate) struct Submitter {
     in_flight: std::collections::VecDeque<wgpu::SubmissionIndex>,
 }
 
+/// Commands sent to the recorder at a time: a heavy frame sends about 10,000.
+const BATCH: usize = 64;
+
+/// The way to the recorder thread (S12c): its batches (16 waiting at most),
+/// how many were sent and how many it applied (with whether it ended, a panic
+/// too), the thread itself (its CPU time, `--perf`), and the host nanoseconds
+/// this thread waited for it.
+struct RecorderThread {
+    batches: std::sync::mpsc::SyncSender<Vec<crate::record::Rec>>,
+    sent: u64,
+    applied: Arc<(Mutex<(u64, bool)>, std::sync::Condvar)>,
+    thread: std::thread::JoinHandle<()>,
+    waited: u64,
+}
+
 /// The way to the submit thread: its jobs (one running and one waiting at
 /// most), the arena bytes it gives back, the nanoseconds its jobs took, and
 /// the thread itself (its CPU time, `--perf`).
@@ -1069,9 +1093,11 @@ impl Surfaces {
         let dynamic_max = device.limits().max_dynamic_uniform_buffers_per_pipeline_layout;
         let clip_distances = device.features().contains(wgpu::Features::CLIP_DISTANCES);
         let window = window.map(|(surface, size)| Window::new(&adapter, &device, surface, size));
-        let rec = crate::record::Recorder::new(&device, &queue, crate::timing::Timing::new(&device, &queue));
+        let timing = crate::timing::Timing::new(&device, &queue);
+        let timed = timing.is_some();
+        let rec = Arc::new(Mutex::new(crate::record::Recorder::new(&device, &queue, timing)));
         let renderable = (0..=0xff).filter_map(color_format).chain((0..=0xff).filter_map(depth_format)).map(|f| (f, renderable_on(&adapter, &device, f))).collect();
-        Ok(Surfaces { renderable, adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, rec, open: None, sets: 0, present: 0, readbacks: Default::default(), hasher: None, belt, big_upload: false, texture_belt, uploads: None, staging: Staging::default(), last_color: None, window, submit: None, submit_ended: false, memo: Memo::default(), compile: Compile::default(), compile_total: Compile::default(), background: false, wait_left: PIPELINE_WAIT, workers: None, finished: Default::default(), disk_cache: None, shader_cache: None, views: Aged::default(), dynamic_max, clip_distances })
+        Ok(Surfaces { renderable, adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, rec, batch: Vec::with_capacity(BATCH), recorder: None, recorder_ended: false, timed, open: None, sets: 0, present: 0, readbacks: Default::default(), hasher: None, belt, big_upload: false, texture_belt, uploads: None, staging: Staging::default(), last_color: None, window, submit: None, submit_ended: false, memo: Memo::default(), compile: Compile::default(), compile_total: Compile::default(), background: false, wait_left: PIPELINE_WAIT, workers: None, finished: Default::default(), disk_cache: None, shader_cache: None, views: Aged::default(), dynamic_max, clip_distances })
     }
 
     /// Shows the presented image (the color target written last, its top-left
@@ -1100,7 +1126,108 @@ impl Surfaces {
         if matches!(r, crate::record::Rec::Run(_)) {
             self.open = None;
         }
-        self.rec.apply(r);
+        self.batch.push(r);
+        if self.batch.len() >= BATCH {
+            self.send_batch();
+        }
+    }
+
+    /// The commands not sent yet go to the recorder thread, or are applied here without one.
+    fn send_batch(&mut self) {
+        if self.batch.is_empty() {
+            return;
+        }
+        match &mut self.recorder {
+            Some(t) => {
+                use std::sync::mpsc::TrySendError;
+                let batch = std::mem::replace(&mut self.batch, Vec::with_capacity(BATCH));
+                // A full queue is a wait for the recorder too: timed.
+                let sent = match t.batches.try_send(batch) {
+                    Err(TrySendError::Full(batch)) => {
+                        let since = std::time::Instant::now();
+                        let sent = t.batches.send(batch).is_ok();
+                        t.waited += since.elapsed().as_nanos() as u64;
+                        sent
+                    }
+                    other => other.is_ok(),
+                };
+                match sent {
+                    true => t.sent += 1,
+                    false => self.recorder_ended = true,
+                }
+            }
+            None => {
+                let mut r = self.rec.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                for c in self.batch.drain(..) {
+                    r.apply(c);
+                }
+            }
+        }
+    }
+
+    /// Returns once the recorder has applied every command sent so far (play
+    /// mode: waits for its thread, or sees it ended).
+    fn drain_recorder(&mut self) {
+        self.send_batch();
+        let Some(t) = &mut self.recorder else { return };
+        let since = std::time::Instant::now();
+        let (state, changed) = &*t.applied;
+        let mut s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        while s.0 < t.sent && !s.1 {
+            s = changed.wait(s).unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        let ended = s.1;
+        drop(s);
+        t.waited += since.elapsed().as_nanos() as u64;
+        self.recorder_ended |= ended;
+    }
+
+    /// The recorder, once it has applied every command sent so far.
+    pub(crate) fn rec(&mut self) -> std::sync::MutexGuard<'_, crate::record::Recorder> {
+        self.drain_recorder();
+        self.rec.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Play mode (S12c): from now on the recorder applies its commands on a
+    /// thread of its own while this one resolves the next draws. Not with
+    /// GYROSHIP_GPU_TIMES, whose timed passes wait for the GPU anyway.
+    pub fn start_recorder_thread(&mut self) -> std::io::Result<()> {
+        if self.timed || self.recorder.is_some() {
+            return Ok(());
+        }
+        self.drain_recorder();
+        let (batches, rx) = std::sync::mpsc::sync_channel::<Vec<crate::record::Rec>>(16);
+        let applied = Arc::new((Mutex::new((0u64, false)), std::sync::Condvar::new()));
+        let (rec, progress) = (self.rec.clone(), applied.clone());
+        let thread = std::thread::Builder::new().name("gpu recorder".into()).spawn(move || {
+            /// However the thread ends (a panic too), the GPU thread's waits see it.
+            struct Ended(Arc<(Mutex<(u64, bool)>, std::sync::Condvar)>);
+            impl Drop for Ended {
+                fn drop(&mut self) {
+                    self.0.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).1 = true;
+                    self.0.1.notify_all();
+                }
+            }
+            let _ended = Ended(progress.clone());
+            for batch in rx {
+                {
+                    let mut r = rec.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    for c in batch {
+                        r.apply(c);
+                    }
+                }
+                progress.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).0 += 1;
+                progress.1.notify_all();
+            }
+        })?;
+        self.recorder = Some(RecorderThread { batches, sent: 0, applied, thread, waited: 0 });
+        Ok(())
+    }
+
+    /// Play mode: the recorder thread, while it runs (its CPU time, `--perf`),
+    /// and the host time this thread waited for it.
+    pub fn recorder_thread(&self) -> Option<(&std::thread::JoinHandle<()>, std::time::Duration)> {
+        self.recorder.as_ref().map(|t| (&t.thread, std::time::Duration::from_nanos(t.waited)))
     }
 
     /// Records `run` into the frame's encoder, in order with the draws.
@@ -1111,8 +1238,10 @@ impl Surfaces {
     /// Times each frame's GPU work from now on (`--perf`); false if the GPU
     /// has no timestamps inside command encoders.
     pub fn measure_frames(&mut self) -> bool {
-        self.rec.clock = crate::timing::FrameClock::new(&self.device, &self.queue);
-        self.rec.clock.is_some()
+        let clock = crate::timing::FrameClock::new(&self.device, &self.queue);
+        let measured = clock.is_some();
+        self.rec().clock = clock;
+        measured
     }
 
     /// Waits for the GPU; each present's GPU milliseconds (index: present) and
@@ -1126,9 +1255,10 @@ impl Surfaces {
             self.send(Box::new(move |s: &mut Submitter| {
                 let _ = tx.send(s.clock.take());
             }));
-            self.rec.clock = rx.recv_timeout(std::time::Duration::from_secs(3)).ok().flatten();
+            self.rec().clock = rx.recv_timeout(std::time::Duration::from_secs(3)).ok().flatten();
         }
-        self.rec.clock.as_mut().map_or((Vec::new(), 0), |c| (c.finish(&self.device), c.stalls))
+        let device = self.device.clone();
+        self.rec().clock.as_mut().map_or((Vec::new(), 0), |c| (c.finish(&device), c.stalls))
     }
 
     /// `--pipeline-cache DIR`: the driver's compiled pipelines are kept in DIR, in
@@ -1307,8 +1437,8 @@ impl Surfaces {
 
     /// The bytes of a block staged in the current arena.
     #[cfg(test)]
-    pub(crate) fn arena_bytes(&self, s: &Slice, len: usize) -> &[u8] {
-        &self.rec.arena.1[s.1 as usize..s.1 as usize + len]
+    pub(crate) fn arena_bytes(&mut self, s: &Slice, len: usize) -> Vec<u8> {
+        self.rec().arena.1[s.1 as usize..s.1 as usize + len].to_vec()
     }
 
     /// Records indices read by the caller (see [`Surfaces::staged_indices`]).
@@ -1327,7 +1457,10 @@ impl Surfaces {
         // The frame's blocks and sets end here, on both sides: their ids start again.
         self.memo.blocks.clear();
         self.sets = 0;
-        let r = &mut self.rec;
+        // The recorder has applied everything (play mode: its thread waits for the next batch).
+        self.drain_recorder();
+        let rec = self.rec.clone();
+        let mut r = rec.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         r.end_frame();
         let whole = r.arena.1.len().next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT as usize);
         r.arena.1.resize(whole, 0);
@@ -1345,15 +1478,16 @@ impl Surfaces {
             self.submit_ended = true;
         }
         if self.submit.is_some() {
-            self.hand_over();
+            self.hand_over(&mut r);
         } else {
             // The texture staging is closed even with no upload: a refresh may have used it.
             self.texture_belt.finish();
-            let r = &mut self.rec;
             let f = Frame { uploads: self.uploads.take(), arena: (r.arena.0.clone(), std::mem::take(&mut r.arena.1)), pending: r.encoder.take(), present: self.present };
+            let r = &mut *r;
             r.arena.1 = submit_frame(&self.device, &self.queue, &mut self.belt, r.clock.as_mut(), r.timing.as_mut(), false, f).0;
             self.texture_belt.recall();
         }
+        drop(r);
         if let Some(t) = &self.submit {
             self.staging.submit_ns = t.busy.load(std::sync::atomic::Ordering::Relaxed);
         }
@@ -1362,8 +1496,7 @@ impl Surfaces {
 
     /// Play mode: the work recorded so far goes to the submit thread, which
     /// finishes and submits it while this thread records the next frame.
-    fn hand_over(&mut self) {
-        let r = &mut self.rec;
+    fn hand_over(&mut self, r: &mut crate::record::Recorder) {
         if self.uploads.is_none() && r.encoder.is_none() && r.arena.1.is_empty() {
             return;
         }
@@ -1394,7 +1527,7 @@ impl Surfaces {
     /// frame clock and the window go with it. Not with GYROSHIP_GPU_TIMES,
     /// which waits for the GPU at each flush anyway.
     pub fn start_submit_thread(&mut self) -> std::io::Result<()> {
-        if self.rec.timing.is_some() {
+        if self.timed {
             return Ok(());
         }
         let (jobs, rx) = std::sync::mpsc::sync_channel::<SubmitJob>(1);
@@ -1402,9 +1535,10 @@ impl Surfaces {
         let busy = Arc::new(std::sync::atomic::AtomicU64::new(0));
         // The arena's staging is the thread's now; this one serves only if the thread ends.
         let belt = std::mem::replace(&mut self.belt, wgpu::util::StagingBelt::new(self.device.clone(), 16 << 20));
-        let mut s = Submitter { device: self.device.clone(), queue: self.queue.clone(), belt, clock: self.rec.clock.take(), window: self.window.take(), spare: back, in_flight: Default::default() };
+        let clock = self.rec().clock.take();
+        let mut s = Submitter { device: self.device.clone(), queue: self.queue.clone(), belt, clock, window: self.window.take(), spare: back, in_flight: Default::default() };
         // The recorder syncs with the thread before the arena grows.
-        self.rec.submit = Some(jobs.clone());
+        self.rec().submit = Some(jobs.clone());
         let took = busy.clone();
         let thread = std::thread::Builder::new().name("gpu submit".into()).spawn(move || {
             for job in rx {
@@ -1446,13 +1580,25 @@ impl Surfaces {
         }
     }
 
-    /// As [`Surfaces::sync`], `patience` at most, even with the submit thread
-    /// stuck in the driver (the end of a run); false if it is still busy then.
-    /// A thread that ended holds nothing more.
+    /// As [`Surfaces::sync`], `patience` at most, even with the recorder or
+    /// the submit thread stuck in the driver (the end of a run); false if one
+    /// is still busy then. A thread that ended holds nothing more. The
+    /// recorder's batches sent are waited for, not the commands not sent yet.
     pub fn drain(&self, patience: std::time::Duration) -> bool {
         use std::sync::mpsc::{RecvTimeoutError, TrySendError};
-        let Some(t) = &self.submit else { return true };
         let since = std::time::Instant::now();
+        if let Some(t) = &self.recorder {
+            let (state, changed) = &*t.applied;
+            let mut s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            while s.0 < t.sent && !s.1 {
+                let left = patience.saturating_sub(since.elapsed());
+                if left.is_zero() {
+                    return false;
+                }
+                s = changed.wait_timeout(s, left).unwrap_or_else(std::sync::PoisonError::into_inner).0;
+            }
+        }
+        let Some(t) = &self.submit else { return true };
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let mut job: SubmitJob = Box::new(move |_: &mut Submitter| {
             let _ = tx.send(());
@@ -1505,7 +1651,7 @@ impl Surfaces {
     /// one before used are dropped.
     pub fn next_frame(&mut self) {
         self.views.age();
-        self.rec.next_frame();
+        self.rec().next_frame();
         self.wait_left = PIPELINE_WAIT;
     }
 
@@ -2023,13 +2169,13 @@ mod tests {
             return;
         };
         let (a, b) = (vec![1u8; 4096], vec![2u8; 4096]);
-        let first = s.rec.stage(&a).1;
-        assert_eq!(s.rec.stage(&a).1, first);
-        assert_ne!(s.rec.stage(&b).1, first);
-        assert_eq!(s.rec.stage(&a[..100]).2, 100);
+        let first = s.rec().stage(&a).1;
+        assert_eq!(s.rec().stage(&a).1, first);
+        assert_ne!(s.rec().stage(&b).1, first);
+        assert_eq!(s.rec().stage(&a[..100]).2, 100);
         s.flush();
-        assert_eq!(s.rec.arena.1.len(), 0);
-        assert_eq!(s.rec.stage(&b).1, 0);
+        assert_eq!(s.rec().arena.1.len(), 0);
+        assert_eq!(s.rec().stage(&b).1, 0);
     }
 
     /// Blocks are shared within their frame only: after a flush, a block takes a
@@ -2042,11 +2188,11 @@ mod tests {
             return;
         };
         let block = vec![5u8; 64];
-        assert_eq!(s.rec.stage(&block).1, 0);
+        assert_eq!(s.rec().stage(&block).1, 0);
         s.flush();
         s.push(crate::record::Rec::Block(0, Arc::new(block.clone())));
-        assert_eq!(s.rec.stage_raw(0).1, 0);
-        assert_eq!(s.rec.stage(&block).1, ARENA_ALIGN as u64, "not the last frame's block");
+        assert_eq!(s.rec().stage_raw(0).1, 0);
+        assert_eq!(s.rec().stage(&block).1, ARENA_ALIGN as u64, "not the last frame's block");
     }
 
     /// The arena's layout hash follows where blocks were written: a block
@@ -2060,11 +2206,12 @@ mod tests {
             return;
         };
         let mut frame = |second: &[u8]| {
-            s.rec.stage(&[1u8; 64]);
-            s.rec.stage(second);
+            s.rec().stage(&[1u8; 64]);
+            s.rec().stage(second);
             s.flush();
-            assert_eq!(s.staging.layout, s.rec.staging.layout, "taken over at the flush");
-            std::mem::take(&mut s.rec.staging.layout)
+            let layout = std::mem::take(&mut s.rec().staging.layout);
+            assert_eq!(s.staging.layout, layout, "taken over at the flush");
+            layout
         };
         let shared = frame(&[1u8; 64]);
         assert_eq!(frame(&[1u8; 64]), shared);
@@ -2205,18 +2352,21 @@ mod tests {
             true
         };
         let (id, _) = s.read_guest(Read::Bank, 0x1000, 64, &mut mem).unwrap();
-        let first = s.rec.stage_bank(id, 64);
-        let calls = s.rec.staging.calls;
-        assert_eq!((s.rec.stage_bank(id, 64).1, s.rec.staging.calls), (first.1, calls), "found by its id");
-        assert_ne!(s.rec.stage_bank(id, 32).1, first.1, "another window, another block");
+        let mut r = s.rec();
+        let first = r.stage_bank(id, 64);
+        let calls = r.staging.calls;
+        assert_eq!((r.stage_bank(id, 64).1, r.staging.calls), (first.1, calls), "found by its id");
+        assert_ne!(r.stage_bank(id, 32).1, first.1, "another window, another block");
+        drop(r);
         s.invalidate(0x1000, 4);
         value.set(2);
         let (again, _) = s.read_guest(Read::Bank, 0x1000, 64, &mut mem).unwrap();
         assert_ne!(again, id, "read again: a new id");
-        let fresh = s.rec.stage_bank(again, 64);
+        let fresh = s.rec().stage_bank(again, 64);
         assert_eq!(s.arena_bytes(&fresh, 64), [2u8; 64], "its new bytes");
-        s.rec.grow(0);
-        assert!(s.rec.stage_bank(again, 64).0 == s.rec.arena.0, "staged again in the grown arena");
+        let mut r = s.rec();
+        r.grow(0);
+        assert!(r.stage_bank(again, 64).0 == r.arena.0, "staged again in the grown arena");
     }
 
     /// The recorder applies its commands in order: two draws to one target share
@@ -2225,14 +2375,23 @@ mod tests {
     /// its own and sets its viewport again, though the last pass ended with it.
     /// Identical blocks staged as they are keep their own ranges. The pipeline
     /// comes before an older one still being made (play mode): found by its id.
-    /// Needs a GPU adapter.
+    /// Applied here, then on the recorder thread. Needs a GPU adapter.
     #[test]
     fn the_recorder_applies_commands_in_order() {
+        recorder_applies(false);
+        recorder_applies(true);
+    }
+
+    fn recorder_applies(threaded: bool) {
         use crate::record::{Call, DrawRec, GroupRec, PassOpen, Rec};
         let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
             eprintln!("no GPU adapter: test skipped");
             return;
         };
+        if threaded {
+            s.start_recorder_thread().unwrap();
+            assert!(s.recorder.is_some(), "no recorder thread (GYROSHIP_GPU_TIMES set?)");
+        }
         let d = s.device.clone();
         // Read back through a sampling pass (`rgba`).
         let texture = |usage| d.create_texture(&wgpu::TextureDescriptor { label: None, size: wgpu::Extent3d { width: 4, height: 4, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::Rgba8Unorm, usage: usage | wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[] });
@@ -2279,20 +2438,41 @@ mod tests {
             rec.record(e);
         });
         s.push(draw(4, 1, 2.0, open()));
-        assert!(s.rec.stage_raw(1).1 != s.rec.stage_raw(3).1, "identical blocks staged as they are keep their own ranges");
-        assert_eq!(s.rec.staging.recordings, 3, "the first two draws shared a pass");
+        let mut r = s.rec();
+        assert!(r.stage_raw(1).1 != r.stage_raw(3).1, "identical blocks staged as they are keep their own ranges");
+        assert_eq!(r.staging.recordings, 3, "the first two draws shared a pass");
+        drop(r);
         s.flush();
         let read = |t: &wgpu::Texture| s.rgba(&Entry { surface: Surface { addr: 0, width: 4, height: 4, format: 0xd5, layers: 1 }, texture: t.clone(), written: 0 }).unwrap();
         // Pixels (0, 0) and (2, 0): the left half and the right.
         let halves = |rgba: Vec<u8>| (rgba[0..4].to_vec(), rgba[8..12].to_vec());
-        assert_eq!(halves(read(&copy)), (vec![255, 0, 0, 255], vec![0, 255, 0, 255]), "the copy sees both draws before it");
-        assert_eq!(halves(read(&target)), (vec![255, 0, 0, 255], vec![0, 0, 255, 255]), "the last draw kept to its viewport");
-        assert!(s.errors.lock().unwrap().is_empty(), "{:?}", s.errors.lock().unwrap());
+        assert_eq!(halves(read(&copy)), (vec![255, 0, 0, 255], vec![0, 255, 0, 255]), "threaded {threaded}: the copy sees both draws before it");
+        assert_eq!(halves(read(&target)), (vec![255, 0, 0, 255], vec![0, 0, 255, 255]), "threaded {threaded}: the last draw kept to its viewport");
+        assert!(s.errors.lock().unwrap().is_empty(), "threaded {threaded}: {:?}", s.errors.lock().unwrap());
+    }
+
+    /// A recorder thread that ends (here a recording that panics) does not
+    /// hold the GPU thread: its flush comes back and says the thread ended.
+    /// Needs a GPU adapter.
+    #[test]
+    fn a_recorder_thread_that_ends_is_seen() {
+        let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
+            eprintln!("no GPU adapter: test skipped");
+            return;
+        };
+        s.start_recorder_thread().unwrap();
+        s.run(|_| panic!("a recording that fails (this test's own panic)"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            s.flush();
+            let _ = tx.send(s.recorder_ended);
+        });
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(10)), Ok(true));
     }
 
     /// Vertices read exactly, then staged as they are: the guest's bytes then
     /// zeros to a multiple of 4, aligned, once a submit, and again in a grown
-    /// arena; an unreadable read stages nothing.
+    /// arena or the next frame; an unreadable read stages nothing.
     #[test]
     fn guest_blocks_are_staged_as_they_were_read() {
         let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
@@ -2303,18 +2483,22 @@ mod tests {
             buf.iter_mut().enumerate().for_each(|(i, b)| *b = (addr as usize + i) as u8);
             addr != 0xdead
         };
-        let mut stage = |s: &mut Surfaces, addr: u64, len: usize| s.read_exact(Read::Vertex, addr, len, len.next_multiple_of(4), &mut mem).map(|id| s.rec.stage_raw(id));
+        let mut stage = |s: &mut Surfaces, addr: u64, len: usize| s.read_exact(Read::Vertex, addr, len, len.next_multiple_of(4), &mut mem).map(|id| s.rec().stage_raw(id));
         let a = stage(&mut s, 0x10, 6).unwrap();
         assert_eq!((a.1, a.2), (0, 8));
         assert_eq!(s.arena_bytes(&a, 8), [0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0, 0]);
-        let len = s.rec.arena.1.len();
+        let len = s.rec().arena.1.len();
         assert_eq!(stage(&mut s, 0x10, 6).unwrap().1, 0, "read and staged once");
         assert!(stage(&mut s, 0xdead, 64).is_none());
-        assert_eq!(s.rec.arena.1.len(), len);
+        assert_eq!(s.rec().arena.1.len(), len);
         let b = stage(&mut s, 0x20, 4).unwrap();
-        assert_eq!((b.1, s.arena_bytes(&b, 4)), (ARENA_ALIGN as u64, &[0x20, 0x21, 0x22, 0x23][..]));
-        s.rec.grow(0);
-        assert!(stage(&mut s, 0x10, 6).unwrap().0 == s.rec.arena.0, "staged again in the grown arena");
+        assert_eq!((b.1, s.arena_bytes(&b, 4)), (ARENA_ALIGN as u64, vec![0x20, 0x21, 0x22, 0x23]));
+        s.rec().grow(0);
+        let again = stage(&mut s, 0x10, 6).unwrap();
+        assert!(again.0 == s.rec().arena.0, "staged again in the grown arena");
+        // A new frame: its blocks' ids start again on both sides.
+        s.flush();
+        assert_eq!(stage(&mut s, 0x10, 6).unwrap().1, 0, "read and staged again in the next frame");
     }
 
     /// Presented images are hashed off the frame: each present's hash comes
@@ -2356,7 +2540,8 @@ mod tests {
             }));
             open
         };
-        for threaded in [false, true] {
+        // The submit thread, and the recorder thread (S12c), each on or off.
+        for (threaded, recorded) in [(false, false), (true, false), (false, true), (true, true)] {
             let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
                 eprintln!("no GPU adapter: test skipped");
                 return;
@@ -2365,6 +2550,9 @@ mod tests {
             if threaded {
                 s.start_submit_thread().unwrap();
                 assert!(s.submit.is_some(), "no submit thread (GYROSHIP_GPU_TIMES set?)");
+            }
+            if recorded {
+                s.start_recorder_thread().unwrap();
             }
             for n in 1..=5u8 {
                 s.present = u64::from(n);
@@ -2387,17 +2575,17 @@ mod tests {
                     assert!(s.hash_presented(u64::from(n), 4, 2));
                 }
             }
-            assert!(s.rec.arena.0.size() > 16 << 20, "the arena grew");
+            assert!(s.rec().arena.0.size() > 16 << 20, "the arena grew");
             let (ms, _) = s.frame_times();
             let rgba = |n: u8| {
                 let green = if n == 5 { 4 } else { n };
                 [17 * n, 255 - 17 * green, if n < 3 { 0 } else { 64 }, 0]
             };
             let want: Vec<_> = [1u8, 3, 5].iter().map(|&n| (u64::from(n), target.addr, fnv(&rgba(n).repeat(8)))).collect();
-            assert_eq!(s.presented_hashes(), want, "threaded {threaded}");
+            assert_eq!(s.presented_hashes(), want, "threaded {threaded}, recorded {recorded}");
             // Microseconds of work: a slot without its first timestamp would give the GPU clock's value.
-            assert!(!timed || (1..=5).all(|n| ms.get(n).is_some_and(|&t| t > 0.0 && t < 100.0)), "threaded {threaded}: GPU times {ms:?}");
-            assert!(s.errors.lock().unwrap().is_empty(), "threaded {threaded}: {:?}", s.errors.lock().unwrap());
+            assert!(!timed || (1..=5).all(|n| ms.get(n).is_some_and(|&t| t > 0.0 && t < 100.0)), "threaded {threaded}, recorded {recorded}: GPU times {ms:?}");
+            assert!(s.errors.lock().unwrap().is_empty(), "threaded {threaded}, recorded {recorded}: {:?}", s.errors.lock().unwrap());
             if threaded {
                 let open = hold(&mut s);
                 assert!(!s.drain(std::time::Duration::from_millis(100)), "a drain waits for a held thread");
