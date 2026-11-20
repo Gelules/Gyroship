@@ -742,29 +742,28 @@ impl Surfaces {
                 }
                 let addr = ib.address + u64::from(ib.first) * size as u64;
                 let restart = ib.restart_enable.then_some(ib.restart_index);
-                // Staged once a submit: the same indices serve many draws.
-                let (slice, format, max) = match self.staged_indices(addr, size, d.count, restart) {
+                // Read once a submit: the same indices serve many draws.
+                let (id, format, max) = match self.staged_indices(addr, size, d.count, restart) {
                     Some(found) => found,
                     None => {
-                        let len = size * d.count as usize;
-                        let found = if let 2 | 4 = size {
-                            // Read straight into the arena: wgpu takes these as they are.
-                            let slice = self.stage_read(addr, len, mem).ok_or("index buffer not readable")?;
-                            let max = index_max(self.arena_bytes(&slice, len), size, restart);
-                            (slice, if size == 4 { wgpu::IndexFormat::Uint32 } else { wgpu::IndexFormat::Uint16 }, max)
-                        } else {
-                            let mut raw = vec![0u8; len];
-                            if !mem(addr, &mut raw) {
-                                return Err("index buffer not readable".into());
-                            }
-                            let max = index_max(&raw, size, restart);
-                            let bytes: Vec<u8> = if size == 1 { raw.iter().flat_map(|&b| u16::from(b).to_le_bytes()).collect() } else { raw.chunks_exact(size).flat_map(|c| (index_value(c) as u16).to_le_bytes()).collect() };
-                            (self.stage(&bytes), wgpu::IndexFormat::Uint16, max)
+                        let mut raw = vec![0u8; size * d.count as usize];
+                        if !mem(addr, &mut raw) {
+                            return Err("index buffer not readable".into());
+                        }
+                        let max = index_max(&raw, size, restart);
+                        let (bytes, format) = match size {
+                            4 => (raw, wgpu::IndexFormat::Uint32),
+                            2 => (raw, wgpu::IndexFormat::Uint16),
+                            1 => (raw.iter().flat_map(|&b| u16::from(b).to_le_bytes()).collect(), wgpu::IndexFormat::Uint16),
+                            _ => (raw.chunks_exact(size).flat_map(|c| (index_value(c) as u16).to_le_bytes()).collect(), wgpu::IndexFormat::Uint16),
                         };
-                        self.remember_indices(addr, size, d.count, restart, found.clone());
+                        let found = (self.block(bytes), format, max);
+                        self.remember_indices(addr, size, d.count, restart, found);
                         found
                     }
                 };
+                // wgpu takes 2- and 4-byte indices as they are; widened ones are shared like any block.
+                let slice = if let 2 | 4 = size { self.stage_raw(id) } else { self.stage_data(id) };
                 (Some((slice, format)), (i64::from(d.base_vertex) + i64::from(max)).max(0) as u64)
             }
             None => (None, u64::from(d.first) + u64::from(d.count) - 1),
@@ -784,15 +783,8 @@ impl Surfaces {
                 return Err("vertex stream shorter than the draw".into());
             }
             let padded = bytes.next_multiple_of(4) as usize;
-            let slice = match self.staged_guest(crate::surfaces::Read::Vertex, start, padded, 0, 0) {
-                Some(slice) => slice,
-                None => {
-                    let slice = self.stage_read(start, bytes as usize, mem).ok_or("vertex stream not readable")?;
-                    self.remember_staged(crate::surfaces::Read::Vertex, start, padded, slice.clone());
-                    slice
-                }
-            };
-            vertex_buffers.push(slice);
+            let id = self.read_exact(crate::surfaces::Read::Vertex, start, bytes as usize, padded, mem).ok_or("vertex stream not readable")?;
+            vertex_buffers.push(self.stage_raw(id));
         }
 
         // Constant buffers and textures, per stage (bind group 0 vertex, 1 pixel).

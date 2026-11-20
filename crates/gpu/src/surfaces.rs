@@ -820,8 +820,8 @@ pub(crate) enum Read {
 /// A range of the upload arena: its buffer, offset and size.
 pub(crate) type Slice = (wgpu::Buffer, u64, u64);
 
-/// Staged indices: the range, their format and the highest index.
-pub(crate) type Indices = (Slice, wgpu::IndexFormat, u32);
+/// Indices as read: their block's id (`Memo::blocks`), their format and the highest index.
+pub(crate) type Indices = (u32, wgpu::IndexFormat, u32);
 
 /// A memo value and the write epoch it was made at.
 type Dated<T> = (T, u64);
@@ -882,14 +882,14 @@ pub(crate) struct Memo {
     /// (kind, address, length) -> the read's id, its place in `blocks`.
     reads: FxMap<(u8, u64, usize), Dated<u32>>,
     /// Each read's bytes, by id: a stage keeps its banks' ids, not their bytes,
-    /// and a bank is staged by its id (`Surfaces::stage_bank`). A read made
-    /// again after a GPU write takes a new id.
+    /// and a block is staged by its id (`Surfaces::stage_bank`, `stage_raw`,
+    /// `stage_data`). A read made again after a GPU write takes a new id.
     blocks: Vec<Bytes>,
     /// (read id, bytes the program may read) -> the bank's staged block.
     banks: FxMap<(u32, u32), Slice>,
-    /// (kind, address, length, filled to, bound as) -> the staged block.
-    staged: FxMap<(u8, u64, usize, usize, usize), Dated<Slice>>,
-    /// (address, index size, count, restart index) -> the staged indices.
+    /// Read id -> the staged block of vertices or indices.
+    data: FxMap<u32, Slice>,
+    /// (address, index size, count, restart index) -> the indices read.
     indices: FxMap<(u64, usize, u32, Option<u32>), Dated<Indices>>,
     /// Address -> a texture or sampler header (two guest reads per texture slot of every draw).
     descriptors: FxMap<u64, Dated<[u8; 32]>>,
@@ -917,7 +917,7 @@ impl Memo {
         self.reads.clear();
         self.blocks.clear();
         self.banks.clear();
-        self.staged.clear();
+        self.data.clear();
         self.indices.clear();
         self.descriptors.clear();
         self.forget_slots();
@@ -1280,17 +1280,35 @@ impl Surfaces {
         slice
     }
 
-    /// The block [`Surfaces::stage_guest`] staged for these arguments, if this
-    /// submit made it and the GPU has not written its bytes since (the read is
-    /// counted in [`Staging`]).
-    pub(crate) fn staged_guest(&mut self, kind: Read, addr: u64, len: usize, zeros: usize, window: usize) -> Option<Slice> {
-        let found = self.memo.staged.get(&(kind as u8, addr, len, zeros, window)).filter(|(_, epoch)| self.memo.fresh(addr, len, *epoch)).map(|(slice, _)| slice.clone());
-        self.note_read(kind, len, found.is_some());
-        found
+    /// `len` bytes of guest memory at `addr`, every one readable, then zeros up
+    /// to `padded`, as a block's id ([`Memo::blocks`]): read once a submit while
+    /// the GPU does not write them; None if a byte is not readable.
+    pub(crate) fn read_exact(&mut self, kind: Read, addr: u64, len: usize, padded: usize, mem: crate::draw::Mem) -> Option<u32> {
+        let key = (kind as u8, addr, padded);
+        if let Some(&(id, epoch)) = self.memo.reads.get(&key)
+            && self.memo.fresh(addr, padded, epoch)
+        {
+            self.note_read(kind, padded, true);
+            return Some(id);
+        }
+        self.note_read(kind, padded, false);
+        let mut bytes = vec![0u8; padded];
+        if !mem(addr, &mut bytes[..len]) {
+            return None;
+        }
+        let id = self.block(bytes);
+        self.memo.reads.insert(key, (id, self.memo.epoch));
+        Some(id)
     }
 
-    /// The staged indices of `count` indices of `size` bytes at `addr` (with a
-    /// restart index), their format and the highest index, if this submit made
+    /// The id of a new block holding `bytes` (until the memo is emptied).
+    pub(crate) fn block(&mut self, bytes: Vec<u8>) -> u32 {
+        self.memo.blocks.push(Arc::new(bytes));
+        self.memo.blocks.len() as u32 - 1
+    }
+
+    /// The indices read of `count` indices of `size` bytes at `addr` (with a
+    /// restart index), their format and the highest index, if this submit read
     /// them and the GPU has not written them since.
     pub(crate) fn staged_indices(&mut self, addr: u64, size: usize, count: u32, restart: Option<u32>) -> Option<Indices> {
         let len = size * count as usize;
@@ -1315,41 +1333,52 @@ impl Surfaces {
         Some(d)
     }
 
-    /// Records a block the caller staged from guest memory at `addr` (see
-    /// [`Surfaces::staged_guest`]).
-    pub(crate) fn remember_staged(&mut self, kind: Read, addr: u64, len: usize, slice: Slice) {
-        self.memo.staged.insert((kind as u8, addr, len, 0, 0), (slice, self.memo.epoch));
-    }
-
-    /// Reads `len` guest bytes at `addr` straight into the arena (padded to 4),
-    /// neither hashed nor compared with what it holds: vertices and indices,
+    /// Block `id` staged as it is (padded to 4), at the arena's end, neither
+    /// hashed nor compared with what the arena holds: vertices and indices,
     /// whose blocks never repeat at another address (the memo finds them at
-    /// theirs). None if they are not readable.
-    pub(crate) fn stage_read(&mut self, addr: u64, len: usize, mem: crate::draw::Mem) -> Option<Slice> {
-        let range = len.next_multiple_of(4).max(4);
+    /// theirs). Once a submit.
+    pub(crate) fn stage_raw(&mut self, id: u32) -> Slice {
+        if let Some(slice) = self.memo.data.get(&id) {
+            return slice.clone();
+        }
+        let bytes = self.memo.blocks[id as usize].clone();
+        let range = bytes.len().next_multiple_of(4).max(4);
         let mut at = self.arena.1.len().next_multiple_of(ARENA_ALIGN);
         if (at + range) as u64 > self.arena.0.size() {
             self.grow_arena(range);
             at = 0;
         }
-        let (before, data) = (self.arena.1.len(), &mut self.arena.1);
+        let data = &mut self.arena.1;
+        data.resize(at, 0);
+        data.extend_from_slice(&bytes);
         data.resize(at + range, 0);
-        if !mem(addr, &mut data[at..at + len]) {
-            data.truncate(before);
-            return None;
-        }
         self.staging.calls += 1;
         self.staging.data_bytes += range as u64;
         self.staging.lay(at as u64, range as u64);
-        Some((self.arena.0.clone(), at as u64, range as u64))
+        let slice = (self.arena.0.clone(), at as u64, range as u64);
+        self.memo.data.insert(id, slice.clone());
+        slice
+    }
+
+    /// Block `id` staged as [`Surfaces::stage`] does (shared with an identical
+    /// block): widened indices. Once a submit.
+    pub(crate) fn stage_data(&mut self, id: u32) -> Slice {
+        if let Some(slice) = self.memo.data.get(&id) {
+            return slice.clone();
+        }
+        let bytes = self.memo.blocks[id as usize].clone();
+        let slice = self.stage(&bytes);
+        self.memo.data.insert(id, slice.clone());
+        slice
     }
 
     /// The bytes of a block staged in the current arena.
+    #[cfg(test)]
     pub(crate) fn arena_bytes(&self, s: &Slice, len: usize) -> &[u8] {
         &self.arena.1[s.1 as usize..s.1 as usize + len]
     }
 
-    /// Records indices staged by the caller (see [`Surfaces::staged_indices`]).
+    /// Records indices read by the caller (see [`Surfaces::staged_indices`]).
     pub(crate) fn remember_indices(&mut self, addr: u64, size: usize, count: u32, restart: Option<u32>, staged: Indices) {
         self.memo.indices.insert((addr, size, count, restart), (staged, self.memo.epoch));
     }
@@ -1559,10 +1588,9 @@ impl Surfaces {
         let capacity = (self.arena.0.size() * 2).max((range as u64).next_power_of_two());
         self.arena = (arena_buffer(&self.device, capacity), Vec::new());
         self.staged.clear();
-        // ponytail: staged blocks stay valid in the old buffer; dropped for simplicity (rare).
-        self.memo.staged.clear();
+        // ponytail: staged blocks stay valid in the old buffer; staged again for simplicity (rare).
         self.memo.banks.clear();
-        self.memo.indices.clear();
+        self.memo.data.clear();
     }
 
     /// A view of `texture` as `desc` describes it.
@@ -2331,10 +2359,11 @@ mod tests {
         assert!(s.stage_bank(again, 64).0 == s.arena.0, "staged again in the grown arena");
     }
 
-    /// Vertices read straight into the arena: the guest's bytes then zeros to a
-    /// multiple of 4, aligned; an unreadable read leaves the arena as it was.
+    /// Vertices read exactly, then staged as they are: the guest's bytes then
+    /// zeros to a multiple of 4, aligned, once a submit, and again in a grown
+    /// arena; an unreadable read stages nothing.
     #[test]
-    fn guest_blocks_are_read_straight_into_the_arena() {
+    fn guest_blocks_are_staged_as_they_were_read() {
         let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
             eprintln!("no GPU adapter: test skipped");
             return;
@@ -2343,14 +2372,18 @@ mod tests {
             buf.iter_mut().enumerate().for_each(|(i, b)| *b = (addr as usize + i) as u8);
             addr != 0xdead
         };
-        let a = s.stage_read(0x10, 6, &mut mem).unwrap();
+        let mut stage = |s: &mut Surfaces, addr: u64, len: usize| s.read_exact(Read::Vertex, addr, len, len.next_multiple_of(4), &mut mem).map(|id| s.stage_raw(id));
+        let a = stage(&mut s, 0x10, 6).unwrap();
         assert_eq!((a.1, a.2), (0, 8));
         assert_eq!(s.arena_bytes(&a, 8), [0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0, 0]);
         let len = s.arena.1.len();
-        assert!(s.stage_read(0xdead, 64, &mut mem).is_none());
+        assert_eq!(stage(&mut s, 0x10, 6).unwrap().1, 0, "read and staged once");
+        assert!(stage(&mut s, 0xdead, 64).is_none());
         assert_eq!(s.arena.1.len(), len);
-        let b = s.stage_read(0x20, 4, &mut mem).unwrap();
+        let b = stage(&mut s, 0x20, 4).unwrap();
         assert_eq!((b.1, s.arena_bytes(&b, 4)), (ARENA_ALIGN as u64, &[0x20, 0x21, 0x22, 0x23][..]));
+        s.grow_arena(0);
+        assert!(stage(&mut s, 0x10, 6).unwrap().0 == s.arena.0, "staged again in the grown arena");
     }
 
     /// Presented images are hashed off the frame: each present's hash comes
