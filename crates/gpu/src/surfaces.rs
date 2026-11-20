@@ -776,6 +776,8 @@ pub struct Staging {
     pub bind_groups: [u64; 2],
     /// Stages looked up in the submit's memo (`Memo::stages`), then found there.
     pub stages: [u64; 2],
+    /// Stages' texture slots looked up by their handles (`Memo::slot_sets`), then found there.
+    pub slot_sets: [u64; 2],
     /// Textures uploaded from guest memory: bytes, and host nanoseconds (read,
     /// deswizzle, copy, and the wait after a large one).
     pub uploads: [u64; 2],
@@ -877,6 +879,10 @@ pub(crate) struct Memo {
     /// (`draw::StageKey`): a draw that repeats a stage's inputs, while they hold,
     /// skips its bank reads and texture slots. Emptied with `slots`.
     pub(crate) stages: FxMap<crate::draw::StageKey, crate::draw::StageMemo>,
+    /// Stages' texture slots resolved this submit, by the handles they read
+    /// (`draw::SlotSetKey`): the same handles from banks rewritten or moved give
+    /// the same slots while their headers and targets hold. Emptied with `slots`.
+    pub(crate) slot_sets: FxMap<crate::draw::SlotSetKey, crate::draw::SlotSet>,
     /// The epoch of each page written by the GPU in this submit, in page order:
     /// an entry's check visits only the written pages inside it.
     pages: BTreeMap<u64, u64>,
@@ -898,6 +904,7 @@ impl Memo {
     pub(crate) fn forget_slots(&mut self) {
         self.slots.clear();
         self.stages.clear();
+        self.slot_sets.clear();
     }
 
     /// The write epoch now: a GPU write after this makes a newer one.
