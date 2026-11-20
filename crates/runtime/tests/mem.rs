@@ -300,6 +300,19 @@ fn written_pages_are_taken_once() {
     assert!(m.take_written(HEAP, 0).is_empty() && m.take_written(mem::SPACE - 0x1000, 0x2000).is_empty());
 }
 
+/// Unmaps and reprotects are logged once each (the write watch does not
+/// report them); maps are not.
+#[test]
+fn unmaps_and_reprotects_are_logged_once() {
+    let m = Memory::new().unwrap();
+    m.map(HEAP, 0x3000, Block::new(state::NORMAL, perm::RW)).unwrap();
+    assert!(m.take_changed().is_empty(), "a map is not");
+    m.protect(HEAP + 0x1000, 0x1000, perm::R).unwrap();
+    m.unmap(HEAP + 0x2000, 0x1000).unwrap();
+    assert_eq!(m.take_changed(), [(HEAP + 0x1000, HEAP + 0x2000), (HEAP + 0x2000, HEAP + 0x3000)]);
+    assert!(m.take_changed().is_empty(), "taken once");
+}
+
 /// Pages a take found clean are armed (read-only on the host): a guest store
 /// or an HLE write to them faults, is retried, and shows at the next take.
 #[test]

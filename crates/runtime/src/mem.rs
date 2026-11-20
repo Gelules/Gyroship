@@ -14,7 +14,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Mutex, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use windows_sys::Win32::Foundation::EXCEPTION_ACCESS_VIOLATION;
 use windows_sys::Win32::System::Diagnostics::Debug::{AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH, EXCEPTION_POINTERS};
@@ -138,6 +138,8 @@ pub struct Memory {
     blocks: RwLock<Table>,
     /// The pages takes found clean, made at the first take (see [`Armed`]).
     armed: OnceLock<Option<&'static Armed>>,
+    /// The ranges unmapped or reprotected since [`Memory::take_changed`].
+    changed: Mutex<Vec<(u64, u64)>>,
 }
 
 // SAFETY: `base` never changes and the reservation is ours until drop; the
@@ -259,7 +261,14 @@ impl Memory {
             return Err(Error::Host(last_error()));
         }
         RESERVATION.store(base as usize, Ordering::Release);
-        Ok(Memory { base, blocks: RwLock::default(), armed: OnceLock::new() })
+        Ok(Memory { base, blocks: RwLock::default(), armed: OnceLock::new(), changed: Mutex::default() })
+    }
+
+    /// The ranges (start, end) unmapped or reprotected since the last call:
+    /// their bytes may have changed (decommitted pages come back as zeros) or
+    /// become unreadable, which the write watch does not report.
+    pub fn take_changed(&self) -> Vec<(u64, u64)> {
+        std::mem::take(&mut *self.changed.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     /// The armed pages, made at the first take; None when every slot of `ARMED`
@@ -617,6 +626,7 @@ impl Memory {
     /// Before an unmap or a reprotect of `[addr, end)` (on the table's write
     /// lock): its pages unarmed, the armed pages locked until the caller is done.
     fn disarm(&self, addr: u64, end: u64) -> Option<&'static Armed> {
+        self.changed.lock().unwrap_or_else(|e| e.into_inner()).push((addr, end));
         let a = self.armed.get().copied().flatten()?;
         a.lock();
         a.set(addr / PAGE, end / PAGE, false);

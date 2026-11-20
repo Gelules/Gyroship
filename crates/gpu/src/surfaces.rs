@@ -265,6 +265,8 @@ pub struct Surfaces {
     pub submit_ended: bool,
     /// This submit's guest reads and staged blocks, for the reads that repeat.
     pub(crate) memo: Memo,
+    /// Guest reads kept from one submit to the next, while unwritten.
+    pub(crate) kept: Kept,
     /// Shader modules and pipelines made since the caller last took them, and
     /// in the whole run (the caller adds what it takes).
     pub compile: Compile,
@@ -799,6 +801,9 @@ pub struct Staging {
     pub handles: [u64; 2],
     /// Draws whose pipeline was looked up, then those whose key was the last draw's.
     pub pipeline_repeats: [u64; 2],
+    /// Reads served from those kept across submits ([`Kept`]) and their bytes,
+    /// reads kept, and acquires met after a take (no read kept until the next submit).
+    pub kept: [u64; 4],
     /// Textures uploaded from guest memory: bytes, and host nanoseconds (read,
     /// deswizzle, copy, and the wait after a large one).
     pub uploads: [u64; 2],
@@ -903,7 +908,8 @@ type Bytes = Arc<Vec<u8>>;
 /// repeat skips the read, the hash and the copy. A GPU write stamps the 4 KiB
 /// pages it touches with a new epoch; an entry is stale once one of its pages
 /// was stamped after it was made. Host state only, emptied at each submit and
-/// flush (guest code may have written in between).
+/// flush (guest code may have written in between), but the stamps, which the
+/// reads kept across submits ([`Kept`]) need until the next take.
 #[derive(Default)]
 pub(crate) struct Memo {
     /// (kind, address, length) -> the read's id, its place in `blocks`.
@@ -931,9 +937,10 @@ pub(crate) struct Memo {
     /// the same handles, unevaluated. Ids restart at a flush: emptied with the
     /// rest, at each submit and flush.
     pub(crate) handles: FxMap<(usize, smallvec::SmallVec<[(u8, u32); 4]>), smallvec::SmallVec<[Option<u32>; 64]>>,
-    /// The epoch of each page written by the GPU in this submit, in page order:
-    /// an entry's check visits only the written pages inside it. Sorted by page
-    /// (30 to 60 pages a submit in heavy Corneria frames: a binary search).
+    /// The epoch of each page written by the GPU in this job (since the last
+    /// submit, through its flushes), in page order: an entry's check visits
+    /// only the written pages inside it. Sorted by page (30 to 60 pages a
+    /// submit in heavy Corneria frames: a binary search).
     pages: Vec<(u64, u64)>,
     epoch: u64,
 }
@@ -945,7 +952,6 @@ impl Memo {
         self.descriptors.clear();
         self.forget_slots();
         self.handles.clear();
-        self.pages.clear();
     }
 
     /// The texture slots resolved this submit are stale (a texture dropped, a
@@ -977,6 +983,111 @@ impl Memo {
     pub(crate) fn fresh(&self, addr: u64, len: usize, epoch: u64) -> bool {
         let (first, last) = (addr >> 12, addr.saturating_add(len.max(1) as u64 - 1) >> 12);
         self.pages[self.pages.partition_point(|&(p, _)| p < first)..].iter().take_while(|&&(p, _)| p <= last).all(|&(_, e)| e <= epoch)
+    }
+}
+
+/// A kept read: guest address, guest length, index size (0: vertices) and restart index.
+type KeptKey = (u64, usize, usize, Option<u32>);
+
+/// Guest reads kept from one submit to the next (vertex streams): most meshes
+/// are read again every frame, unchanged. An entry holds while its pages go
+/// unwritten: the HLE's write-watch take before each submit reports the pages
+/// written since the one before (`Surfaces::kept_taken`), the memo's pages
+/// those the GPU writes in the job. Used and made only while `live`: in a job
+/// that began with a take (`Surfaces::new_submit`), until an acquire is met
+/// after the take (`Surfaces::kept_unsure`); and only where a GPU address is
+/// its CPU address, which the take watches.
+#[derive(Default)]
+pub(crate) struct Kept {
+    /// The bytes as staged, their highest index, the memo epoch they were read
+    /// at, and the present they were last used in.
+    map: FxMap<KeptKey, (Bytes, u32, u64, u64)>,
+    /// Pages whose writes dropped an entry, by page number: the present of the
+    /// last such write, and the present until which no entry is made on the
+    /// page. Written twice within STRIKES presents (memory the CPU fills every
+    /// frame), a page is refused for REFUSED presents: its entries would only
+    /// cost takes and write faults.
+    struck: FxMap<u64, (u64, u64)>,
+    /// The GPU ranges (start, end) mapped elsewhere in CPU memory, as of the
+    /// last take: no entry is made on them.
+    foreign: Vec<(u64, u64)>,
+    live: bool,
+}
+
+// ponytail: fixed; tune them from the refusals if they show in --perf.
+const STRIKES: u64 = 30;
+const REFUSED: u64 = 300;
+
+/// The page numbers of `[addr, addr + len)`.
+fn page_numbers(addr: u64, len: usize) -> std::ops::RangeInclusive<u64> {
+    addr >> 12..=addr.saturating_add(len.max(1) as u64 - 1) >> 12
+}
+
+impl Kept {
+    /// The bytes kept for `key` and their highest index, unless the GPU wrote
+    /// them in this job since they were read (`memo`): now used in `present`.
+    fn get(&mut self, key: KeptKey, memo: &Memo, present: u64) -> Option<(Bytes, u32)> {
+        if !self.live {
+            return None;
+        }
+        let e = self.map.get_mut(&key)?;
+        if !memo.fresh(key.0, key.1, e.2) {
+            return None;
+        }
+        e.3 = present;
+        Some((e.0.clone(), e.1))
+    }
+
+    /// Keeps `bytes` read for `key` at memo epoch `epoch`, with their highest
+    /// index, unless a page of them is refused or they are mapped elsewhere;
+    /// whether it did.
+    fn put(&mut self, key: KeptKey, bytes: Bytes, max: u32, epoch: u64, present: u64) -> bool {
+        if !self.live {
+            return false;
+        }
+        let end = key.0.saturating_add(key.1.max(1) as u64);
+        let refused = (!self.struck.is_empty() && page_numbers(key.0, key.1).any(|p| self.struck.get(&p).is_some_and(|s| s.1 > present))) || self.foreign.iter().any(|&(s, e)| s < end && key.0 < e);
+        if refused {
+            return false;
+        }
+        self.map.insert(key, (bytes, max, epoch, present));
+        true
+    }
+
+    /// Drops the entries on `pages` (sorted guest page addresses), counting
+    /// the write against each page that held one (see `struck`).
+    fn written(&mut self, pages: &[u64], present: u64) {
+        if pages.is_empty() || self.map.is_empty() {
+            return;
+        }
+        let mut hit = BTreeSet::new();
+        self.map.retain(|&(addr, len, ..), _| {
+            let end = addr.saturating_add(len.max(1) as u64);
+            let (from, to) = (pages.partition_point(|&p| p + 0x1000 <= addr), pages.partition_point(|&p| p < end));
+            hit.extend(pages[from..to].iter().map(|p| p >> 12));
+            from == to
+        });
+        for p in hit {
+            match self.struck.get_mut(&p) {
+                Some(s) if present.saturating_sub(s.0) <= STRIKES => *s = (present, present + REFUSED),
+                Some(s) => s.0 = present,
+                None => _ = self.struck.insert(p, (present, 0)),
+            }
+        }
+    }
+
+    /// Drops the entries that overlap `ranges` (start, end).
+    fn changed(&mut self, ranges: &[(u64, u64)]) {
+        if !ranges.is_empty() {
+            self.map.retain(|&(addr, len, ..), _| !ranges.iter().any(|&(s, e)| s < addr.saturating_add(len.max(1) as u64) && addr < e));
+        }
+    }
+
+    /// A present ended: the entries unused in it and the one before go, and
+    /// the strikes that no longer count.
+    fn age(&mut self, present: u64) {
+        self.map.retain(|_, e| e.3 + 2 > present);
+        self.struck.retain(|_, s| s.1 > present || present.saturating_sub(s.0) <= STRIKES);
     }
 }
 
@@ -1106,7 +1217,7 @@ impl Surfaces {
         let timed = timing.is_some();
         let rec = Arc::new(Mutex::new(crate::record::Recorder::new(&device, &queue, timing)));
         let renderable = (0..=0xff).filter_map(color_format).chain((0..=0xff).filter_map(depth_format)).map(|f| (f, renderable_on(&adapter, &device, f))).collect();
-        Ok(Surfaces { renderable, adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, rec, batch: Vec::with_capacity(BATCH), recorder: None, recorder_ended: false, timed, open: None, sets: 0, present: 0, readbacks: Default::default(), hasher: None, belt, big_upload: false, texture_belt, uploads: None, global_bytes: Vec::new(), staging: Staging::default(), last_color: None, window, submit: None, submit_ended: false, memo: Memo::default(), compile: Compile::default(), compile_total: Compile::default(), background: false, wait_left: PIPELINE_WAIT, workers: None, finished: Default::default(), disk_cache: None, shader_cache: None, views: Aged::default(), dynamic_max, clip_distances })
+        Ok(Surfaces { renderable, adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, rec, batch: Vec::with_capacity(BATCH), recorder: None, recorder_ended: false, timed, open: None, sets: 0, present: 0, readbacks: Default::default(), hasher: None, belt, big_upload: false, texture_belt, uploads: None, global_bytes: Vec::new(), staging: Staging::default(), last_color: None, window, submit: None, submit_ended: false, memo: Memo::default(), kept: Kept::default(), compile: Compile::default(), compile_total: Compile::default(), background: false, wait_left: PIPELINE_WAIT, workers: None, finished: Default::default(), disk_cache: None, shader_cache: None, views: Aged::default(), dynamic_max, clip_distances })
     }
 
     /// Shows the presented image (the color target written last, its top-left
@@ -1354,9 +1465,43 @@ impl Surfaces {
 
     /// Guest code may have run since the last GPU work (a new submit, or a
     /// wait that ended): what was read from guest memory may have changed.
+    /// `verified`: after the HLE's write-watch take, which also tells the kept
+    /// reads it found written (`kept_taken`): they serve this job.
     pub fn new_submit(&mut self, verified: bool) {
         self.memo.clear();
+        self.memo.pages.clear();
+        self.kept.live = verified;
         self.begin_job(verified);
+    }
+
+    /// The kept reads' guest ranges (start, end), for the write-watch take
+    /// before the next submit: GPU addresses, which are the CPU's there.
+    pub fn kept_ranges(&self) -> Vec<(u64, u64)> {
+        self.kept.map.keys().map(|&(addr, len, ..)| (addr, addr.saturating_add(len.max(1) as u64))).collect()
+    }
+
+    /// After the write-watch take before a submit: the kept reads on `written`
+    /// pages (sorted guest page addresses: those the take reported, and those
+    /// copies reset since the last take) drop, counted against them, and those
+    /// on `changed` ranges (unmapped or reprotected since) and on `foreign`
+    /// ones (GPU ranges mapped elsewhere in CPU memory), where none is made.
+    pub fn kept_taken(&mut self, foreign: Vec<(u64, u64)>, changed: &[(u64, u64)], written: &[u64]) {
+        if foreign != self.kept.foreign {
+            self.kept.changed(&foreign);
+            self.kept.foreign = foreign;
+        }
+        self.kept.changed(changed);
+        self.kept.written(written, self.present);
+    }
+
+    /// An acquire was met after this job's take: the CPU may have written
+    /// under the reads before releasing it. This job's are forgotten (the
+    /// memo, as at a new submit), and no kept one is used or made until the
+    /// next submit.
+    pub fn kept_unsure(&mut self) {
+        self.memo.clear();
+        self.kept.live = false;
+        self.staging.kept[3] += 1;
     }
 
     /// The id of the read of `len` bytes of guest memory at `addr` (its bytes
@@ -1392,8 +1537,9 @@ impl Surfaces {
 
     /// `len` bytes of guest memory at `addr`, every one readable, then zeros up
     /// to `padded`, as a block's id ([`Memo::blocks`]): read once a submit while
-    /// the GPU does not write them; None if a byte is not readable.
-    pub(crate) fn read_exact(&mut self, kind: Read, addr: u64, len: usize, padded: usize, mem: crate::draw::Mem) -> Option<u32> {
+    /// the GPU does not write them, and once for many submits if `keep`, while
+    /// nothing writes them ([`Kept`]); None if a byte is not readable.
+    pub(crate) fn read_exact(&mut self, kind: Read, addr: u64, len: usize, padded: usize, keep: bool, mem: crate::draw::Mem) -> Option<u32> {
         let key = (kind as u8, addr, padded);
         if let Some(&(id, epoch)) = self.memo.reads.get(&key)
             && self.memo.fresh(addr, padded, epoch)
@@ -1402,11 +1548,28 @@ impl Surfaces {
             return Some(id);
         }
         self.note_read(kind, padded, false);
-        let mut bytes = Vec::with_capacity(padded);
-        if !mem.append(addr, len, &mut bytes) {
-            return None;
-        }
-        bytes.resize(padded, 0);
+        let kept = (addr, len, 0, None);
+        let found = if keep { self.kept.get(kept, &self.memo, self.present) } else { None };
+        let bytes = match found {
+            Some((bytes, _)) => {
+                self.staging.kept[0] += 1;
+                self.staging.kept[1] += padded as u64;
+                bytes
+            }
+            None => {
+                let mut bytes = Vec::with_capacity(padded);
+                if !mem.append(addr, len, &mut bytes) {
+                    return None;
+                }
+                bytes.resize(padded, 0);
+                let bytes = Arc::new(bytes);
+                if keep && self.kept.put(kept, bytes.clone(), 0, self.memo.epoch, self.present) {
+                    self.staging.kept[2] += 1;
+                }
+                bytes
+            }
+        };
+        // A kept read takes a new id, as a read: the frame's blocks and the arena stay as they were.
         let id = self.block(bytes);
         self.memo.reads.insert(key, (id, self.memo.epoch));
         Some(id)
@@ -1414,8 +1577,8 @@ impl Surfaces {
 
     /// The id of a new block holding `bytes` (until the next flush), announced
     /// to the recorder, which stages it at its first use.
-    pub(crate) fn block(&mut self, bytes: Vec<u8>) -> u32 {
-        let (id, bytes) = (self.memo.blocks.len() as u32, Arc::new(bytes));
+    pub(crate) fn block(&mut self, bytes: impl Into<Bytes>) -> u32 {
+        let (id, bytes) = (self.memo.blocks.len() as u32, bytes.into());
         self.memo.blocks.push(bytes.clone());
         self.push(crate::record::Rec::Block(id, bytes));
         id
@@ -1659,10 +1822,11 @@ impl Surfaces {
         self.view(texture, &wgpu::TextureViewDescriptor { format: other, usage: other.map(|_| usage), ..desc })
     }
 
-    /// A frame was presented: the views and bind groups neither it nor the
-    /// one before used are dropped.
+    /// A frame was presented: the views, bind groups and kept reads neither it
+    /// nor the one before used are dropped.
     pub fn next_frame(&mut self) {
         self.views.age();
+        self.kept.age(self.present);
         self.rec().next_frame();
         self.wait_left = PIPELINE_WAIT;
     }
@@ -2543,7 +2707,7 @@ mod tests {
         }
         let guest: Vec<u8> = (0..0x1800u32).map(|i| (i * 3 + 1) as u8).collect();
         let mut mem = Dirty(guest.clone());
-        let id = s.read_exact(Read::Index, 0x1000, 10, 16, &mut mem).unwrap();
+        let id = s.read_exact(Read::Index, 0x1000, 10, 16, false, &mut mem).unwrap();
         assert!(s.memo.blocks[id as usize][..] == [&guest[..10], &[0u8; 6][..]].concat()[..], "the bytes, then zero padding");
         let id = s.read_guest(Read::Bank, 0x1000, 0x2000, &mut mem).unwrap();
         assert!(s.memo.blocks[id as usize][..] == [&guest[..0x1000], &[0u8; 0x1000][..]].concat()[..], "the readable page, then zeros");
@@ -2562,11 +2726,113 @@ mod tests {
             true
         };
         for _ in 0..2 {
-            s.read_exact(Read::Vertex, 0x1000, 16, 16, &mut mem).unwrap();
+            s.read_exact(Read::Vertex, 0x1000, 16, 16, false, &mut mem).unwrap();
         }
         s.mark_dirty(0x1008, 4);
-        s.read_exact(Read::Vertex, 0x1000, 16, 16, &mut mem).unwrap();
+        s.read_exact(Read::Vertex, 0x1000, 16, 16, false, &mut mem).unwrap();
         assert_eq!(s.staging.memo_hits[Read::Vertex as usize], 1, "read again after the mark");
+    }
+
+    /// A kept read is served while live and unwritten by the GPU in the job,
+    /// for its own length only. A write on one of its pages drops it (and the
+    /// others there) and counts against the page: written again within
+    /// STRIKES presents, the page takes no entry for REFUSED presents. A
+    /// changed range drops the entries on it; unused for two presents, an
+    /// entry ages out.
+    #[test]
+    fn kept_reads_hold_until_written() {
+        let (mut k, mut memo) = (Kept::default(), Memo::default());
+        let bytes = Arc::new(vec![1u8; 12]);
+        let (a, b, far) = ((0x1000, 10, 0, None), (0x1000, 12, 0, None), (0x9000, 4, 0, None));
+        assert!(!k.put(a, bytes.clone(), 0, 0, 1), "not live");
+        k.live = true;
+        assert!(k.put(a, bytes.clone(), 0, 0, 1));
+        assert!(k.get(a, &memo, 1).is_some() && k.get(b, &memo, 1).is_none(), "its own length only");
+        memo.wrote(0x1009, 1);
+        assert!(k.get(a, &memo, 1).is_none(), "the GPU wrote its last byte");
+        memo.pages.clear();
+        k.live = false;
+        assert!(k.get(a, &memo, 1).is_none(), "not live");
+        k.live = true;
+        assert!(k.put(b, bytes.clone(), 0, memo.epoch, 1) && k.put(far, bytes.clone(), 0, 0, 1));
+        k.written(&[0x1000], 2);
+        assert_eq!(k.map.keys().copied().collect::<Vec<_>>(), [far], "the entries on the page dropped");
+        assert!(k.put(a, bytes.clone(), 0, 0, 2 + STRIKES), "one write is no refusal");
+        k.written(&[0x1000], 2 + STRIKES);
+        assert!(!k.put(a, bytes.clone(), 0, 0, 3 + STRIKES), "written twice within STRIKES: refused");
+        assert!(k.put(a, bytes.clone(), 0, 0, 2 + STRIKES + REFUSED), "for REFUSED presents");
+        k.changed(&[(0x9003, 0x9004)]);
+        assert!(!k.map.contains_key(&far), "a changed range");
+        k.age(4 + STRIKES + REFUSED);
+        assert!(k.map.is_empty(), "unused for two presents");
+        k.foreign = vec![(0x1009, 0x100a)];
+        assert!(!k.put(a, bytes.clone(), 0, 0, 5 + STRIKES + REFUSED), "mapped elsewhere");
+    }
+
+    /// Vertices kept from one submit to the next are not read again: a new
+    /// block each submit, with the same bytes. They are read again after a GPU
+    /// write in the job (across a flush too), a mark, a page found written, a
+    /// changed range, in a job without a take or after an acquire, and where
+    /// their GPU addresses are mapped elsewhere; another length is its own read.
+    #[test]
+    fn kept_vertices_are_read_again_once_they_may_have_changed() {
+        let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
+            eprintln!("no GPU adapter: test skipped");
+            return;
+        };
+        let reads = std::cell::Cell::new(0);
+        let mut mem = |addr: u64, out: &mut [u8]| {
+            reads.set(reads.get() + 1);
+            out.iter_mut().zip(addr..).for_each(|(b, a)| *b = a as u8);
+            true
+        };
+        // The guest reads of `len` bytes at 0x1000.
+        let mut read = |s: &mut Surfaces, len: usize| {
+            let before = reads.get();
+            s.read_exact(Read::Vertex, 0x1000, len, len.next_multiple_of(4), true, &mut mem).unwrap();
+            reads.get() - before
+        };
+        s.kept_taken(Vec::new(), &[], &[]);
+        s.new_submit(true);
+        assert_eq!(read(&mut s, 16), 1);
+        s.new_submit(true);
+        assert_eq!(read(&mut s, 16), 0, "kept");
+        assert!(s.memo.blocks.len() == 2 && s.memo.blocks[1] == s.memo.blocks[0], "a new block, the same bytes");
+        s.new_submit(true);
+        s.invalidate(0x100f, 1);
+        s.flush();
+        assert_eq!(read(&mut s, 16), 1, "written by the GPU in the job, before a flush");
+        s.new_submit(true);
+        assert_eq!(read(&mut s, 16), 0, "kept again");
+        s.new_submit(true);
+        s.mark_dirty(0x1004, 2);
+        assert_eq!(read(&mut s, 16), 1, "marked");
+        s.kept_taken(Vec::new(), &[], &[0x1000]);
+        s.new_submit(true);
+        assert_eq!(read(&mut s, 16), 1, "a page found written");
+        s.kept_taken(Vec::new(), &[(0x100f, 0x1010)], &[]);
+        s.new_submit(true);
+        assert_eq!(read(&mut s, 16), 1, "a changed range");
+        s.new_submit(false);
+        assert_eq!(read(&mut s, 16), 1, "a job without a take");
+        s.new_submit(true);
+        assert_eq!(read(&mut s, 16), 0, "kept");
+        s.kept_unsure();
+        assert_eq!(read(&mut s, 16), 1, "an acquire after the take: this job's reads too");
+        s.new_submit(true);
+        assert_eq!(read(&mut s, 16), 0, "neither replaced the entry");
+        s.new_submit(true);
+        assert_eq!(read(&mut s, 6), 1);
+        s.new_submit(true);
+        assert_eq!(read(&mut s, 8), 1, "another length: its own read");
+        s.kept_taken(vec![(0x1008, 0x1010)], &[], &[]);
+        s.new_submit(true);
+        assert_eq!(read(&mut s, 16), 1, "mapped elsewhere");
+        s.kept_taken(Vec::new(), &[], &[]);
+        s.new_submit(true);
+        assert_eq!(read(&mut s, 16), 1, "none was kept");
+        // Hits, their bytes, reads kept, acquires.
+        assert_eq!(s.staging.kept, [4, 64, 8, 1]);
     }
 
     /// Vertices read exactly, then staged as they are: the guest's bytes then
@@ -2582,7 +2848,7 @@ mod tests {
             buf.iter_mut().enumerate().for_each(|(i, b)| *b = (addr as usize + i) as u8);
             addr != 0xdead
         };
-        let mut stage = |s: &mut Surfaces, addr: u64, len: usize| s.read_exact(Read::Vertex, addr, len, len.next_multiple_of(4), &mut mem).map(|id| s.rec().stage_raw(id));
+        let mut stage = |s: &mut Surfaces, addr: u64, len: usize| s.read_exact(Read::Vertex, addr, len, len.next_multiple_of(4), false, &mut mem).map(|id| s.rec().stage_raw(id));
         let a = stage(&mut s, 0x10, 6).unwrap();
         assert_eq!((a.1, a.2), (0, 8));
         assert_eq!(s.arena_bytes(&a, 8), [0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0, 0]);

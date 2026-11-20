@@ -177,6 +177,13 @@ pub fn gpu_to_cpu(maps: &Mappings, space: u32, gpu: u64) -> u64 {
     lookup(&maps.table, space, gpu)
 }
 
+/// The GPU ranges (start, end) that `maps` maps elsewhere in CPU memory, in
+/// any address space: everywhere else a GPU address is its CPU address (all
+/// of NVN's mappings but a few large pools at high GPU addresses).
+pub fn foreign(maps: &Mappings) -> Vec<(u64, u64)> {
+    maps.table.iter().filter(|&(&(_, first), &(_, cpu))| first != cpu).map(|(&(_, first), &(last, _))| (first, last.saturating_add(1))).collect()
+}
+
 /// `GYROSHIP_PROFILE_THREAD=gpu`: `--profile` samples the thread that applies
 /// the GPU work (the GPU thread in play mode) instead of the presenting guest
 /// thread, from the same present. A diagnostic aid: nothing else changes.
@@ -1277,6 +1284,16 @@ mod tests {
         // Past the second mapping, GPU 0x1_2000 is CPU 0x1_2000: not mapped.
         assert!(!read_gpu_append(&mem, &maps, 0, 0x1_1800, 0x1000, &mut out));
         assert_eq!(out.len(), 0x1001, "nothing appended");
+    }
+
+    /// The foreign ranges are those mapped elsewhere in CPU memory, in any
+    /// address space, the identity's parts left out.
+    #[test]
+    fn foreign_ranges_are_those_mapped_elsewhere() {
+        let same = [(0, 0x1_0000, 0x1_ffff, 0x1_0000), (1, 0x5_0000, 0x5_0fff, 0x5_0000)];
+        assert!(foreign(&Mappings { table: flatten(&same), ..Default::default() }).is_empty());
+        let other = [&same[..], &[(1, 0x6_0000, 0x6_0fff, 0x5_0000), (0, 0x1_8000, 0x1_8fff, 0x9_0000)]].concat();
+        assert_eq!(foreign(&Mappings { table: flatten(&other), ..Default::default() }), [(0x1_8000, 0x1_9000), (0x6_0000, 0x6_1000)]);
     }
 
     /// The flattened table answers what a scan of the mappings from the last one

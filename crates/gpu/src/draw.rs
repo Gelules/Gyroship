@@ -802,7 +802,8 @@ impl Surfaces {
                 return Err("vertex stream shorter than the draw".into());
             }
             let padded = bytes.next_multiple_of(4) as usize;
-            vertex.push(self.read_exact(crate::surfaces::Read::Vertex, start, bytes as usize, padded, mem).ok_or("vertex stream not readable")?);
+            // Kept across submits but an instance's element (one per instanced draw).
+            vertex.push(self.read_exact(crate::surfaces::Read::Vertex, start, bytes as usize, padded, !per_instance, mem).ok_or("vertex stream not readable")?);
         }
 
         // Constant buffers and textures, per stage (bind group 0 vertex, 1 pixel).
