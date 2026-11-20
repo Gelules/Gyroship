@@ -583,7 +583,7 @@ pub fn run(mut table: Vec<rt::Entry>, window: Option<HostWindow>) {
                     eprintln!("gyroship: cannot start the GPU recorder thread: {e}");
                     std::process::exit(2);
                 }
-                k.gpu_side().surfaces = Some(s);
+                k.gpu_side().surfaces = Some(Box::new(s));
             }
             Err(e) => {
                 k.log(&format!("gpu: no host renderer: {e}"));

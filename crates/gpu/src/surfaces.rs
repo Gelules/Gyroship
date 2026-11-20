@@ -790,8 +790,6 @@ pub struct Staging {
     /// Texture views and bind groups made, then asked for (the rest came from their caches).
     pub views: [u64; 2],
     pub bind_groups: [u64; 2],
-    /// Stages looked up in the submit's memo (`Memo::stages`), then found there.
-    pub stages: [u64; 2],
     /// Stages' texture slots looked up by their handles (`Memo::slot_sets`), then found there.
     pub slot_sets: [u64; 2],
     /// Textures uploaded from guest memory: bytes, and host nanoseconds (read,
@@ -917,10 +915,6 @@ pub(crate) struct Memo {
     /// dropped, a target made, or a dispatch starts (`forget_slots`); a target's
     /// slot is checked against the target's last write at each use.
     pub(crate) slots: FxMap<crate::draw::SlotKey, crate::draw::Resolved>,
-    /// Stages' bindings resolved this submit, by what they were resolved from
-    /// (`draw::StageKey`): a draw that repeats a stage's inputs, while they hold,
-    /// skips its bank reads and texture slots. Emptied with `slots`.
-    pub(crate) stages: FxMap<crate::draw::StageKey, crate::draw::StageMemo>,
     /// Stages' texture slots resolved this submit, by the handles they read
     /// (`draw::SlotSetKey`): the same handles from banks rewritten or moved give
     /// the same slots while their headers and targets hold. Emptied with `slots`.
@@ -941,10 +935,9 @@ impl Memo {
     }
 
     /// The texture slots resolved this submit are stale (a texture dropped, a
-    /// target made, a dispatch), and so are the stages made of them.
+    /// target made, a dispatch), and so are the slot sets made of them.
     pub(crate) fn forget_slots(&mut self) {
         self.slots.clear();
-        self.stages.clear();
         self.slot_sets.clear();
     }
 

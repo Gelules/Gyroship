@@ -237,7 +237,7 @@ impl Surfaces {
         }
 
         // Bindings: constant banks, textures and swizzles as for draws, then the images.
-        let (textures, swizzles, _, set) = self.texture_slots(t, &banks, pools.headers, pools.samplers, pools.sampler_binding, &[], mem)?;
+        let (textures, swizzles, set) = self.texture_slots(t, &banks, pools.headers, pools.samplers, pools.sampler_binding, &[], mem)?;
         let cbufs = banks.iter().filter(|(b, _)| t.interface.cbufs.contains(b)).map(|&(b, (id, _))| (b, id)).collect();
         let bindings = Bindings { cbufs, textures, swizzles: t.interface.swizzles.then_some(swizzles), set, sizes: &t.interface.cbuf_sizes };
         let mut layout_entries = bindings.layout(wgpu::ShaderStages::COMPUTE);

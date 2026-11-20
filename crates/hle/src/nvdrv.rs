@@ -316,7 +316,8 @@ fn anomaly(tally: &Mutex<crate::Tally>, journal: &crate::journal::Journal, explo
 /// where the kernel stood when it handed the work over.
 pub struct GpuSide {
     /// The host render targets, when something renders.
-    pub surfaces: Option<gyroship_gpu::surfaces::Surfaces>,
+    /// Boxed: each draw takes it out and puts it back (8 bytes moved, not the ~3 KB of Surfaces).
+    pub surfaces: Option<Box<gyroship_gpu::surfaces::Surfaces>>,
     /// The GPU channels and what they ran.
     pub gpu: Gpu,
     /// `--hashes`: the presents with no image to hash (the others come back from the GPU).
