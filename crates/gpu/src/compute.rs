@@ -217,27 +217,41 @@ impl Surfaces {
             // ponytail: a window, not the buffer's real extent; bound it by the program's
             // offsets if a buffer ever runs past it.
             let address = u64::from(hi) << 32 | u64::from(lo);
-            let mut data = Vec::new();
             // The device's own bounds (DX12's are lower than Vulkan's here).
             let limits = self.device.limits();
             let max = (1u64 << 30).min(limits.max_storage_buffer_binding_size).min(limits.max_buffer_size);
+            // Read into bytes kept from one global to the next (not zeroed each time), staged
+            // in the texture belt (reused mapped chunks, not write_buffer's fresh pages), and
+            // copied into the buffer before the frame's commands (`uploads`, as a texture
+            // level). A window whose last byte cannot be read goes to the smaller read at once.
+            let mut read = None;
             for bytes in [size.max(1 << 20), size] {
-                if bytes == 0 || u64::from(bytes.next_multiple_of(4)) > max {
+                let n = u64::from(bytes.next_multiple_of(4));
+                if bytes == 0 || n > max || !mem(address.wrapping_add(n - 1), &mut [0u8]) {
                     continue;
                 }
-                data = vec![0u8; bytes.next_multiple_of(4) as usize];
-                if mem(address, &mut data) {
-                    self.note_read(crate::surfaces::Read::Global, data.len(), false);
+                if self.global_bytes.len() < n as usize {
+                    self.global_bytes.resize(n as usize, 0);
+                }
+                if mem(address, &mut self.global_bytes[..n as usize]) {
+                    read = Some(n);
                     break;
                 }
-                data.clear();
             }
-            if data.is_empty() {
+            let Some(n) = read else {
                 return Err(format!("global memory at c[{bank}][{at:#x}] ({address:#x}, size word {size:#x}) not readable"));
+            };
+            let room = self.texture_belt.allocate(wgpu::BufferSize::new(n).expect("a global has bytes"), wgpu::BufferSize::new(256).unwrap());
+            let (staging, offset) = (room.buffer().clone(), room.offset());
+            room.get_mapped_range_mut().expect("staging belt chunks are mapped").slice(0..n as usize).copy_from_slice(&self.global_bytes[..n as usize]);
+            self.note_read(crate::surfaces::Read::Global, n as usize, false);
+            // Past a belt chunk, its staging is freed before the next draw or dispatch (`flush_big_uploads`).
+            if n > 16 << 20 {
+                self.big_upload = true;
             }
             // Not create_buffer_init: an invalid buffer must come out as a wgpu error, not a panic.
-            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("global"), size: data.len() as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-            self.queue.write_buffer(&buffer, 0, &data);
+            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("global"), size: n, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+            self.uploads.get_or_insert_with(|| self.device.create_command_encoder(&Default::default())).copy_buffer_to_buffer(&staging, offset, &buffer, 0, n);
             globals.push(buffer);
         }
 

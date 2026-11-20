@@ -250,6 +250,9 @@ pub struct Surfaces {
     /// and the copies out of it, which `flush` submits before the frame.
     pub(crate) texture_belt: wgpu::util::StagingBelt,
     pub(crate) uploads: Option<wgpu::CommandEncoder>,
+    /// A dispatch's global memory as read, before its staging (whose mapped view
+    /// is write-only): kept from one global to the next, zeroed only as it grows.
+    pub(crate) global_bytes: Vec<u8>,
     /// The color target written last (the presented image at a present).
     last_color: Option<(u64, u32)>,
     /// The window the presented images go to, if any.
@@ -1090,7 +1093,7 @@ impl Surfaces {
         let timed = timing.is_some();
         let rec = Arc::new(Mutex::new(crate::record::Recorder::new(&device, &queue, timing)));
         let renderable = (0..=0xff).filter_map(color_format).chain((0..=0xff).filter_map(depth_format)).map(|f| (f, renderable_on(&adapter, &device, f))).collect();
-        Ok(Surfaces { renderable, adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, rec, batch: Vec::with_capacity(BATCH), recorder: None, recorder_ended: false, timed, open: None, sets: 0, present: 0, readbacks: Default::default(), hasher: None, belt, big_upload: false, texture_belt, uploads: None, staging: Staging::default(), last_color: None, window, submit: None, submit_ended: false, memo: Memo::default(), compile: Compile::default(), compile_total: Compile::default(), background: false, wait_left: PIPELINE_WAIT, workers: None, finished: Default::default(), disk_cache: None, shader_cache: None, views: Aged::default(), dynamic_max, clip_distances })
+        Ok(Surfaces { renderable, adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, rec, batch: Vec::with_capacity(BATCH), recorder: None, recorder_ended: false, timed, open: None, sets: 0, present: 0, readbacks: Default::default(), hasher: None, belt, big_upload: false, texture_belt, uploads: None, global_bytes: Vec::new(), staging: Staging::default(), last_color: None, window, submit: None, submit_ended: false, memo: Memo::default(), compile: Compile::default(), compile_total: Compile::default(), background: false, wait_left: PIPELINE_WAIT, workers: None, finished: Default::default(), disk_cache: None, shader_cache: None, views: Aged::default(), dynamic_max, clip_distances })
     }
 
     /// Shows the presented image (the color target written last, its top-left
