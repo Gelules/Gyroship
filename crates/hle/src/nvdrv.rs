@@ -7,7 +7,7 @@
 //! Ioctls that read and write get their input copied into their output
 //! first, then the fields the client reads are filled in.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use gyroship_gpu::pushbuf::{Channel, Effect};
 use gyroship_runtime::mem::{Memory, PAGE};
@@ -335,6 +335,10 @@ pub struct GpuSide {
     /// textures' write watch went over so far.
     pub frames: String,
     pub watched: u64,
+    /// Pages a write-watch take reported under no texture (another range taken
+    /// with them): reported again to the next take or copy reset of a texture on
+    /// them, as when textures alone were taken (see [`written_textures`]).
+    pub owed: BTreeSet<u64>,
     /// Host nanoseconds so far performing GPU ops (the take of written
     /// textures, guest writes, and translating and recording draws), for `--perf`.
     pub effects_ns: u64,
@@ -383,7 +387,7 @@ pub enum GpuJob {
 
 impl GpuSide {
     pub fn new(mem: Arc<Memory>, journal: crate::journal::Journal, tally: Arc<Mutex<crate::Tally>>, syncpts: Arc<[AtomicU32; 32]>, config: crate::Config) -> GpuSide {
-        GpuSide { surfaces: None, gpu: Gpu::default(), frame_hashes: Vec::new(), video: None, window: None, hud: None, rewrites: Vec::new(), frames: String::new(), watched: 0, effects_ns: 0, applying: 0, wrote: None, mem, journal, tally, syncpts, config, at: Phase::default() }
+        GpuSide { surfaces: None, gpu: Gpu::default(), frame_hashes: Vec::new(), video: None, window: None, hud: None, rewrites: Vec::new(), frames: String::new(), watched: 0, owed: BTreeSet::new(), effects_ns: 0, applying: 0, wrote: None, mem, journal, tally, syncpts, config, at: Phase::default() }
     }
 
     /// The kernel time the work was handed over at.
@@ -1255,7 +1259,8 @@ fn forget_written_textures(k: &mut GpuSide, space: u32) {
     // (GPU start, GPU end, CPU address), by CPU address.
     let mut cpu: Vec<(u64, u64, u64)> = ranges.iter().map(|&(start, end)| (start, end, k.gpu_to_cpu(space, start))).collect();
     cpu.sort_unstable_by_key(|c| c.2);
-    let (written, pages) = written_textures(&k.mem, &cpu);
+    let members: Vec<Member> = cpu.into_iter().map(|(start, end, at)| (start, end, at, true)).collect();
+    let (written, pages) = written_textures(&k.mem, &members, &mut k.owed);
     k.watched += pages;
     rewritten(k, written);
 }
@@ -1281,7 +1286,8 @@ fn rewritten(k: &mut GpuSide, written: Vec<(u64, u64)>) {
 /// per write). Any other texture on a reset page (sharing one, or the same
 /// memory at another GPU address) is dropped as that take would drop it.
 fn forget_copied(k: &mut GpuSide, space: u32, start: u64, len: u64) {
-    let pages = k.mem.reset_written(k.gpu_to_cpu(space, start), len);
+    let at = k.gpu_to_cpu(space, start);
+    let pages = reset_pages(&k.mem, &mut k.owed, at, len);
     if pages.is_empty() {
         return;
     }
@@ -1291,20 +1297,63 @@ fn forget_copied(k: &mut GpuSide, space: u32, start: u64, len: u64) {
     rewritten(k, written);
 }
 
-/// The textures of `cpu` (GPU start, GPU end, CPU address; sorted by CPU
-/// address) whose pages were written since the last call, as (GPU start, GPU
-/// end). One write-watch take per span of textures whose pages touch: the
-/// span's written pages are reported and reset in one call, so a write that
-/// races it shows at the next submit, and every texture of the span is tested
-/// against them, so textures sharing a page all see its write. Spans share no
-/// page: taking one hides nothing from another. Also the pages the takes went over.
-fn written_textures(mem: &Memory, cpu: &[(u64, u64, u64)]) -> (Vec<(u64, u64)>, u64) {
+/// The pages of `[at, at + len)` written since they were last taken, reset
+/// (`Memory::reset_written`), with those `owed` there, now paid.
+fn reset_pages(mem: &Memory, owed: &mut BTreeSet<u64>, at: u64, len: u64) -> Vec<u64> {
+    if len == 0 {
+        return Vec::new();
+    }
+    let mut pages = mem.reset_written(at, len);
+    let paid: Vec<u64> = owed.range(at / PAGE * PAGE..at.saturating_add(len)).copied().collect();
+    if !paid.is_empty() {
+        paid.iter().for_each(|p| _ = owed.remove(p));
+        pages.extend(paid);
+        pages.sort_unstable();
+        pages.dedup();
+    }
+    pages
+}
+
+/// A write-watch take's member: GPU start, GPU end, CPU address, and whether
+/// it is a texture (else another range taken with them).
+type Member = (u64, u64, u64, bool);
+
+/// The textures of `members` (sorted by CPU address) whose pages were written
+/// since the last call, as (GPU start, GPU end). One write-watch take per span
+/// of members whose pages touch: the span's written pages are reported and
+/// reset in one call, so a write that races it shows at the next submit, and
+/// every texture of the span is tested against them, so textures sharing a
+/// page all see its write. Spans share no page: taking one hides nothing from
+/// another. A page reported under no texture is `owed`, and reported again
+/// with the next take of a texture on it (or a reset, `reset_pages`): textures
+/// are found written as when they alone were taken. Also the pages the takes
+/// went over.
+fn written_textures(mem: &Memory, members: &[Member], owed: &mut BTreeSet<u64>) -> (Vec<(u64, u64)>, u64) {
     let (mut written, mut watched) = (Vec::new(), 0);
-    for span in page_spans(cpu) {
-        let (first, last) = (span[0].2, span.iter().map(|&(start, end, at)| at + (end - start)).max().unwrap_or(0));
-        let pages = mem.take_written(first, last - first);
+    for span in page_spans(members) {
+        let (first, last) = (span[0].2, span.iter().map(|&(start, end, at, _)| at + (end - start)).max().unwrap_or(0));
+        let mut pages = mem.take_written(first, last - first);
         watched += (last - first).div_ceil(PAGE);
-        written.extend(span.iter().filter(|&&(start, end, at)| touches(&pages, at, end - start)).map(|&(start, end, _)| (start, end)));
+        pages.extend(owed.range(first / PAGE * PAGE..last));
+        if pages.is_empty() {
+            continue;
+        }
+        pages.sort_unstable();
+        pages.dedup();
+        let mut under = vec![false; pages.len()];
+        for &(start, end, at, texture) in span {
+            if texture && end > start {
+                under[pages.partition_point(|&p| p + PAGE <= at)..pages.partition_point(|&p| p < at + (end - start))].fill(true);
+            }
+        }
+        for (&p, under) in pages.iter().zip(under) {
+            if under {
+                owed.remove(&p);
+            } else {
+                owed.insert(p);
+            }
+        }
+        written.extend(span.iter().filter(|&&(start, end, at, texture)| texture && touches(&pages, at, end - start)).map(|&(start, end, ..)| (start, end)));
     }
     (written, watched)
 }
@@ -1317,11 +1366,11 @@ fn touches(pages: &[u64], at: u64, len: u64) -> bool {
 
 /// `ranges` (GPU start, GPU end, CPU address), sorted by CPU address, cut into
 /// runs whose 4 KiB pages touch or overlap: a run's pages are its members' pages.
-fn page_spans(ranges: &[(u64, u64, u64)]) -> Vec<&[(u64, u64, u64)]> {
+fn page_spans(ranges: &[Member]) -> Vec<&[Member]> {
     let mut spans = Vec::new();
     let mut from = 0;
     let mut reach = 0u64;
-    for (i, &(start, end, at)) in ranges.iter().enumerate() {
+    for (i, &(start, end, at, _)) in ranges.iter().enumerate() {
         if i > from && at > reach.next_multiple_of(PAGE) {
             spans.push(&ranges[from..i]);
             from = i;
@@ -2498,8 +2547,9 @@ mod tests {
 
 #[cfg(test)]
 mod page_span_tests {
-    use super::{page_spans, written_textures};
-    use gyroship_runtime::mem::{Block, Memory, perm, state};
+    use super::{Member, page_spans, reset_pages, touches, written_textures};
+    use gyroship_runtime::mem::{Block, Memory, PAGE, perm, state};
+    use std::collections::BTreeSet;
 
     /// Textures that share a written page all see the write, once: the span's
     /// pages are taken in one call and every texture is tested against them.
@@ -2508,18 +2558,94 @@ mod page_span_tests {
         const AT: u64 = 0x10_0000_0000;
         let m = Memory::new().unwrap();
         m.map(AT, 0x3000, Block::new(state::NORMAL, perm::RW)).unwrap();
-        // (GPU start, GPU end, CPU address): two textures on page 1, one on page 2.
-        let cpu = [(0x100, 0x900, AT + 0x1000), (0x900, 0xa00, AT + 0x1800), (0xa00, 0xb00, AT + 0x2000)];
-        written_textures(&m, &cpu);
+        // (GPU start, GPU end, CPU address, texture): two textures on page 1, one on page 2.
+        let cpu = [(0x100, 0x900, AT + 0x1000, true), (0x900, 0xa00, AT + 0x1800, true), (0xa00, 0xb00, AT + 0x2000, true)];
+        let mut owed = BTreeSet::new();
+        written_textures(&m, &cpu, &mut owed);
         m.write(AT + 0x1ff0, &[1]).unwrap();
-        assert_eq!(written_textures(&m, &cpu).0, [(0x100, 0x900), (0x900, 0xa00)]);
-        assert!(written_textures(&m, &cpu).0.is_empty(), "taken once");
+        assert_eq!(written_textures(&m, &cpu, &mut owed).0, [(0x100, 0x900), (0x900, 0xa00)]);
+        assert!(written_textures(&m, &cpu, &mut owed).0.is_empty(), "taken once");
+        assert!(owed.is_empty(), "textures alone owe nothing");
+    }
+
+    /// A written page taken under no texture is owed: the next take of a
+    /// texture on it reports it, once.
+    #[test]
+    fn a_page_taken_under_no_texture_is_owed() {
+        const AT: u64 = 0x10_0000_0000;
+        let m = Memory::new().unwrap();
+        m.map(AT, 0x2000, Block::new(state::NORMAL, perm::RW)).unwrap();
+        let (other, texture) = ((0, 0x100, AT, false), (0x1000, 0x1100, AT + 0x80, true));
+        let mut owed = BTreeSet::new();
+        m.write(AT + 0x10, &[1]).unwrap();
+        assert!(written_textures(&m, &[other], &mut owed).0.is_empty());
+        assert_eq!(owed, BTreeSet::from([AT]), "owed");
+        assert_eq!(written_textures(&m, &[other, texture], &mut owed).0, [(0x1000, 0x1100)], "reported to the texture");
+        assert!(owed.is_empty(), "paid");
+        assert!(written_textures(&m, &[other, texture], &mut owed).0.is_empty(), "then clean");
+    }
+
+    /// Textures taken alone, or with other ranges, are found written alike at
+    /// every take and copy reset, over random textures, ranges, writes and
+    /// resets on two memories written alike.
+    #[test]
+    fn other_ranges_taken_leave_the_textures_as_before() {
+        const AT: u64 = 0x10_0000_0000;
+        const SIZE: u64 = 24 * PAGE;
+        let (a, b) = (Memory::new().unwrap(), Memory::new().unwrap());
+        for m in [&a, &b] {
+            m.map(AT, SIZE, Block::new(state::NORMAL, perm::RW)).unwrap();
+        }
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        // GPU start: the step that made the range, to tell them apart; CPU addresses on a
+        // 1 KiB grid, so that some textures share theirs.
+        let (mut textures, mut others): (Vec<Member>, Vec<Member>) = (Vec::new(), Vec::new());
+        let (mut owed_a, mut owed_b) = (BTreeSet::new(), BTreeSet::new());
+        for step in 0..600u64 {
+            let at = AT + next(SIZE / 0x400) * 0x400;
+            let len = (1 + next(3 * PAGE)).min(AT + SIZE - at);
+            match next(8) {
+                0 => textures.push((step, step + len, at, true)),
+                1 => others.push((step, step + len, at, false)),
+                2 if !textures.is_empty() => _ = textures.swap_remove(next(textures.len() as u64) as usize),
+                3 if !others.is_empty() => _ = others.swap_remove(next(others.len() as u64) as usize),
+                4 => {
+                    let dropped = |m: &Memory, owed: &mut BTreeSet<u64>| {
+                        let pages = reset_pages(m, owed, at, len);
+                        textures.iter().filter(|t| touches(&pages, t.2, t.1 - t.0)).map(|t| t.0).collect::<Vec<_>>()
+                    };
+                    assert_eq!(dropped(&a, &mut owed_a), dropped(&b, &mut owed_b), "step {step}: a copy reset");
+                }
+                _ => {
+                    let byte = at + next(len);
+                    for m in [&a, &b] {
+                        m.write(byte, &[step as u8]).unwrap();
+                    }
+                }
+            }
+            if next(3) == 0 {
+                // As `forget_written_textures` sorts them: textures as before, the others among them.
+                let mut alone = textures.clone();
+                alone.sort_unstable_by_key(|t| t.2);
+                let mut with = alone.clone();
+                with.extend(&others);
+                with.sort_by_key(|t| t.2);
+                assert_eq!(written_textures(&a, &alone, &mut owed_a).0, written_textures(&b, &with, &mut owed_b).0, "step {step}: a take");
+            }
+        }
+        assert!(owed_a.is_empty(), "textures alone owe nothing");
     }
 
     #[test]
     fn spans_join_ranges_whose_pages_touch() {
-        // (GPU start, GPU end, CPU address); CPU ranges [at, at + len).
-        let r = [(0, 0x100, 0x1000), (0, 0x10, 0x1f00), (0, 0x2000, 0x2000), (0, 0x10, 0x5000), (0, 0x10, 0x6ff0), (0, 0x20, 0x9000)];
+        // (GPU start, GPU end, CPU address, texture); CPU ranges [at, at + len).
+        let r = [(0, 0x100, 0x1000, true), (0, 0x10, 0x1f00, true), (0, 0x2000, 0x2000, true), (0, 0x10, 0x5000, true), (0, 0x10, 0x6ff0, true), (0, 0x20, 0x9000, true)];
         let spans: Vec<Vec<u64>> = page_spans(&r).iter().map(|s| s.iter().map(|x| x.2).collect()).collect();
         // 0x1000.. and 0x1f00.. share a page; 0x2000.. starts at the next page boundary
         // (touching); 0x5000 starts a page after the run's last page; 0x6ff0 too.

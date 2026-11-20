@@ -2549,6 +2549,26 @@ mod tests {
         assert!(s.memo.blocks[id as usize][..] == [&guest[..0x1000], &[0u8; 0x1000][..]].concat()[..], "the readable page, then zeros");
     }
 
+    /// Bytes a copy wrote past its declared span (`mark_dirty`) are read again,
+    /// as those inside it.
+    #[test]
+    fn bytes_marked_dirty_are_read_again() {
+        let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
+            eprintln!("no GPU adapter: test skipped");
+            return;
+        };
+        let mut mem = |_: u64, out: &mut [u8]| {
+            out.fill(1);
+            true
+        };
+        for _ in 0..2 {
+            s.read_exact(Read::Vertex, 0x1000, 16, 16, &mut mem).unwrap();
+        }
+        s.mark_dirty(0x1008, 4);
+        s.read_exact(Read::Vertex, 0x1000, 16, 16, &mut mem).unwrap();
+        assert_eq!(s.staging.memo_hits[Read::Vertex as usize], 1, "read again after the mark");
+    }
+
     /// Vertices read exactly, then staged as they are: the guest's bytes then
     /// zeros to a multiple of 4, aligned, once a submit, and again in a grown
     /// arena or the next frame; an unreadable read stages nothing.

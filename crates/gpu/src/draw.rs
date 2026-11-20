@@ -1772,9 +1772,10 @@ impl Surfaces {
 
     /// A GPU write reached `[start, start + len)` past the range it invalidated
     /// (a copy whose declared span falls short): refreshes take those bytes,
-    /// drops do not (the next write-watch take reports them, as before). Always
-    /// with a write of its own to `invalidate`.
+    /// drops do not (the next write-watch take reports them, as before), and
+    /// the memo reads them again. Always with a write of its own to `invalidate`.
     pub fn mark_dirty(&mut self, start: u64, len: u64) {
+        self.memo.wrote(start, len);
         self.cache.marked.push((start, start.saturating_add(len)));
     }
 
