@@ -879,8 +879,14 @@ type Bytes = Arc<Vec<u8>>;
 /// flush (guest code may have written in between).
 #[derive(Default)]
 pub(crate) struct Memo {
-    /// (kind, address, length) -> the bytes.
-    reads: FxMap<(u8, u64, usize), Dated<Bytes>>,
+    /// (kind, address, length) -> the read's id, its place in `blocks`.
+    reads: FxMap<(u8, u64, usize), Dated<u32>>,
+    /// Each read's bytes, by id: a stage keeps its banks' ids, not their bytes,
+    /// and a bank is staged by its id (`Surfaces::stage_bank`). A read made
+    /// again after a GPU write takes a new id.
+    blocks: Vec<Bytes>,
+    /// (read id, bytes the program may read) -> the bank's staged block.
+    banks: FxMap<(u32, u32), Slice>,
     /// (kind, address, length, filled to, bound as) -> the staged block.
     staged: FxMap<(u8, u64, usize, usize, usize), Dated<Slice>>,
     /// (address, index size, count, restart index) -> the staged indices.
@@ -909,6 +915,8 @@ pub(crate) struct Memo {
 impl Memo {
     fn clear(&mut self) {
         self.reads.clear();
+        self.blocks.clear();
+        self.banks.clear();
         self.staged.clear();
         self.indices.clear();
         self.descriptors.clear();
@@ -1227,17 +1235,17 @@ impl Surfaces {
         self.begin_job(verified);
     }
 
-    /// `len` bytes of guest memory at `addr`, read through `mem` unless this
-    /// submit read them already and the GPU has not written them since; None
-    /// if they are not readable.
-    pub(crate) fn read_guest(&mut self, kind: Read, addr: u64, len: usize, mem: crate::draw::Mem) -> Option<Arc<Vec<u8>>> {
+    /// `len` bytes of guest memory at `addr` and the read's id (see
+    /// [`Memo::blocks`]), read through `mem` unless this submit read them
+    /// already and the GPU has not written them since; None if they are not
+    /// readable.
+    pub(crate) fn read_guest(&mut self, kind: Read, addr: u64, len: usize, mem: crate::draw::Mem) -> Option<(u32, Arc<Vec<u8>>)> {
         let key = (kind as u8, addr, len);
-        if let Some((bytes, epoch)) = self.memo.reads.get(&key)
-            && self.memo.fresh(addr, len, *epoch)
+        if let Some(&(id, epoch)) = self.memo.reads.get(&key)
+            && self.memo.fresh(addr, len, epoch)
         {
-            let bytes = bytes.clone();
             self.note_read(kind, len, true);
-            return Some(bytes);
+            return Some((id, self.memo.blocks[id as usize].clone()));
         }
         self.note_read(kind, len, false);
         let mut bytes = vec![0u8; len];
@@ -1252,21 +1260,23 @@ impl Surfaces {
             bytes[n..].fill(0);
         }
         let bytes = Arc::new(bytes);
-        self.memo.reads.insert(key, (bytes.clone(), self.memo.epoch));
-        Some(bytes)
+        let id = self.memo.blocks.len() as u32;
+        self.memo.blocks.push(bytes.clone());
+        self.memo.reads.insert(key, (id, self.memo.epoch));
+        Some((id, bytes))
     }
 
-    /// As [`Surfaces::stage_window`], for `bytes` read from guest memory at
-    /// `addr`: staged once a submit while the GPU does not write them.
-    pub(crate) fn stage_guest(&mut self, kind: Read, addr: u64, bytes: &[u8], zeros: usize, window: usize) -> Slice {
-        let key = (kind as u8, addr, bytes.len(), zeros, window);
-        if let Some((slice, epoch)) = self.memo.staged.get(&key)
-            && self.memo.fresh(addr, bytes.len(), *epoch)
-        {
+    /// The constant bank of read `id` as a program reading `window` bytes of
+    /// it binds it ([`Surfaces::stage_window`]: the bytes it may read, then
+    /// zeros to there, bound as 64 KiB): staged once a submit for each window,
+    /// a read made again after a GPU write taking a new id.
+    pub(crate) fn stage_bank(&mut self, id: u32, window: usize) -> Slice {
+        if let Some(slice) = self.memo.banks.get(&(id, window as u32)) {
             return slice.clone();
         }
-        let slice = self.stage_window(bytes, zeros, window);
-        self.memo.staged.insert(key, (slice.clone(), self.memo.epoch));
+        let bytes = self.memo.blocks[id as usize].clone();
+        let slice = self.stage_window(&bytes[..bytes.len().min(window)], window, 0x10000);
+        self.memo.banks.insert((id, window as u32), slice.clone());
         slice
     }
 
@@ -1551,6 +1561,7 @@ impl Surfaces {
         self.staged.clear();
         // ponytail: staged blocks stay valid in the old buffer; dropped for simplicity (rare).
         self.memo.staged.clear();
+        self.memo.banks.clear();
         self.memo.indices.clear();
     }
 
@@ -2270,7 +2281,7 @@ mod tests {
             buf.fill(7);
             true
         };
-        let mut read = |s: &mut Surfaces| s.read_guest(Read::Bank, 0x1000, 16, &mut mem).map(|b| b.to_vec());
+        let mut read = |s: &mut Surfaces| s.read_guest(Read::Bank, 0x1000, 16, &mut mem).map(|(_, b)| b.to_vec());
         assert_eq!(read(&mut s), Some(vec![7; 16]));
         assert_eq!(read(&mut s), Some(vec![7; 16]));
         s.invalidate(0x3000, 4);
@@ -2289,6 +2300,35 @@ mod tests {
         s.invalidate(0x2010, 4);
         s.descriptor(0x2000, &mut mem);
         assert_eq!(reads.get(), 5);
+    }
+
+    /// A bank read is staged once a submit for each window a program reads of
+    /// it; read again after a GPU write, it takes a new id and its new bytes
+    /// are staged; a grown arena stages it again there. Needs a GPU adapter.
+    #[test]
+    fn a_bank_read_is_staged_once_per_id_and_window() {
+        let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
+            eprintln!("no GPU adapter: test skipped");
+            return;
+        };
+        let value = std::cell::Cell::new(1u8);
+        let mut mem = |_: u64, buf: &mut [u8]| {
+            buf.fill(value.get());
+            true
+        };
+        let (id, _) = s.read_guest(Read::Bank, 0x1000, 64, &mut mem).unwrap();
+        let first = s.stage_bank(id, 64);
+        let calls = s.staging.calls;
+        assert_eq!((s.stage_bank(id, 64).1, s.staging.calls), (first.1, calls), "found by its id");
+        assert_ne!(s.stage_bank(id, 32).1, first.1, "another window, another block");
+        s.invalidate(0x1000, 4);
+        value.set(2);
+        let (again, _) = s.read_guest(Read::Bank, 0x1000, 64, &mut mem).unwrap();
+        assert_ne!(again, id, "read again: a new id");
+        let fresh = s.stage_bank(again, 64);
+        assert_eq!(s.arena_bytes(&fresh, 64), [2u8; 64], "its new bytes");
+        s.grow_arena(0);
+        assert!(s.stage_bank(again, 64).0 == s.arena.0, "staged again in the grown arena");
     }
 
     /// Vertices read straight into the arena: the guest's bytes then zeros to a

@@ -94,11 +94,11 @@ impl Surfaces {
         }
         let mut banks = Banks::new();
         for &(bank, addr, size) in &l.cbufs {
-            let data = self.read_guest(crate::surfaces::Read::ComputeBank, addr, (size as usize).min(CBUF_BYTES), mem).ok_or_else(|| format!("compute constant bank {bank} at {addr:#x} not readable"))?;
+            let read = self.read_guest(crate::surfaces::Read::ComputeBank, addr, (size as usize).min(CBUF_BYTES), mem).ok_or_else(|| format!("compute constant bank {bank} at {addr:#x} not readable"))?;
             // In bank order; a bank given twice keeps its last binding.
             match banks.binary_search_by_key(&bank, |(k, _)| *k) {
-                Ok(i) => banks[i].1 = (addr, data),
-                Err(i) => banks.insert(i, (bank, (addr, data))),
+                Ok(i) => banks[i].1 = read,
+                Err(i) => banks.insert(i, (bank, read)),
             }
         }
         let word = |banks: &[(u8, Bank)], h: &Handle| -> Option<u32> {
@@ -238,8 +238,8 @@ impl Surfaces {
 
         // Bindings: constant banks, textures and swizzles as for draws, then the images.
         let (textures, swizzles, _) = self.texture_slots(t, &banks, pools.headers, pools.samplers, pools.sampler_binding, &[], mem)?;
-        banks.retain(|(b, _)| t.interface.cbufs.contains(b));
-        let bindings = Bindings { cbufs: banks, textures, swizzles: t.interface.swizzles.then_some(swizzles), sizes: &t.interface.cbuf_sizes };
+        let cbufs = banks.iter().filter(|(b, _)| t.interface.cbufs.contains(b)).map(|&(b, (id, _))| (b, id)).collect();
+        let bindings = Bindings { cbufs, textures, swizzles: t.interface.swizzles.then_some(swizzles), sizes: &t.interface.cbuf_sizes };
         let mut layout_entries = bindings.layout(wgpu::ShaderStages::COMPUTE);
         for (i, (img, (_, format, _, _))) in t.interface.images.iter().zip(&images).enumerate() {
             let view_dimension = match img.dim {
@@ -292,14 +292,7 @@ impl Surfaces {
             self.compile.made.push(format!("p{key:016x}+compute"));
         }
         let (pipeline, layout) = self.cache.compute_pipelines[&id].clone();
-        let mut buffers: Vec<(u32, (wgpu::Buffer, u64, u64))> = bindings
-            .cbufs
-            .iter()
-            .map(|(b, (addr, data))| {
-                let (len, zeros) = bindings.staged(*b, data);
-                (u32::from(*b), self.stage_guest(crate::surfaces::Read::ComputeBank, *addr, &data[..len], zeros, 0x10000))
-            })
-            .collect();
+        let mut buffers: Vec<(u32, (wgpu::Buffer, u64, u64))> = bindings.cbufs.iter().map(|&(b, id)| (u32::from(b), self.stage_bank(id, bindings.window(b)))).collect();
         if let Some(codes) = &bindings.swizzles {
             let bytes: Vec<u8> = codes.iter().flat_map(|c| c.to_le_bytes()).collect();
             buffers.push((shader::SWIZZLE_BINDING, self.stage(&bytes)));

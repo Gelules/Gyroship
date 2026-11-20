@@ -28,11 +28,16 @@ use std::collections::{BTreeMap, BTreeSet};
 /// Reads guest memory at a GPU address; false if a byte is not readable.
 pub type Mem<'a> = &'a mut dyn FnMut(u64, &mut [u8]) -> bool;
 
-/// A constant bank as read: its guest address and bytes (shared by the draws of a submit).
-pub(crate) type Bank = (u64, std::sync::Arc<Vec<u8>>);
+/// A constant bank as read: the read's id in the submit's memo (`Memo::blocks`)
+/// and its bytes (shared by the draws of a submit).
+pub(crate) type Bank = (u32, std::sync::Arc<Vec<u8>>);
 
 /// A stage's constant banks by bank, in bank order, each once.
 pub(crate) type Banks = SmallVec<[(u8, Bank); 16]>;
+
+/// A stage's constant banks by bank, in bank order: each read's id, which
+/// tells its bytes and stages them (`Surfaces::stage_bank`).
+pub(crate) type BankIds = SmallVec<[(u8, u32); 16]>;
 
 /// Bank `b` of `banks`.
 pub(crate) fn bank(banks: &[(u8, Bank)], b: u8) -> Option<&Bank> {
@@ -448,7 +453,7 @@ type PipelineKey = (
 /// memo of stages (`Memo::stages`): a stage found there is one count each.
 pub(crate) struct Bindings<'t> {
     /// Constant buffers by bank.
-    pub(crate) cbufs: Banks,
+    pub(crate) cbufs: BankIds,
     pub(crate) textures: std::sync::Arc<[Slot]>,
     /// Each slot's header swizzle, when the program reads them.
     pub(crate) swizzles: Option<std::sync::Arc<[u32]>>,
@@ -473,7 +478,7 @@ pub(crate) type StageKey = (usize, SmallVec<[(u8, u64, u32); 16]>, Pool, Pool, S
 /// whether they still hold (`Surfaces::holds`): the write epoch they were made
 /// at and what their slots read; and the textures they read, for the journal.
 pub(crate) struct StageMemo {
-    banks: Banks,
+    banks: BankIds,
     textures: std::sync::Arc<[Slot]>,
     swizzles: Option<std::sync::Arc<[u32]>>,
     epoch: u64,
@@ -539,15 +544,8 @@ pub(crate) struct Slot {
 
 impl Bindings<'_> {
     /// The bytes of bank `bank` the program may read.
-    pub(crate) fn window(&self, bank: u8) -> u64 {
-        self.sizes.get(&bank).map_or(CBUF_BYTES as u64, |&s| u64::from(s))
-    }
-
-    /// The bank's bytes to stage (what the program may read of them) and the
-    /// bytes that must read as the bank then zeros.
-    pub(crate) fn staged(&self, bank: u8, data: &[u8]) -> (usize, usize) {
-        let window = self.window(bank) as usize;
-        (data.len().min(window), window)
+    pub(crate) fn window(&self, bank: u8) -> usize {
+        self.sizes.get(&bank).map_or(CBUF_BYTES, |&s| s as usize)
     }
 
     /// The layout these bindings take in a stage.
@@ -918,13 +916,7 @@ impl Surfaces {
         let mut bind_groups: SmallVec<[(wgpu::BindGroup, SmallVec<[u32; 16]>); 2]> = SmallVec::new();
         for (g, layout) in bind_layouts.iter().flatten().enumerate() {
             let Bindings { cbufs, textures, swizzles, .. } = &stages[g];
-            let mut buffers: SmallVec<[(u32, crate::surfaces::Slice); 16]> = cbufs
-                .iter()
-                .map(|(b, (addr, data))| {
-                    let (len, zeros) = stages[g].staged(*b, data);
-                    (u32::from(*b), self.stage_guest(crate::surfaces::Read::Bank, *addr, &data[..len], zeros, 0x10000))
-                })
-                .collect();
+            let mut buffers: SmallVec<[(u32, crate::surfaces::Slice); 16]> = cbufs.iter().map(|&(b, id)| (u32::from(b), self.stage_bank(id, stages[g].window(b)))).collect();
             if let Some(codes) = swizzles {
                 let bytes: SmallVec<[u8; 256]> = codes.iter().flat_map(|c| c.to_le_bytes()).collect();
                 buffers.push((shader::SWIZZLE_BINDING, self.stage(&bytes)));
@@ -1193,18 +1185,18 @@ impl Surfaces {
             let Err(at) = banks.binary_search_by_key(&b, |(k, _)| *k) else { continue };
             let (addr, size) = cbufs.get(usize::from(b)).copied().flatten().ok_or_else(|| format!("constant bank {b} not bound"))?;
             // Its bound size only: binding it as 64 KiB is `stage_window`'s.
-            let data = self.read_guest(crate::surfaces::Read::Bank, addr, (size as usize).min(CBUF_BYTES), mem).ok_or_else(|| format!("constant bank {b} at {addr:#x} not readable"))?;
-            banks.insert(at, (b, (addr, data)));
+            let read = self.read_guest(crate::surfaces::Read::Bank, addr, (size as usize).min(CBUF_BYTES), mem).ok_or_else(|| format!("constant bank {b} at {addr:#x} not readable"))?;
+            banks.insert(at, (b, read));
         }
         let (textures, swizzles, read) = self.texture_slots(t, &banks, headers, samplers, binding, attached, mem)?;
         // The handle banks were for the textures; the program reads the others.
-        banks.retain(|(b, _)| t.interface.cbufs.contains(b));
+        let ids: BankIds = banks.iter().filter(|(b, _)| t.interface.cbufs.contains(b)).map(|&(b, (id, _))| (b, id)).collect();
         let swizzles = t.interface.swizzles.then_some(swizzles);
         if let Some(k) = key {
             let journal = self.textures_read[journaled..].to_vec();
-            self.memo.stages.insert(k, StageMemo { banks: banks.clone(), textures: textures.clone(), swizzles: swizzles.clone(), epoch, read, journal });
+            self.memo.stages.insert(k, StageMemo { banks: ids.clone(), textures: textures.clone(), swizzles: swizzles.clone(), epoch, read, journal });
         }
-        Ok(Bindings { cbufs: banks, textures, swizzles, sizes: &t.interface.cbuf_sizes })
+        Ok(Bindings { cbufs: ids, textures, swizzles, sizes: &t.interface.cbuf_sizes })
     }
 
     /// Whether stage `s`, resolved earlier in this submit from banks `bound`,
@@ -1935,7 +1927,7 @@ mod tests {
         let banks: Banks = smallvec![(0u8, (0, std::sync::Arc::new(vec![0u8; 16])))];
         let (slots, _, _) = s.texture_slots(&t, &banks, resources::header_pool(&reg), resources::sampler_pool(&reg), resources::sampler_binding(&reg), &[], &mut mem).unwrap_or_else(|e| panic!("{e}"));
         let none = BTreeMap::new();
-        let bindings = Bindings { cbufs: Banks::new(), textures: slots, swizzles: None, sizes: &none };
+        let bindings = Bindings { cbufs: BankIds::new(), textures: slots, swizzles: None, sizes: &none };
         let mut entries = bindings.layout(wgpu::ShaderStages::COMPUTE);
         let storage = wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None };
         entries.push(wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::COMPUTE, ty: storage, count: None });
@@ -2045,8 +2037,7 @@ mod tests {
         let sampler = s.device.create_sampler(&Default::default());
         let slot = |depth: bool, sampled: bool| Slot { view: view.clone(), sampler: sampled.then(|| sampler.clone()), depth, compare: false, dimension: wgpu::TextureViewDimension::D2 };
         let sizes = BTreeMap::new();
-        let bank: Bank = (0, std::sync::Arc::new(Vec::new()));
-        let bindings = |slots: Vec<Slot>| Bindings { cbufs: smallvec![(0, bank.clone()), (3, bank.clone())], textures: slots.into(), swizzles: Some(vec![0u32; 4].into()), sizes: &sizes };
+        let bindings = |slots: Vec<Slot>| Bindings { cbufs: smallvec![(0, 0), (3, 1)], textures: slots.into(), swizzles: Some(vec![0u32; 4].into()), sizes: &sizes };
         let translation = |key| Translation { key, stage: Stage::Pixel, wgsl: String::new(), interface: Interface::default() };
         let (t1, t2) = (translation(1), translation(2));
         let b = bindings(vec![slot(false, true), slot(false, false)]);
@@ -2151,9 +2142,10 @@ mod tests {
     }
 
     /// A stage resolved in a submit is taken again while its inputs hold, its
-    /// bank unread and the texture it read journaled again; a GPU write on its
-    /// bank or on its texture headers, a forgotten slots memo or a new submit
-    /// resolves it afresh.
+    /// bank unread (the same read's id) and the texture it read journaled
+    /// again; a GPU write on its bank (read again under a new id) or on its
+    /// texture headers, a forgotten slots memo or a new submit resolves it
+    /// afresh.
     #[test]
     fn a_stage_is_resolved_once_while_its_inputs_hold() {
         let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
@@ -2167,7 +2159,7 @@ mod tests {
         put(&mut tic, &[(6, 0, 0x08), (9, 7, 2), (12, 10, 2), (15, 13, 2), (18, 16, 2), (21, 19, 2), (24, 22, 3), (27, 25, 4), (30, 28, 5)]);
         put(&mut tic, &[(63, 41, (TEX >> 9) as u32), (87, 85, 3), (144, 128, 7), (175, 160, 7), (154, 151, 1), (191, 191, 1)]);
         let x = Texture { handle: Handle::CBuf { bank: 0, offset: 0 }, dim: TexDim::D2, compare: false, fetch: false, query: false };
-        let t = Translation { key: 0, stage: Stage::Pixel, wgsl: String::new(), interface: Interface { textures: vec![x], handle_banks: [0].into(), ..Default::default() } };
+        let t = Translation { key: 0, stage: Stage::Pixel, wgsl: String::new(), interface: Interface { textures: vec![x], cbufs: [0].into(), handle_banks: [0].into(), ..Default::default() } };
         let regions = [(TEX, vec![7u8; 512]), (HEADERS, tic.to_vec()), (SAMPLERS, vec![0u8; 32]), (BANK, vec![0u8; 16])];
         let reads = std::cell::Cell::new(0);
         let mut mem = |addr: u64, out: &mut [u8]| {
@@ -2186,19 +2178,19 @@ mod tests {
         let mut cbufs = [None; resources::BANKS];
         cbufs[0] = Some((BANK, 16));
         let pools = (resources::header_pool(&reg), resources::sampler_pool(&reg), resources::sampler_binding(&reg));
-        // Resolves the stage; its view, the bank reads so far, and (lookups, finds) in the stage memo.
+        // Resolves the stage; its view, the bank reads so far, (lookups, finds) in the stage memo, and its banks.
         let mut stage = |s: &mut Surfaces| {
             s.textures_read.clear();
             let b = s.stage_bindings(&cbufs, pools.0, pools.1, pools.2, &t, &[], &mut mem).unwrap_or_else(|e| panic!("{e}"));
             assert_eq!(s.textures_read, [(TEX, "memory")], "journaled as read");
-            (b.textures[0].view.clone(), reads.get(), s.staging.stages)
+            (b.textures[0].view.clone(), reads.get(), s.staging.stages, b.cbufs.clone())
         };
-        let (first, ..) = stage(&mut s);
-        let (again, read, memo) = stage(&mut s);
-        assert_eq!((again == first, read, memo), (true, 1, [2, 1]), "taken again, the bank unread");
+        let (first, _, _, banks) = stage(&mut s);
+        let (again, read, memo, same) = stage(&mut s);
+        assert_eq!((again == first, read, memo, same == banks), (true, 1, [2, 1], true), "taken again, the bank unread");
         s.memo.wrote(BANK, 4);
-        let (_, read, memo) = stage(&mut s);
-        assert_eq!((read, memo), (2, [3, 1]), "a bank written: resolved afresh");
+        let (_, read, memo, fresh) = stage(&mut s);
+        assert_eq!((read, memo, fresh != banks), (2, [3, 1], true), "a bank written: resolved afresh, read under a new id");
         assert_eq!(stage(&mut s).2, [4, 2], "then taken again");
         s.memo.wrote(HEADERS, 4);
         assert_eq!(stage(&mut s).2, [5, 2], "the headers written");
@@ -2241,8 +2233,8 @@ mod tests {
         let mut headers = resources::header_pool(&reg);
         headers.maximum_index = 1;
         let (samplers, binding) = (resources::sampler_pool(&reg), resources::sampler_binding(&reg));
-        // Bank 0 at `addr`, holding handle `h` (header h, sampler 0).
-        let bank = |addr: u64, h: u32| -> Banks { smallvec![(0u8, (addr, std::sync::Arc::new(h.to_le_bytes().to_vec())))] };
+        // Bank 0 as read `id`, holding handle `h` (header h, sampler 0).
+        let bank = |id: u32, h: u32| -> Banks { smallvec![(0u8, (id, std::sync::Arc::new(h.to_le_bytes().to_vec())))] };
         // The slot's view, and (lookups, finds) by handles.
         let mut slots = |s: &mut Surfaces, banks: Banks| {
             s.textures_read.clear();
@@ -2250,15 +2242,15 @@ mod tests {
             assert_eq!(s.textures_read, [(TEX, "memory")], "journaled as read");
             (textures[0].view.clone(), s.staging.slot_sets)
         };
-        let (first, _) = slots(&mut s, bank(0x60_0000, 0));
-        let (again, memo) = slots(&mut s, bank(0x61_0000, 0));
+        let (first, _) = slots(&mut s, bank(1, 0));
+        let (again, memo) = slots(&mut s, bank(2, 0));
         assert_eq!((again == first, memo), (true, [2, 1]), "the same handle from another bank");
-        assert_eq!(slots(&mut s, bank(0x61_0000, 1)).1, [3, 1], "another handle");
+        assert_eq!(slots(&mut s, bank(2, 1)).1, [3, 1], "another handle");
         s.memo.wrote(HEADERS, 4);
-        assert_eq!(slots(&mut s, bank(0x60_0000, 0)).1, [4, 1], "the headers written");
-        assert_eq!(slots(&mut s, bank(0x60_0000, 0)).1, [5, 2]);
+        assert_eq!(slots(&mut s, bank(1, 0)).1, [4, 1], "the headers written");
+        assert_eq!(slots(&mut s, bank(1, 0)).1, [5, 2]);
         s.memo.forget_slots();
-        assert_eq!(slots(&mut s, bank(0x60_0000, 0)).1, [6, 2], "the slots forgotten");
+        assert_eq!(slots(&mut s, bank(1, 0)).1, [6, 2], "the slots forgotten");
     }
 
     /// Level `level` of `t`, every slice, as rows of `pitch` bytes (`t` needs COPY_SRC).
