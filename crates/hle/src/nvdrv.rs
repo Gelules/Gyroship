@@ -1415,20 +1415,38 @@ impl Gpu {
         Some(key)
     }
 
-    /// Performs a channel's effects in guest memory and on the host GPU, in order.
+    /// Performs a channel's effects in guest memory and on the host GPU, in
+    /// order. Its draws are counted once, after the last effect or the one that
+    /// stopped it (the tally's lock is not taken for each draw).
     fn effects(&mut self, k: &mut GpuSide, space: u32, effects: Vec<Effect>) -> Result<(), Stop> {
+        let before = crate::lock(&k.tally).counts.get("draws").copied().unwrap_or(0);
+        let mut draws = 0;
+        let done = self.perform(k, space, effects, before, &mut draws);
+        if draws > 0 {
+            *crate::lock(&k.tally).counts.entry("draws").or_default() += draws;
+        }
+        done
+    }
+
+    /// [`Gpu::effects`]' work: the op's draws are numbered on from `before`,
+    /// and counted in `draws`.
+    fn perform(&mut self, k: &mut GpuSide, space: u32, effects: Vec<Effect>, before: u64, draws: &mut u64) -> Result<(), Stop> {
         for effect in effects {
             match effect {
                 Effect::Release(r) => {
                     let at = k.gpu_to_cpu(space, r.addr);
                     let width = usize::from(r.width);
-                    // The payload is written last (publish_object): a guest thread polling it sees the whole report.
-                    let mut bytes = r.value.to_le_bytes()[..width].to_vec();
-                    if r.timestamp {
-                        bytes.resize(8, 0);
-                        bytes.extend((k.now() * 32).to_le_bytes());
-                    }
-                    let what = format!("method {:#x} releases {} at {:#x} (cpu {at:#x}){}", r.method, r.value, r.addr, if r.timestamp { " with timestamp" } else { "" });
+                    // The payload is written last (publish_object): a guest thread polling it sees the whole
+                    // report. A timestamp follows it, from byte 8.
+                    let mut bytes = [0u8; 16];
+                    bytes[..width].copy_from_slice(&r.value.to_le_bytes()[..width]);
+                    let len = if r.timestamp {
+                        bytes[8..].copy_from_slice(&(k.now() * 32).to_le_bytes());
+                        16
+                    } else {
+                        width
+                    };
+                    let what = || format!("method {:#x} releases {} at {:#x} (cpu {at:#x}){}", r.method, r.value, r.addr, if r.timestamp { " with timestamp" } else { "" });
                     // NVN releases 1 at GPU address 0 after each of its sync objects: that
                     // increments the channel's syncpoint, whose value vi2's present fences
                     // name (syncpoint !0xfffffffe = 1, value = the count of such releases).
@@ -1437,16 +1455,16 @@ impl Gpu {
                         // reads this after publishing it (gs.rs `signal_reached`): one sees the other.
                         k.syncpts[CHANNEL_SYNCPT as usize].fetch_add(1, Ordering::SeqCst);
                         k.count("syncpoint increments");
-                    } else if k.mem.publish_object(at, width, &bytes[width..], |_| r.value).is_err() {
-                        k.anomaly(if r.addr == 0 { "gpu release at 0" } else { "gpu release not writable" }, &what)?;
+                    } else if k.mem.publish_object(at, width, &bytes[width..len], |_| r.value).is_err() {
+                        k.anomaly(if r.addr == 0 { "gpu release at 0" } else { "gpu release not writable" }, &what())?;
                     } else {
-                        k.note_write(at, bytes.len());
+                        k.note_write(at, len);
                         // Read again by later GPU work, as any GPU write.
                         if let Some(s) = k.surfaces.as_mut() {
-                            s.invalidate(r.addr, bytes.len() as u64);
+                            s.invalidate(r.addr, len as u64);
                         }
                         if k.journal.few("gpu release", 8) {
-                            k.log(&format!("gpu: {what}"));
+                            k.log(&format!("gpu: {}", what()));
                         }
                     }
                 }
@@ -1461,10 +1479,16 @@ impl Gpu {
                     }
                 }
                 Effect::Draw(d) => {
-                    let draw = k.count("draws");
-                    // The programs first (a new one is journaled and dumped before the draw);
-                    // the draw's line, and the strings it needs, only on the frames it is written.
-                    let programs: Vec<(usize, u64, Option<u64>)> = d.programs.iter().enumerate().filter_map(|(stage, p)| Some((stage, (*p)?, self.program(k, space, (*p)?)))).collect();
+                    *draws += 1;
+                    let draw = before + *draws;
+                    // The programs first, in stage order (a new one is journaled and dumped before the
+                    // draw); the draw's line, and the strings it needs, only on the frames it is written.
+                    let mut programs = d.programs.map(|_| None);
+                    for (stage, p) in d.programs.iter().enumerate() {
+                        if let &Some(gpu) = p {
+                            programs[stage] = Some((gpu, self.program(k, space, gpu)));
+                        }
+                    }
                     let dumped = k.config.dumps(k.at.presents + 1);
                     let logged = k.at.presents < 3 || draw <= 64 || dumped;
                     let mut outcome = String::new();
@@ -1488,9 +1512,12 @@ impl Gpu {
                     if logged {
                         let keys: Vec<String> = programs
                             .iter()
-                            .map(|&(stage, gpu, key)| match key {
-                                Some(key) => format!("stage {stage} {key:016x}"),
-                                None => format!("stage {stage} program at {gpu:#x}: no end found in readable memory"),
+                            .enumerate()
+                            .filter_map(|(stage, p)| {
+                                p.map(|(gpu, key)| match key {
+                                    Some(key) => format!("stage {stage} {key:016x}"),
+                                    None => format!("stage {stage} program at {gpu:#x}: no end found in readable memory"),
+                                })
                             })
                             .collect();
                         let index = d.index.as_ref().map(|i| (i.address, i.bytes_per_index, i.first));
@@ -1730,6 +1757,51 @@ mod tests {
         k.mem.read(page, &mut b).unwrap();
         assert_eq!(b, [0; 4], "the write after the anomaly is not applied");
         assert_eq!(k.tally().anomalies["gpu method ignored"], 1);
+    }
+
+    /// An op's draws are counted once, after it: three draws read 3 and are
+    /// numbered 1 to 3 in the journal; an op without draws adds no entry; a
+    /// strict anomaly after two draws still counts them.
+    #[test]
+    fn the_draws_of_an_op_are_counted_after_it() {
+        use gyroship_runtime::mem::Memory;
+        let header = |method: u32| 1 << 29 | 1 << 16 | method / 4;
+        // The 3D class bound, then `n` draws of 3 vertices (BEGIN triangles, DRAW_VERTEX_ARRAY).
+        let draws = |n: usize| -> Vec<Effect> {
+            let words: Vec<u32> = [header(0), 0xc797].into_iter().chain((0..n).flat_map(|_| [header(0x1618), 4, header(0xd78), 3])).collect();
+            gyroship_gpu::pushbuf::Channel::default().run(&words)
+        };
+        let k = Kernel::new(Memory::new().unwrap(), crate::journal::Journal::memory(), crate::Config::default());
+        k.gpu_side().apply(GpuOp::Effects { space: 0, effects: Vec::new(), read: None }).unwrap();
+        assert_eq!(k.tally().counts.get("draws"), None, "no draws, no entry");
+        k.gpu_side().apply(GpuOp::Effects { space: 0, effects: draws(3), read: None }).unwrap();
+        assert_eq!(k.tally().counts.get("draws"), Some(&3));
+        let text = k.journal.text();
+        let numbers: Vec<&str> = text.lines().filter_map(|l| l.split("gpu: draw ").nth(1)?.split(':').next()).collect();
+        assert_eq!(numbers, ["1", "2", "3"]);
+        let mut effects = draws(2);
+        effects.push(Effect::Ignored { class: 0xc797, method: 0x123, value: 1 });
+        assert!(k.gpu_side().apply(GpuOp::Effects { space: 0, effects, read: None }).is_err());
+        assert_eq!(k.tally().counts.get("draws"), Some(&5), "counted up to the anomaly");
+    }
+
+    /// The first 8 releases are journaled, with their text; all are written.
+    #[test]
+    fn the_first_releases_are_journaled() {
+        use gyroship_gpu::pushbuf::Release;
+        use gyroship_runtime::mem::{Block, Memory, perm, state};
+        let page = crate::layout::ALIAS.0;
+        let k = Kernel::new(Memory::new().unwrap(), crate::journal::Journal::memory(), crate::Config::default());
+        k.mem.map(page, 0x1000, Block::new(state::NORMAL, perm::RW)).unwrap();
+        let effects = (0..10).map(|i| Effect::Release(Release { method: 0x1b0c, addr: page + 8 * i, value: i, width: 4, timestamp: false })).collect();
+        k.gpu_side().apply(GpuOp::Effects { space: 0, effects, read: None }).unwrap();
+        let text = k.journal.text();
+        let lines: Vec<&str> = text.lines().filter(|l| l.contains("gpu: method 0x1b0c releases")).collect();
+        assert_eq!(lines.len(), 8);
+        assert!(lines[7].ends_with(&format!("gpu: method 0x1b0c releases 7 at {:#x} (cpu {:#x})", page + 56, page + 56)), "{}", lines[7]);
+        let mut b = [0u8; 4];
+        k.mem.read(page + 72, &mut b).unwrap();
+        assert_eq!(b, 9u32.to_le_bytes());
     }
 
     /// The play engine leaves GPU work for after the kernel lock, as the SVC's

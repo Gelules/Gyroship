@@ -70,9 +70,13 @@ impl Journal {
     /// Whether `key` has been seen fewer than `n` times; counts this one.
     pub fn few(&self, key: &str, n: u32) -> bool {
         let mut i = self.inner();
-        let c = i.counts.entry(key.to_string()).or_insert(0);
-        *c += 1;
-        *c <= n
+        // A key seen before is found by reference: no String made.
+        if let Some(c) = i.counts.get_mut(key) {
+            *c += 1;
+            return *c <= n;
+        }
+        i.counts.insert(key.to_string(), 1);
+        1 <= n
     }
 
     /// What a memory journal holds so far.
