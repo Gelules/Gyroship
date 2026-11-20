@@ -923,8 +923,9 @@ pub(crate) struct Memo {
     /// the same slots while their headers and targets hold. Emptied with `slots`.
     pub(crate) slot_sets: FxMap<crate::draw::SlotSetKey, crate::draw::SlotSet>,
     /// The epoch of each page written by the GPU in this submit, in page order:
-    /// an entry's check visits only the written pages inside it.
-    pages: BTreeMap<u64, u64>,
+    /// an entry's check visits only the written pages inside it. Sorted by page
+    /// (30 to 60 pages a submit in heavy Corneria frames: a binary search).
+    pages: Vec<(u64, u64)>,
     epoch: u64,
 }
 
@@ -949,21 +950,23 @@ impl Memo {
         self.epoch
     }
 
-    /// The GPU wrote `[start, start + len)`.
+    /// The GPU wrote `[start, start + len)`: its pages take a new epoch, in one
+    /// splice (a copy may invalidate a whole surface, thousands of pages).
     pub(crate) fn wrote(&mut self, start: u64, len: u64) {
         if len == 0 {
             return;
         }
         self.epoch += 1;
-        for page in start >> 12..=start.saturating_add(len - 1) >> 12 {
-            self.pages.insert(page, self.epoch);
-        }
+        let (first, last, epoch) = (start >> 12, start.saturating_add(len - 1) >> 12, self.epoch);
+        let from = self.pages.partition_point(|&(p, _)| p < first);
+        let to = self.pages.partition_point(|&(p, _)| p <= last);
+        self.pages.splice(from..to, (first..=last).map(|p| (p, epoch)));
     }
 
     /// No GPU write on `[addr, addr + len)`'s pages since `epoch`.
     pub(crate) fn fresh(&self, addr: u64, len: usize, epoch: u64) -> bool {
         let (first, last) = (addr >> 12, addr.saturating_add(len.max(1) as u64 - 1) >> 12);
-        self.pages.range(first..=last).all(|(_, e)| *e <= epoch)
+        self.pages[self.pages.partition_point(|&(p, _)| p < first)..].iter().take_while(|&&(p, _)| p <= last).all(|&(_, e)| e <= epoch)
     }
 }
 
@@ -2467,6 +2470,39 @@ mod tests {
             let _ = tx.send(s.recorder_ended);
         });
         assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(10)), Ok(true));
+    }
+
+    /// The written pages answer what a map of page -> epoch answers, over random
+    /// writes (empty, of a page, of thousands, up to the address space's end)
+    /// and checks of random ranges since random epochs.
+    #[test]
+    fn written_pages_answer_as_a_map_of_pages() {
+        let (mut memo, mut map) = (Memo::default(), BTreeMap::<u64, u64>::new());
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        for round in 0..2000 {
+            let start = if next(4) == 0 { u64::MAX - next(0x3000) } else { next(64) * 0x800 + next(0x800) };
+            let len = [0, next(4) + 1, next(0x3000), next(3000) * 0x1000, next(0x10000)][next(5) as usize];
+            memo.wrote(start, len);
+            if len > 0 {
+                for page in start >> 12..=start.saturating_add(len - 1) >> 12 {
+                    map.insert(page, memo.epoch);
+                }
+            }
+            for _ in 0..8 {
+                let addr = if next(4) == 0 { u64::MAX - next(0x3000) } else { next(80) * 0x800 + next(0x800) };
+                let (n, epoch) = (next(0x4000) as usize, next(memo.epoch + 1));
+                let want = map.range(addr >> 12..=addr.saturating_add(n.max(1) as u64 - 1) >> 12).all(|(_, e)| *e <= epoch);
+                assert_eq!(memo.fresh(addr, n, epoch), want, "round {round}: {addr:#x} + {n:#x} since {epoch}");
+            }
+        }
+        assert!(memo.pages.windows(2).all(|w| w[0].0 < w[1].0), "sorted, each page once");
+        assert_eq!(memo.pages.len(), map.len());
     }
 
     /// A block holds the bytes read whatever a reader leaves past them (this

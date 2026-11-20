@@ -154,13 +154,20 @@ fn lookup(table: &Table, space: u32, gpu: u64) -> u64 {
 /// The CPU address of `gpu` in `space` and how many bytes from it stay in one
 /// range of `table`: to its end, or, outside every range, to the next one's start.
 fn span(table: &Table, space: u32, gpu: u64) -> (u64, u64) {
-    match table.range(..=(space, gpu)).next_back() {
-        Some((&(s, first), &(last, cpu))) if s == space && gpu <= last => (cpu + (gpu - first), (last - gpu).saturating_add(1)),
-        _ => {
+    match mapping(table, space, gpu) {
+        Some((first, last, cpu)) => (cpu + (gpu - first), (last - gpu).saturating_add(1)),
+        None => {
             let next = table.range((space, gpu)..).next().filter(|((s, _), _)| *s == space).map_or(u64::MAX, |((_, f), _)| *f);
             (gpu, next - gpu)
         }
     }
+}
+
+/// The range of `table` that holds `gpu` in `space`: its first and last GPU
+/// addresses and the CPU address of its first.
+fn mapping(table: &Table, space: u32, gpu: u64) -> Option<(u64, u64, u64)> {
+    let (&(s, first), &(last, cpu)) = table.range(..=(space, gpu)).next_back()?;
+    (s == space && gpu <= last).then_some((first, last, cpu))
 }
 
 /// The CPU address of a GPU address in address space `space`, through the
@@ -181,8 +188,13 @@ fn profile_gpu_thread() -> bool {
 /// a byte is not readable. A naturally aligned 4- or 8-byte read (the
 /// semaphore an acquire polls while guest threads release it) is one Acquire
 /// load. Other reads go through the mapping that covers each part.
-pub fn read_gpu(mem: &Memory, maps: &Mappings, space: u32, mut gpu: u64, mut out: &mut [u8]) -> bool {
-    let (mut at, mut room) = span(&maps.table, space, gpu);
+pub fn read_gpu(mem: &Memory, maps: &Mappings, space: u32, gpu: u64, out: &mut [u8]) -> bool {
+    read_gpu_by(mem, |gpu| span(&maps.table, space, gpu), gpu, out)
+}
+
+/// [`read_gpu`], `span` giving each part's CPU address and the bytes left in its range.
+fn read_gpu_by(mem: &Memory, mut span: impl FnMut(u64) -> (u64, u64), mut gpu: u64, mut out: &mut [u8]) -> bool {
+    let (mut at, mut room) = span(gpu);
     let word = match out.len() {
         4 if at.is_multiple_of(4) => mem.load_u32(at).map(u64::from),
         8 if at.is_multiple_of(8) => mem.load_u64(at),
@@ -196,7 +208,7 @@ pub fn read_gpu(mem: &Memory, maps: &Mappings, space: u32, mut gpu: u64, mut out
                 return true;
             }
             (gpu, out) = (gpu + n as u64, rest);
-            (at, room) = span(&maps.table, space, gpu);
+            (at, room) = span(gpu);
         },
     };
     word.map(|v| out.copy_from_slice(&v.to_le_bytes()[..out.len()])).is_ok()
@@ -204,10 +216,15 @@ pub fn read_gpu(mem: &Memory, maps: &Mappings, space: u32, mut gpu: u64, mut out
 
 /// As [`read_gpu`] for a long read, appended to `out` (none appended if a byte
 /// is not readable) without zeroing its room first (`Memory::read_append`).
-pub fn read_gpu_append(mem: &Memory, maps: &Mappings, space: u32, mut gpu: u64, mut len: usize, out: &mut Vec<u8>) -> bool {
+pub fn read_gpu_append(mem: &Memory, maps: &Mappings, space: u32, gpu: u64, len: usize, out: &mut Vec<u8>) -> bool {
+    read_gpu_append_by(mem, |gpu| span(&maps.table, space, gpu), gpu, len, out)
+}
+
+/// [`read_gpu_append`] with `span` as in [`read_gpu_by`].
+fn read_gpu_append_by(mem: &Memory, mut span: impl FnMut(u64) -> (u64, u64), mut gpu: u64, mut len: usize, out: &mut Vec<u8>) -> bool {
     let start = out.len();
     while len > 0 {
-        let (at, room) = span(&maps.table, space, gpu);
+        let (at, room) = span(gpu);
         let n = len.min(usize::try_from(room).unwrap_or(usize::MAX));
         if mem.read_append(at, n, out).is_err() {
             out.truncate(start);
@@ -224,15 +241,38 @@ pub struct GpuReader<'a> {
     mem: &'a Memory,
     maps: &'a Mappings,
     space: u32,
+    /// The range the last read went through (first, last, CPU address of
+    /// first): a read inside it skips the table, which cannot change while
+    /// the reader borrows it.
+    last: Option<(u64, u64, u64)>,
+}
+
+impl GpuReader<'_> {
+    /// [`span`], through the range of the last read when it holds `gpu`.
+    fn span(&mut self, gpu: u64) -> (u64, u64) {
+        let range = match self.last {
+            Some(r @ (first, last, _)) if (first..=last).contains(&gpu) => Some(r),
+            _ => mapping(&self.maps.table, self.space, gpu),
+        };
+        match range {
+            Some(r @ (first, last, cpu)) => {
+                self.last = Some(r);
+                (cpu + (gpu - first), (last - gpu).saturating_add(1))
+            }
+            None => span(&self.maps.table, self.space, gpu),
+        }
+    }
 }
 
 impl gyroship_gpu::draw::GuestMem for GpuReader<'_> {
     fn read(&mut self, gpu: u64, out: &mut [u8]) -> bool {
-        read_gpu(self.mem, self.maps, self.space, gpu, out)
+        let mem = self.mem;
+        read_gpu_by(mem, |gpu| self.span(gpu), gpu, out)
     }
 
     fn append(&mut self, gpu: u64, len: usize, out: &mut Vec<u8>) -> bool {
-        read_gpu_append(self.mem, self.maps, self.space, gpu, len, out)
+        let mem = self.mem;
+        read_gpu_append_by(mem, |gpu| self.span(gpu), gpu, len, out)
     }
 }
 
@@ -271,7 +311,7 @@ impl GpuSide {
     /// The renderer's reader of address space `space`, through the mappings of
     /// the work's hand-over.
     pub fn reader(&self, space: u32) -> GpuReader<'_> {
-        GpuReader { mem: &self.mem, maps: &self.at.maps, space }
+        GpuReader { mem: &self.mem, maps: &self.at.maps, space, last: None }
     }
 
     /// [`read_gpu`] through the mappings of the work's hand-over.
@@ -1252,6 +1292,7 @@ mod tests {
             seed % n
         };
         let (mut maps, mut table): (Vec<(u32, u64, u64, u64)>, Table) = Default::default();
+        let mem = gyroship_runtime::mem::Memory::new().unwrap();
         for round in 0..400 {
             let (space, first) = (next(2) as u32, next(64) * 0x1000);
             let last = first + next(16) * 0x1000 + 0xfff;
@@ -1263,9 +1304,15 @@ mod tests {
                 maps.push((space, first, last, cpu));
                 paint(&mut table, space, first, last, cpu);
             }
-            let probes = (0..64).map(|_| (next(2) as u32, next(80 * 0x1000))).chain([first.wrapping_sub(1), first, last, last + 1].map(|gpu| (space, gpu)));
+            let probes: Vec<(u32, u64)> = (0..64).map(|_| (next(2) as u32, next(80 * 0x1000))).chain([first.wrapping_sub(1), first, last, last + 1].map(|gpu| (space, gpu))).collect();
             let scan = |maps: &[(u32, u64, u64, u64)], space: u32, gpu: u64| maps.iter().rev().find(|m| m.0 == space && (m.1..=m.2).contains(&gpu)).map_or(gpu, |m| m.3 + (gpu - m.1));
-            for (space, gpu) in probes.collect::<Vec<_>>() {
+            // A reader of each space answers as the table does, the range of its last read kept from probe to probe.
+            let flat = Mappings { table: table.clone(), ..Default::default() };
+            let mut readers = [0u32, 1].map(|space| GpuReader { mem: &mem, maps: &flat, space, last: None });
+            for &(space, gpu) in &probes {
+                assert_eq!(readers[space as usize].span(gpu), span(&table, space, gpu), "round {round}: reader of space {space}, gpu {gpu:#x}");
+            }
+            for (space, gpu) in probes {
                 let (cpu, room) = span(&table, space, gpu);
                 assert_eq!(cpu, scan(&maps, space, gpu), "round {round}: space {space}, gpu {gpu:#x}");
                 // The span's last byte is still contiguous with its first.
