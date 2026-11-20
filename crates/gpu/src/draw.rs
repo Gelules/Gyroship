@@ -17,6 +17,7 @@ use crate::shader::{self, Handle, Options, Translation};
 use crate::state::resources::{Pool, SamplerBinding, TexHandle};
 use crate::state::textures::{self, Layout, TextureType};
 use crate::state::vertex::{AttrKind, wgpu_vertex_format};
+use crate::record::{Call, DrawRec, GroupRec, PassOpen, Rec};
 use crate::surfaces::{FxMap, Surfaces, color_format, depth_format};
 use smallvec::{SmallVec, smallvec};
 use std::collections::{BTreeMap, BTreeSet};
@@ -54,28 +55,6 @@ pub(crate) type PassKey = (Colors, Option<(Surface, wgpu::TextureFormat)>, bool)
 
 /// The vertex buffer layouts of a pipeline: stream, step, stride and attributes.
 type VertexLayouts = SmallVec<[(u8, wgpu::VertexStepMode, u64, SmallVec<[wgpu::VertexAttribute; 4]>); 4]>;
-
-/// What the open pass was last given: a draw sets only what changed (wgpu
-/// validates and encodes each call again, and consecutive draws mostly repeat).
-/// Pipelines and bind groups wgpu already skips when repeated.
-#[derive(Default)]
-pub(crate) struct PassState {
-    viewport: Option<[f32; 6]>,
-    scissor: Option<[u32; 4]>,
-    blend: Option<[f32; 4]>,
-    stencil: Option<u32>,
-    vertex: Vec<Option<crate::surfaces::Slice>>,
-    index: Option<(crate::surfaces::Slice, wgpu::IndexFormat)>,
-}
-
-/// Stores `new` in `old`; whether it differed.
-fn changed<T: PartialEq>(old: &mut Option<T>, new: T) -> bool {
-    let differs = old.as_ref() != Some(&new);
-    if differs {
-        *old = Some(new);
-    }
-    differs
-}
 
 /// The bytes of a constant bank as the translated programs declare it.
 const CBUF_BYTES: usize = 0x10000;
@@ -144,28 +123,40 @@ pub(crate) enum Made<T> {
 
 impl<T: Clone> Made<T> {
     /// The pipeline, once made (a pending one done since becomes ready).
+    #[cfg(test)]
     pub(crate) fn ready(&mut self) -> Option<T> {
+        self.made().cloned()
+    }
+
+    /// As [`Made::ready`], without a copy (no reference count changes).
+    pub(crate) fn made(&mut self) -> Option<&T> {
         if let Made::Pending(cell, ..) = self
             && let Some(p) = cell.get()
         {
             *self = Made::Ready(p.clone());
         }
         match self {
-            Made::Ready(p) => Some(p.clone()),
+            Made::Ready(p) => Some(p),
             Made::Pending(..) => None,
         }
     }
 
     /// The pipeline, waited for until `until` at most: one the driver has in
     /// its cache is made in a few milliseconds, sooner than a frame without it.
-    /// ponytail: polls every 200 µs; a condition variable if that shows up.
+    #[cfg(test)]
     pub(crate) fn wait(&mut self, until: std::time::Instant) -> Option<T> {
+        if self.waited(until) { self.ready() } else { None }
+    }
+
+    /// Whether the pipeline is made by `until` (see [`Made::wait`]).
+    /// ponytail: polls every 200 µs; a condition variable if that shows up.
+    pub(crate) fn waited(&mut self, until: std::time::Instant) -> bool {
         loop {
-            if let Some(p) = self.ready() {
-                return Some(p);
+            if self.made().is_some() {
+                return true;
             }
             if std::time::Instant::now() >= until {
-                return None;
+                return false;
             }
             std::thread::sleep(std::time::Duration::from_micros(200));
         }
@@ -218,7 +209,10 @@ pub struct Cache {
     /// same options (a vertex program with pixel programs of the same varyings)
     /// share one (D72).
     shared: FxMap<(u64, Options), std::sync::Arc<(Translation, wgpu::ShaderModule)>>,
-    pipelines: FxMap<PipelineKey, (Made<wgpu::RenderPipeline>, [Option<wgpu::BindGroupLayout>; 2])>,
+    /// Render pipelines with their bind group layouts, their id for the run
+    /// (`Rec::Pipeline`; never removed: their count is the next id), and
+    /// whether the recorder has them (announced once made).
+    pipelines: FxMap<PipelineKey, (Made<wgpu::RenderPipeline>, [Option<wgpu::BindGroupLayout>; 2], u32, bool)>,
     /// Bind group layouts by their entries, shared by the pipelines.
     layouts: FxMap<Vec<wgpu::BindGroupLayoutEntry>, wgpu::BindGroupLayout>,
     /// A draw's bind group layout entries by id (`group_id`), and the ids by entries.
@@ -457,6 +451,8 @@ pub(crate) struct Bindings<'t> {
     pub(crate) textures: std::sync::Arc<[Slot]>,
     /// Each slot's header swizzle, when the program reads them.
     pub(crate) swizzles: Option<std::sync::Arc<[u32]>>,
+    /// The id the recorder knows the slots and swizzles by (`Rec::Set`).
+    pub(crate) set: u32,
     /// The program's `Interface::cbuf_sizes`, the bytes of each bank it may
     /// read (all 64 KiB of a bank it has no entry for): staged as bound, then
     /// zeros up to there, as the console reads past a bank's size. The binding
@@ -481,6 +477,7 @@ pub(crate) struct StageMemo {
     banks: BankIds,
     textures: std::sync::Arc<[Slot]>,
     swizzles: Option<std::sync::Arc<[u32]>>,
+    set: u32,
     epoch: u64,
     read: SlotsRead,
     journal: Vec<(u64, &'static str)>,
@@ -507,6 +504,7 @@ pub(crate) type SlotSetKey = (usize, SmallVec<[u32; 64]>, Pool, Pool, SamplerBin
 pub(crate) struct SlotSet {
     textures: std::sync::Arc<[Slot]>,
     swizzles: std::sync::Arc<[u32]>,
+    id: u32,
     epoch: u64,
     read: SlotsRead,
     journal: Vec<(u64, &'static str)>,
@@ -613,7 +611,7 @@ impl Surfaces {
     /// The pipelines still being made `after` they were asked for, each named
     /// once (play mode: the driver may take seconds, or never return).
     pub fn overdue(&mut self, after: std::time::Duration) -> Vec<String> {
-        self.cache.pipelines.values_mut().filter_map(|(m, _)| m.overdue(after)).collect()
+        self.cache.pipelines.values_mut().filter_map(|(m, ..)| m.overdue(after)).collect()
     }
 
     /// The guest memory each uploaded texture came from, as GPU address ranges
@@ -763,12 +761,11 @@ impl Surfaces {
                     }
                 };
                 // wgpu takes 2- and 4-byte indices as they are; widened ones are shared like any block.
-                let slice = if let 2 | 4 = size { self.stage_raw(id) } else { self.stage_data(id) };
-                (Some((slice, format)), (i64::from(d.base_vertex) + i64::from(max)).max(0) as u64)
+                (Some((id, matches!(size, 2 | 4), format)), (i64::from(d.base_vertex) + i64::from(max)).max(0) as u64)
             }
             None => (None, u64::from(d.first) + u64::from(d.count) - 1),
         };
-        let mut vertex_buffers: SmallVec<[crate::surfaces::Slice; 8]> = SmallVec::new();
+        let mut vertex: SmallVec<[u32; 8]> = SmallVec::new();
         for (index, step, stride, attributes) in &layouts {
             let s = d.streams.iter().find(|s| s.index == *index).ok_or("stream")?;
             let per_instance = *step == wgpu::VertexStepMode::Instance;
@@ -783,8 +780,7 @@ impl Surfaces {
                 return Err("vertex stream shorter than the draw".into());
             }
             let padded = bytes.next_multiple_of(4) as usize;
-            let id = self.read_exact(crate::surfaces::Read::Vertex, start, bytes as usize, padded, mem).ok_or("vertex stream not readable")?;
-            vertex_buffers.push(self.stage_raw(id));
+            vertex.push(self.read_exact(crate::surfaces::Read::Vertex, start, bytes as usize, padded, mem).ok_or("vertex stream not readable")?);
         }
 
         // Constant buffers and textures, per stage (bind group 0 vertex, 1 pixel).
@@ -824,7 +820,7 @@ impl Surfaces {
             }
             None => None,
         };
-        let strip = matches!(topology, P::LineStrip | P::TriangleStrip).then(|| indices.as_ref().map(|i| i.1)).flatten();
+        let strip = matches!(topology, P::LineStrip | P::TriangleStrip).then(|| indices.as_ref().map(|i| i.2)).flatten();
         let primitive = wgpu::PrimitiveState {
             topology,
             strip_index_format: strip,
@@ -852,8 +848,19 @@ impl Surfaces {
         // Play mode: a pending pipeline is waited for within the frame's budget.
         let waiting = std::time::Instant::now();
         let until = waiting + if self.background { self.wait_left } else { std::time::Duration::ZERO };
-        let found = self.cache.pipelines.get_mut(&key).map(|(made, layouts)| (made.wait(until), layouts.clone()));
-        let (pipeline, bind_layouts) = match found {
+        // Neither the pipeline nor its layouts are copied here: the recorder, which has them once
+        // announced, is the one to use them at each draw.
+        let found = self.cache.pipelines.get_mut(&key).map(|(made, layouts, id, announced)| {
+            let ready = made.waited(until);
+            let announce = if ready && !*announced {
+                *announced = true;
+                made.made().map(|p| (p.clone(), layouts.clone()))
+            } else {
+                None
+            };
+            (ready, *id, announce)
+        });
+        let (ready, id, announce) = match found {
             Some(found) => found,
             None => {
                 let since = std::time::Instant::now();
@@ -887,104 +894,55 @@ impl Surfaces {
                 };
                 let label = format!("p{:016x}+{}", vs.0.key, ps.as_ref().map_or("none".into(), |p| format!("{:016x}", p.0.key)));
                 let mut made = self.make(make, label.clone());
-                let ready = made.wait(until);
-                self.cache.pipelines.insert(key, (made, bind_layouts.clone()));
+                let ready = made.waited(until);
+                let id = self.cache.pipelines.len() as u32;
+                let announce = if ready { made.made().map(|p| (p.clone(), bind_layouts.clone())) } else { None };
+                self.cache.pipelines.insert(key, (made, bind_layouts, id, ready));
                 self.compile.pipelines += 1;
                 self.compile.pipeline_time += since.elapsed();
                 self.compile.made.push(label);
-                (ready, bind_layouts)
+                (ready, id, announce)
             }
         };
         if self.background {
             self.wait_left = self.wait_left.saturating_sub(waiting.elapsed());
         }
-        let Some(pipeline) = pipeline else {
+        if !ready {
             // Still being made on a worker thread (play mode), the frame's wait spent:
             // the frame goes on without this draw.
             self.compile.waited += 1;
             return Ok(());
-        };
-
-        let mut bind_groups: SmallVec<[(wgpu::BindGroup, SmallVec<[u32; 16]>); 2]> = SmallVec::new();
-        for (g, layout) in bind_layouts.iter().flatten().enumerate() {
-            let Bindings { cbufs, textures, swizzles, .. } = &stages[g];
-            let mut buffers: SmallVec<[(u32, crate::surfaces::Slice); 16]> = cbufs.iter().map(|&(b, id)| (u32::from(b), self.stage_bank(id, stages[g].window(b)))).collect();
-            if let Some(codes) = swizzles {
-                let bytes: SmallVec<[u8; 256]> = codes.iter().flat_map(|c| c.to_le_bytes()).collect();
-                buffers.push((shader::SWIZZLE_BINDING, self.stage(&bytes)));
-            }
-            // In binding order, as wgpu takes them: the banks', then the swizzles' (binding 999).
-            let offsets: SmallVec<[u32; 16]> = if dynamic[g] { buffers.iter().map(|(_, (_, at, _))| u32::try_from(*at).unwrap_or(u32::MAX)).collect() } else { SmallVec::new() };
-            bind_groups.push((self.bind_group(layout, &buffers, textures, dynamic[g]), offsets));
         }
-        let index_buffer = indices;
+        if let Some((pipeline, layouts)) = announce {
+            self.push(Rec::Pipeline(id, pipeline, layouts));
+        }
+        // Each group of the pipeline's layout (every stage before `used`): its banks as the
+        // program reads them, its slots, and its swizzle codes if the program reads them.
+        let groups = stages[..used].iter().zip(&dynamic).map(|(b, &dynamic)| GroupRec { banks: b.cbufs.iter().map(|&(bank, id)| (bank, id, b.window(bank) as u32)).collect(), set: b.set, swizzles: b.swizzles.is_some(), dynamic }).collect();
 
         // The pass: the open one when this draw writes the same targets (every
         // attachment loads and stores, so consecutive draws can share it; one
         // sampling its own attachment is refused by wgpu either way); else a new
-        // one. Anything else recorded ends it (`Surfaces::encoder`). Timed draws
+        // one. Anything else recorded ends it (`Surfaces::push`). Timed draws
         // each keep a pass of their own.
         let key: PassKey = (colors.clone(), depth, ps.is_some());
-        if self.timing.is_some() || self.pass.as_ref().is_none_or(|(open, ..)| *open != key) {
+        let timed = self.rec.timing.is_some();
+        let pass = if timed || self.open.as_ref() != Some(&key) {
             let color_views: Vec<Option<wgpu::TextureView>> = colors.iter().map(|c| c.map(|(s, f)| self.texture(&s, f))).collect();
             let depth_view = depth.map(|(s, f)| (self.texture(&s, f), f));
-            let timed = self.timing.as_mut().and_then(|t| t.next(format!("draw vs {:016x} ps {}", vs.0.key, ps.as_ref().map_or("none".into(), |p| format!("{:016x}", p.0.key)))));
-            let mut encoder = self.encoder();
-            let load = wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store };
-            let attachments: Vec<Option<wgpu::RenderPassColorAttachment>> = color_views.iter().map(|v| v.as_ref().map(|view| wgpu::RenderPassColorAttachment { view, depth_slice: None, resolve_target: None, ops: load })).collect();
+            let label = timed.then(|| format!("draw vs {:016x} ps {}", vs.0.key, ps.as_ref().map_or("none".into(), |p| format!("{:016x}", p.0.key))));
+            self.open = Some(key);
             // Without a pixel program the pipeline has no color targets: neither may the pass.
-            let attachments = if ps.is_none() { Vec::new() } else { attachments };
-            let timestamp_writes = timed.zip(self.timing.as_ref()).map(|(i, t)| wgpu::RenderPassTimestampWrites { query_set: &t.set, beginning_of_pass_write_index: Some(i), end_of_pass_write_index: Some(i + 1) });
-            let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("draw"),
-                timestamp_writes,
-                color_attachments: &attachments,
-                depth_stencil_attachment: depth_view.as_ref().map(|(view, f)| wgpu::RenderPassDepthStencilAttachment {
-                    view,
-                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
-                    stencil_ops: f.has_stencil_aspect().then_some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
-                }),
-                ..Default::default()
-            });
-            let pass = pass.forget_lifetime();
-            self.record(encoder);
-            self.pass = Some((key, pass, PassState::default()));
-        }
-        {
-            let Some((_, pass, last)) = self.pass.as_mut() else { return Err("no open render pass".into()) };
-            pass.set_pipeline(&pipeline);
-            if changed(&mut last.viewport, [v.x, v.y, v.width, v.height, v.min_depth, v.max_depth]) {
-                pass.set_viewport(v.x, v.y, v.width, v.height, v.min_depth, v.max_depth);
-            }
-            if changed(&mut last.scissor, [x, y, x1 - x, y1 - y]) {
-                pass.set_scissor_rect(x, y, x1 - x, y1 - y);
-            }
-            if changed(&mut last.blend, r.blend_constant) {
-                let [cr, cg, cb, ca] = r.blend_constant.map(f64::from);
-                pass.set_blend_constant(wgpu::Color { r: cr, g: cg, b: cb, a: ca });
-            }
-            if changed(&mut last.stencil, u32::from(ds.front.reference)) {
-                pass.set_stencil_reference(u32::from(ds.front.reference));
-            }
-            for (g, (group, offsets)) in bind_groups.iter().enumerate() {
-                pass.set_bind_group(g as u32, group, offsets);
-            }
-            last.vertex.resize(last.vertex.len().max(vertex_buffers.len()), None);
-            for (slot, b @ (buffer, at, size)) in vertex_buffers.iter().enumerate() {
-                if changed(&mut last.vertex[slot], b.clone()) {
-                    pass.set_vertex_buffer(slot as u32, buffer.slice(*at..at + size));
-                }
-            }
-            match &index_buffer {
-                Some((b @ (buffer, at, size), format)) => {
-                    if changed(&mut last.index, (b.clone(), *format)) {
-                        pass.set_index_buffer(buffer.slice(*at..at + size), *format);
-                    }
-                    pass.draw_indexed(0..d.count, d.base_vertex, d.instance..d.instance + 1);
-                }
-                None => pass.draw(d.first..d.first + d.count, d.instance..d.instance + 1),
-            }
-        }
+            Some(Box::new(PassOpen { colors: if ps.is_none() { Vec::new() } else { color_views }, depth: depth_view, timed: label }))
+        } else {
+            None
+        };
+        let call = match indices {
+            Some(_) => Call::Indexed { count: d.count, base_vertex: d.base_vertex, instance: d.instance },
+            None => Call::Direct { first: d.first, count: d.count, instance: d.instance },
+        };
+        let (blend, stencil) = (d.render.blend_constant, u32::from(ds.front.reference));
+        self.push(Rec::Draw(DrawRec { pipeline: id, index: indices, vertex, groups, viewport: [v.x, v.y, v.width, v.height, v.min_depth, v.max_depth], scissor: [x, y, x1 - x, y1 - y], blend, stencil, call, pass }));
         for (s, _) in colors.iter().flatten() {
             self.wrote((s.addr, s.format));
         }
@@ -1167,7 +1125,7 @@ impl Surfaces {
                         self.touched.insert(target);
                     }
                 }
-                return Ok(Bindings { cbufs: s.banks.clone(), textures: s.textures.clone(), swizzles: s.swizzles.clone(), sizes: &t.interface.cbuf_sizes });
+                return Ok(Bindings { cbufs: s.banks.clone(), textures: s.textures.clone(), swizzles: s.swizzles.clone(), set: s.set, sizes: &t.interface.cbuf_sizes });
             }
         }
         let (epoch, journaled) = (self.memo.epoch(), self.textures_read.len());
@@ -1180,15 +1138,15 @@ impl Surfaces {
             let read = self.read_guest(crate::surfaces::Read::Bank, addr, (size as usize).min(CBUF_BYTES), mem).ok_or_else(|| format!("constant bank {b} at {addr:#x} not readable"))?;
             banks.insert(at, (b, read));
         }
-        let (textures, swizzles, read) = self.texture_slots(t, &banks, headers, samplers, binding, attached, mem)?;
+        let (textures, swizzles, read, set) = self.texture_slots(t, &banks, headers, samplers, binding, attached, mem)?;
         // The handle banks were for the textures; the program reads the others.
         let ids: BankIds = banks.iter().filter(|(b, _)| t.interface.cbufs.contains(b)).map(|&(b, (id, _))| (b, id)).collect();
         let swizzles = t.interface.swizzles.then_some(swizzles);
         if let Some(k) = key {
             let journal = self.textures_read[journaled..].to_vec();
-            self.memo.stages.insert(k, StageMemo { banks: ids.clone(), textures: textures.clone(), swizzles: swizzles.clone(), epoch, read, journal });
+            self.memo.stages.insert(k, StageMemo { banks: ids.clone(), textures: textures.clone(), swizzles: swizzles.clone(), set, epoch, read, journal });
         }
-        Ok(Bindings { cbufs: ids, textures, swizzles, sizes: &t.interface.cbuf_sizes })
+        Ok(Bindings { cbufs: ids, textures, swizzles, set, sizes: &t.interface.cbuf_sizes })
     }
 
     /// Whether stage `s`, resolved earlier in this submit from banks `bound`,
@@ -1243,9 +1201,10 @@ impl Surfaces {
     /// Slots resolved earlier in this submit from the same handles (`SlotSetKey`)
     /// are taken again while what they read holds, the textures they read
     /// journaled again: a stage whose banks were rewritten or moved, with the same
-    /// handles, skips its headers and slots.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn texture_slots(&mut self, t: &Translation, banks: &[(u8, Bank)], headers: Pool, samplers: Pool, binding: SamplerBinding, attached: &[u64], mem: Mem) -> Result<(std::sync::Arc<[Slot]>, std::sync::Arc<[u32]>, SlotsRead), String> {
+    /// handles, skips its headers and slots. Last, the id the recorder knows the
+    /// slots and swizzles by (a set made here is announced: `Rec::Set`).
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub(crate) fn texture_slots(&mut self, t: &Translation, banks: &[(u8, Bank)], headers: Pool, samplers: Pool, binding: SamplerBinding, attached: &[u64], mem: Mem) -> Result<(std::sync::Arc<[Slot]>, std::sync::Arc<[u32]>, SlotsRead, u32), String> {
         let word = |b: u8, offset: u16| -> Option<u32> {
             let at = usize::from(offset);
             let w = bank(banks, b)?.1.get(at..at + 4)?;
@@ -1275,7 +1234,7 @@ impl Surfaces {
                         self.touched.insert(target);
                     }
                 }
-                return Ok((set.textures.clone(), set.swizzles.clone(), set.read.clone()));
+                return Ok((set.textures.clone(), set.swizzles.clone(), set.read.clone(), set.id));
             }
         }
         let (epoch, journaled) = (self.memo.epoch(), self.textures_read.len());
@@ -1462,11 +1421,14 @@ impl Surfaces {
             textures.push(resolved);
         }
         let (textures, swizzles): (std::sync::Arc<[Slot]>, std::sync::Arc<[u32]>) = (textures.into(), swizzles.into());
+        let id = self.sets;
+        self.sets += 1;
+        self.push(Rec::Set(id, textures.clone(), swizzles.clone()));
         if let Some(k) = key {
             let journal = self.textures_read[journaled..].to_vec();
-            self.memo.slot_sets.insert(k, SlotSet { textures: textures.clone(), swizzles: swizzles.clone(), epoch, read: read.clone(), journal });
+            self.memo.slot_sets.insert(k, SlotSet { textures: textures.clone(), swizzles: swizzles.clone(), id, epoch, read: read.clone(), journal });
         }
-        Ok((textures, swizzles, read))
+        Ok((textures, swizzles, read, id))
     }
 
     /// A 2D, 3D, 2D array or cube texture from guest memory: the level the view
@@ -1627,13 +1589,17 @@ impl Surfaces {
         let room = self.texture_belt.allocate(wgpu::BufferSize::new(size).expect("a texture level has texels"), wgpu::BufferSize::new(256).unwrap());
         let (buffer, offset) = (room.buffer().clone(), room.offset());
         let view = room.get_mapped_range_mut().expect("staging belt chunks are mapped");
-        let source = wgpu::TexelCopyBufferInfo { buffer: &buffer, layout: wgpu::TexelCopyBufferLayout { offset, bytes_per_row: Some(pitch), rows_per_image: Some(rows) } };
+        let layout = wgpu::TexelCopyBufferLayout { offset, bytes_per_row: Some(pitch), rows_per_image: Some(rows) };
         if in_place {
-            let mut encoder = self.encoder();
-            encoder.copy_buffer_to_texture(source, target, extent);
-            self.record(encoder);
+            // Recorded now, the texels written after: the frame is submitted once the belt is closed.
+            let (texture, mip_level, origin, aspect) = (target.texture.clone(), target.mip_level, target.origin, target.aspect);
+            self.run(move |rec| {
+                let mut encoder = rec.encoder();
+                encoder.copy_buffer_to_texture(wgpu::TexelCopyBufferInfo { buffer: &buffer, layout }, wgpu::TexelCopyTextureInfo { texture: &texture, mip_level, origin, aspect }, extent);
+                rec.record(encoder);
+            });
         } else {
-            self.uploads.get_or_insert_with(|| self.device.create_command_encoder(&Default::default())).copy_buffer_to_texture(source, target, extent);
+            self.uploads.get_or_insert_with(|| self.device.create_command_encoder(&Default::default())).copy_buffer_to_texture(wgpu::TexelCopyBufferInfo { buffer: &buffer, layout }, target, extent);
         }
         view
     }
@@ -1653,10 +1619,13 @@ impl Surfaces {
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("float twin"), size: u64::from(row * size.height * size.depth_or_array_layers), usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let twin = self.device.create_texture(&wgpu::TextureDescriptor { label: Some("float twin"), size, mip_level_count: 1, sample_count: 1, dimension: t.dimension(), format, usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST, view_formats: &[] });
         let layout = wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(size.height) };
-        let mut encoder = self.encoder();
-        encoder.copy_texture_to_buffer(t.as_image_copy(), wgpu::TexelCopyBufferInfo { buffer: &buffer, layout }, size);
-        encoder.copy_buffer_to_texture(wgpu::TexelCopyBufferInfo { buffer: &buffer, layout }, twin.as_image_copy(), size);
-        self.record(encoder);
+        let (t, made) = (t.clone(), twin.clone());
+        self.run(move |rec| {
+            let mut encoder = rec.encoder();
+            encoder.copy_texture_to_buffer(t.as_image_copy(), wgpu::TexelCopyBufferInfo { buffer: &buffer, layout }, size);
+            encoder.copy_buffer_to_texture(wgpu::TexelCopyBufferInfo { buffer: &buffer, layout }, made.as_image_copy(), size);
+            rec.record(encoder);
+        });
         Ok(twin)
     }
 
@@ -1684,9 +1653,12 @@ impl Surfaces {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &view_formats,
         });
-        let mut encoder = self.encoder();
-        encoder.copy_texture_to_texture(t.as_image_copy(), crop.as_image_copy(), size);
-        self.record(encoder);
+        let (t, to) = (t.clone(), crop.clone());
+        self.run(move |rec| {
+            let mut encoder = rec.encoder();
+            encoder.copy_texture_to_texture(t.as_image_copy(), to.as_image_copy(), size);
+            rec.record(encoder);
+        });
         self.cache.crops.insert(id, (stamp, crop.clone()));
         crop
     }
@@ -1726,22 +1698,29 @@ impl Surfaces {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
-        let mut encoder = self.encoder();
-        for layer in 0..floats.size().depth_or_array_layers {
-            let one = |t: &wgpu::Texture| t.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2), base_array_layer: layer, array_layer_count: Some(1), ..Default::default() });
-            let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &pipeline.get_bind_group_layout(0), entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&one(floats)) }] });
-            let view = one(&depth);
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("depth copy"),
-                color_attachments: &[],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &view, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Store }), stencil_ops: None }),
-                ..Default::default()
-            });
-            pass.set_pipeline(&pipeline);
-            pass.set_bind_group(0, &group, &[]);
-            pass.draw(0..3, 0..1);
-        }
-        self.record(encoder);
+        // Each layer's source as a bind group and its depth view, made here; their passes recorded in order.
+        let layers: Vec<(wgpu::BindGroup, wgpu::TextureView)> = (0..floats.size().depth_or_array_layers)
+            .map(|layer| {
+                let one = |t: &wgpu::Texture| t.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2), base_array_layer: layer, array_layer_count: Some(1), ..Default::default() });
+                let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &pipeline.get_bind_group_layout(0), entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&one(floats)) }] });
+                (group, one(&depth))
+            })
+            .collect();
+        self.run(move |rec| {
+            let mut encoder = rec.encoder();
+            for (group, view) in &layers {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("depth copy"),
+                    color_attachments: &[],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Store }), stencil_ops: None }),
+                    ..Default::default()
+                });
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, group, &[]);
+                pass.draw(0..3, 0..1);
+            }
+            rec.record(encoder);
+        });
         depth
     }
 
@@ -1917,9 +1896,9 @@ mod tests {
             _ => 0,
         };
         let banks: Banks = smallvec![(0u8, (0, std::sync::Arc::new(vec![0u8; 16])))];
-        let (slots, _, _) = s.texture_slots(&t, &banks, resources::header_pool(&reg), resources::sampler_pool(&reg), resources::sampler_binding(&reg), &[], &mut mem).unwrap_or_else(|e| panic!("{e}"));
+        let (slots, ..) = s.texture_slots(&t, &banks, resources::header_pool(&reg), resources::sampler_pool(&reg), resources::sampler_binding(&reg), &[], &mut mem).unwrap_or_else(|e| panic!("{e}"));
         let none = BTreeMap::new();
-        let bindings = Bindings { cbufs: BankIds::new(), textures: slots, swizzles: None, sizes: &none };
+        let bindings = Bindings { cbufs: BankIds::new(), textures: slots, swizzles: None, set: 0, sizes: &none };
         let mut entries = bindings.layout(wgpu::ShaderStages::COMPUTE);
         let storage = wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None };
         entries.push(wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::COMPUTE, ty: storage, count: None });
@@ -2029,7 +2008,7 @@ mod tests {
         let sampler = s.device.create_sampler(&Default::default());
         let slot = |depth: bool, sampled: bool| Slot { view: view.clone(), sampler: sampled.then(|| sampler.clone()), depth, compare: false, dimension: wgpu::TextureViewDimension::D2 };
         let sizes = BTreeMap::new();
-        let bindings = |slots: Vec<Slot>| Bindings { cbufs: smallvec![(0, 0), (3, 1)], textures: slots.into(), swizzles: Some(vec![0u32; 4].into()), sizes: &sizes };
+        let bindings = |slots: Vec<Slot>| Bindings { cbufs: smallvec![(0, 0), (3, 1)], textures: slots.into(), swizzles: Some(vec![0u32; 4].into()), set: 0, sizes: &sizes };
         let translation = |key| Translation { key, stage: Stage::Pixel, wgsl: String::new(), interface: Interface::default() };
         let (t1, t2) = (translation(1), translation(2));
         let b = bindings(vec![slot(false, true), slot(false, false)]);
@@ -2076,7 +2055,7 @@ mod tests {
         put(&mut h, &[(63, 41, (TEX >> 9) as u32), (87, 85, 3), (144, 128, 7), (175, 160, 7), (154, 151, 1), (191, 191, 1)]);
         // RGBA8 4096x2048, one level: 32 MiB.
         let tic = textures::Tic { width: 4096, height: 2048, max_mip_level: 0, view_levels: Some((0, 0)), ..textures::tic(&h).unwrap() };
-        let staged = s.stage(&[1, 2, 3, 4]);
+        let staged = s.rec.stage(&[1, 2, 3, 4]);
         let guest = vec![7u8; textures::layer_stride(&tic).unwrap() as usize];
         let mut mem = |addr: u64, out: &mut [u8]| guest.get((addr - TEX) as usize..(addr - TEX) as usize + out.len()).map(|src| out.copy_from_slice(src)).is_some();
         s.upload(&tic, h, &mut mem).unwrap_or_else(|e| panic!("{e}"));
@@ -2445,11 +2424,14 @@ mod tests {
         let (old, pitch, rows) = read_level(&s, &t, 0);
         // Level 0 copied into a buffer, recorded with the frame's commands.
         let buffer = s.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: old.len() as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
-        let mut e = s.encoder();
-        let image = wgpu::TexelCopyTextureInfo { texture: &t, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All };
         let layout = wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(pitch as u32), rows_per_image: Some(rows) };
-        e.copy_texture_to_buffer(image, wgpu::TexelCopyBufferInfo { buffer: &buffer, layout }, t.size().mip_level_size(0, t.dimension()).physical_size(t.format()));
-        s.record(e);
+        let (texture, into) = (t.clone(), buffer.clone());
+        s.run(move |rec| {
+            let mut e = rec.encoder();
+            let image = wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All };
+            e.copy_texture_to_buffer(image, wgpu::TexelCopyBufferInfo { buffer: &into, layout }, texture.size().mip_level_size(0, texture.dimension()).physical_size(texture.format()));
+            rec.record(e);
+        });
         // Then the GPU writes layer 0's level 0, and the texture is refreshed in place.
         for i in slice(0, 0) {
             guest[i] ^= 0xff;

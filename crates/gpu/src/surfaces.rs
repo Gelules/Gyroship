@@ -68,7 +68,7 @@ impl<K: std::hash::Hash + Eq, V: Clone> Aged<K, V> {
 }
 
 /// A bind group's layout and entries, as kept with it.
-type GroupKey = (wgpu::BindGroupLayout, Vec<Bound>);
+pub(crate) type GroupKey = (wgpu::BindGroupLayout, Vec<Bound>);
 
 /// Values by a hash of their key, two presents' worth as [`Aged`] keeps them:
 /// the caller hashes and compares its key through references, and builds the
@@ -86,7 +86,7 @@ impl<K, V> Default for Groups<K, V> {
 
 impl<K, V: Clone> Groups<K, V> {
     /// The value of hash `hash` whose key `same` recognizes; else `make`'s (key, value).
-    fn get_or(&mut self, hash: u64, same: impl Fn(&K) -> bool, make: impl FnOnce() -> (K, V)) -> V {
+    pub(crate) fn get_or(&mut self, hash: u64, same: impl Fn(&K) -> bool, make: impl FnOnce() -> (K, V)) -> V {
         if let Some((_, g)) = self.now.get(&hash).and_then(|b| b.iter().find(|(k, _)| same(k))) {
             return g.clone();
         }
@@ -97,7 +97,7 @@ impl<K, V: Clone> Groups<K, V> {
         g
     }
 
-    fn age(&mut self) {
+    pub(crate) fn age(&mut self) {
         std::mem::swap(&mut self.now, &mut self.before);
         self.now.clear();
     }
@@ -211,27 +211,24 @@ pub struct Surfaces {
     pub staging: Staging,
     /// wgpu validation errors (the first ones), which the HLE takes as anomalies.
     pub errors: Arc<Mutex<Vec<String>>>,
-    /// The render pass the last draw recorded into, left open for the next draws
-    /// to the same targets (a pass per draw cost a begin and an end each, ~585 a
-    /// frame); anything else recorded ends it first ([`Surfaces::encoder`]).
-    /// Declared before `pending`, so that it ends before its encoder is dropped.
-    pub(crate) pass: Option<(crate::draw::PassKey, wgpu::RenderPass<'static>, crate::draw::PassState)>,
+    /// What the recording side keeps and does (S12): the frame's encoder and its
+    /// open pass, the upload arena, the bind groups. It is sent commands
+    /// ([`Surfaces::push`]) and read only at a flush.
+    pub(crate) rec: crate::record::Recorder,
+    /// The targets of the pass the recorder holds open for the next draws: a
+    /// draw to the same ones records into it (a pass per draw cost a begin and
+    /// an end each, ~585 a frame); anything else recorded ends it first.
+    pub(crate) open: Option<crate::draw::PassKey>,
+    /// The ids the next texture slot set announced takes (from 0 at each flush).
+    pub(crate) sets: u32,
     /// Whether each target format is renderable here, asked once (a driver query per draw otherwise).
     renderable: Vec<(wgpu::TextureFormat, bool)>,
-    /// The work recorded since the last [`Surfaces::flush`], in order.
-    pending: Option<wgpu::CommandEncoder>,
-    /// GPU time per program, when asked for (`timing.rs`).
-    pub(crate) timing: Option<crate::timing::Timing>,
-    /// GPU time per frame, for `--perf` ([`Surfaces::measure_frames`]).
-    clock: Option<crate::timing::FrameClock>,
     /// The present the work recorded now belongs to (set by the caller at each present).
     pub present: u64,
     /// `--hashes` images on their way back from the GPU, oldest first.
     readbacks: std::collections::VecDeque<Readback>,
     /// The thread hashing them, and the channel to it.
     hasher: Option<Hasher>,
-    /// This frame's vertex, index and constant data: one buffer, written at flush.
-    arena: (wgpu::Buffer, Vec<u8>),
     /// The arena's way to the GPU: mapped chunks that come back once the GPU is
     /// done with them (`write_buffer` took fresh staging pages each frame in the
     /// game: 10 MB in 6.6 ms, 1.8 ms into reused ones).
@@ -244,9 +241,6 @@ pub struct Surfaces {
     /// and the copies out of it, which `flush` submits before the frame.
     pub(crate) texture_belt: wgpu::util::StagingBelt,
     pub(crate) uploads: Option<wgpu::CommandEncoder>,
-    /// Offsets of the arena's staged blocks by content hash: draws share identical
-    /// constant banks (64 KiB each) instead of staging each copy.
-    staged: FxMap<u64, Vec<(usize, usize)>>,
     /// The color target written last (the presented image at a present).
     last_color: Option<(u64, u32)>,
     /// The window the presented images go to, if any.
@@ -278,11 +272,9 @@ pub struct Surfaces {
     pub(crate) disk_cache: Option<DiskCache>,
     /// `--pipeline-cache DIR`: the translated shaders, kept in DIR/shaders (D72).
     pub shader_cache: Option<crate::shader::cache::ShaderCache>,
-    /// Texture views and bind groups, made once while the frames use them: a
-    /// view per texture slot and a bind group per draw cost wgpu and the
-    /// driver more than the rest of the draw.
+    /// Texture views, made once while the frames use them: a view per texture
+    /// slot cost wgpu and the driver more than the rest of the draw.
     views: Aged<ViewKey, wgpu::TextureView>,
-    bind_groups: Groups<GroupKey, wgpu::BindGroup>,
     /// The device's limit on uniform buffers bound at dynamic offsets.
     pub(crate) dynamic_max: u32,
     /// Whether the device has Features::CLIP_DISTANCES (user clip planes).
@@ -728,10 +720,10 @@ fn due<T>(queue: &mut std::collections::VecDeque<T>) -> Option<T> {
 }
 
 /// A job for the submit thread.
-type SubmitJob = Box<dyn FnOnce(&mut Submitter) + Send>;
+pub(crate) type SubmitJob = Box<dyn FnOnce(&mut Submitter) + Send>;
 
 /// What the submit thread owns: the arena's staging, the frame clock and the window.
-struct Submitter {
+pub(crate) struct Submitter {
     device: wgpu::Device,
     queue: wgpu::Queue,
     belt: wgpu::util::StagingBelt,
@@ -799,11 +791,17 @@ pub struct Staging {
 
 impl Staging {
     /// Folds `at`, `size` into `layout`.
-    fn lay(&mut self, at: u64, size: u64) {
+    pub(crate) fn lay(&mut self, at: u64, size: u64) {
         let mut h = Fx(self.layout);
         h.add(at);
         h.add(size);
         self.layout = h.0;
+    }
+
+    /// Takes the counters the recorder keeps from its own (`Recorder::staging`).
+    pub(crate) fn recorded(&mut self, r: &Staging) {
+        (self.calls, self.hits, self.bank_bytes, self.data_bytes, self.zero_bytes, self.flushed, self.flushes) = (r.calls, r.hits, r.bank_bytes, r.data_bytes, r.zero_bytes, r.flushed, r.flushes);
+        (self.bind_groups, self.recordings, self.layout) = (r.bind_groups, r.recordings, r.layout);
     }
 }
 
@@ -882,13 +880,10 @@ pub(crate) struct Memo {
     /// (kind, address, length) -> the read's id, its place in `blocks`.
     reads: FxMap<(u8, u64, usize), Dated<u32>>,
     /// Each read's bytes, by id: a stage keeps its banks' ids, not their bytes,
-    /// and a block is staged by its id (`Surfaces::stage_bank`, `stage_raw`,
-    /// `stage_data`). A read made again after a GPU write takes a new id.
+    /// and the recorder, which has them too (`Rec::Block`), stages a block by
+    /// its id. A read made again after a GPU write takes a new id. Ids last
+    /// the frame: kept at a new submit, dropped at a flush.
     blocks: Vec<Bytes>,
-    /// (read id, bytes the program may read) -> the bank's staged block.
-    banks: FxMap<(u32, u32), Slice>,
-    /// Read id -> the staged block of vertices or indices.
-    data: FxMap<u32, Slice>,
     /// (address, index size, count, restart index) -> the indices read.
     indices: FxMap<(u64, usize, u32, Option<u32>), Dated<Indices>>,
     /// Address -> a texture or sampler header (two guest reads per texture slot of every draw).
@@ -915,9 +910,6 @@ pub(crate) struct Memo {
 impl Memo {
     fn clear(&mut self) {
         self.reads.clear();
-        self.blocks.clear();
-        self.banks.clear();
-        self.data.clear();
         self.indices.clear();
         self.descriptors.clear();
         self.forget_slots();
@@ -956,7 +948,7 @@ impl Memo {
 }
 
 /// Offsets in the upload arena: the uniform binding alignment wgpu allows at most.
-const ARENA_ALIGN: usize = 256;
+pub(crate) const ARENA_ALIGN: usize = 256;
 
 /// What the game's programs cannot run without (D32): subgroup operations,
 /// on subgroups of exactly 32 lanes, since the translated warp code (shuffles,
@@ -980,7 +972,7 @@ pub(crate) fn uniform((buffer, at, size): &(wgpu::Buffer, u64, u64)) -> wgpu::Bi
     wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer, offset: *at, size: wgpu::BufferSize::new(*size) })
 }
 
-fn arena_buffer(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
+pub(crate) fn arena_buffer(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
     let usage = wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::INDEX | wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST;
     device.create_buffer(&wgpu::BufferDescriptor { label: Some("arena"), size, usage, mapped_at_creation: false })
 }
@@ -1072,15 +1064,14 @@ impl Surfaces {
             }],
         });
         let fill = (fill_module, fill_layout, Default::default());
-        let arena = (arena_buffer(&device, 16 << 20), Vec::new());
         let belt = wgpu::util::StagingBelt::new(device.clone(), 16 << 20);
         let texture_belt = wgpu::util::StagingBelt::new(device.clone(), 16 << 20);
         let dynamic_max = device.limits().max_dynamic_uniform_buffers_per_pipeline_layout;
         let clip_distances = device.features().contains(wgpu::Features::CLIP_DISTANCES);
         let window = window.map(|(surface, size)| Window::new(&adapter, &device, surface, size));
-        let timing = crate::timing::Timing::new(&device, &queue);
+        let rec = crate::record::Recorder::new(&device, &queue, crate::timing::Timing::new(&device, &queue));
         let renderable = (0..=0xff).filter_map(color_format).chain((0..=0xff).filter_map(depth_format)).map(|f| (f, renderable_on(&adapter, &device, f))).collect();
-        Ok(Surfaces { renderable, adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, pass: None, pending: None, timing, clock: None, present: 0, readbacks: Default::default(), hasher: None, arena, belt, big_upload: false, texture_belt, uploads: None, staging: Staging::default(), staged: FxMap::default(), last_color: None, window, submit: None, submit_ended: false, memo: Memo::default(), compile: Compile::default(), compile_total: Compile::default(), background: false, wait_left: PIPELINE_WAIT, workers: None, finished: Default::default(), disk_cache: None, shader_cache: None, views: Aged::default(), bind_groups: Groups::default(), dynamic_max, clip_distances })
+        Ok(Surfaces { renderable, adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, rec, open: None, sets: 0, present: 0, readbacks: Default::default(), hasher: None, belt, big_upload: false, texture_belt, uploads: None, staging: Staging::default(), last_color: None, window, submit: None, submit_ended: false, memo: Memo::default(), compile: Compile::default(), compile_total: Compile::default(), background: false, wait_left: PIPELINE_WAIT, workers: None, finished: Default::default(), disk_cache: None, shader_cache: None, views: Aged::default(), dynamic_max, clip_distances })
     }
 
     /// Shows the presented image (the color target written last, its top-left
@@ -1104,26 +1095,24 @@ impl Surfaces {
         }
     }
 
-    /// The encoder that collects a frame's passes: one submit per frame
-    /// instead of one per operation. Give it back with [`Surfaces::record`].
-    pub(crate) fn encoder(&mut self) -> wgpu::CommandEncoder {
-        // A pass left open for the next draw ends before anything else is recorded.
-        self.pass = None;
-        self.staging.recordings += 1;
-        self.pending.take().unwrap_or_else(|| {
-            let mut encoder = self.device.create_command_encoder(&Default::default());
-            if let Some(c) = &self.clock {
-                c.open(&mut encoder);
-            }
-            encoder
-        })
+    /// Sends `r` to the recorder: anything but a draw ends the pass it held open.
+    pub(crate) fn push(&mut self, r: crate::record::Rec) {
+        if matches!(r, crate::record::Rec::Run(_)) {
+            self.open = None;
+        }
+        self.rec.apply(r);
+    }
+
+    /// Records `run` into the frame's encoder, in order with the draws.
+    pub(crate) fn run(&mut self, run: impl FnOnce(&mut crate::record::Recorder) + Send + 'static) {
+        self.push(crate::record::Rec::Run(Box::new(run)));
     }
 
     /// Times each frame's GPU work from now on (`--perf`); false if the GPU
     /// has no timestamps inside command encoders.
     pub fn measure_frames(&mut self) -> bool {
-        self.clock = crate::timing::FrameClock::new(&self.device, &self.queue);
-        self.clock.is_some()
+        self.rec.clock = crate::timing::FrameClock::new(&self.device, &self.queue);
+        self.rec.clock.is_some()
     }
 
     /// Waits for the GPU; each present's GPU milliseconds (index: present) and
@@ -1137,9 +1126,9 @@ impl Surfaces {
             self.send(Box::new(move |s: &mut Submitter| {
                 let _ = tx.send(s.clock.take());
             }));
-            self.clock = rx.recv_timeout(std::time::Duration::from_secs(3)).ok().flatten();
+            self.rec.clock = rx.recv_timeout(std::time::Duration::from_secs(3)).ok().flatten();
         }
-        self.clock.as_mut().map_or((Vec::new(), 0), |c| (c.finish(&self.device), c.stalls))
+        self.rec.clock.as_mut().map_or((Vec::new(), 0), |c| (c.finish(&self.device), c.stalls))
     }
 
     /// `--pipeline-cache DIR`: the driver's compiled pipelines are kept in DIR, in
@@ -1214,10 +1203,6 @@ impl Surfaces {
         }
     }
 
-    pub(crate) fn record(&mut self, encoder: wgpu::CommandEncoder) {
-        self.pending = Some(encoder);
-    }
-
     /// Counts a guest read for the GPU, `memo` if the memo served it (host
     /// statistics, see [`Staging`]).
     pub(crate) fn note_read(&mut self, kind: Read, len: usize, memo: bool) {
@@ -1259,25 +1244,9 @@ impl Surfaces {
             }
             bytes[n..].fill(0);
         }
-        let bytes = Arc::new(bytes);
-        let id = self.memo.blocks.len() as u32;
-        self.memo.blocks.push(bytes.clone());
+        let id = self.block(bytes);
         self.memo.reads.insert(key, (id, self.memo.epoch));
-        Some((id, bytes))
-    }
-
-    /// The constant bank of read `id` as a program reading `window` bytes of
-    /// it binds it ([`Surfaces::stage_window`]: the bytes it may read, then
-    /// zeros to there, bound as 64 KiB): staged once a submit for each window,
-    /// a read made again after a GPU write taking a new id.
-    pub(crate) fn stage_bank(&mut self, id: u32, window: usize) -> Slice {
-        if let Some(slice) = self.memo.banks.get(&(id, window as u32)) {
-            return slice.clone();
-        }
-        let bytes = self.memo.blocks[id as usize].clone();
-        let slice = self.stage_window(&bytes[..bytes.len().min(window)], window, 0x10000);
-        self.memo.banks.insert((id, window as u32), slice.clone());
-        slice
+        Some((id, self.memo.blocks[id as usize].clone()))
     }
 
     /// `len` bytes of guest memory at `addr`, every one readable, then zeros up
@@ -1301,10 +1270,13 @@ impl Surfaces {
         Some(id)
     }
 
-    /// The id of a new block holding `bytes` (until the memo is emptied).
+    /// The id of a new block holding `bytes` (until the next flush), announced
+    /// to the recorder, which stages it at its first use.
     pub(crate) fn block(&mut self, bytes: Vec<u8>) -> u32 {
-        self.memo.blocks.push(Arc::new(bytes));
-        self.memo.blocks.len() as u32 - 1
+        let (id, bytes) = (self.memo.blocks.len() as u32, Arc::new(bytes));
+        self.memo.blocks.push(bytes.clone());
+        self.push(crate::record::Rec::Block(id, bytes));
+        id
     }
 
     /// The indices read of `count` indices of `size` bytes at `addr` (with a
@@ -1333,49 +1305,10 @@ impl Surfaces {
         Some(d)
     }
 
-    /// Block `id` staged as it is (padded to 4), at the arena's end, neither
-    /// hashed nor compared with what the arena holds: vertices and indices,
-    /// whose blocks never repeat at another address (the memo finds them at
-    /// theirs). Once a submit.
-    pub(crate) fn stage_raw(&mut self, id: u32) -> Slice {
-        if let Some(slice) = self.memo.data.get(&id) {
-            return slice.clone();
-        }
-        let bytes = self.memo.blocks[id as usize].clone();
-        let range = bytes.len().next_multiple_of(4).max(4);
-        let mut at = self.arena.1.len().next_multiple_of(ARENA_ALIGN);
-        if (at + range) as u64 > self.arena.0.size() {
-            self.grow_arena(range);
-            at = 0;
-        }
-        let data = &mut self.arena.1;
-        data.resize(at, 0);
-        data.extend_from_slice(&bytes);
-        data.resize(at + range, 0);
-        self.staging.calls += 1;
-        self.staging.data_bytes += range as u64;
-        self.staging.lay(at as u64, range as u64);
-        let slice = (self.arena.0.clone(), at as u64, range as u64);
-        self.memo.data.insert(id, slice.clone());
-        slice
-    }
-
-    /// Block `id` staged as [`Surfaces::stage`] does (shared with an identical
-    /// block): widened indices. Once a submit.
-    pub(crate) fn stage_data(&mut self, id: u32) -> Slice {
-        if let Some(slice) = self.memo.data.get(&id) {
-            return slice.clone();
-        }
-        let bytes = self.memo.blocks[id as usize].clone();
-        let slice = self.stage(&bytes);
-        self.memo.data.insert(id, slice.clone());
-        slice
-    }
-
     /// The bytes of a block staged in the current arena.
     #[cfg(test)]
     pub(crate) fn arena_bytes(&self, s: &Slice, len: usize) -> &[u8] {
-        &self.arena.1[s.1 as usize..s.1 as usize + len]
+        &self.rec.arena.1[s.1 as usize..s.1 as usize + len]
     }
 
     /// Records indices read by the caller (see [`Surfaces::staged_indices`]).
@@ -1389,23 +1322,36 @@ impl Surfaces {
     /// refresh in place copies among the frame's commands instead.
     pub fn flush(&mut self) {
         let started = std::time::Instant::now();
-        self.pass = None;
+        self.open = None;
         self.memo.clear();
-        let whole = self.arena.1.len().next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT as usize);
-        self.arena.1.resize(whole, 0);
-        self.staging.lay(u64::MAX, whole as u64);
+        // The frame's blocks and sets end here, on both sides: their ids start again.
+        self.memo.blocks.clear();
+        self.sets = 0;
+        let r = &mut self.rec;
+        r.end_frame();
+        let whole = r.arena.1.len().next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT as usize);
+        r.arena.1.resize(whole, 0);
+        r.staging.lay(u64::MAX, whole as u64);
         if whole > 0 {
-            self.staging.flushed += whole as u64;
-            self.staging.flushes += 1;
-            self.staged.clear();
+            r.staging.flushed += whole as u64;
+            r.staging.flushes += 1;
+        }
+        self.staging.recorded(&r.staging);
+        if r.lost > 0 {
+            *self.skipped.entry("no open render pass".into()).or_default() += std::mem::take(&mut r.lost);
+        }
+        if std::mem::take(&mut r.submit_ended) {
+            self.submit = None;
+            self.submit_ended = true;
         }
         if self.submit.is_some() {
             self.hand_over();
         } else {
             // The texture staging is closed even with no upload: a refresh may have used it.
             self.texture_belt.finish();
-            let f = Frame { uploads: self.uploads.take(), arena: (self.arena.0.clone(), std::mem::take(&mut self.arena.1)), pending: self.pending.take(), present: self.present };
-            self.arena.1 = submit_frame(&self.device, &self.queue, &mut self.belt, self.clock.as_mut(), self.timing.as_mut(), false, f).0;
+            let r = &mut self.rec;
+            let f = Frame { uploads: self.uploads.take(), arena: (r.arena.0.clone(), std::mem::take(&mut r.arena.1)), pending: r.encoder.take(), present: self.present };
+            r.arena.1 = submit_frame(&self.device, &self.queue, &mut self.belt, r.clock.as_mut(), r.timing.as_mut(), false, f).0;
             self.texture_belt.recall();
         }
         if let Some(t) = &self.submit {
@@ -1417,18 +1363,19 @@ impl Surfaces {
     /// Play mode: the work recorded so far goes to the submit thread, which
     /// finishes and submits it while this thread records the next frame.
     fn hand_over(&mut self) {
-        if self.uploads.is_none() && self.pending.is_none() && self.arena.1.is_empty() {
+        let r = &mut self.rec;
+        if self.uploads.is_none() && r.encoder.is_none() && r.arena.1.is_empty() {
             return;
         }
         // The texture staging is mapped again right after the submit that carries its
         // copies (each staging allocation records its copy at once: `stage_level`).
-        match self.pending.as_ref().or(self.uploads.as_ref()) {
+        match r.encoder.as_ref().or(self.uploads.as_ref()) {
             Some(e) => self.texture_belt.finish_and_recall_on_submit(e),
             None => self.texture_belt.finish(),
         }
-        let len = self.arena.1.len();
+        let len = r.arena.1.len();
         let spare = self.submit.as_ref().and_then(|t| t.spare.try_recv().ok()).unwrap_or_else(|| Vec::with_capacity(len));
-        let f = Frame { uploads: self.uploads.take(), arena: (self.arena.0.clone(), std::mem::replace(&mut self.arena.1, spare)), pending: self.pending.take(), present: self.present };
+        let f = Frame { uploads: self.uploads.take(), arena: (r.arena.0.clone(), std::mem::replace(&mut r.arena.1, spare)), pending: r.encoder.take(), present: self.present };
         self.send(Box::new(move |s: &mut Submitter| {
             // A window's swapchain already waits for the GPU (`Window::show`).
             if let Some(i) = due(&mut s.in_flight)
@@ -1447,7 +1394,7 @@ impl Surfaces {
     /// frame clock and the window go with it. Not with GYROSHIP_GPU_TIMES,
     /// which waits for the GPU at each flush anyway.
     pub fn start_submit_thread(&mut self) -> std::io::Result<()> {
-        if self.timing.is_some() {
+        if self.rec.timing.is_some() {
             return Ok(());
         }
         let (jobs, rx) = std::sync::mpsc::sync_channel::<SubmitJob>(1);
@@ -1455,7 +1402,9 @@ impl Surfaces {
         let busy = Arc::new(std::sync::atomic::AtomicU64::new(0));
         // The arena's staging is the thread's now; this one serves only if the thread ends.
         let belt = std::mem::replace(&mut self.belt, wgpu::util::StagingBelt::new(self.device.clone(), 16 << 20));
-        let mut s = Submitter { device: self.device.clone(), queue: self.queue.clone(), belt, clock: self.clock.take(), window: self.window.take(), spare: back, in_flight: Default::default() };
+        let mut s = Submitter { device: self.device.clone(), queue: self.queue.clone(), belt, clock: self.rec.clock.take(), window: self.window.take(), spare: back, in_flight: Default::default() };
+        // The recorder syncs with the thread before the arena grows.
+        self.rec.submit = Some(jobs.clone());
         let took = busy.clone();
         let thread = std::thread::Builder::new().name("gpu submit".into()).spawn(move || {
             for job in rx {
@@ -1533,66 +1482,6 @@ impl Surfaces {
         }
     }
 
-    /// Copies `bytes` (padded to 4) into this frame's upload arena; returns
-    /// the buffer and the range they will occupy when the frame is submitted.
-    pub(crate) fn stage(&mut self, bytes: &[u8]) -> (wgpu::Buffer, u64, u64) {
-        self.stage_window(bytes, 0, 0)
-    }
-
-    /// As [`Surfaces::stage`], the range given being at least `window` bytes: a
-    /// constant bank is bound as 64 KiB but only its bound size is hashed and
-    /// compared; the rest of its window is zeros, as the console reads past a bank's
-    /// size (text vanished when it held the arena's next blocks).
-    pub(crate) fn stage_window(&mut self, bytes: &[u8], zeros: usize, window: usize) -> (wgpu::Buffer, u64, u64) {
-        let size = bytes.len().next_multiple_of(4).max(4);
-        // Filled: the bytes, then zeros up to `zeros`; bound: `window` at least.
-        let fill = size.max(zeros);
-        let range = fill.max(window);
-        // A fast word hash (SipHash cost 5% of a tutorial frame); bytes are compared after.
-        let (words, tail) = bytes.as_chunks::<8>();
-        let hash = words.iter().map(|w| u64::from_le_bytes(*w)).chain(tail.iter().map(|&b| u64::from(b))).fold(bytes.len() as u64, |h, w| (h.rotate_left(5) ^ w).wrapping_mul(0x517c_c1b7_2722_0a95));
-        let capacity = self.arena.0.size();
-        self.staging.calls += 1;
-        if let Some(&(at, _)) = self.staged.get(&hash).and_then(|v| v.iter().find(|&&(at, filled)| filled >= fill && (at + range) as u64 <= capacity && self.arena.1.get(at..at + bytes.len()) == Some(bytes))) {
-            self.staging.hits += 1;
-            return (self.arena.0.clone(), at as u64, range as u64);
-        }
-        let at = self.arena.1.len().next_multiple_of(ARENA_ALIGN);
-        if (at + range) as u64 > capacity {
-            self.grow_arena(range);
-            return self.stage_window(bytes, zeros, window);
-        }
-        match window {
-            0 => self.staging.data_bytes += size as u64,
-            _ => self.staging.bank_bytes += size as u64,
-        }
-        self.staging.zero_bytes += (fill - size) as u64;
-        let data = &mut self.arena.1;
-        data.resize(at, 0);
-        data.extend_from_slice(bytes);
-        data.resize(at + fill, 0);
-        self.staged.entry(hash).or_default().push((at, fill));
-        self.staging.lay(at as u64, range as u64);
-        (self.arena.0.clone(), at as u64, range as u64)
-    }
-
-    /// The arena is full: its bytes are written now (it is not reused this frame)
-    /// and a buffer twice as large, with room for `range`, takes over; recorded
-    /// work keeps the old one alive.
-    fn grow_arena(&mut self, range: usize) {
-        // Play mode: no frame may wait in the submit thread's queue, or this write
-        // (sent with the next submit) would land before that frame's own arena copy.
-        self.sync();
-        self.staging.flushed += self.arena.1.len() as u64;
-        self.queue.write_buffer(&self.arena.0, 0, &self.arena.1);
-        let capacity = (self.arena.0.size() * 2).max((range as u64).next_power_of_two());
-        self.arena = (arena_buffer(&self.device, capacity), Vec::new());
-        self.staged.clear();
-        // ponytail: staged blocks stay valid in the old buffer; staged again for simplicity (rare).
-        self.memo.banks.clear();
-        self.memo.data.clear();
-    }
-
     /// A view of `texture` as `desc` describes it.
     pub(crate) fn view(&mut self, texture: &wgpu::Texture, desc: &wgpu::TextureViewDescriptor) -> wgpu::TextureView {
         let key = (texture.clone(), desc.format, desc.dimension, desc.usage, desc.aspect, desc.base_mip_level, desc.mip_level_count, desc.base_array_layer, desc.array_layer_count);
@@ -1612,65 +1501,11 @@ impl Surfaces {
         self.view(texture, &wgpu::TextureViewDescriptor { format: other, usage: other.map(|_| usage), ..desc })
     }
 
-    /// A bind group of `layout` with these buffer ranges (bound from 0 when
-    /// their offsets are dynamic), then the slots' views and samplers.
-    pub(crate) fn bind_group(&mut self, layout: &wgpu::BindGroupLayout, buffers: &[(u32, Slice)], textures: &[crate::draw::Slot], dynamic: bool) -> wgpu::BindGroup {
-        use std::hash::{Hash, Hasher};
-        // The entries, borrowed: a buffer at offset 0 when the offset is dynamic, then each
-        // texture slot's view and sampler. Hashed and compared as they are; cloned into a
-        // key only for a group made here.
-        let at = |a: u64| if dynamic { 0 } else { a };
-        let mut h = Fx::default();
-        layout.hash(&mut h);
-        for (binding, (buffer, a, size)) in buffers {
-            (binding, buffer, at(*a), size).hash(&mut h);
-        }
-        for s in textures {
-            s.view.hash(&mut h);
-            s.sampler.hash(&mut h);
-        }
-        let same = |(l, bound): &GroupKey| {
-            let mut it = bound.iter();
-            l == layout
-                && buffers.iter().all(|(binding, (buffer, a, size))| matches!(it.next(), Some(Bound::Buffer(b, f, o, z)) if b == binding && f == buffer && *o == at(*a) && z == size))
-                && textures.iter().enumerate().all(|(slot, s)| {
-                    matches!(it.next(), Some(Bound::View(b, v)) if *b == 32 + 2 * slot as u32 && *v == s.view)
-                        && s.sampler.as_ref().is_none_or(|sampler| matches!(it.next(), Some(Bound::Sampler(b, x)) if *b == 33 + 2 * slot as u32 && x == sampler))
-                })
-                && it.next().is_none()
-        };
-        let (device, made) = (&self.device, &mut self.staging.bind_groups);
-        made[1] += 1;
-        self.bind_groups.get_or(h.finish(), same, || {
-            made[0] += 1;
-            let mut bound = Vec::with_capacity(buffers.len() + 2 * textures.len());
-            for (binding, (buffer, a, size)) in buffers {
-                bound.push(Bound::Buffer(*binding, buffer.clone(), at(*a), *size));
-            }
-            for (slot, s) in textures.iter().enumerate() {
-                bound.push(Bound::View(32 + 2 * slot as u32, s.view.clone()));
-                if let Some(sampler) = &s.sampler {
-                    bound.push(Bound::Sampler(33 + 2 * slot as u32, sampler.clone()));
-                }
-            }
-            let entries: Vec<wgpu::BindGroupEntry> = bound
-                .iter()
-                .map(|b| match b {
-                    Bound::Buffer(binding, buffer, at, size) => wgpu::BindGroupEntry { binding: *binding, resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer, offset: *at, size: wgpu::BufferSize::new(*size) }) },
-                    Bound::View(binding, view) => wgpu::BindGroupEntry { binding: *binding, resource: wgpu::BindingResource::TextureView(view) },
-                    Bound::Sampler(binding, sampler) => wgpu::BindGroupEntry { binding: *binding, resource: wgpu::BindingResource::Sampler(sampler) },
-                })
-                .collect();
-            let group = device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout, entries: &entries });
-            ((layout.clone(), bound), group)
-        })
-    }
-
     /// A frame was presented: the views and bind groups neither it nor the
     /// one before used are dropped.
     pub fn next_frame(&mut self) {
         self.views.age();
-        self.bind_groups.age();
+        self.rec.next_frame();
         self.wait_left = PIPELINE_WAIT;
     }
 
@@ -1846,18 +1681,20 @@ impl Surfaces {
                 Some(format) => {
                     let view = self.texture(s, format);
                     let [r, g, b, a] = value.map(|v| f64::from(f32::from_bits(v)));
-                    let mut encoder = self.encoder();
-                    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("clear"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &view,
-                            depth_slice: None,
-                            resolve_target: None,
-                            ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r, g, b, a }), store: wgpu::StoreOp::Store },
-                        })],
-                        ..Default::default()
+                    self.run(move |rec| {
+                        let mut encoder = rec.encoder();
+                        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("clear"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &view,
+                                depth_slice: None,
+                                resolve_target: None,
+                                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r, g, b, a }), store: wgpu::StoreOp::Store },
+                            })],
+                            ..Default::default()
+                        });
+                        rec.record(encoder);
                     });
-                    self.record(encoder);
                     self.wrote((s.addr, s.format));
                 }
             }
@@ -1877,13 +1714,15 @@ impl Surfaces {
                     let view = self.texture(s, format);
                     let depth_ops = Some(wgpu::Operations { load: z.map_or(wgpu::LoadOp::Load, |z| wgpu::LoadOp::Clear(f32::from_bits(z))), store: wgpu::StoreOp::Store });
                     let stencil_ops = format.has_stencil_aspect().then(|| wgpu::Operations { load: stencil.map_or(wgpu::LoadOp::Load, |v| wgpu::LoadOp::Clear(u32::from(v))), store: wgpu::StoreOp::Store });
-                    let mut encoder = self.encoder();
-                    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("clear"),
-                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &view, depth_ops, stencil_ops }),
-                        ..Default::default()
+                    self.run(move |rec| {
+                        let mut encoder = rec.encoder();
+                        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("clear"),
+                            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &view, depth_ops, stencil_ops }),
+                            ..Default::default()
+                        });
+                        rec.record(encoder);
                     });
-                    self.record(encoder);
                     if z.is_some() || (stencil.is_some() && format.has_stencil_aspect()) {
                         self.mark((s.addr, s.format));
                     }
@@ -1931,30 +1770,33 @@ impl Surfaces {
         };
         let mut bytes: Vec<u8> = color.iter().chain(&[depth, 0.0, 0.0, 0.0]).flat_map(|v| v.to_le_bytes()).collect();
         bytes.truncate(32);
-        let u = self.stage(&bytes);
-        let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &self.fill.1, entries: &[wgpu::BindGroupEntry { binding: 0, resource: uniform(&u) }] });
+        let layout = self.fill.1.clone();
         let view = self.texture(s, format);
-        let load = wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store };
-        let mut encoder = self.encoder();
-        {
-            let color_attachment = [Some(wgpu::RenderPassColorAttachment { view: &view, depth_slice: None, resolve_target: None, ops: load })];
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("fill"),
-                color_attachments: if matches!(fill, Fill::Color { .. }) { &color_attachment } else { &[] },
-                depth_stencil_attachment: matches!(fill, Fill::Depth { .. }).then(|| wgpu::RenderPassDepthStencilAttachment {
-                    view: &view,
-                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
-                    stencil_ops: format.has_stencil_aspect().then_some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
-                }),
-                ..Default::default()
-            });
-            pass.set_pipeline(&pipeline);
-            pass.set_bind_group(0, &group, &[]);
-            pass.set_scissor_rect(x, y, x1 - x, y1 - y);
-            pass.set_stencil_reference(u32::from(stencil));
-            pass.draw(0..3, 0..1);
-        }
-        self.record(encoder);
+        self.run(move |rec| {
+            let u = rec.stage(&bytes);
+            let group = rec.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &layout, entries: &[wgpu::BindGroupEntry { binding: 0, resource: uniform(&u) }] });
+            let load = wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store };
+            let mut encoder = rec.encoder();
+            {
+                let color_attachment = [Some(wgpu::RenderPassColorAttachment { view: &view, depth_slice: None, resolve_target: None, ops: load })];
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("fill"),
+                    color_attachments: if matches!(fill, Fill::Color { .. }) { &color_attachment } else { &[] },
+                    depth_stencil_attachment: matches!(fill, Fill::Depth { .. }).then(|| wgpu::RenderPassDepthStencilAttachment {
+                        view: &view,
+                        depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                        stencil_ops: format.has_stencil_aspect().then_some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                    }),
+                    ..Default::default()
+                });
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, &group, &[]);
+                pass.set_scissor_rect(x, y, x1 - x, y1 - y);
+                pass.set_stencil_reference(u32::from(stencil));
+                pass.draw(0..3, 0..1);
+            }
+            rec.record(encoder);
+        });
         true
     }
 
@@ -2181,13 +2023,30 @@ mod tests {
             return;
         };
         let (a, b) = (vec![1u8; 4096], vec![2u8; 4096]);
-        let first = s.stage(&a).1;
-        assert_eq!(s.stage(&a).1, first);
-        assert_ne!(s.stage(&b).1, first);
-        assert_eq!(s.stage(&a[..100]).2, 100);
+        let first = s.rec.stage(&a).1;
+        assert_eq!(s.rec.stage(&a).1, first);
+        assert_ne!(s.rec.stage(&b).1, first);
+        assert_eq!(s.rec.stage(&a[..100]).2, 100);
         s.flush();
-        assert_eq!(s.arena.1.len(), 0);
-        assert_eq!(s.stage(&b).1, 0);
+        assert_eq!(s.rec.arena.1.len(), 0);
+        assert_eq!(s.rec.stage(&b).1, 0);
+    }
+
+    /// Blocks are shared within their frame only: after a flush, a block takes a
+    /// range of its own though a raw block of the same bytes now lies where the
+    /// last frame staged it. Needs a GPU adapter.
+    #[test]
+    fn a_frame_shares_only_its_own_blocks() {
+        let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
+            eprintln!("no GPU adapter: test skipped");
+            return;
+        };
+        let block = vec![5u8; 64];
+        assert_eq!(s.rec.stage(&block).1, 0);
+        s.flush();
+        s.push(crate::record::Rec::Block(0, Arc::new(block.clone())));
+        assert_eq!(s.rec.stage_raw(0).1, 0);
+        assert_eq!(s.rec.stage(&block).1, ARENA_ALIGN as u64, "not the last frame's block");
     }
 
     /// The arena's layout hash follows where blocks were written: a block
@@ -2201,10 +2060,11 @@ mod tests {
             return;
         };
         let mut frame = |second: &[u8]| {
-            s.stage(&[1u8; 64]);
-            s.stage(second);
+            s.rec.stage(&[1u8; 64]);
+            s.rec.stage(second);
             s.flush();
-            std::mem::take(&mut s.staging.layout)
+            assert_eq!(s.staging.layout, s.rec.staging.layout, "taken over at the flush");
+            std::mem::take(&mut s.rec.staging.layout)
         };
         let shared = frame(&[1u8; 64]);
         assert_eq!(frame(&[1u8; 64]), shared);
@@ -2345,18 +2205,89 @@ mod tests {
             true
         };
         let (id, _) = s.read_guest(Read::Bank, 0x1000, 64, &mut mem).unwrap();
-        let first = s.stage_bank(id, 64);
-        let calls = s.staging.calls;
-        assert_eq!((s.stage_bank(id, 64).1, s.staging.calls), (first.1, calls), "found by its id");
-        assert_ne!(s.stage_bank(id, 32).1, first.1, "another window, another block");
+        let first = s.rec.stage_bank(id, 64);
+        let calls = s.rec.staging.calls;
+        assert_eq!((s.rec.stage_bank(id, 64).1, s.rec.staging.calls), (first.1, calls), "found by its id");
+        assert_ne!(s.rec.stage_bank(id, 32).1, first.1, "another window, another block");
         s.invalidate(0x1000, 4);
         value.set(2);
         let (again, _) = s.read_guest(Read::Bank, 0x1000, 64, &mut mem).unwrap();
         assert_ne!(again, id, "read again: a new id");
-        let fresh = s.stage_bank(again, 64);
+        let fresh = s.rec.stage_bank(again, 64);
         assert_eq!(s.arena_bytes(&fresh, 64), [2u8; 64], "its new bytes");
-        s.grow_arena(0);
-        assert!(s.stage_bank(again, 64).0 == s.arena.0, "staged again in the grown arena");
+        s.rec.grow(0);
+        assert!(s.rec.stage_bank(again, 64).0 == s.rec.arena.0, "staged again in the grown arena");
+    }
+
+    /// The recorder applies its commands in order: two draws to one target share
+    /// a pass, each in its viewport (the left half, then the right); a copy sent
+    /// between draws ends that pass and sees both; the next draw opens a pass of
+    /// its own and sets its viewport again, though the last pass ended with it.
+    /// Identical blocks staged as they are keep their own ranges. The pipeline
+    /// comes before an older one still being made (play mode): found by its id.
+    /// Needs a GPU adapter.
+    #[test]
+    fn the_recorder_applies_commands_in_order() {
+        use crate::record::{Call, DrawRec, GroupRec, PassOpen, Rec};
+        let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
+            eprintln!("no GPU adapter: test skipped");
+            return;
+        };
+        let d = s.device.clone();
+        // Read back through a sampling pass (`rgba`).
+        let texture = |usage| d.create_texture(&wgpu::TextureDescriptor { label: None, size: wgpu::Extent3d { width: 4, height: 4, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::Rgba8Unorm, usage: usage | wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[] });
+        let (target, copy) = (texture(wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC), texture(wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC));
+        let wgsl = "struct C { color: vec4<f32> };
+            @group(0) @binding(0) var<uniform> c: C;
+            @vertex fn vs(@location(0) p: vec2<f32>) -> @builtin(position) vec4<f32> { return vec4(p, 0.0, 1.0); }
+            @fragment fn fs() -> @location(0) vec4<f32> { return c.color; }";
+        let module = d.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(wgsl.into()) });
+        let uniform = wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: wgpu::BufferSize::new(16) };
+        let layout = d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &[wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: uniform, count: None }] });
+        let pipeline_layout = d.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&layout)], ..Default::default() });
+        let attributes = [wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 0, shader_location: 0 }];
+        let pipeline = d.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: None,
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState { module: &module, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[Some(wgpu::VertexBufferLayout { array_stride: 8, step_mode: wgpu::VertexStepMode::Vertex, attributes: &attributes })] },
+            fragment: Some(wgpu::FragmentState { module: &module, entry_point: Some("fs"), compilation_options: Default::default(), targets: &[Some(wgpu::TextureFormat::Rgba8Unorm.into())] }),
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let bytes = |v: &[f32]| Arc::new(v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
+        // A triangle over the whole viewport, twice under two ids; a color per draw.
+        let corner = bytes(&[-1.0, -1.0, 3.0, -1.0, -1.0, 3.0]);
+        s.push(Rec::Pipeline(1, pipeline, [Some(layout), None]));
+        s.push(Rec::Set(0, Arc::from(Vec::<crate::draw::Slot>::new()), Arc::from(Vec::<u32>::new())));
+        for (id, block) in [bytes(&[1.0, 0.0, 0.0, 1.0]), corner.clone(), bytes(&[0.0, 1.0, 0.0, 1.0]), corner, bytes(&[0.0, 0.0, 1.0, 1.0])].into_iter().enumerate() {
+            s.push(Rec::Block(id as u32, block));
+        }
+        let draw = |color: u32, vertices: u32, x: f32, pass: Option<Box<PassOpen>>| {
+            let groups = smallvec::smallvec![GroupRec { banks: smallvec::smallvec![(0, color, 16)], set: 0, swizzles: false, dynamic: false }];
+            Rec::Draw(DrawRec { pipeline: 1, index: None, vertex: smallvec::smallvec![vertices], groups, viewport: [x, 0.0, 2.0, 4.0, 0.0, 1.0], scissor: [0, 0, 4, 4], blend: [0.0; 4], stencil: 0, call: Call::Direct { first: 0, count: 3, instance: 0 }, pass })
+        };
+        let open = || Some(Box::new(PassOpen { colors: vec![Some(target.create_view(&Default::default()))], depth: None, timed: None }));
+        s.push(draw(0, 1, 0.0, open()));
+        s.push(draw(2, 3, 2.0, None));
+        let (from, to) = (target.clone(), copy.clone());
+        s.run(move |rec| {
+            let mut e = rec.encoder();
+            e.copy_texture_to_texture(from.as_image_copy(), to.as_image_copy(), from.size());
+            rec.record(e);
+        });
+        s.push(draw(4, 1, 2.0, open()));
+        assert!(s.rec.stage_raw(1).1 != s.rec.stage_raw(3).1, "identical blocks staged as they are keep their own ranges");
+        assert_eq!(s.rec.staging.recordings, 3, "the first two draws shared a pass");
+        s.flush();
+        let read = |t: &wgpu::Texture| s.rgba(&Entry { surface: Surface { addr: 0, width: 4, height: 4, format: 0xd5, layers: 1 }, texture: t.clone(), written: 0 }).unwrap();
+        // Pixels (0, 0) and (2, 0): the left half and the right.
+        let halves = |rgba: Vec<u8>| (rgba[0..4].to_vec(), rgba[8..12].to_vec());
+        assert_eq!(halves(read(&copy)), (vec![255, 0, 0, 255], vec![0, 255, 0, 255]), "the copy sees both draws before it");
+        assert_eq!(halves(read(&target)), (vec![255, 0, 0, 255], vec![0, 0, 255, 255]), "the last draw kept to its viewport");
+        assert!(s.errors.lock().unwrap().is_empty(), "{:?}", s.errors.lock().unwrap());
     }
 
     /// Vertices read exactly, then staged as they are: the guest's bytes then
@@ -2372,18 +2303,18 @@ mod tests {
             buf.iter_mut().enumerate().for_each(|(i, b)| *b = (addr as usize + i) as u8);
             addr != 0xdead
         };
-        let mut stage = |s: &mut Surfaces, addr: u64, len: usize| s.read_exact(Read::Vertex, addr, len, len.next_multiple_of(4), &mut mem).map(|id| s.stage_raw(id));
+        let mut stage = |s: &mut Surfaces, addr: u64, len: usize| s.read_exact(Read::Vertex, addr, len, len.next_multiple_of(4), &mut mem).map(|id| s.rec.stage_raw(id));
         let a = stage(&mut s, 0x10, 6).unwrap();
         assert_eq!((a.1, a.2), (0, 8));
         assert_eq!(s.arena_bytes(&a, 8), [0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0, 0]);
-        let len = s.arena.1.len();
+        let len = s.rec.arena.1.len();
         assert_eq!(stage(&mut s, 0x10, 6).unwrap().1, 0, "read and staged once");
         assert!(stage(&mut s, 0xdead, 64).is_none());
-        assert_eq!(s.arena.1.len(), len);
+        assert_eq!(s.rec.arena.1.len(), len);
         let b = stage(&mut s, 0x20, 4).unwrap();
         assert_eq!((b.1, s.arena_bytes(&b, 4)), (ARENA_ALIGN as u64, &[0x20, 0x21, 0x22, 0x23][..]));
-        s.grow_arena(0);
-        assert!(stage(&mut s, 0x10, 6).unwrap().0 == s.arena.0, "staged again in the grown arena");
+        s.rec.grow(0);
+        assert!(stage(&mut s, 0x10, 6).unwrap().0 == s.rec.arena.0, "staged again in the grown arena");
     }
 
     /// Presented images are hashed off the frame: each present's hash comes
@@ -2439,7 +2370,9 @@ mod tests {
                 s.present = u64::from(n);
                 fill(&mut s, if n == 5 { 0x1 } else { 0x3 }, [17 * n, 255 - 17 * n, 0, 0]);
                 if n == 3 {
-                    s.stage(&vec![1; 17 << 20]);
+                    s.run(|rec| {
+                        rec.stage(&vec![1; 17 << 20]);
+                    });
                     fill(&mut s, 0x4, [0, 0, 64, 0]);
                 }
                 if threaded && n % 2 == 0 {
@@ -2454,7 +2387,7 @@ mod tests {
                     assert!(s.hash_presented(u64::from(n), 4, 2));
                 }
             }
-            assert!(s.arena.0.size() > 16 << 20, "the arena grew");
+            assert!(s.rec.arena.0.size() > 16 << 20, "the arena grew");
             let (ms, _) = s.frame_times();
             let rgba = |n: u8| {
                 let green = if n == 5 { 4 } else { n };

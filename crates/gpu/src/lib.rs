@@ -10,6 +10,7 @@ pub mod datazip;
 pub mod draw;
 pub mod mme;
 pub mod pushbuf;
+mod record;
 pub mod sass;
 pub mod shader;
 pub mod state;

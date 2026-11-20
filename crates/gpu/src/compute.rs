@@ -237,9 +237,9 @@ impl Surfaces {
         }
 
         // Bindings: constant banks, textures and swizzles as for draws, then the images.
-        let (textures, swizzles, _) = self.texture_slots(t, &banks, pools.headers, pools.samplers, pools.sampler_binding, &[], mem)?;
+        let (textures, swizzles, _, set) = self.texture_slots(t, &banks, pools.headers, pools.samplers, pools.sampler_binding, &[], mem)?;
         let cbufs = banks.iter().filter(|(b, _)| t.interface.cbufs.contains(b)).map(|&(b, (id, _))| (b, id)).collect();
-        let bindings = Bindings { cbufs, textures, swizzles: t.interface.swizzles.then_some(swizzles), sizes: &t.interface.cbuf_sizes };
+        let bindings = Bindings { cbufs, textures, swizzles: t.interface.swizzles.then_some(swizzles), set, sizes: &t.interface.cbuf_sizes };
         let mut layout_entries = bindings.layout(wgpu::ShaderStages::COMPUTE);
         for (i, (img, (_, format, _, _))) in t.interface.images.iter().zip(&images).enumerate() {
             let view_dimension = match img.dim {
@@ -292,50 +292,55 @@ impl Surfaces {
             self.compile.made.push(format!("p{key:016x}+compute"));
         }
         let (pipeline, layout) = self.cache.compute_pipelines[&id].clone();
-        let mut buffers: Vec<(u32, (wgpu::Buffer, u64, u64))> = bindings.cbufs.iter().map(|&(b, id)| (u32::from(b), self.stage_bank(id, bindings.window(b)))).collect();
-        if let Some(codes) = &bindings.swizzles {
-            let bytes: Vec<u8> = codes.iter().flat_map(|c| c.to_le_bytes()).collect();
-            buffers.push((shader::SWIZZLE_BINDING, self.stage(&bytes)));
-        }
-        let mut entries: Vec<wgpu::BindGroupEntry> = buffers.iter().map(|(b, u)| wgpu::BindGroupEntry { binding: *b, resource: crate::surfaces::uniform(u) }).collect();
-        for (slot, s) in bindings.textures.iter().enumerate() {
-            entries.push(wgpu::BindGroupEntry { binding: 32 + 2 * slot as u32, resource: wgpu::BindingResource::TextureView(&s.view) });
-            if let Some(sampler) = &s.sampler {
-                entries.push(wgpu::BindGroupEntry { binding: 33 + 2 * slot as u32, resource: wgpu::BindingResource::Sampler(sampler) });
+        // Staged, bound and recorded in order with the draws, by the recorder.
+        let banks: Vec<(u8, u32, usize)> = bindings.cbufs.iter().map(|&(b, id)| (b, id, bindings.window(b))).collect();
+        let (slots, swizzles, grid) = (bindings.textures.clone(), bindings.swizzles.clone(), l.grid);
+        self.run(move |rec| {
+            let mut buffers: Vec<(u32, (wgpu::Buffer, u64, u64))> = banks.iter().map(|&(b, id, window)| (u32::from(b), rec.stage_bank(id, window))).collect();
+            if let Some(codes) = &swizzles {
+                let bytes: Vec<u8> = codes.iter().flat_map(|c| c.to_le_bytes()).collect();
+                buffers.push((shader::SWIZZLE_BINDING, rec.stage(&bytes)));
             }
-        }
-        for (i, view) in views.iter().enumerate() {
-            let resource = match view {
-                ImageBinding::View(v) => wgpu::BindingResource::TextureView(v),
-                ImageBinding::Buffer(b, ..) => b.as_entire_binding(),
-            };
-            entries.push(wgpu::BindGroupEntry { binding: IMAGE_BINDING + i as u32, resource });
-        }
-        for (i, buffer) in globals.iter().enumerate() {
-            entries.push(wgpu::BindGroupEntry { binding: shader::BUFFER_BINDING + i as u32, resource: buffer.as_entire_binding() });
-        }
-        let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &layout, entries: &entries });
-        let timed = self.timing.as_mut().and_then(|t| t.next(format!("compute {key:016x}")));
-        let mut encoder = self.encoder();
-        // Images bound as buffers: their texels in before the dispatch, back out after it.
-        for v in &views {
-            if let ImageBinding::Buffer(b, t, layout) = v {
-                encoder.copy_texture_to_buffer(t.as_image_copy(), wgpu::TexelCopyBufferInfo { buffer: b, layout: *layout }, t.size());
+            let mut entries: Vec<wgpu::BindGroupEntry> = buffers.iter().map(|(b, u)| wgpu::BindGroupEntry { binding: *b, resource: crate::surfaces::uniform(u) }).collect();
+            for (slot, s) in slots.iter().enumerate() {
+                entries.push(wgpu::BindGroupEntry { binding: 32 + 2 * slot as u32, resource: wgpu::BindingResource::TextureView(&s.view) });
+                if let Some(sampler) = &s.sampler {
+                    entries.push(wgpu::BindGroupEntry { binding: 33 + 2 * slot as u32, resource: wgpu::BindingResource::Sampler(sampler) });
+                }
             }
-        }
-        {
-            let timestamp_writes = timed.zip(self.timing.as_ref()).map(|(i, t)| wgpu::ComputePassTimestampWrites { query_set: &t.set, beginning_of_pass_write_index: Some(i), end_of_pass_write_index: Some(i + 1) });
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("dispatch"), timestamp_writes });
-            pass.set_pipeline(&pipeline);
-            pass.set_bind_group(0, &group, &[]);
-            pass.dispatch_workgroups(l.grid[0], l.grid[1], l.grid[2]);
-        }
-        for v in &views {
-            if let ImageBinding::Buffer(b, t, layout) = v {
-                encoder.copy_buffer_to_texture(wgpu::TexelCopyBufferInfo { buffer: b, layout: *layout }, t.as_image_copy(), t.size());
+            for (i, view) in views.iter().enumerate() {
+                let resource = match view {
+                    ImageBinding::View(v) => wgpu::BindingResource::TextureView(v),
+                    ImageBinding::Buffer(b, ..) => b.as_entire_binding(),
+                };
+                entries.push(wgpu::BindGroupEntry { binding: IMAGE_BINDING + i as u32, resource });
             }
-        }
-        self.record(encoder);
+            for (i, buffer) in globals.iter().enumerate() {
+                entries.push(wgpu::BindGroupEntry { binding: shader::BUFFER_BINDING + i as u32, resource: buffer.as_entire_binding() });
+            }
+            let group = rec.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &layout, entries: &entries });
+            let timed = rec.timing.as_mut().and_then(|t| t.next(format!("compute {key:016x}")));
+            let mut encoder = rec.encoder();
+            // Images bound as buffers: their texels in before the dispatch, back out after it.
+            for v in &views {
+                if let ImageBinding::Buffer(b, t, layout) = v {
+                    encoder.copy_texture_to_buffer(t.as_image_copy(), wgpu::TexelCopyBufferInfo { buffer: b, layout: *layout }, t.size());
+                }
+            }
+            {
+                let timestamp_writes = timed.zip(rec.timing.as_ref()).map(|(i, t)| wgpu::ComputePassTimestampWrites { query_set: &t.set, beginning_of_pass_write_index: Some(i), end_of_pass_write_index: Some(i + 1) });
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("dispatch"), timestamp_writes });
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, &group, &[]);
+                pass.dispatch_workgroups(grid[0], grid[1], grid[2]);
+            }
+            for v in &views {
+                if let ImageBinding::Buffer(b, t, layout) = v {
+                    encoder.copy_buffer_to_texture(wgpu::TexelCopyBufferInfo { buffer: b, layout: *layout }, t.as_image_copy(), t.size());
+                }
+            }
+            rec.record(encoder);
+        });
         for key in written {
             self.mark(key);
         }
