@@ -126,8 +126,9 @@ pub struct Nvdrv {
 /// processors live in the [`Decoder`].
 #[derive(Debug, Default)]
 pub struct Gpu {
-    /// Program keys by GPU address, and the keys already seen.
-    programs: BTreeMap<u64, u64>,
+    /// Program keys by GPU address (looked up for every stage of every draw: hashed),
+    /// and the keys already seen.
+    programs: gyroship_gpu::surfaces::FxMap<u64, u64>,
     keys: std::collections::BTreeSet<u64>,
     /// Every channel's compute QMDs and what they wait for.
     scheduler: gyroship_gpu::state::qmd::Scheduler,

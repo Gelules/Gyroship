@@ -240,6 +240,10 @@ pub struct Cache {
     /// (`Rec::Pipeline`; never removed: their count is the next id), and
     /// whether the recorder has them (announced once made).
     pipelines: FxMap<PipelineKey, (Made<wgpu::RenderPipeline>, [Option<wgpu::BindGroupLayout>; 2], u32, bool)>,
+    /// The key and id of the last draw's pipeline, made (and so announced): a
+    /// draw with the same key (consecutive draws often share one) takes it
+    /// without a hash, a probe or a wait.
+    last_pipeline: Option<(PipelineKey, u32)>,
     /// Bind group layouts by their entries, shared by the pipelines.
     layouts: FxMap<Vec<wgpu::BindGroupLayoutEntry>, wgpu::BindGroupLayout>,
     /// A draw's bind group layout entries by id (`group_id`), and the ids by entries.
@@ -867,19 +871,26 @@ impl Surfaces {
         // (a pipeline made already reads no clock).
         let budget = if self.background { self.wait_left } else { std::time::Duration::ZERO };
         let mut began = None;
+        // The last draw's pipeline when this draw's key is the same: made and announced already.
+        let repeat = self.cache.last_pipeline.as_ref().filter(|(last, _)| *last == key).map(|&(_, id)| id);
+        self.staging.pipeline_repeats[0] += 1;
+        self.staging.pipeline_repeats[1] += u64::from(repeat.is_some());
         // Neither the pipeline nor its layouts are copied here: the recorder, which has them once
         // announced, is the one to use them at each draw.
-        let found = self.cache.pipelines.get_mut(&key).map(|(made, layouts, id, announced)| {
-            let (ready, at) = made.waited_for(budget);
-            began = at;
-            let announce = if ready && !*announced {
-                *announced = true;
-                made.made().map(|p| (p.clone(), layouts.clone()))
-            } else {
-                None
-            };
-            (ready, *id, announce)
-        });
+        let found = match repeat {
+            Some(id) => Some((true, id, None)),
+            None => self.cache.pipelines.get_mut(&key).map(|(made, layouts, id, announced)| {
+                let (ready, at) = made.waited_for(budget);
+                began = at;
+                let announce = if ready && !*announced {
+                    *announced = true;
+                    made.made().map(|p| (p.clone(), layouts.clone()))
+                } else {
+                    None
+                };
+                (ready, *id, announce)
+            }),
+        };
         let (ready, id, announce) = match found {
             Some(found) => found,
             None => {
@@ -918,13 +929,16 @@ impl Surfaces {
                 let ready = made.waited(since + budget);
                 let id = self.cache.pipelines.len() as u32;
                 let announce = if ready { made.made().map(|p| (p.clone(), bind_layouts.clone())) } else { None };
-                self.cache.pipelines.insert(key, (made, bind_layouts, id, ready));
+                self.cache.pipelines.insert(key.clone(), (made, bind_layouts, id, ready));
                 self.compile.pipelines += 1;
                 self.compile.pipeline_time += since.elapsed();
                 self.compile.made.push(label);
                 (ready, id, announce)
             }
         };
+        if ready && repeat.is_none() {
+            self.cache.last_pipeline = Some((key, id));
+        }
         if self.background
             && let Some(began) = began
         {
@@ -1128,7 +1142,12 @@ impl Surfaces {
     #[allow(clippy::too_many_arguments)]
     fn stage_bindings<'t>(&mut self, cbufs: &[Option<(u64, u32)>], headers: Pool, samplers: Pool, binding: SamplerBinding, t: &'t Translation, attached: &[u64], mem: Mem) -> Result<Bindings<'t>, String> {
         let mut banks = BankIds::new();
-        for b in t.interface.cbufs.iter().chain(&t.interface.handle_banks).copied() {
+        // The banks the program reads (the chain's first part), as a mask: the others are for the textures.
+        let (mut reads, programs) = (0u32, t.interface.cbufs.len());
+        for (i, b) in t.interface.cbufs.iter().chain(&t.interface.handle_banks).copied().enumerate() {
+            if i < programs {
+                reads |= 1 << (b % 32);
+            }
             // Each bank once, in bank order: the order of the bindings and of the arena.
             let Err(at) = banks.binary_search_by_key(&b, |(k, _)| *k) else { continue };
             let (addr, size) = cbufs.get(usize::from(b)).copied().flatten().ok_or_else(|| format!("constant bank {b} not bound"))?;
@@ -1138,7 +1157,7 @@ impl Surfaces {
         }
         let (textures, swizzles, set) = self.texture_slots(t, &banks, headers, samplers, binding, attached, mem)?;
         // The handle banks were for the textures; the program reads the others.
-        let ids: BankIds = banks.iter().filter(|(b, _)| t.interface.cbufs.contains(b)).copied().collect();
+        let ids: BankIds = banks.iter().filter(|(b, _)| reads >> (b % 32) & 1 != 0).copied().collect();
         let swizzles = t.interface.swizzles.then_some(swizzles);
         Ok(Bindings { cbufs: ids, textures, swizzles, set, sizes: &t.interface.cbuf_sizes })
     }

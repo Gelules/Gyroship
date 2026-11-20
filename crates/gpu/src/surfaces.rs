@@ -797,6 +797,8 @@ pub struct Staging {
     pub slot_sets: [u64; 2],
     /// Stages' handles looked up by their banks' read ids (`Memo::handles`), then found there.
     pub handles: [u64; 2],
+    /// Draws whose pipeline was looked up, then those whose key was the last draw's.
+    pub pipeline_repeats: [u64; 2],
     /// Textures uploaded from guest memory: bytes, and host nanoseconds (read,
     /// deswizzle, copy, and the wait after a large one).
     pub uploads: [u64; 2],
@@ -855,7 +857,7 @@ type Dated<T> = (T, u64);
 /// SipHash (the default) costs more than the lookup; fixed, so iteration
 /// orders are the same in every run.
 #[derive(Default, Clone, Copy)]
-pub(crate) struct Fx(u64);
+pub struct Fx(u64);
 
 impl Fx {
     fn add(&mut self, w: u64) {
@@ -891,7 +893,7 @@ impl std::hash::Hasher for Fx {
 }
 
 /// A map hashed with [`Fx`].
-pub(crate) type FxMap<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<Fx>>;
+pub type FxMap<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<Fx>>;
 
 /// Bytes read from guest memory, shared by the draws that read them.
 type Bytes = Arc<Vec<u8>>;
