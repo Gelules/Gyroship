@@ -434,6 +434,20 @@ impl Memory {
         self.chunked(addr, out.len(), |t, a, n| t.accessible(a, n, perm::R), |at, n| unsafe { std::ptr::copy_nonoverlapping(self.base.add(addr as usize + at), to.add(at), n) })
     }
 
+    /// As [`Memory::read`], appending the `len` bytes to `out` (none on an
+    /// error) without zeroing their room first: copied into what `reserve`
+    /// made, the length set once all are in.
+    pub fn read_append(&self, addr: u64, len: usize, out: &mut Vec<u8>) -> Result<(), Error> {
+        out.reserve(len);
+        let start = out.len();
+        let to = out.as_mut_ptr();
+        // SAFETY: as in `read`, into the `len` bytes of room past `start` that `reserve` made.
+        self.chunked(addr, len, |t, a, n| t.accessible(a, n, perm::R), |at, n| unsafe { std::ptr::copy_nonoverlapping(self.base.add(addr as usize + at), to.add(start + at), n) })?;
+        // SAFETY: every byte up to `start + len` is written: the old ones, then the copy above.
+        unsafe { out.set_len(start + len) };
+        Ok(())
+    }
+
     /// Writes a guest-supplied buffer for the HLE; every byte needs guest
     /// permission W.
     pub fn write(&self, addr: u64, data: &[u8]) -> Result<(), Error> {

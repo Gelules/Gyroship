@@ -521,7 +521,7 @@ impl Decoder {
         *channel_space = space;
         let before = channel.waiting();
         let mut waited = Duration::ZERO;
-        let effects = channel.run_with(&words, &mut |a, buf| {
+        let effects = channel.run_with(&words, &mut |a: u64, buf: &mut [u8]| {
             waited += barrier(gpu.as_ref(), writes, &phase.maps, space, a, buf.len() as u64);
             crate::gs::read_gpu(mem, &phase.maps, space, a, buf)
         });
@@ -1403,7 +1403,7 @@ impl Gpu {
         if let Some(key) = self.programs.get(&gpu) {
             return Some(*key);
         }
-        let (key, code) = gyroship_gpu::draw::read_program(&mut |gpu, buf| k.read_gpu(space, gpu, buf), gpu)?;
+        let (key, code) = gyroship_gpu::draw::read_program(&mut k.reader(space), gpu)?;
         self.programs.insert(gpu, key);
         if self.keys.insert(key) {
             k.log(&format!("gpu: program {key:016x}: {} bytes at {gpu:#x}", code.len()));
@@ -1493,7 +1493,7 @@ impl Gpu {
                     let logged = k.at.presents < 3 || draw <= 64 || dumped;
                     let mut outcome = String::new();
                     if let Some(mut s) = k.surfaces.take() {
-                        let result = s.draw(&d, &mut |gpu, buf| k.read_gpu(space, gpu, buf));
+                        let result = s.draw(&d, &mut k.reader(space));
                         if logged {
                             outcome = match result {
                                 Ok(()) => format!(" -> drawn{}", if s.textures_read.is_empty() { String::new() } else { format!(", textures {:x?}", s.textures_read) }),
@@ -1598,7 +1598,7 @@ impl Gpu {
                         let dispatch = k.count("dispatches");
                         let releases = qmd::releases(&q);
                         let launch = qmd::launch(&q);
-                        let program = gyroship_gpu::draw::read_compute_program(&mut |gpu, buf| k.read_gpu(space, gpu, buf), launch.program);
+                        let program = gyroship_gpu::draw::read_compute_program(&mut k.reader(space), launch.program);
                         let key = program.as_ref().map_or_else(|| "not readable".to_string(), |(key, code)| format!("{key:016x}, {} bytes", code.len()));
                         if let (Some(dir), Some((key, code))) = (&k.config.shaders_dump, &program) {
                             let _ = std::fs::create_dir_all(dir);
@@ -1609,7 +1609,7 @@ impl Gpu {
                         }
                         // The program runs before its releases signal it done; then its dependent QMD.
                         if let Some(mut s) = k.surfaces.take() {
-                            let result = s.dispatch(&launch, pools, &mut |gpu, buf| k.read_gpu(space, gpu, buf));
+                            let result = s.dispatch(&launch, pools, &mut k.reader(space));
                             let read = std::mem::take(&mut s.textures_read);
                             k.surfaces = Some(s);
                             if let Err(e) = result {

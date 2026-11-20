@@ -85,6 +85,27 @@ fn unmaps_never_pull_pages_from_under_a_copy() {
     });
 }
 
+/// `read_append` appends what `read` reads after what the buffer held, over
+/// several chunks; a range with an unreadable byte appends nothing.
+#[test]
+fn read_append_appends_what_read_reads() {
+    const SIZE: usize = 0x30_0000;
+    let m = Memory::new().unwrap();
+    m.map(HEAP, SIZE as u64, Block::new(state::NORMAL, perm::RW)).unwrap();
+    let data: Vec<u8> = (0..SIZE as u32).map(|i| (i.wrapping_mul(7) ^ i >> 9) as u8).collect();
+    m.write(HEAP, &data).unwrap();
+    let mut out = vec![1, 2, 3];
+    m.read_append(HEAP + 5, 0x20_0003, &mut out).unwrap();
+    assert_eq!(out[..3], [1, 2, 3]);
+    assert!(out[3..] == data[5..5 + 0x20_0003], "the bytes read");
+    let mut read = vec![0u8; 0x20_0003];
+    m.read(HEAP + 5, &mut read).unwrap();
+    assert!(out[3..] == read[..], "what read reads");
+    let before = out.clone();
+    assert!(m.read_append(HEAP + SIZE as u64 - 0x10, 0x20, &mut out).is_err());
+    assert_eq!(out, before, "nothing appended past the mapping");
+}
+
 #[test]
 fn walk_sees_free_gaps_and_the_inaccessible_tail() {
     let m = Memory::new().unwrap();

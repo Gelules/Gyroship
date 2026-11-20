@@ -170,6 +170,13 @@ pub fn gpu_to_cpu(maps: &Mappings, space: u32, gpu: u64) -> u64 {
     lookup(&maps.table, space, gpu)
 }
 
+/// `GYROSHIP_PROFILE_THREAD=gpu`: `--profile` samples the thread that applies
+/// the GPU work (the GPU thread in play mode) instead of the presenting guest
+/// thread, from the same present. A diagnostic aid: nothing else changes.
+fn profile_gpu_thread() -> bool {
+    std::env::var_os("GYROSHIP_PROFILE_THREAD").is_some_and(|v| v == "gpu")
+}
+
 /// Reads guest memory at a GPU address for the GPU, through `maps`; false if
 /// a byte is not readable. A naturally aligned 4- or 8-byte read (the
 /// semaphore an acquire polls while guest threads release it) is one Acquire
@@ -193,6 +200,40 @@ pub fn read_gpu(mem: &Memory, maps: &Mappings, space: u32, mut gpu: u64, mut out
         },
     };
     word.map(|v| out.copy_from_slice(&v.to_le_bytes()[..out.len()])).is_ok()
+}
+
+/// As [`read_gpu`] for a long read, appended to `out` (none appended if a byte
+/// is not readable) without zeroing its room first (`Memory::read_append`).
+pub fn read_gpu_append(mem: &Memory, maps: &Mappings, space: u32, mut gpu: u64, mut len: usize, out: &mut Vec<u8>) -> bool {
+    let start = out.len();
+    while len > 0 {
+        let (at, room) = span(&maps.table, space, gpu);
+        let n = len.min(usize::try_from(room).unwrap_or(usize::MAX));
+        if mem.read_append(at, n, out).is_err() {
+            out.truncate(start);
+            return false;
+        }
+        (gpu, len) = (gpu + n as u64, len - n);
+    }
+    true
+}
+
+/// Guest memory as the GPU reads it in address space `space`, through
+/// `maps`: what the renderer takes, its long reads appended unzeroed.
+pub struct GpuReader<'a> {
+    mem: &'a Memory,
+    maps: &'a Mappings,
+    space: u32,
+}
+
+impl gyroship_gpu::draw::GuestMem for GpuReader<'_> {
+    fn read(&mut self, gpu: u64, out: &mut [u8]) -> bool {
+        read_gpu(self.mem, self.maps, self.space, gpu, out)
+    }
+
+    fn append(&mut self, gpu: u64, len: usize, out: &mut Vec<u8>) -> bool {
+        read_gpu_append(self.mem, self.maps, self.space, gpu, len, out)
+    }
 }
 
 /// The CPU ranges (start, end) that `len` bytes at GPU address `gpu` of
@@ -225,6 +266,12 @@ impl GpuSide {
             (gpu, bytes) = (gpu + n as u64, &bytes[n..]);
         }
         Ok(())
+    }
+
+    /// The renderer's reader of address space `space`, through the mappings of
+    /// the work's hand-over.
+    pub fn reader(&self, space: u32) -> GpuReader<'_> {
+        GpuReader { mem: &self.mem, maps: &self.at.maps, space }
     }
 
     /// [`read_gpu`] through the mappings of the work's hand-over.
@@ -629,6 +676,7 @@ impl Kernel {
         }
         if let Some((path, from)) = &self.config.profile
             && n == (*from).max(1)
+            && !profile_gpu_thread()
         {
             gyroship_runtime::profile::start(path.clone());
         }
@@ -711,6 +759,12 @@ impl GpuSide {
             s.present = n;
             // No take here: no refresh in place.
             s.new_submit(false);
+        }
+        if profile_gpu_thread()
+            && let Some((path, from)) = &self.config.profile
+            && n == (*from).max(1)
+        {
+            gyroship_runtime::profile::start(path.clone());
         }
     }
 
@@ -1159,6 +1213,30 @@ mod tests {
         assert_eq!(unmap(&mut k, 1, 0x4000, 0x8fff), 0x3000u64.to_le_bytes(), "both mappings of space 1");
         assert_eq!(unmap(&mut k, 1, 0x4000, 0x8fff), 0u64.to_le_bytes(), "nothing left there");
         assert_eq!(unmap(&mut k, 2, 0, 0xffff), 0x1000u64.to_le_bytes(), "space 2 kept its own");
+    }
+
+    /// A long read appended through mappings that are not the identity gives
+    /// what `read_gpu` reads, mapping by mapping, after what the buffer held;
+    /// one that reaches an unreadable byte appends nothing.
+    #[test]
+    fn appended_reads_follow_the_mappings() {
+        use gyroship_runtime::mem::{Block, Memory, perm, state};
+        let mem = Memory::new().unwrap();
+        let cpu = crate::layout::ALIAS.0;
+        mem.map(cpu, 0x4000, Block::new(state::NORMAL, perm::RW)).unwrap();
+        let data: Vec<u8> = (0..0x4000u32).map(|i| (i.wrapping_mul(13) ^ i >> 7) as u8).collect();
+        mem.write(cpu, &data).unwrap();
+        // GPU page 0x1_0000 is CPU page 1, GPU page 0x1_1000 CPU page 0: a read across them swaps them.
+        let maps = Mappings { table: flatten(&[(0, 0x1_0000, 0x1_0fff, cpu + 0x1000), (0, 0x1_1000, 0x1_1fff, cpu)]), ..Default::default() };
+        let mut want = vec![0u8; 0x1000];
+        assert!(read_gpu(&mem, &maps, 0, 0x1_0800, &mut want));
+        assert!(want[..0x800] == data[0x1800..0x2000] && want[0x800..] == data[..0x800]);
+        let mut out = vec![9];
+        assert!(read_gpu_append(&mem, &maps, 0, 0x1_0800, 0x1000, &mut out));
+        assert!(out[0] == 9 && out[1..] == want[..]);
+        // Past the second mapping, GPU 0x1_2000 is CPU 0x1_2000: not mapped.
+        assert!(!read_gpu_append(&mem, &maps, 0, 0x1_1800, 0x1000, &mut out));
+        assert_eq!(out.len(), 0x1001, "nothing appended");
     }
 
     /// The flattened table answers what a scan of the mappings from the last one

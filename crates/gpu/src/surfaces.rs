@@ -251,7 +251,7 @@ pub struct Surfaces {
     pub(crate) texture_belt: wgpu::util::StagingBelt,
     pub(crate) uploads: Option<wgpu::CommandEncoder>,
     /// A dispatch's global memory as read, before its staging (whose mapped view
-    /// is write-only): kept from one global to the next, zeroed only as it grows.
+    /// is write-only): kept from one global to the next, never zeroed (`GuestMem::append`).
     pub(crate) global_bytes: Vec<u8>,
     /// The color target written last (the presented image at a present).
     last_color: Option<(u64, u32)>,
@@ -1359,11 +1359,13 @@ impl Surfaces {
             return Some(id);
         }
         self.note_read(kind, len, false);
-        let mut bytes = vec![0u8; len];
+        // Read into the block's room, not zeroed first.
+        let mut bytes = Vec::with_capacity(len);
         // ponytail: a bank may be bound at its full size near the end of a mapping
         // (a ring buffer): its readable pages, then zeros, as programs never read
         // past them (the console's GPU would fault).
-        if !mem(addr, &mut bytes) {
+        if !mem.append(addr, len, &mut bytes) {
+            bytes.resize(len, 0);
             let n = crate::draw::read_pages(mem, addr, &mut bytes);
             if n == 0 {
                 return None;
@@ -1387,10 +1389,11 @@ impl Surfaces {
             return Some(id);
         }
         self.note_read(kind, padded, false);
-        let mut bytes = vec![0u8; padded];
-        if !mem(addr, &mut bytes[..len]) {
+        let mut bytes = Vec::with_capacity(padded);
+        if !mem.append(addr, len, &mut bytes) {
             return None;
         }
+        bytes.resize(padded, 0);
         let id = self.block(bytes);
         self.memo.reads.insert(key, (id, self.memo.epoch));
         Some(id)
@@ -1424,7 +1427,7 @@ impl Surfaces {
             return Some(*d);
         }
         let mut d = [0u8; 32];
-        if !mem(addr, &mut d) {
+        if !mem.read(addr, &mut d) {
             return None;
         }
         self.memo.descriptors.insert(addr, (d, self.memo.epoch));
@@ -2464,6 +2467,40 @@ mod tests {
             let _ = tx.send(s.recorder_ended);
         });
         assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(10)), Ok(true));
+    }
+
+    /// A block holds the bytes read whatever a reader leaves past them (this
+    /// one's appends leave 0xAA in the room after their bytes): read_exact's
+    /// padding is zeros, and read_guest over an unreadable second page keeps
+    /// the readable one, then zeros.
+    #[test]
+    fn blocks_hold_the_bytes_read_then_zeros() {
+        let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
+            eprintln!("no GPU adapter: test skipped");
+            return;
+        };
+        // Guest memory from 0x1000 on: 0x1800 bytes.
+        struct Dirty(Vec<u8>);
+        impl crate::draw::GuestMem for Dirty {
+            fn read(&mut self, gpu: u64, out: &mut [u8]) -> bool {
+                let Some(src) = gpu.checked_sub(0x1000).and_then(|o| self.0.get(o as usize..o as usize + out.len())) else { return false };
+                out.copy_from_slice(src);
+                true
+            }
+            fn append(&mut self, gpu: u64, len: usize, out: &mut Vec<u8>) -> bool {
+                let start = out.len();
+                out.resize(start + len + 64, 0xaa);
+                let read = self.read(gpu, &mut out[start..start + len]);
+                out.truncate(if read { start + len } else { start });
+                read
+            }
+        }
+        let guest: Vec<u8> = (0..0x1800u32).map(|i| (i * 3 + 1) as u8).collect();
+        let mut mem = Dirty(guest.clone());
+        let id = s.read_exact(Read::Index, 0x1000, 10, 16, &mut mem).unwrap();
+        assert!(s.memo.blocks[id as usize][..] == [&guest[..10], &[0u8; 6][..]].concat()[..], "the bytes, then zero padding");
+        let id = s.read_guest(Read::Bank, 0x1000, 0x2000, &mut mem).unwrap();
+        assert!(s.memo.blocks[id as usize][..] == [&guest[..0x1000], &[0u8; 0x1000][..]].concat()[..], "the readable page, then zeros");
     }
 
     /// Vertices read exactly, then staged as they are: the guest's bytes then

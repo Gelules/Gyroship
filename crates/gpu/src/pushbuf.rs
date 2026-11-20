@@ -75,7 +75,7 @@ impl Acquire {
     fn met_in(&self, read: Mem) -> bool {
         let mut b = [0u8; 8];
         let n = if self.wide { 8 } else { 4 };
-        !read(self.addr, &mut b[..n]) || self.met(u64::from_le_bytes(b))
+        !read.read(self.addr, &mut b[..n]) || self.met(u64::from_le_bytes(b))
     }
 }
 
@@ -420,7 +420,7 @@ impl mme::Host for MacroHost<'_> {
     }
     fn read(&mut self, addr: u64, words: &mut [u32]) {
         let mut bytes = vec![0u8; words.len() * 4];
-        (self.read)(addr, &mut bytes);
+        self.read.read(addr, &mut bytes);
         // Writes earlier in this run are not in memory yet; the GPU would see them.
         // ponytail: copies and dispatches still pending are not seen; flush them first if a macro needs them.
         let end = addr + bytes.len() as u64;
@@ -460,7 +460,7 @@ impl Channel {
     /// Runs one pushbuffer segment, every acquire taken as met (for replays
     /// without memory).
     pub fn run(&mut self, words: &[u32]) -> Vec<Effect> {
-        self.run_with(words, &mut |_, _| false)
+        self.run_with(words, &mut |_: u64, _: &mut [u8]| false)
     }
 
     /// Queues one pushbuffer segment and runs the channel as far as its
@@ -1160,8 +1160,8 @@ mod tests {
             for value in [0u32, 1, 0x5a5a_5a5a, 0xffff_ffff, 0x0400_0000] {
                 for method in (HOST_METHODS..0x4000).step_by(4).filter(|m| !CALL_MME.contains(m)) {
                     let (mut a, mut b) = (Vec::new(), Vec::new());
-                    fast.write(0, method, value, &mut a, &mut |_, _| false);
-                    full.write(0, method, value, &mut b, &mut |_, _| false);
+                    fast.write(0, method, value, &mut a, &mut |_: u64, _: &mut [u8]| false);
+                    full.write(0, method, value, &mut b, &mut |_: u64, _: &mut [u8]| false);
                     assert_eq!(format!("{a:?}"), format!("{b:?}"), "class {class:#x} method {method:#x} = {value:#x}: effects");
                     assert_eq!(state(&fast), state(&full), "class {class:#x} method {method:#x} = {value:#x}: state");
                     skipped += usize::from(ACTED[(method / 4 / 64) as usize] >> (method / 4 % 64) & 1 == 0);

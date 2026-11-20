@@ -115,7 +115,7 @@ impl Surfaces {
         let mut tic_of = |h: &Handle| -> Result<textures::Tic, String> {
             let handle = TexHandle::new(word(h).ok_or_else(|| format!("image handle {h:?}"))?);
             let mut header = [0u8; 32];
-            if !mem(pools.headers.entry(handle.header).ok_or("image index past the pool")?, &mut header) {
+            if !mem.read(pools.headers.entry(handle.header).ok_or("image index past the pool")?, &mut header) {
                 return Err("image header not readable".into());
             }
             textures::tic(&header).ok_or_else(|| "image header layout".into())
@@ -227,13 +227,11 @@ impl Surfaces {
             let mut read = None;
             for bytes in [size.max(1 << 20), size] {
                 let n = u64::from(bytes.next_multiple_of(4));
-                if bytes == 0 || n > max || !mem(address.wrapping_add(n - 1), &mut [0u8]) {
+                if bytes == 0 || n > max || !mem.read(address.wrapping_add(n - 1), &mut [0u8]) {
                     continue;
                 }
-                if self.global_bytes.len() < n as usize {
-                    self.global_bytes.resize(n as usize, 0);
-                }
-                if mem(address, &mut self.global_bytes[..n as usize]) {
+                self.global_bytes.clear();
+                if mem.append(address, n as usize, &mut self.global_bytes) {
                     read = Some(n);
                     break;
                 }

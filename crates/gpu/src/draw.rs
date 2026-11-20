@@ -26,8 +26,32 @@ use std::collections::{BTreeMap, BTreeSet};
 // draws, and their twenty-odd heap allocations each cost as much as the rest of a draw's
 // bookkeeping. A longer list than the inline room still works, from the heap.
 
-/// Reads guest memory at a GPU address; false if a byte is not readable.
-pub type Mem<'a> = &'a mut dyn FnMut(u64, &mut [u8]) -> bool;
+/// Reads guest memory at a GPU address; false if a byte is not readable. A
+/// closure `(address, bytes) -> bool` is one.
+pub trait GuestMem {
+    fn read(&mut self, gpu: u64, out: &mut [u8]) -> bool;
+
+    /// `len` bytes appended to `out`, none if a byte is not readable. A reader
+    /// that copies into `out`'s spare room skips zeroing it first.
+    fn append(&mut self, gpu: u64, len: usize, out: &mut Vec<u8>) -> bool {
+        let start = out.len();
+        out.resize(start + len, 0);
+        let read = self.read(gpu, &mut out[start..]);
+        if !read {
+            out.truncate(start);
+        }
+        read
+    }
+}
+
+impl<F: FnMut(u64, &mut [u8]) -> bool> GuestMem for F {
+    fn read(&mut self, gpu: u64, out: &mut [u8]) -> bool {
+        self(gpu, out)
+    }
+}
+
+/// Reads guest memory at a GPU address (see [`GuestMem`]).
+pub type Mem<'a> = &'a mut dyn GuestMem;
 
 /// A stage's constant banks by bank, in bank order, each once: each read's id,
 /// which tells its bytes (`Memo::blocks`, no reference count taken per draw)
@@ -69,11 +93,9 @@ fn read_until(mem: Mem, gpu: u64, key: fn(&[u8]) -> Option<(u64, usize)>) -> Opt
     while code.len() < 0x4_0000 {
         // To the end of a page: never past the page that holds the closing self-branch.
         let at = gpu + code.len() as u64;
-        let mut chunk = vec![0u8; (0x1000 - (at & 0xfff)) as usize];
-        if !mem(at, &mut chunk) {
+        if !mem.append(at, (0x1000 - (at & 0xfff)) as usize, &mut code) {
             return None;
         }
-        code.extend(chunk);
         if let Some((key, len)) = key(&code) {
             code.truncate(len);
             return Some((key, code));
@@ -88,7 +110,7 @@ pub(crate) fn read_pages(mem: Mem, addr: u64, out: &mut [u8]) -> usize {
     while done < out.len() {
         let at = addr + done as u64;
         let n = ((0x1000 - (at & 0xfff)) as usize).min(out.len() - done);
-        if !mem(at, &mut out[done..done + n]) {
+        if !mem.read(at, &mut out[done..done + n]) {
             break;
         }
         done += n;
@@ -282,8 +304,8 @@ fn jump_banks(tables: &[shader::JumpTable], banks: &[Option<(u64, u32)>], mem: M
         let (addr, size) = (*banks.get(usize::from(bank))?)?;
         let start = usize::from(offset).min(size as usize);
         let len = entries.map_or(TABLE_MAX, |n| 4 * n as usize).min((size as usize).min(CBUF_BYTES).saturating_sub(start));
-        let mut data = vec![0u8; len];
-        if !mem(addr + start as u64, &mut data) {
+        let mut data = Vec::with_capacity(len);
+        if !mem.append(addr + start as u64, len, &mut data) {
             return None;
         }
         out.push(data);
@@ -740,8 +762,8 @@ impl Surfaces {
                 let (id, format, max) = match self.staged_indices(addr, size, d.count, restart) {
                     Some(found) => found,
                     None => {
-                        let mut raw = vec![0u8; size * d.count as usize];
-                        if !mem(addr, &mut raw) {
+                        let mut raw = Vec::with_capacity(size * d.count as usize);
+                        if !mem.append(addr, size * d.count as usize, &mut raw) {
                             return Err("index buffer not readable".into());
                         }
                         let max = index_max(&raw, size, restart);
@@ -1491,14 +1513,15 @@ impl Surfaces {
                         Some((_, _, dirty)) => dirty_layers(dirty, layers, tic.address + offset, stride, bl.size()),
                         None => vec![std::ops::Range { start: 0, end: layers }],
                     };
-                    let mut raw = vec![0u8; bl.size() as usize];
+                    let mut raw = Vec::with_capacity(bl.size() as usize);
                     for run in runs {
                         // A layer is a slice, or a 3D level's `bl.depth` slices.
                         let staged = wgpu::Extent3d { depth_or_array_layers: if three_d { extent.depth_or_array_layers } else { run.len() as u32 }, ..extent };
                         let target = wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: i, origin: wgpu::Origin3d { z: run.start, ..wgpu::Origin3d::ZERO }, aspect: wgpu::TextureAspect::All };
                         let mut view = self.stage_level(target, staged, pitch as u32, host_rows, aside.is_some());
                         for layer in run.clone() {
-                            if !mem(tic.address + u64::from(layer) * stride + offset, &mut raw) {
+                            raw.clear();
+                            if !mem.append(tic.address + u64::from(layer) * stride + offset, bl.size() as usize, &mut raw) {
                                 return Err("texture not readable".into());
                             }
                             let at = (layer - run.start) as usize * bl.depth as usize * image;
@@ -1520,8 +1543,9 @@ impl Surfaces {
             }
             Layout::Pitch if level == 0 && !three_d && layers == 1 => {
                 let row = (columns * bpe) as usize;
-                let mut raw = vec![0u8; tic.pitch as usize * (rows as usize - 1) + row];
-                if !mem(tic.address, &mut raw) {
+                let len = tic.pitch as usize * (rows as usize - 1) + row;
+                let mut raw = Vec::with_capacity(len);
+                if !mem.append(tic.address, len, &mut raw) {
                     return Err("texture not readable".into());
                 }
                 end = tic.address + raw.len() as u64;
@@ -2364,7 +2388,7 @@ mod tests {
         let (tic, h, slice) = dxt1_array();
         let mut guest: Vec<u8> = (0..slice(2, 2).end).map(|i| (i * 7 + i / 251 + 1) as u8).collect();
         s.begin_job(true);
-        let t = s.upload(&tic, h, &mut |a, o| guest_at(&guest, a, o)).unwrap_or_else(|e| panic!("{e}"));
+        let t = s.upload(&tic, h, &mut |a: u64, o: &mut [u8]| guest_at(&guest, a, o)).unwrap_or_else(|e| panic!("{e}"));
         s.flush();
         let whole = s.staging.uploads[0];
         assert_eq!(whole, 3 * (200 + 72 + 8), "every layer of every level");
@@ -2376,26 +2400,26 @@ mod tests {
         s.invalidate(0x50_0000 + a.start as u64, a.len() as u64);
         s.mark_dirty(0x50_0000 + b.start as u64, b.len() as u64);
         s.drain_invalidations();
-        let again = s.upload(&tic, h, &mut |a, o| guest_at(&guest, a, o)).unwrap_or_else(|e| panic!("{e}"));
+        let again = s.upload(&tic, h, &mut |a: u64, o: &mut [u8]| guest_at(&guest, a, o)).unwrap_or_else(|e| panic!("{e}"));
         assert!(again == t, "refreshed in place");
         // Layer 1's level 2 is one block (8 bytes), layer 2's level 0 25 blocks.
         assert_eq!(s.staging.uploads[0] - whole, 8 + 200);
         s.flush();
         let mut other = h;
         other[0] ^= 1;
-        let fresh = s.upload(&tic, other, &mut |a, o| guest_at(&guest, a, o)).unwrap_or_else(|e| panic!("{e}"));
+        let fresh = s.upload(&tic, other, &mut |a: u64, o: &mut [u8]| guest_at(&guest, a, o)).unwrap_or_else(|e| panic!("{e}"));
         s.flush();
         for level in 0..3 {
             assert!(read_level(&s, &t, level) == read_level(&s, &fresh, level), "level {level}");
         }
         // A write the take skipped (pending when the job starts), then a job without a take.
         for verified in [true, false] {
-            let cached = s.upload(&tic, h, &mut |a, o| guest_at(&guest, a, o)).unwrap_or_else(|e| panic!("{e}"));
+            let cached = s.upload(&tic, h, &mut |a: u64, o: &mut [u8]| guest_at(&guest, a, o)).unwrap_or_else(|e| panic!("{e}"));
             s.invalidate(0x50_0000 + a.start as u64, 1);
             s.begin_job(verified);
             s.drain_invalidations();
             let before = s.staging.uploads[0];
-            let new = s.upload(&tic, h, &mut |a, o| guest_at(&guest, a, o)).unwrap_or_else(|e| panic!("{e}"));
+            let new = s.upload(&tic, h, &mut |a: u64, o: &mut [u8]| guest_at(&guest, a, o)).unwrap_or_else(|e| panic!("{e}"));
             assert!(new != cached, "verified {verified}: a new texture");
             assert_eq!(s.staging.uploads[0] - before, whole, "verified {verified}: uploaded whole");
             s.flush();
@@ -2423,7 +2447,7 @@ mod tests {
         let (tic, h, slice) = dxt1_array();
         let mut guest: Vec<u8> = (0..slice(2, 2).end).map(|i| (i * 3 + 1) as u8).collect();
         s.begin_job(true);
-        let t = s.upload(&tic, h, &mut |a, o| guest_at(&guest, a, o)).unwrap_or_else(|e| panic!("{e}"));
+        let t = s.upload(&tic, h, &mut |a: u64, o: &mut [u8]| guest_at(&guest, a, o)).unwrap_or_else(|e| panic!("{e}"));
         s.flush();
         s.sync();
         let (old, pitch, rows) = read_level(&s, &t, 0);
@@ -2443,7 +2467,7 @@ mod tests {
         }
         s.invalidate(0x50_0000 + slice(0, 0).start as u64, 4);
         s.drain_invalidations();
-        let again = s.upload(&tic, h, &mut |a, o| guest_at(&guest, a, o)).unwrap_or_else(|e| panic!("{e}"));
+        let again = s.upload(&tic, h, &mut |a: u64, o: &mut [u8]| guest_at(&guest, a, o)).unwrap_or_else(|e| panic!("{e}"));
         assert!(again == t, "refreshed in place");
         s.flush();
         s.sync();
