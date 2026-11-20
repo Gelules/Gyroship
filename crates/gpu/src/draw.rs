@@ -677,6 +677,39 @@ impl Surfaces {
         result
     }
 
+    /// `count` indices of `size` bytes at `addr` (with a restart index) as a
+    /// block (8-bit ones widened: wgpu has none), their format and the highest
+    /// index: read once a submit, the same indices serving many draws, and kept
+    /// from one submit to the next while unwritten ([`crate::surfaces::Kept`]).
+    pub(crate) fn read_indices(&mut self, addr: u64, size: usize, count: u32, restart: Option<u32>, mem: Mem) -> Result<crate::surfaces::Indices, String> {
+        if let Some(found) = self.staged_indices(addr, size, count, restart) {
+            return Ok(found);
+        }
+        let len = size * count as usize;
+        let key = (addr, len, size, restart);
+        let (bytes, max) = match self.kept_get(key) {
+            Some(found) => found,
+            None => {
+                let mut raw = Vec::with_capacity(len);
+                if !mem.append(addr, len, &mut raw) {
+                    return Err("index buffer not readable".into());
+                }
+                let max = index_max(&raw, size, restart);
+                let bytes = std::sync::Arc::new(match size {
+                    4 | 2 => raw,
+                    1 => raw.iter().flat_map(|&b| u16::from(b).to_le_bytes()).collect(),
+                    _ => raw.chunks_exact(size).flat_map(|c| (index_value(c) as u16).to_le_bytes()).collect(),
+                });
+                self.kept_put(key, bytes.clone(), max);
+                (bytes, max)
+            }
+        };
+        let format = if size == 4 { wgpu::IndexFormat::Uint32 } else { wgpu::IndexFormat::Uint16 };
+        let found = (self.block(bytes), format, max);
+        self.remember_indices(addr, size, count, restart, found);
+        Ok(found)
+    }
+
     fn try_draw(&mut self, d: &Draw, mem: Mem) -> Result<(), String> {
         use wgpu::PrimitiveTopology as P;
         let topology = match d.topology {
@@ -762,26 +795,7 @@ impl Surfaces {
                 }
                 let addr = ib.address + u64::from(ib.first) * size as u64;
                 let restart = ib.restart_enable.then_some(ib.restart_index);
-                // Read once a submit: the same indices serve many draws.
-                let (id, format, max) = match self.staged_indices(addr, size, d.count, restart) {
-                    Some(found) => found,
-                    None => {
-                        let mut raw = Vec::with_capacity(size * d.count as usize);
-                        if !mem.append(addr, size * d.count as usize, &mut raw) {
-                            return Err("index buffer not readable".into());
-                        }
-                        let max = index_max(&raw, size, restart);
-                        let (bytes, format) = match size {
-                            4 => (raw, wgpu::IndexFormat::Uint32),
-                            2 => (raw, wgpu::IndexFormat::Uint16),
-                            1 => (raw.iter().flat_map(|&b| u16::from(b).to_le_bytes()).collect(), wgpu::IndexFormat::Uint16),
-                            _ => (raw.chunks_exact(size).flat_map(|c| (index_value(c) as u16).to_le_bytes()).collect(), wgpu::IndexFormat::Uint16),
-                        };
-                        let found = (self.block(bytes), format, max);
-                        self.remember_indices(addr, size, d.count, restart, found);
-                        found
-                    }
-                };
+                let (id, format, max) = self.read_indices(addr, size, d.count, restart, mem)?;
                 // wgpu takes 2- and 4-byte indices as they are; widened ones are shared like any block.
                 (Some((id, matches!(size, 2 | 4), format)), (i64::from(d.base_vertex) + i64::from(max)).max(0) as u64)
             }
@@ -2658,6 +2672,44 @@ mod tests {
             let only = top.to_le_bytes()[..size].repeat(5);
             assert_eq!(index_max(&only, size, Some(top)), 0);
         }
+    }
+
+    /// Indices kept from one submit to the next come back as read: widened
+    /// from 1 byte, with their highest index (the restart value left out), and
+    /// are not read again; another size, count or restart value is its own
+    /// read; a page found written reads them again, with their new highest index.
+    #[test]
+    fn kept_indices_come_back_widened_with_their_highest_index() {
+        let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
+            eprintln!("no GPU adapter: test skipped");
+            return;
+        };
+        let data = std::cell::RefCell::new(vec![0u8, 5, 0xff, 3, 2, 1, 0, 0]);
+        let reads = std::cell::Cell::new(0);
+        let mut mem = |addr: u64, out: &mut [u8]| {
+            reads.set(reads.get() + 1);
+            let at = (addr - 0x1000) as usize;
+            out.copy_from_slice(&data.borrow()[at..at + out.len()]);
+            true
+        };
+        // A new job's read of `count` indices of `size` bytes at 0x1000: guest reads, bytes, format, highest index.
+        let mut job = |s: &mut Surfaces, size: usize, count: u32, restart: Option<u32>| {
+            s.new_submit(true);
+            let before = reads.get();
+            let (id, format, max) = s.read_indices(0x1000, size, count, restart, &mut mem).unwrap();
+            (reads.get() - before, s.memo.blocks[id as usize].to_vec(), format, max)
+        };
+        s.kept_taken(Vec::new(), &[], &[]);
+        let widened = vec![0, 0, 5, 0, 0xff, 0, 3, 0, 2, 0, 1, 0];
+        assert_eq!(job(&mut s, 1, 6, Some(0xff)), (1, widened.clone(), wgpu::IndexFormat::Uint16, 5));
+        assert_eq!(job(&mut s, 1, 6, Some(0xff)), (0, widened, wgpu::IndexFormat::Uint16, 5), "kept");
+        assert_eq!(job(&mut s, 1, 6, None).0, 1, "another restart value");
+        assert_eq!(job(&mut s, 1, 7, Some(0xff)).0, 1, "another count");
+        assert_eq!(job(&mut s, 2, 3, None).0, 1, "another size over the same bytes");
+        data.borrow_mut()[1] = 9;
+        s.kept_taken(Vec::new(), &[], &[0x1000]);
+        let again = job(&mut s, 1, 6, Some(0xff));
+        assert_eq!((again.0, again.3), (1, 9), "a page found written: read again, with its new highest index");
     }
 
     #[test]

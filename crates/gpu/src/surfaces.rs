@@ -901,7 +901,7 @@ impl std::hash::Hasher for Fx {
 pub type FxMap<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<Fx>>;
 
 /// Bytes read from guest memory, shared by the draws that read them.
-type Bytes = Arc<Vec<u8>>;
+pub(crate) type Bytes = Arc<Vec<u8>>;
 
 /// What this submit already read from guest memory for the GPU, and staged:
 /// most reads repeat (the same constant banks and meshes for many draws), and a
@@ -987,9 +987,9 @@ impl Memo {
 }
 
 /// A kept read: guest address, guest length, index size (0: vertices) and restart index.
-type KeptKey = (u64, usize, usize, Option<u32>);
+pub(crate) type KeptKey = (u64, usize, usize, Option<u32>);
 
-/// Guest reads kept from one submit to the next (vertex streams): most meshes
+/// Guest reads kept from one submit to the next (vertices, indices): most meshes
 /// are read again every frame, unchanged. An entry holds while its pages go
 /// unwritten: the HLE's write-watch take before each submit reports the pages
 /// written since the one before (`Surfaces::kept_taken`), the memo's pages
@@ -1549,13 +1549,8 @@ impl Surfaces {
         }
         self.note_read(kind, padded, false);
         let kept = (addr, len, 0, None);
-        let found = if keep { self.kept.get(kept, &self.memo, self.present) } else { None };
-        let bytes = match found {
-            Some((bytes, _)) => {
-                self.staging.kept[0] += 1;
-                self.staging.kept[1] += padded as u64;
-                bytes
-            }
+        let bytes = match if keep { self.kept_get(kept) } else { None } {
+            Some((bytes, _)) => bytes,
             None => {
                 let mut bytes = Vec::with_capacity(padded);
                 if !mem.append(addr, len, &mut bytes) {
@@ -1563,8 +1558,8 @@ impl Surfaces {
                 }
                 bytes.resize(padded, 0);
                 let bytes = Arc::new(bytes);
-                if keep && self.kept.put(kept, bytes.clone(), 0, self.memo.epoch, self.present) {
-                    self.staging.kept[2] += 1;
+                if keep {
+                    self.kept_put(kept, bytes.clone(), 0);
                 }
                 bytes
             }
@@ -1573,6 +1568,23 @@ impl Surfaces {
         let id = self.block(bytes);
         self.memo.reads.insert(key, (id, self.memo.epoch));
         Some(id)
+    }
+
+    /// The bytes kept for `key` and their highest index ([`Kept`]), counted.
+    pub(crate) fn kept_get(&mut self, key: KeptKey) -> Option<(Bytes, u32)> {
+        let found = self.kept.get(key, &self.memo, self.present);
+        if let Some((bytes, _)) = &found {
+            self.staging.kept[0] += 1;
+            self.staging.kept[1] += bytes.len() as u64;
+        }
+        found
+    }
+
+    /// Keeps `bytes` just read for `key`, with their highest index ([`Kept`]), counted.
+    pub(crate) fn kept_put(&mut self, key: KeptKey, bytes: Bytes, max: u32) {
+        if self.kept.put(key, bytes, max, self.memo.epoch, self.present) {
+            self.staging.kept[2] += 1;
+        }
     }
 
     /// The id of a new block holding `bytes` (until the next flush), announced
