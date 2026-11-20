@@ -116,8 +116,9 @@ fn address(upper: u32, lower: u32) -> u64 {
     ((upper & 0xff) as u64) << 32 | lower as u64
 }
 
-/// The texture header pool (SET_TEX_HEADER_POOL_A/B/C).
-pub fn header_pool(r: Reg) -> Pool {
+/// The texture header pool (SET_TEX_HEADER_POOL_A/B/C). The per-draw readers
+/// take any register reader, inlined into a draw's snapshot (see `vertex`).
+pub fn header_pool<R: Fn(u32) -> u32 + ?Sized>(r: &R) -> Pool {
     Pool {
         address: address(r(SET_TEX_HEADER_POOL_A), r(SET_TEX_HEADER_POOL_B)),
         maximum_index: r(SET_TEX_HEADER_POOL_C) & 0x3f_ffff,
@@ -126,7 +127,7 @@ pub fn header_pool(r: Reg) -> Pool {
 }
 
 /// The sampler pool (SET_TEX_SAMPLER_POOL_A/B/C).
-pub fn sampler_pool(r: Reg) -> Pool {
+pub fn sampler_pool<R: Fn(u32) -> u32 + ?Sized>(r: &R) -> Pool {
     Pool {
         address: address(r(SET_TEX_SAMPLER_POOL_A), r(SET_TEX_SAMPLER_POOL_B)),
         maximum_index: r(SET_TEX_SAMPLER_POOL_C) & 0xf_ffff,
@@ -145,7 +146,7 @@ pub enum SamplerBinding {
     ViaHeaderBinding,
 }
 
-pub fn sampler_binding(r: Reg) -> SamplerBinding {
+pub fn sampler_binding<R: Fn(u32) -> u32 + ?Sized>(r: &R) -> SamplerBinding {
     if r(SET_SAMPLER_BINDING) & 1 == 0 { SamplerBinding::Independently } else { SamplerBinding::ViaHeaderBinding }
 }
 
@@ -193,6 +194,9 @@ pub struct Resources {
 
 /// The constant buffers bound to every stage and bank: (address, size).
 pub type Bindings = [[Option<(u64, u32)>; BANKS]; STAGES];
+/// A draw's banks: those of the only stages it runs, vertex (0) then pixel (4);
+/// `try_draw` refuses a program on another stage before it reads a bank.
+pub type DrawBanks = [[Option<(u64, u32)>; BANKS]; 2];
 
 impl Resources {
     /// Feeds one 3D method; `r` reads the register file after this write, and
@@ -219,8 +223,9 @@ impl Resources {
         }
     }
 
-    pub fn bindings(&self) -> Bindings {
-        self.banks
+    /// The banks a draw reads: the vertex stage's (0), then the pixel stage's (4).
+    pub fn draw_banks(&self) -> DrawBanks {
+        [self.banks[0], self.banks[4]]
     }
 
     /// (address, size) bound to bank `bank` of stage `stage`.

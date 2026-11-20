@@ -20,7 +20,7 @@ use crate::mme::{self, Mme};
 use std::collections::VecDeque;
 use crate::state::qmd;
 use crate::state::raster::{self, RenderState};
-use crate::state::resources::{self, Bindings, MemWrite, Pool, Resources, SamplerBinding, Unsupported};
+use crate::state::resources::{self, DrawBanks, MemWrite, Pool, Resources, SamplerBinding, Unsupported};
 use crate::state::vertex::{self, Attribute, IndexBuffer, Stream};
 
 /// A semaphore release: `value` (4 or 8 bytes) at `addr`; with `timestamp`,
@@ -133,8 +133,8 @@ pub struct Draw {
     pub targets: Vec<Surface>,
     /// The depth-stencil target, when SET_ZT_SELECT enables one.
     pub depth: Option<Surface>,
-    /// Constant buffers by stage (0 vertex .. 4 pixel) and bank.
-    pub cbufs: Bindings,
+    /// Constant buffers by bank, of the vertex stage then the pixel stage.
+    pub cbufs: DrawBanks,
     pub headers: Pool,
     pub samplers: Pool,
     pub sampler_binding: SamplerBinding,
@@ -671,7 +671,8 @@ impl Channel {
     }
 
     fn host_effect(&self, method: u32, value: u32) -> Option<Effect> {
-        let ignored = Effect::Ignored { class: 0, method, value };
+        // Made only where returned (not built and dropped for every method).
+        let ignored = || Effect::Ignored { class: 0, method, value };
         match method {
             // Operation in bits 4:0 (2 = release); bit 24: 4 bytes, else 16 with a timestamp.
             SEMAPHORE_D => Some(match value & 0x1f {
@@ -682,7 +683,7 @@ impl Channel {
                     width: 4,
                     timestamp: value >> 24 & 1 == 0,
                 }),
-                _ => ignored,
+                _ => ignored(),
             }),
             // Operation in bits 2:0 (1 = release); bit 24: 64-bit payload; bit 25: timestamp.
             SEM_EXECUTE => Some(match value & 7 {
@@ -697,7 +698,7 @@ impl Channel {
                         timestamp: value >> 25 & 1 == 1,
                     })
                 }
-                _ => ignored,
+                _ => ignored(),
             }),
             _ => None,
         }
@@ -734,8 +735,18 @@ impl Channel {
         Clear { layer: value >> 10 & 0xffff, color, depth, scissor }
     }
 
+    /// A draw's effect. Out of line, so that its snapshot (a few KB) is built in
+    /// this frame: inlined, it made the frame of `write`, which takes every
+    /// method, need a stack probe at each call.
+    #[inline(never)]
+    fn draw_effect(&self, sub: usize, method: u32, count: u32) -> Effect {
+        Effect::Draw(Box::new(self.draw(sub, method, count)))
+    }
+
     fn draw(&self, sub: usize, method: u32, count: u32) -> Draw {
-        let reg = |m: u32| self.reg(sub, m);
+        // The subchannel's registers, a fixed-size array: a constant method reads with no bounds check.
+        let regs: &[u32; 0x1000] = self.engine[sub * 0x1000..][..0x1000].try_into().expect("0x1000 registers per subchannel");
+        let reg = |m: u32| regs[(m / 4) as usize];
         let indexed = method == DRAW_INDEX_BUFFER;
         let programs = std::array::from_fn(|j| {
             let p = PIPELINE_SHADER + 64 * j as u32;
@@ -756,7 +767,7 @@ impl Channel {
             targets: render.outputs.iter().map(|o| self.color_target(sub, o.location)).collect(),
             render,
             depth: self.depth_target(sub),
-            cbufs: self.resources.bindings(),
+            cbufs: self.resources.draw_banks(),
             headers: resources::header_pool(&reg),
             samplers: resources::sampler_pool(&reg),
             sampler_binding: resources::sampler_binding(&reg),
@@ -797,7 +808,7 @@ impl Channel {
 
     fn engine_effect(&self, subchannel: usize, method: u32, value: u32) -> Option<Effect> {
         let class = self.classes[subchannel];
-        let ignored = Effect::Ignored { class, method, value };
+        let ignored = || Effect::Ignored { class, method, value };
         match (class & 0xff, method) {
             // 3D and compute: operation in bits 1:0 (0 = release); bit 28: one word, else four.
             // REPORT_ONLY (2) of REPORT_NONE (27:23 = 0) writes the payload too.
@@ -819,14 +830,14 @@ impl Channel {
                     width: if value >> 28 & 1 == 0 { 8 } else { 4 },
                     timestamp: value >> 28 & 1 == 0,
                 }),
-                _ => ignored,
+                _ => ignored(),
             }),
             (0x97, CLEAR_SURFACE) => Some(Effect::Clear(self.clear(subchannel, value))),
             // PCAS_B with SCHEDULE (bit 1), INVALIDATE (bit 0) a reload; PCAS2_B's PCAS_ACTION.
             (0xc0, SEND_SIGNALING_PCAS_B) if value & 2 != 0 => self.pcas(subchannel, qmd::Action::pcas2(value & 3)),
             (0xc0, SEND_SIGNALING_PCAS2_B) => self.pcas(subchannel, qmd::Action::pcas2(value)),
-            (0x97, DRAW_INDEX_BUFFER | DRAW_VERTEX_ARRAY) => Some(Effect::Draw(Box::new(self.draw(subchannel, method, value)))),
-            (0x97, m) if OTHER_DRAWS.contains(&m) => Some(ignored),
+            (0x97, DRAW_INDEX_BUFFER | DRAW_VERTEX_ARRAY) => Some(self.draw_effect(subchannel, method, value)),
+            (0x97, m) if OTHER_DRAWS.contains(&m) => Some(ignored()),
             // Copy engine: after the copy (`copy`), a semaphore by bits 4:3 (1 one word, 2 four).
             (0xb5, DMA_LAUNCH) => Some(match value >> 3 & 3 {
                 kind @ (1 | 2) => Effect::Release(Release {
@@ -1058,7 +1069,9 @@ mod tests {
             0x100,
             0x12,
             0x3456_7800,
-            // Bind it to the pixel stage's bank 2, then load two words at 0x70.
+            // Bind it to the vertex stage's bank 1 and the pixel stage's bank 2, then load two words at 0x70.
+            header(1, 1, 0, 0x2410),
+            0x11,
             header(1, 1, 0, 0x2410 + 4 * 32),
             0x21,
             header(1, 1, 0, 0x238c),
@@ -1074,7 +1087,9 @@ mod tests {
         // The two words are contiguous: one write, in stream order.
         assert_eq!(writes, vec![(0x12_3456_7870, [[0x11; 4], [0x22; 4]].concat())]);
         let Some(Effect::Draw(d)) = effects.last() else { panic!("{effects:?}") };
-        assert_eq!(d.cbufs[4][2], Some((0x12_3456_7800, 0x100)));
+        // The draw keeps the vertex stage's banks, then the pixel stage's.
+        assert_eq!((d.cbufs[0][1], d.cbufs[0][2]), (Some((0x12_3456_7800, 0x100)), None));
+        assert_eq!((d.cbufs[1][1], d.cbufs[1][2]), (None, Some((0x12_3456_7800, 0x100))));
         assert!(d.index.is_none());
     }
 

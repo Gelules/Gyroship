@@ -13,13 +13,12 @@
 //! a valid encoding then decode to `Unknown(0)` (e.g. SET_STENCIL_FUNC while
 //! the stencil test is off); for stencil ops, 0 is OGL_ZERO.
 
-use super::Reg;
-
 fn bit(v: u32, b: u32) -> bool {
     v >> b & 1 != 0
 }
 
-fn float(r: Reg, method: u32) -> f32 {
+// The readers take any register reader (see `vertex`): a draw's snapshot reads inlined.
+fn float<R: Fn(u32) -> u32 + ?Sized>(r: &R, method: u32) -> f32 {
     f32::from_bits(r(method))
 }
 
@@ -697,7 +696,7 @@ impl Raster {
     }
 }
 
-fn stencil_face(r: Reg, ops: u32, func: u32, reference: u32, read_mask: u32, write_mask: u32) -> StencilFace {
+fn stencil_face<R: Fn(u32) -> u32 + ?Sized>(r: &R, ops: u32, func: u32, reference: u32, read_mask: u32, write_mask: u32) -> StencilFace {
     StencilFace {
         fail_op: StencilOperation::decode(r(ops)),
         depth_fail_op: StencilOperation::decode(r(ops + 4)),
@@ -709,7 +708,7 @@ fn stencil_face(r: Reg, ops: u32, func: u32, reference: u32, read_mask: u32, wri
     }
 }
 
-fn blend_component(r: Reg, op: u32, src: u32, dst: u32) -> BlendComponent {
+fn blend_component<R: Fn(u32) -> u32 + ?Sized>(r: &R, op: u32, src: u32, dst: u32) -> BlendComponent {
     BlendComponent {
         src_factor: BlendFactor::decode(r(src)),
         dst_factor: BlendFactor::decode(r(dst)),
@@ -718,7 +717,7 @@ fn blend_component(r: Reg, op: u32, src: u32, dst: u32) -> BlendComponent {
 }
 
 /// Decodes the fixed-function state of the current draw.
-pub fn render_state(r: Reg) -> RenderState {
+pub fn render_state<R: Fn(u32) -> u32 + ?Sized>(r: &R) -> RenderState {
     let origin = r(0x13ac); // SET_WINDOW_ORIGIN
     let viewport = Viewport {
         scale: [float(r, 0x0a00), float(r, 0x0a04), float(r, 0x0a08)],

@@ -3,7 +3,10 @@
 //! Facts come from NVIDIA's clc797.h (method offsets, fields, enums) and
 //! from how Mesa's NVK emits Vulkan state as these methods
 //! (nvk_cmd_draw.c, nvk_format.c).
-use super::Reg;
+//!
+//! The readers take any register reader `r` (method -> value), not a `Reg`:
+//! a draw's snapshot calls them with its own closure, inlined (no call through
+//! a vtable for each of its ~190 register reads).
 
 /// Vertex streams and vertex attributes: 32 of each. clc797.h names each
 /// array in two halves (`..._A(j)` for 0..15, `..._B(j)` for 16..31) at
@@ -18,7 +21,7 @@ fn field(v: u32, hi: u32, lo: u32) -> u32 {
 }
 
 /// 40-bit GPU address from an `_UPPER` (7:0) / `_LOWER` (31:0) method pair.
-fn addr40(r: Reg, upper: u32) -> u64 {
+fn addr40<R: Fn(u32) -> u32 + ?Sized>(r: &R, upper: u32) -> u64 {
     (u64::from(field(r(upper), 7, 0)) << 32) | u64::from(r(upper + 4))
 }
 
@@ -109,34 +112,40 @@ pub struct Attribute {
 /// never-written register reads 0). Constant attributes are kept so the
 /// shader translator can substitute their value; which of them the shader
 /// actually reads is in its header, not in this state.
-pub fn vertex_input(r: Reg) -> (Vec<Stream>, Vec<Attribute>) {
-    let streams = (0..COUNT)
-        .filter(|j| field(r(0x1c00 + 16 * j), 12, 12) == 1) // SET_VERTEX_STREAM_A_FORMAT_ENABLE
-        .map(|j| {
-            let address = addr40(r, 0x1c04 + 16 * j); // SET_VERTEX_STREAM_A_LOCATION_A/B
-            let size = addr40(r, 0x600 + 8 * j); // SET_VERTEX_STREAM_SIZE_A/B
-            Stream {
-                index: j as u8,
-                address,
-                stride: field(r(0x1c00 + 16 * j), 11, 0),
-                end: address.wrapping_add(size).wrapping_sub(1),
-                per_instance: field(r(0x1880 + 4 * j), 0, 0) == 1,
-                divisor: r(0x1c0c + 16 * j),
-            }
-        })
-        .collect();
-    let attributes = (0..COUNT)
-        .map(|i| (i, r(0x1160 + 4 * i)))
-        .filter(|&(_, v)| field(v, 26, 21) != 0)
-        .map(|(i, v)| Attribute {
+pub fn vertex_input<R: Fn(u32) -> u32 + ?Sized>(r: &R) -> (Vec<Stream>, Vec<Attribute>) {
+    // Plain loops into lists sized once (a filtered chain grew them 4, 8, 16, 32).
+    let mut streams = Vec::with_capacity(COUNT as usize);
+    for j in 0..COUNT {
+        let format = r(0x1c00 + 16 * j);
+        if field(format, 12, 12) != 1 {
+            continue; // SET_VERTEX_STREAM_A_FORMAT_ENABLE
+        }
+        let address = addr40(r, 0x1c04 + 16 * j); // SET_VERTEX_STREAM_A_LOCATION_A/B
+        let size = addr40(r, 0x600 + 8 * j); // SET_VERTEX_STREAM_SIZE_A/B
+        streams.push(Stream {
+            index: j as u8,
+            address,
+            stride: field(format, 11, 0),
+            end: address.wrapping_add(size).wrapping_sub(1),
+            per_instance: field(r(0x1880 + 4 * j), 0, 0) == 1,
+            divisor: r(0x1c0c + 16 * j),
+        });
+    }
+    let mut attributes = Vec::with_capacity(COUNT as usize);
+    for i in 0..COUNT {
+        let v = r(0x1160 + 4 * i);
+        if field(v, 26, 21) == 0 {
+            continue;
+        }
+        attributes.push(Attribute {
             location: i as u8,
             stream: field(v, 4, 0) as u8,
             offset: field(v, 20, 7),
             constant: field(v, 6, 6) == 1,
             format: attr_format(v),
             raw: v,
-        })
-        .collect();
+        });
+    }
     (streams, attributes)
 }
 
@@ -243,12 +252,12 @@ pub fn wgpu_vertex_format(f: &AttrFormat) -> Option<wgpu::VertexFormat> {
 
 /// SET_GLOBAL_BASE_VERTEX_INDEX: added to every index before the fetch (NVK
 /// writes the Vulkan vertexOffset there).
-pub fn base_vertex(r: Reg) -> i32 {
+pub fn base_vertex<R: Fn(u32) -> u32 + ?Sized>(r: &R) -> i32 {
     r(0x1434) as i32
 }
 
 /// SET_GLOBAL_BASE_INSTANCE_INDEX (NVK: the Vulkan firstInstance).
-pub fn base_instance(r: Reg) -> u32 {
+pub fn base_instance<R: Fn(u32) -> u32 + ?Sized>(r: &R) -> u32 {
     r(0x1438)
 }
 
@@ -274,7 +283,7 @@ pub struct IndexBuffer {
     pub restart_index: u32,
 }
 
-pub fn index_buffer(r: Reg) -> IndexBuffer {
+pub fn index_buffer<R: Fn(u32) -> u32 + ?Sized>(r: &R) -> IndexBuffer {
     let address = addr40(r, 0x17c8);
     IndexBuffer {
         address,
@@ -289,6 +298,7 @@ pub fn index_buffer(r: Reg) -> IndexBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::Reg;
     use std::collections::HashMap;
 
     fn with<T>(m: &[(u32, u32)], f: impl Fn(Reg) -> T) -> T {
@@ -312,7 +322,7 @@ mod tests {
                 (0x1d00 + 16, 0x1000 | 20),      // SET_VERTEX_STREAM_B_FORMAT(1) = stream 17
                 (0x1d08 + 16, 0x1000),           // its size stays 0
             ],
-            vertex_input,
+            |r| vertex_input(r),
         );
         assert!(a.is_empty());
         assert_eq!(
@@ -339,7 +349,7 @@ mod tests {
                 // 22: widths 0 -> not programmed, skipped.
                 (0x1160 + 4 * 22, 3 | 7 << 27),
             ],
-            vertex_input,
+            |r| vertex_input(r),
         );
         let f = |components, bits, kind, bgra| AttrFormat { components, bits, kind, bgra };
         let want = [
@@ -386,14 +396,55 @@ mod tests {
         for (e, bytes) in [(0, 1), (1, 2), (2, 4), (3, 0)] {
             let ib = with(
                 &[(0x17c8, 0x311), (0x17cc, 0x3330_1774), (0x17d8, e), (0x17dc, 9), (0x238, 0), (0x23c, 0x100), (0x1644, 1), (0x1648, 0xffff)],
-                index_buffer,
+                |r| index_buffer(r),
             );
             assert_eq!(
                 ib,
                 IndexBuffer { address: 0x11_3330_1774, bytes_per_index: bytes, first: 9, end: 0x11_3330_1873, restart_enable: true, restart_index: 0xffff }
             );
         }
-        let ib = with(&[], index_buffer);
+        let ib = with(&[], |r| index_buffer(r));
         assert!(!ib.restart_enable && ib.end == u64::MAX);
+    }
+
+    /// The loops give what the iterator chains they replaced gave (kept here,
+    /// frozen), for random register files: streams enabled or not, attributes
+    /// programmed or not, with gaps.
+    #[test]
+    fn vertex_input_matches_the_chains_it_replaced() {
+        fn chains(r: Reg) -> (Vec<Stream>, Vec<Attribute>) {
+            let streams = (0..COUNT)
+                .filter(|j| field(r(0x1c00 + 16 * j), 12, 12) == 1)
+                .map(|j| {
+                    let address = addr40(r, 0x1c04 + 16 * j);
+                    let size = addr40(r, 0x600 + 8 * j);
+                    Stream { index: j as u8, address, stride: field(r(0x1c00 + 16 * j), 11, 0), end: address.wrapping_add(size).wrapping_sub(1), per_instance: field(r(0x1880 + 4 * j), 0, 0) == 1, divisor: r(0x1c0c + 16 * j) }
+                })
+                .collect();
+            let attributes = (0..COUNT)
+                .map(|i| (i, r(0x1160 + 4 * i)))
+                .filter(|&(_, v)| field(v, 26, 21) != 0)
+                .map(|(i, v)| Attribute { location: i as u8, stream: field(v, 4, 0) as u8, offset: field(v, 20, 7), constant: field(v, 6, 6) == 1, format: attr_format(v), raw: v })
+                .collect();
+            (streams, attributes)
+        }
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..200 {
+            // About half the registers 0 (stream disabled, attribute not programmed).
+            let regs: Vec<u32> = (0..0x1000)
+                .map(|_| {
+                    let v = next();
+                    if v >> 40 & 1 == 0 { 0 } else { v as u32 }
+                })
+                .collect();
+            let r = |m: u32| regs[(m / 4) as usize];
+            assert_eq!(vertex_input(&r), chains(&r));
+        }
     }
 }

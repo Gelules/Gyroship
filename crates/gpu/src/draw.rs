@@ -674,7 +674,7 @@ impl Surfaces {
             return Err("vertex-A, tessellation or geometry program".into());
         }
         let ps = match d.programs[5] {
-            Some(at) => Some(self.module(mem, at, None, 0, &d.cbufs[4], 0)?),
+            Some(at) => Some(self.module(mem, at, None, 0, &d.cbufs[1], 0)?),
             None => None,
         };
         // The user clip planes the draw enables, where the device can clip (else none).
@@ -789,7 +789,7 @@ impl Surfaces {
         let attached: SmallVec<[u64; 9]> = colors.iter().flatten().chain(&depth).map(|(s, _)| s.addr).collect();
         let mut stages: SmallVec<[Bindings; 2]> = smallvec![self.stage_bindings(&d.cbufs[0], d.headers, d.samplers, d.sampler_binding, &vs.0, &attached, mem)?];
         if let Some(p) = &ps {
-            stages.push(self.stage_bindings(&d.cbufs[4], d.headers, d.samplers, d.sampler_binding, &p.0, &attached, mem)?);
+            stages.push(self.stage_bindings(&d.cbufs[1], d.headers, d.samplers, d.sampler_binding, &p.0, &attached, mem)?);
         }
 
         // The pipeline.
