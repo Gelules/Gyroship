@@ -161,6 +161,17 @@ impl<T: Clone> Made<T> {
             std::thread::sleep(std::time::Duration::from_micros(200));
         }
     }
+
+    /// As [`Made::waited`], for `budget` at most, the clock read only when the
+    /// pipeline is not made yet: whether it is made, and when the wait began
+    /// (None when it was made already).
+    pub(crate) fn waited_for(&mut self, budget: std::time::Duration) -> (bool, Option<std::time::Instant>) {
+        if self.made().is_some() {
+            return (true, None);
+        }
+        let now = std::time::Instant::now();
+        (self.waited(now + budget), Some(now))
+    }
 }
 
 /// The worker threads and their queue. The SPIR-V of a program is written
@@ -303,6 +314,18 @@ fn jump_targets(tables: &[shader::JumpTable], bytes: &[Vec<u8>], code_len: usize
         }
     }
     targets
+}
+
+/// The attributes a vertex program fetches as integers, as its module's key
+/// holds them: bit `l` for location `l`, bit `32 + l` when signed. Each
+/// location is below 32 and comes once (`vertex_input`).
+fn int_mask(attributes: &[crate::state::vertex::Attribute]) -> u64 {
+    attributes.iter().filter(|a| !a.constant && matches!(a.format.kind, AttrKind::Uint | AttrKind::Sint)).fold(0, |m, a| m | 1 << (a.location % 32) | u64::from(a.format.kind == AttrKind::Sint) << (32 + a.location % 32))
+}
+
+/// [`int_mask`] as the translator takes it: location -> signed.
+fn int_attributes(mask: u64) -> BTreeMap<u8, bool> {
+    (0..32u8).filter(|l| mask >> l & 1 != 0).map(|l| (l, mask >> (32 + l) & 1 != 0)).collect()
 }
 
 /// `ranges` (start, end) sorted and merged where they touch or overlap.
@@ -651,14 +674,12 @@ impl Surfaces {
             return Err("vertex-A, tessellation or geometry program".into());
         }
         let ps = match d.programs[5] {
-            Some(at) => Some(self.module(mem, at, None, &BTreeMap::new(), &d.cbufs[4], 0)?),
+            Some(at) => Some(self.module(mem, at, None, 0, &d.cbufs[4], 0)?),
             None => None,
         };
-        // Attributes fetched as integers: the vertex program declares them so.
-        let ints: BTreeMap<u8, bool> = d.attributes.iter().filter(|a| !a.constant && matches!(a.format.kind, AttrKind::Uint | AttrKind::Sint)).map(|a| (a.location, a.format.kind == AttrKind::Sint)).collect();
         // The user clip planes the draw enables, where the device can clip (else none).
         let clip = if self.clip_distances { d.render.user_clip } else { 0 };
-        let vs = self.module(mem, d.programs[1].ok_or("no vertex program")?, ps.as_ref().map(|p| &p.0), &ints, &d.cbufs[0], clip)?;
+        let vs = self.module(mem, d.programs[1].ok_or("no vertex program")?, ps.as_ref().map(|p| &p.0), int_mask(&d.attributes), &d.cbufs[0], clip)?;
 
         // Attachments: the locations the pixel program writes, and depth when tested.
         let none = BTreeMap::new();
@@ -826,13 +847,15 @@ impl Surfaces {
         let used = groups.iter().rposition(|&id| id != u32::MAX && !self.cache.group_entries[id as usize].is_empty()).map_or(0, |g| g + 1);
         groups[used..].fill(u32::MAX);
         let key: PipelineKey = ((vs.0.key, vs.0.wgsl.len()), ps.as_ref().map(|p| (p.0.key, p.0.wgsl.len())), layouts, primitive, color_states, depth_state, groups);
-        // Play mode: a pending pipeline is waited for within the frame's budget.
-        let waiting = std::time::Instant::now();
-        let until = waiting + if self.background { self.wait_left } else { std::time::Duration::ZERO };
+        // Play mode: a pending pipeline is waited for within the frame's budget, from `began`
+        // (a pipeline made already reads no clock).
+        let budget = if self.background { self.wait_left } else { std::time::Duration::ZERO };
+        let mut began = None;
         // Neither the pipeline nor its layouts are copied here: the recorder, which has them once
         // announced, is the one to use them at each draw.
         let found = self.cache.pipelines.get_mut(&key).map(|(made, layouts, id, announced)| {
-            let ready = made.waited(until);
+            let (ready, at) = made.waited_for(budget);
+            began = at;
             let announce = if ready && !*announced {
                 *announced = true;
                 made.made().map(|p| (p.clone(), layouts.clone()))
@@ -845,6 +868,7 @@ impl Surfaces {
             Some(found) => found,
             None => {
                 let since = std::time::Instant::now();
+                began = Some(since);
                 let (_, _, layouts, primitive, color_states, depth_state, groups) = &key;
                 // Pipelines with the same group layouts share them, and so their bind groups.
                 let mut bind_layouts: [Option<wgpu::BindGroupLayout>; 2] = Default::default();
@@ -875,7 +899,7 @@ impl Surfaces {
                 };
                 let label = format!("p{:016x}+{}", vs.0.key, ps.as_ref().map_or("none".into(), |p| format!("{:016x}", p.0.key)));
                 let mut made = self.make(make, label.clone());
-                let ready = made.waited(until);
+                let ready = made.waited(since + budget);
                 let id = self.cache.pipelines.len() as u32;
                 let announce = if ready { made.made().map(|p| (p.clone(), bind_layouts.clone())) } else { None };
                 self.cache.pipelines.insert(key, (made, bind_layouts, id, ready));
@@ -885,8 +909,10 @@ impl Surfaces {
                 (ready, id, announce)
             }
         };
-        if self.background {
-            self.wait_left = self.wait_left.saturating_sub(waiting.elapsed());
+        if self.background
+            && let Some(began) = began
+        {
+            self.wait_left = self.wait_left.saturating_sub(began.elapsed());
         }
         if !ready {
             // Still being made on a worker thread (play mode), the frame's wait spent:
@@ -936,8 +962,9 @@ impl Surfaces {
     }
 
     /// The translation and WGSL module of the program at `at`; a vertex
-    /// program pairs with its pixel program's varyings.
-    fn module(&mut self, mem: Mem, at: u64, pixel: Option<&Translation>, ints: &BTreeMap<u8, bool>, banks: &[Option<(u64, u32)>], clip: u8) -> Module {
+    /// program pairs with its pixel program's varyings and fetches the
+    /// attributes of `mask` as integers (`int_mask`).
+    fn module(&mut self, mem: Mem, at: u64, pixel: Option<&Translation>, mask: u64, banks: &[Option<(u64, u32)>], clip: u8) -> Module {
         // A failed read is not kept: play mode may read while guest threads map memory.
         let key = match self.cache.programs.get(&at) {
             Some(&key) => key,
@@ -949,15 +976,20 @@ impl Surfaces {
             }
         };
         let pair = pixel.map(|p| p.key);
-        let mask = ints.iter().fold(0u64, |m, (&l, &signed)| m | 1 << (l % 32) | u64::from(signed) << (32 + l % 32));
         // Jump tables: the translation without them (variant 0) says where they are;
         // the tables' words give the targets, and the module with exact blocks is
         // keyed by them too. Both are made in one call: variant 0 (every instruction
         // a block, a switch of thousands of cases the driver took minutes over)
         // serves only while a table's bank cannot be read.
         let mut id = (key, pair, mask, 0, clip);
+        // Most programs have no table: one lookup.
+        if let Some(m) = self.cache.modules.get(&id)
+            && m.as_ref().is_ok_and(|m| m.0.interface.jump_tables.is_none())
+        {
+            return m.clone();
+        }
         if !self.cache.modules.contains_key(&id) {
-            self.translate_module(id, pixel, ints, None);
+            self.translate_module(id, pixel, None);
         }
         if let Some(Ok(m)) = self.cache.modules.get(&id)
             && let Some(tables) = m.0.interface.jump_tables.clone()
@@ -976,7 +1008,7 @@ impl Surfaces {
                     };
                     self.cache.jumps.insert((key, pair, mask, clip), (bytes, id.3));
                     if !self.cache.modules.contains_key(&id) {
-                        self.translate_module(id, pixel, ints, Some(targets));
+                        self.translate_module(id, pixel, Some(targets));
                     }
                 }
             }
@@ -984,11 +1016,11 @@ impl Surfaces {
         self.cache.modules[&id].clone()
     }
 
-    /// Translates program `id.0` (paired with `pixel`, attributes `ints`, the
-    /// jump targets of variant `id.3`) into the module cache.
-    fn translate_module(&mut self, id: ModuleId, pixel: Option<&Translation>, ints: &BTreeMap<u8, bool>, jump: Option<BTreeSet<usize>>) {
+    /// Translates program `id.0` (paired with `pixel`, the integer attributes of
+    /// `id.2`, the jump targets of variant `id.3`) into the module cache.
+    fn translate_module(&mut self, id: ModuleId, pixel: Option<&Translation>, jump: Option<BTreeSet<usize>>) {
         let key = id.0;
-        let options = Options { varyings: pixel.map(|p| p.interface.varyings.clone()).unwrap_or_default(), int_attributes: ints.clone(), jump_targets: jump, clip_planes: id.4, ..Default::default() };
+        let options = Options { varyings: pixel.map(|p| p.interface.varyings.clone()).unwrap_or_default(), int_attributes: int_attributes(id.2), jump_targets: jump, clip_planes: id.4, ..Default::default() };
         let made = self.translated(key, options, "program", format!("{key:016x}/{:x}", id.3), |t| {
             // GYROSHIP_WGSL_OVERRIDE=<dir>: <dir>/<key>.wgsl replaces the translation (a
             // debugging aid: a program edited to show its intermediate values; the shader
@@ -2584,6 +2616,35 @@ mod tests {
         assert!(s.skipped.is_empty(), "{:?}", s.skipped);
     }
 
+    /// The integer-attribute mask of a module's key equals the fold over the
+    /// map the draw built before (each location once, last kind wins), and the
+    /// map comes back from it, for random attribute sets of every kind.
+    #[test]
+    fn integer_attributes_round_trip_through_the_module_key() {
+        use crate::state::vertex::{AttrFormat, Attribute};
+        let kinds = [AttrKind::Float, AttrKind::Uint, AttrKind::Sint, AttrKind::Unorm, AttrKind::Snorm, AttrKind::Uscaled];
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..500 {
+            let attributes: Vec<Attribute> = (0..32u8)
+                .filter_map(|location| {
+                    let r = next();
+                    (r % 3 != 0).then(|| Attribute { location, stream: 0, offset: 0, constant: r >> 8 & 7 == 0, format: AttrFormat { components: 1, bits: [32, 0, 0, 0], kind: kinds[(r >> 16) as usize % kinds.len()], bgra: false }, raw: 0 })
+                })
+                .collect();
+            // The draw's map and the module's fold, as they were.
+            let map: BTreeMap<u8, bool> = attributes.iter().filter(|a| !a.constant && matches!(a.format.kind, AttrKind::Uint | AttrKind::Sint)).map(|a| (a.location, a.format.kind == AttrKind::Sint)).collect();
+            let mask = map.iter().fold(0u64, |m, (&l, &signed)| m | 1 << (l % 32) | u64::from(signed) << (32 + l % 32));
+            assert_eq!(int_mask(&attributes), mask);
+            assert_eq!(int_attributes(mask), map);
+        }
+    }
+
     /// Jump targets come from the table alone: its entries when its length is
     /// known, else its words up to the first that is not an instruction offset.
     #[test]
@@ -2621,6 +2682,10 @@ mod tests {
         let waited = std::time::Instant::now();
         assert_eq!(slow.wait(waited + std::time::Duration::from_millis(20)), None);
         assert!(waited.elapsed() >= std::time::Duration::from_millis(20));
+        // A made pipeline is not waited for (no clock); a pending one for its budget, from when it began.
+        assert_eq!(quick.waited_for(std::time::Duration::from_secs(5)), (true, None));
+        let (ready, began) = slow.waited_for(std::time::Duration::from_millis(20));
+        assert!(!ready && began.is_some_and(|b| b.elapsed() >= std::time::Duration::from_millis(20)));
         let mut soon = s.make(|| 10u32, "soon".into());
         assert_eq!(soon.wait(std::time::Instant::now() + std::time::Duration::from_secs(5)), Some(10));
         tx.send(()).unwrap();
