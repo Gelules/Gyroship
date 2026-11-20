@@ -788,6 +788,23 @@ pub struct Staging {
     /// Play mode: host nanoseconds the submit thread's jobs took (each
     /// flush's GPU half, each frame shown), as of the last flush.
     pub submit_ns: u64,
+    /// Times the frames' encoder was taken (`Surfaces::encoder`): each draw
+    /// pass opened, and each other recording (clear, copy, dispatch).
+    pub recordings: u64,
+    /// A hash of where each block was written in the arena (offset, bound
+    /// size) and of each flushed arena's length, in order: two runs that lay
+    /// out their arenas alike match, whatever their memos found.
+    pub layout: u64,
+}
+
+impl Staging {
+    /// Folds `at`, `size` into `layout`.
+    fn lay(&mut self, at: u64, size: u64) {
+        let mut h = Fx(self.layout);
+        h.add(at);
+        h.add(size);
+        self.layout = h.0;
+    }
 }
 
 /// What a guest read for the GPU was for, an index into [`Staging`]'s arrays.
@@ -1084,6 +1101,7 @@ impl Surfaces {
     pub(crate) fn encoder(&mut self) -> wgpu::CommandEncoder {
         // A pass left open for the next draw ends before anything else is recorded.
         self.pass = None;
+        self.staging.recordings += 1;
         self.pending.take().unwrap_or_else(|| {
             let mut encoder = self.device.create_command_encoder(&Default::default());
             if let Some(c) = &self.clock {
@@ -1312,6 +1330,7 @@ impl Surfaces {
         }
         self.staging.calls += 1;
         self.staging.data_bytes += range as u64;
+        self.staging.lay(at as u64, range as u64);
         Some((self.arena.0.clone(), at as u64, range as u64))
     }
 
@@ -1335,6 +1354,7 @@ impl Surfaces {
         self.memo.clear();
         let whole = self.arena.1.len().next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT as usize);
         self.arena.1.resize(whole, 0);
+        self.staging.lay(u64::MAX, whole as u64);
         if whole > 0 {
             self.staging.flushed += whole as u64;
             self.staging.flushes += 1;
@@ -1513,6 +1533,7 @@ impl Surfaces {
         data.extend_from_slice(bytes);
         data.resize(at + fill, 0);
         self.staged.entry(hash).or_default().push((at, fill));
+        self.staging.lay(at as u64, range as u64);
         (self.arena.0.clone(), at as u64, range as u64)
     }
 
@@ -2128,6 +2149,27 @@ mod tests {
         s.flush();
         assert_eq!(s.arena.1.len(), 0);
         assert_eq!(s.stage(&b).1, 0);
+    }
+
+    /// The arena's layout hash follows where blocks were written: a block
+    /// staged again shares its range, another of its size takes the next one,
+    /// and the two frames hash apart; frames staged alike hash alike. Needs a
+    /// GPU adapter.
+    #[test]
+    fn the_arena_layout_tells_where_blocks_went() {
+        let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
+            eprintln!("no GPU adapter: test skipped");
+            return;
+        };
+        let mut frame = |second: &[u8]| {
+            s.stage(&[1u8; 64]);
+            s.stage(second);
+            s.flush();
+            std::mem::take(&mut s.staging.layout)
+        };
+        let shared = frame(&[1u8; 64]);
+        assert_eq!(frame(&[1u8; 64]), shared);
+        assert_ne!(frame(&[2u8; 64]), shared);
     }
 
     /// A clear reaches the texture: 4x2 targets in RF16_GF16_BF16_AF16 and in
