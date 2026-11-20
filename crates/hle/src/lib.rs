@@ -241,6 +241,8 @@ pub struct Kernel {
     pub decoder: Arc<Mutex<nvdrv::Decoder>>,
     /// Play mode: how far the GPU thread got (`start_gpu_thread`).
     pub(crate) gpu_progress: Option<Arc<nvdrv::Progress>>,
+    /// Play mode without --gpu-sync: the decoder thread's queue (S7).
+    pub(crate) decoding: Option<nvdrv::Decoding>,
     /// Activity and anomaly counts, shared with the GPU side and the decoder.
     pub tally: Arc<Mutex<Tally>>,
     /// The host's live controller state, read at each hid sample.
@@ -325,7 +327,7 @@ impl Kernel {
         let (mem, tally, gs) = (Arc::new(mem), Arc::new(Mutex::new(Tally::default())), gs::State::default());
         let gpu_side = Arc::new(Mutex::new(nvdrv::GpuSide::new(mem.clone(), journal.share(), tally.clone(), gs.syncpts.clone(), config.clone())));
         let decoder = Arc::new(Mutex::new(nvdrv::Decoder::new(mem.clone(), journal.share(), tally.clone(), config.clone())));
-        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None, sessions: Vec::new(), objects: Vec::new(), domains: Vec::new(), allowed_services: Vec::new(), shared: Vec::new(), transfers: Vec::new(), time_shared: None, frame: (0, 0, 0), symbols: Vec::new(), romfs: None, deferred: None, gs, hid_shared: None, input: Default::default(), spin: Vec::new(), census: Census::default(), saves: Default::default(), timers: Vec::new(), gpu_side, decoder, gpu_progress: None, tally, live_input: None, recorded, audio_out: None, audio_samples, opus: Default::default(), audio_gain: 1.0, audio_format: (2, 48_000), trace: None }
+        Kernel { mem, journal, config, handles: thread::Handles::new(), sched: thread::Sched::default(), events: Vec::new(), oracle: None, sessions: Vec::new(), objects: Vec::new(), domains: Vec::new(), allowed_services: Vec::new(), shared: Vec::new(), transfers: Vec::new(), time_shared: None, frame: (0, 0, 0), symbols: Vec::new(), romfs: None, deferred: None, gs, hid_shared: None, input: Default::default(), spin: Vec::new(), census: Census::default(), saves: Default::default(), timers: Vec::new(), gpu_side, decoder, gpu_progress: None, decoding: None, tally, live_input: None, recorded, audio_out: None, audio_samples, opus: Default::default(), audio_gain: 1.0, audio_format: (2, 48_000), trace: None }
     }
 
     /// The activity and anomaly counts.
@@ -806,14 +808,18 @@ pub enum Deferred {
     RomFsRead { romfs: Arc<fs::RomFs>, mem: Arc<Memory>, offset: u64, addr: u64, len: u64 },
     /// GPU work (`Kernel::gpu_work`), decoded and performed, handed over at `phase`.
     Gpu { side: Arc<Mutex<nvdrv::GpuSide>>, decoder: Arc<Mutex<nvdrv::Decoder>>, phase: nvdrv::Phase, job: nvdrv::GpuJob },
+    /// GPU work the decoder thread decodes: the wait for job `until` (a present's
+    /// for the present before it), then `after` (`nvdrv::handed`).
+    Handed { progress: Arc<nvdrv::Progress>, until: u64, after: After },
 }
 
 /// What deferred work leaves for the kernel lock (`Kernel::after`).
 pub enum After {
     Nothing,
-    /// The rest of present `n` (`Kernel::present_end`): its swap interval and
-    /// the kernel time it was handed over at.
-    Present { n: u64, interval: u64, at: u64 },
+    /// The rest of present `n` (`Kernel::present_end`): its swap interval, the
+    /// kernel time it was handed over at, and with the decoder thread how long
+    /// it waited for the present before it.
+    Present { n: u64, interval: u64, at: u64, waited: Option<std::time::Duration> },
 }
 
 impl Deferred {
@@ -829,6 +835,7 @@ impl Deferred {
                 Ok(After::Nothing)
             }
             Deferred::Gpu { side, decoder, phase, job } => nvdrv::run(&side, &decoder, phase, job),
+            Deferred::Handed { progress, until, after } => nvdrv::handed(&progress, until, after),
         }
     }
 }
@@ -839,7 +846,17 @@ impl Kernel {
         match done {
             Err((code, why)) => self.stop(code, &why),
             Ok(After::Nothing) => {}
-            Ok(After::Present { n, interval, at }) => self.present_end(n, interval, at),
+            Ok(After::Present { n, interval, at, waited: None }) => self.present_end(n, interval, at),
+            // With the decoder thread: the wait for the present before it is a census kind of
+            // its own; the display's cadence counts from its end, so that a frame later than
+            // its vsync waits for the next one (D48) instead of going on at once off the grid.
+            Ok(After::Present { n, interval, waited: Some(w), .. }) => {
+                if let Some(me) = self.sched.current {
+                    self.parked(me, ("present", None), w);
+                }
+                let now = self.now();
+                self.present_end(n, interval, now);
+            }
         }
     }
 }
@@ -920,21 +937,23 @@ pub struct Census {
 }
 
 /// The `--perf` frames file: per present, counters so far (cpu_ms: the
-/// presenting host thread's CPU time; watched_pages: pages the textures' write
-/// watch went over; submit_ms: play mode, the GPU submit thread's busy time,
-/// as of the present's flush; decode_ms: host time decoding pushbuffers,
-/// `Decoder::decode_ns`; effects_ms: host time performing their effects,
-/// `GpuSide::effects_ns`, on the GPU thread in play mode; submit_cpu_ms and
-/// gpu_cpu_ms: the submit thread's and the GPU thread's CPU time;
-/// gpu_wait_ms: the submitting thread's waits for the GPU thread at its
-/// barriers, and with --gpu-sync at the end of each job,
-/// `Decoder::gpu_wait_ns`; queue_wait_ms: its waits for room, a full op
-/// channel and in play mode a present's wait for the previous one). cpu_ms,
-/// macro_calls, decode_ms, gpu_wait_ms and queue_wait_ms are the presenting
-/// thread's, as of the present's hand-over; the others are read at the
-/// frame's end, on the GPU thread in play mode. Only `skipped` is the
-/// present's own.
-pub(crate) const FRAME_COLUMNS: &str = "present,cpu_ms,draws,skipped,views_made,bind_groups_made,flushed_bytes,upload_bytes,upload_ms,macro_calls,watched_pages,flush_ms,submit_ms,decode_ms,effects_ms,submit_cpu_ms,gpu_cpu_ms,gpu_wait_ms,queue_wait_ms\n";
+/// presenting host thread's CPU time, as of the present's hand-over;
+/// watched_pages: pages the textures' write watch went over; submit_ms: play
+/// mode, the GPU submit thread's busy time, as of the present's flush;
+/// decode_ms: host time decoding pushbuffers, `Decoder::decode_ns`;
+/// effects_ms: host time performing their effects, `GpuSide::effects_ns`, on
+/// the GPU thread in play mode; submit_cpu_ms and gpu_cpu_ms: the submit
+/// thread's and the GPU thread's CPU time; gpu_wait_ms: the decoding thread's
+/// waits for the GPU thread at its barriers, and with --gpu-sync at the end of
+/// each job, `Decoder::gpu_wait_ns`; queue_wait_ms: its waits for room in a full
+/// op channel; decoder_cpu_ms: the decoder thread's CPU time, 0 without it).
+/// macro_calls, decode_ms, gpu_wait_ms and queue_wait_ms are the decoding
+/// thread's (the decoder thread in play mode, else the presenting thread), as
+/// of the present's decoding; the others are read at the frame's end, on the
+/// GPU thread in play mode. Only `skipped` is the present's own. The
+/// presenting thread's wait for the present before it is the census wait
+/// kind "present" (waits.csv).
+pub(crate) const FRAME_COLUMNS: &str = "present,cpu_ms,draws,skipped,views_made,bind_groups_made,flushed_bytes,upload_bytes,upload_ms,macro_calls,watched_pages,flush_ms,submit_ms,decode_ms,effects_ms,submit_cpu_ms,gpu_cpu_ms,gpu_wait_ms,queue_wait_ms,decoder_cpu_ms\n";
 
 const COUNTER: u32 = 0x100;
 const WAIT: u32 = 0x200;

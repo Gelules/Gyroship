@@ -701,7 +701,7 @@ impl GpuSide {
         self.begin_present(n);
         // GPU work that waited for the CPU's semaphores runs before the frame is shown.
         crate::nvdrv::poll(d, self)?;
-        let perf = d.frame_in();
+        let perf = d.frame_in(None);
         self.finish_present(n, fence, area, perf)
     }
 
@@ -749,7 +749,7 @@ impl GpuSide {
                 let submit_cpu: Option<std::time::Duration> = None;
                 let (st, calls) = (&s.staging, p.macro_calls);
                 let row = format!(
-                    "{n},{cpu:.1},{},{},{},{},{},{},{:.1},{calls},{},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1}\n",
+                    "{n},{cpu:.1},{},{},{},{},{},{},{:.1},{calls},{},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1}\n",
                     s.drawn,
                     skipped.values().sum::<u64>(),
                     st.views[0],
@@ -765,7 +765,8 @@ impl GpuSide {
                     submit_cpu.unwrap_or_default().as_secs_f64() * 1e3,
                     gpu_cpu.unwrap_or_default().as_secs_f64() * 1e3,
                     p.gpu_wait_ns as f64 / 1e6,
-                    p.queue_wait_ns as f64 / 1e6
+                    p.queue_wait_ns as f64 / 1e6,
+                    p.decoder_cpu.as_secs_f64() * 1e3
                 );
                 self.frames += &row;
             }
@@ -1039,6 +1040,23 @@ mod tests {
         assert_eq!(super::next_vsync(10, 1, 14, true), (13, false));
         // Interval 2: due at 12, now before it: wait for 12.
         assert_eq!(super::next_vsync(10, 2, 12, true), (12, true));
+    }
+
+    /// With the decoder thread, a present that waited for the present before it
+    /// counts its vsync from the end of that wait (D48's even cadence): back
+    /// past vsync 9, it waits for vsync 10, not for one already past.
+    #[test]
+    fn a_present_that_waited_counts_its_vsync_from_the_end_of_the_wait() {
+        use crate::thread::{State, Wait};
+        let config = crate::Config { play: true, ..crate::Config::default() };
+        let mut k = Kernel::new(gyroship_runtime::mem::Memory::new().unwrap(), crate::journal::Journal::memory(), config);
+        k.create_main(0, 0);
+        k.sched.current = Some(0);
+        // Handed over at tick 0, back from its wait just past vsync 9.
+        k.sched.real_now = vsync(9) + 1;
+        k.after(Ok(crate::After::Present { n: 1, interval: 1, at: 0, waited: Some(std::time::Duration::from_millis(150)) }));
+        let th = &k.sched.threads[0];
+        assert_eq!((th.state, &th.wait, th.deadline), (State::Waiting, &Wait::Vsync, Some(vsync(10))));
     }
 
     /// A present waits for its vsync as Vsync, not as the game's own Sleep:

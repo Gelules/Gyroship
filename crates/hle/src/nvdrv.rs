@@ -165,27 +165,25 @@ pub struct Decoder {
 }
 
 /// The GPU thread (play mode): it applies the decoded ops in order while the
-/// submitting thread decodes the next GPFIFO entries. A job returns once its
-/// ops are sent; then a present waits until the previous present is applied,
-/// so at most one present is in flight behind the frame being decoded. With
-/// --gpu-sync every job waits until its ops are applied (S2's join).
+/// decoder thread decodes the next GPFIFO entries (`Decoding`). With
+/// --gpu-sync the submitting thread decodes, and every job waits until its
+/// ops are applied (S2's join).
 pub struct GpuThread {
     ops: std::sync::mpsc::SyncSender<(Phase, GpuOp)>,
     progress: Arc<Progress>,
-    /// Ops sent so far, and up to the last present's `End`.
+    /// Ops sent so far.
     sent: u64,
-    presented: u64,
-    /// Host nanoseconds the submitting thread waited for room: a full op
-    /// channel, and a present's wait for the previous one (`--perf`).
+    /// Host nanoseconds the decoding thread waited for room in a full op channel (`--perf`).
     queue_wait_ns: u64,
 }
 
 /// How far the GPU thread got; its waiters wake at each op. `armed` is the
 /// kernel's count of guest waits on GPU work (`gs::State::armed`): the GPU
 /// thread wakes the boot thread for them. The mutex is a leaf: it is taken
-/// under the kernel lock or the decoder lock, and nothing is taken under it.
+/// under the kernel lock or the decoder lock, or with no lock (the wait of a
+/// thread that handed a job over, `handed`), and nothing is taken under it.
 #[derive(Default)]
-pub(crate) struct Progress {
+pub struct Progress {
     state: Mutex<Applied>,
     changed: std::sync::Condvar,
     pub(crate) armed: std::sync::atomic::AtomicUsize,
@@ -280,14 +278,17 @@ pub enum GpuOp {
     PresentEnd { n: u64, fence: (u32, u32), area: u32, perf: Option<FrameIn> },
     /// The end of a job's ops (a submit's or a present's): once applied, the
     /// GPU thread counts the job done (`Applied::jobs`), which gpu memory 213
-    /// and 102 and the drain at a run's end wait for.
-    End,
+    /// and 102 and the drain at a run's end wait for. With the decoder thread,
+    /// the stop its decoding met, applied in stream order.
+    End(Option<Stop>),
 }
 
-/// A frame's `--perf` values only the presenting thread can read, as of the
-/// present's hand-over, for its row (`FRAME_COLUMNS`).
+/// A frame's `--perf` values only the presenting and decoding threads can
+/// read, as of the present's hand-over and decoding, for its row (`FRAME_COLUMNS`).
 pub struct FrameIn {
     pub cpu: Duration,
+    /// The decoder thread's CPU time (0 without it).
+    pub decoder_cpu: Duration,
     pub macro_calls: u64,
     pub decode_ns: u64,
     pub gpu_wait_ns: u64,
@@ -426,7 +427,8 @@ impl GpuSide {
                 self.gpu = gpu;
                 done
             }),
-            GpuOp::End => Ok(()),
+            // The decoder thread's stop comes here, after the ops it sent before it.
+            GpuOp::End(stop) => stop.map_or(Ok(()), Err),
         };
         self.effects_ns += started.elapsed().as_nanos() as u64;
         done
@@ -578,11 +580,20 @@ impl Decoder {
         all
     }
 
-    /// The presenting thread's `--perf` values for its frame's row (None without `--perf`).
-    pub(crate) fn frame_in(&self) -> Option<FrameIn> {
+    /// The `--perf` values of a frame's row (None without `--perf`), on the thread
+    /// that decodes it. `handed`: with the decoder thread, the presenting thread's
+    /// CPU time read at the hand-over (0 if it could not be read), this thread's
+    /// own being the decoder's; None when this thread presents.
+    pub(crate) fn frame_in(&self, handed: Option<Option<Duration>>) -> Option<FrameIn> {
         self.config.perf.as_ref()?;
+        let own = gyroship_runtime::profile::own_cpu_time().unwrap_or_default();
+        let (cpu, decoder_cpu) = match handed {
+            Some(cpu) => (cpu.unwrap_or_default(), own),
+            None => (own, Duration::ZERO),
+        };
         Some(FrameIn {
-            cpu: gyroship_runtime::profile::own_cpu_time().unwrap_or_default(),
+            cpu,
+            decoder_cpu,
             macro_calls: self.mme_stats().calls,
             decode_ns: self.decode_ns,
             gpu_wait_ns: self.gpu_wait_ns,
@@ -618,41 +629,31 @@ impl Decoder {
 
     /// Play mode: present `n`'s ops. The channels waiting for the CPU go on
     /// (behind the barrier) before the frame is shown; the rest of the present
-    /// carries the values only this thread can read.
-    fn present_ops(&mut self, phase: &Phase, n: u64, fence: (u32, u32), area: u32) -> Result<(), Stop> {
+    /// carries the values only this thread can read (`handed`: see `frame_in`).
+    fn present_ops(&mut self, phase: &Phase, n: u64, fence: (u32, u32), area: u32, handed: Option<Option<Duration>>) -> Result<(), Stop> {
         self.send(phase, GpuOp::PresentBegin { n })?;
         for fd in self.waiting() {
             if let Some((space, effects)) = self.resume(fd)? {
                 self.send_effects(phase, space, effects, None)?;
             }
         }
-        let perf = self.frame_in();
+        let perf = self.frame_in(handed);
         self.send(phase, GpuOp::PresentEnd { n, fence, area, perf })
     }
 
-    /// A job's end, once its ops are `sent`: `End`, even after a decode stop
-    /// (the job then counts as done: the drain, 213 and 102 wait for it).
-    /// Then a present waits until the previous present is applied, and with
-    /// --gpu-sync every job until its own ops are. The first stop in stream
+    /// --gpu-sync: a job's end, once its ops are `sent`: `End`, even after a
+    /// decode stop (the job then counts as done: the drain, 213 and 102 wait for
+    /// it), then the wait until its ops are applied. The first stop in stream
     /// order wins: the GPU thread's (from the wait, or which the send of `End`
-    /// returns) comes from an earlier op than the decoder's.
-    fn end_job(&mut self, phase: &Phase, present: bool, sent: Result<(), Stop>) -> Result<(), Stop> {
-        let ended = self.send(phase, GpuOp::End);
+    /// returns) comes from an earlier op than the decoder's. Without --gpu-sync
+    /// the decoder thread ends the jobs (`decode_jobs`).
+    fn end_job(&mut self, phase: &Phase, sent: Result<(), Stop>) -> Result<(), Stop> {
+        let ended = self.send(phase, GpuOp::End(None));
         let Some(t) = self.gpu.as_mut() else { return ended.and(sent) };
         let since = Instant::now();
-        let waited = if self.config.gpu_sync {
-            let joined = t.join();
-            self.gpu_wait_ns += since.elapsed().as_nanos() as u64;
-            joined
-        } else if present {
-            let previous = std::mem::replace(&mut t.presented, t.sent);
-            let applied = t.wait_for(previous);
-            t.queue_wait_ns += since.elapsed().as_nanos() as u64;
-            applied
-        } else {
-            Ok(())
-        };
-        waited.and(ended).and(sent)
+        let joined = t.join();
+        self.gpu_wait_ns += since.elapsed().as_nanos() as u64;
+        joined.and(ended).and(sent)
     }
 }
 
@@ -695,7 +696,7 @@ impl GpuThread {
             let channel = &syncpts[CHANNEL_SYNCPT as usize];
             let mut count = channel.load(Ordering::SeqCst);
             for (n, (phase, op)) in (0u64..).zip(rx) {
-                let job = matches!(op, GpuOp::End).then(|| phase.job());
+                let job = matches!(op, GpuOp::End(_)).then(|| phase.job());
                 let stopped = crate::lock(&p.state).stop.is_some();
                 let done = if stopped { Ok(()) } else { apply_op(&side, phase, op, n) };
                 let mut state = crate::lock(&p.state);
@@ -717,7 +718,7 @@ impl GpuThread {
                 count = now;
             }
         })?;
-        Ok(GpuThread { ops, progress, sent: 0, presented: 0, queue_wait_ns: 0 })
+        Ok(GpuThread { ops, progress, sent: 0, queue_wait_ns: 0 })
     }
 
     /// Sends an op; the stop the thread met, if any, instead. A full channel
@@ -761,6 +762,93 @@ impl GpuThread {
     }
 }
 
+/// The stop of a run whose decoder thread ended (a panic).
+fn decoder_thread_ended() -> Stop {
+    (crate::STOP_EXIT, "the decoder thread ended: GPU work was lost".into())
+}
+
+/// A test's job whose decoding panics, on this guest thread (`Phase::thread`).
+#[cfg(test)]
+const PANIC_THREAD: u64 = u64::MAX;
+
+/// The decoder thread (play mode without --gpu-sync, S7): it decodes the jobs
+/// in hand-over order and sends their ops to the GPU thread, so that the guest
+/// thread that hands a job over goes on at once (`handed`). Jobs are queued
+/// under the kernel lock, where each gets its number (`Phase::job`): the queue
+/// holds them in that order, whichever thread hands them over. The decoder
+/// thread ends with the kernel, which holds the queue's sender.
+// ponytail: an unbounded queue; the present wait keeps it to about two frames' jobs (one
+// submit per present in Corneria). A game that submits without presenting would grow it: bound it then.
+pub(crate) struct Decoding {
+    /// Each job, with the presenting thread's CPU time at the hand-over (`--perf`, presents).
+    jobs: std::sync::mpsc::Sender<(Phase, GpuJob, Option<Duration>)>,
+    /// The number of the last present handed over: the next present waits for it.
+    presented: u64,
+}
+
+impl Decoding {
+    /// Starts the decoder thread, with the guest threads' stack reservation (the
+    /// MME runs there, and program reads).
+    fn start(decoder: Arc<Mutex<Decoder>>, progress: Arc<Progress>) -> std::io::Result<Decoding> {
+        let (jobs, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new().name("decoder".into()).stack_size(gyroship_runtime::fiber::STACK_RESERVE).spawn(move || decode_jobs(rx, &decoder, progress))?;
+        Ok(Decoding { jobs, presented: 0 })
+    }
+}
+
+/// The decoder thread: each job decoded under the decoder lock, then its `End`,
+/// which carries the stop its decoding met, so that the stop follows the ops
+/// sent before it. After a stop, jobs are ended undecoded, as `run` ends at one.
+/// A panic leaves its stop in `progress`, which every wait on GPU work sees.
+fn decode_jobs(jobs: std::sync::mpsc::Receiver<(Phase, GpuJob, Option<Duration>)>, decoder: &Mutex<Decoder>, progress: Arc<Progress>) {
+    struct Gone(Arc<Progress>);
+    impl Drop for Gone {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                crate::lock(&self.0.state).stop.get_or_insert_with(decoder_thread_ended);
+                self.0.changed.notify_all();
+            }
+        }
+    }
+    let _gone = Gone(progress);
+    let (mut stopped, mut last) = (false, None);
+    for (phase, job, cpu) in jobs {
+        // Numbered under the kernel lock, one by one.
+        debug_assert!(last.is_none_or(|l: u64| phase.job() == l + 1), "job {} after job {last:?}", phase.job());
+        last = Some(phase.job());
+        #[cfg(test)]
+        if phase.thread == PANIC_THREAD {
+            panic!("a test's decoder panic");
+        }
+        let mut d = crate::lock(decoder);
+        d.at = phase.clone();
+        let sent = match job {
+            _ if stopped => Ok(()),
+            GpuJob::Submit { fd, space, entries } => d.submit_ops(&phase, fd, space, &entries),
+            GpuJob::Present { n, fence, area, .. } => d.present_ops(&phase, n, fence, area, Some(cpu)),
+        };
+        stopped |= sent.is_err();
+        let _ = d.send(&phase, GpuOp::End(sent.err()));
+        d.at = Phase::default();
+    }
+}
+
+/// The part of a job the decoder thread decodes that the handing thread runs
+/// after the kernel lock (`Deferred::Handed`), holding no lock: a present waits
+/// until job `until`, the present before it, is done, so that one present is in
+/// flight behind the one handed over; a submit waits for nothing (`until` 0). A
+/// stop the decoder or GPU thread met comes back here, at the next hand-over.
+pub(crate) fn handed(progress: &Progress, until: u64, after: After) -> Result<After, Stop> {
+    let since = Instant::now();
+    if let (Some(stop), _) = progress.drain(until, Duration::MAX) {
+        return Err(stop);
+    }
+    Ok(match after {
+        After::Present { n, interval, at, .. } => After::Present { n, interval, at, waited: Some(since.elapsed()) },
+        other => other,
+    })
+}
+
 /// On the GPU thread: op number `n`, handed over at `phase`, under the GPU
 /// side's lock, which the play engine's watchdog sees held.
 fn apply_op(side: &Mutex<GpuSide>, phase: Phase, op: GpuOp, n: u64) -> Result<(), Stop> {
@@ -788,10 +876,14 @@ impl Kernel {
     pub fn start_gpu_thread(&mut self) -> std::io::Result<()> {
         let t = GpuThread::start(self.gpu_side.clone(), std::thread::current())?;
         self.gpu_side().wrote = Some(std::collections::VecDeque::new());
-        self.gpu_progress = Some(t.progress.clone());
+        let progress = t.progress.clone();
+        self.gpu_progress = Some(progress.clone());
         crate::lock(&self.decoder).gpu = Some(t);
+        if !self.config.gpu_sync {
+            self.decoding = Some(Decoding::start(self.decoder.clone(), progress)?);
+        }
         // Which mode a measurement ran in.
-        self.log(if self.config.gpu_sync { "gpu: the GPU thread applies the GPU work; a job returns once its ops are applied (--gpu-sync)" } else { "gpu: the GPU thread applies the GPU work; a job returns once its ops are sent, with one present in flight" });
+        self.log(if self.config.gpu_sync { "gpu: the GPU thread applies the GPU work; a job returns once its ops are applied (--gpu-sync)" } else { "gpu: a decoder thread decodes the GPU work and the GPU thread applies it; a job returns once handed over, with one present in flight" });
         Ok(())
     }
 
@@ -803,6 +895,28 @@ impl Kernel {
     /// goes on, while the other threads use the kernel.
     pub(crate) fn gpu_work(&mut self, job: GpuJob) {
         let phase = Phase { now: self.now(), thread: self.sched.current.map_or(0, |t| self.sched.threads[t].id), presents: self.gs.presents, submits: self.tally().counts.get("submits").copied().unwrap_or(0), maps: self.gs.maps.clone() };
+        // The decoder thread decodes it (S7): queued here, in hand-over order; this thread
+        // goes on after the kernel lock, a present once the present before it is done.
+        if let (Some(q), Some(progress)) = (self.decoding.as_mut(), self.gpu_progress.clone()) {
+            let (until, after) = match &job {
+                GpuJob::Present { n, interval, .. } => (std::mem::replace(&mut q.presented, phase.job()), After::Present { n: *n, interval: *interval, at: phase.now, waited: None }),
+                GpuJob::Submit { .. } => (0, After::Nothing),
+            };
+            // The presenting thread's CPU time for its frame's row, read on its own host thread.
+            let cpu = (self.config.perf.is_some() && matches!(job, GpuJob::Present { .. })).then(gyroship_runtime::profile::own_cpu_time).flatten();
+            // A send fails only once the decoder thread died: its stop is in `progress` then.
+            let _ = q.jobs.send((phase, job, cpu));
+            let handed = crate::Deferred::Handed { progress, until, after };
+            // ponytail: as below, no SVC hands two GPU jobs over; the second's wait would run under the kernel lock.
+            match self.deferred {
+                None => self.deferred = Some(handed),
+                Some(_) => {
+                    let done = handed.run();
+                    self.after(done);
+                }
+            }
+            return;
+        }
         if self.config.play && self.deferred.is_none() {
             self.deferred = Some(crate::Deferred::Gpu { side: self.gpu_side.clone(), decoder: self.decoder.clone(), phase, job });
             return;
@@ -849,9 +963,9 @@ pub fn run(side: &Mutex<GpuSide>, decoder: &Mutex<Decoder>, phase: Phase, job: G
         // Play mode: the GPU thread applies the job's ops while this thread decodes.
         let sent = match &job {
             GpuJob::Submit { fd, space, entries } => d.submit_ops(&phase, *fd, *space, entries),
-            GpuJob::Present { n, fence, area, .. } => d.present_ops(&phase, *n, *fence, *area),
+            GpuJob::Present { n, fence, area, .. } => d.present_ops(&phase, *n, *fence, *area, None),
         };
-        d.end_job(&phase, matches!(job, GpuJob::Present { .. }), sent)
+        d.end_job(&phase, sent)
     } else {
         let mut g = crate::lock(side);
         // The play engine's watchdog sees who holds the GPU side, and since when.
@@ -877,7 +991,7 @@ pub fn run(side: &Mutex<GpuSide>, decoder: &Mutex<Decoder>, phase: Phase, job: G
     drop(d);
     done?;
     Ok(match job {
-        GpuJob::Present { n, interval, .. } => After::Present { n, interval, at },
+        GpuJob::Present { n, interval, .. } => After::Present { n, interval, at, waited: None },
         GpuJob::Submit { .. } => After::Nothing,
     })
 }
@@ -1630,6 +1744,9 @@ mod tests {
             if threaded {
                 k.start_gpu_thread().unwrap();
             }
+            // The decoder thread decodes from the hand-over on: the GPU thread applies nothing meanwhile.
+            let side = k.gpu_side.clone();
+            let held = threaded.then(|| crate::lock(&side));
             // As vi2 229 does: the present is counted, then handed over.
             k.gs.presents = 1;
             k.gpu_work(GpuJob::Present { n: 1, fence: (!CHANNEL_SYNCPT, 5), area: 0, interval: 1 });
@@ -1637,9 +1754,10 @@ mod tests {
             if play {
                 assert_eq!(ran(&k), None, "queued, not run");
                 let done = k.deferred.take().expect("a deferred job").run();
-                assert!(matches!(done, Ok(After::Present { n: 1, interval: 1, at: 0 })));
+                assert!(matches!(done, Ok(After::Present { n: 1, interval: 1, at: 0, .. })));
                 k.after(done);
             }
+            drop(held);
             assert!(k.deferred.is_none());
             assert_eq!(k.drain_gpu(), None);
             assert_eq!(ran(&k), Some(1));
@@ -1743,10 +1861,10 @@ mod tests {
     fn a_job_returns_before_its_ops_are_applied() {
         for sync in [false, true] {
             let mut k = play_kernel(true, false, sync);
-            let job = hand_over(&mut k, 1, PUSHBUFFERS, &[semaphore(WORDS, 1, true)]);
             // The GPU thread applies nothing while the test holds the GPU side.
             let side = k.gpu_side.clone();
             let held = crate::lock(&side);
+            let job = hand_over(&mut k, 1, PUSHBUFFERS, &[semaphore(WORDS, 1, true)]);
             let running = std::thread::spawn(move || job.run());
             if sync {
                 std::thread::sleep(std::time::Duration::from_millis(100));
@@ -1763,20 +1881,21 @@ mod tests {
     }
 
     /// An acquire reads what a job before it released, still queued: its
-    /// read waits until that release is applied.
+    /// decoding waits until that release is applied, while the threads that
+    /// handed both jobs over go on.
     #[test]
     fn an_acquire_waits_for_a_release_of_the_job_before() {
         let mut k = play_kernel(true, false, false);
-        let first = hand_over(&mut k, 1, PUSHBUFFERS, &[semaphore(WORDS, 1, true)]);
-        let second = hand_over(&mut k, 1, PUSHBUFFERS + 0x100, &[[semaphore(WORDS, 1, false), semaphore(WORDS + 8, 2, true)].concat()]);
         let side = k.gpu_side.clone();
         let held = crate::lock(&side);
+        let first = hand_over(&mut k, 1, PUSHBUFFERS, &[semaphore(WORDS, 1, true)]);
+        let second = hand_over(&mut k, 1, PUSHBUFFERS + 0x100, &[[semaphore(WORDS, 1, false), semaphore(WORDS + 8, 2, true)].concat()]);
         assert!(matches!(first.run(), Ok(After::Nothing)), "returns with its ops queued");
-        let running = std::thread::spawn(move || second.run());
+        assert!(matches!(second.run(), Ok(After::Nothing)), "returns before its acquire is met");
         std::thread::sleep(std::time::Duration::from_millis(100));
-        assert!(!running.is_finished(), "its acquire waits for the release queued before it");
+        assert_eq!(k.gpu_progress.as_ref().map(|p| p.jobs().0), Some(0), "nothing applied");
+        assert_eq!(word(&k, WORDS + 8), 0);
         drop(held);
-        assert!(matches!(running.join().unwrap(), Ok(After::Nothing)));
         assert_eq!(k.drain_gpu(), None);
         assert_eq!(word(&k, WORDS + 8), 2);
         assert!(crate::lock(&k.decoder).waiting().is_empty());
@@ -1789,10 +1908,10 @@ mod tests {
     fn a_present_waits_for_the_present_before_it() {
         for sync in [false, true] {
             let mut k = play_kernel(true, false, sync);
-            let first = hand_present(&mut k, (!CHANNEL_SYNCPT, 0));
-            let second = hand_present(&mut k, (!CHANNEL_SYNCPT, 0));
             let side = k.gpu_side.clone();
             let held = crate::lock(&side);
+            let first = hand_present(&mut k, (!CHANNEL_SYNCPT, 0));
+            let second = hand_present(&mut k, (!CHANNEL_SYNCPT, 0));
             let first = std::thread::spawn(move || first.run());
             if sync {
                 std::thread::sleep(std::time::Duration::from_millis(100));
@@ -1812,15 +1931,78 @@ mod tests {
         }
     }
 
+    /// With the decoder thread, a guest thread that hands a job over never
+    /// waits for its decoding: a submit and the first present return while the
+    /// decoder is held, the second present waits until the first is done. With
+    /// --gpu-sync the handing thread decodes.
+    #[test]
+    fn a_hand_over_never_waits_for_the_decoder() {
+        for sync in [false, true] {
+            let mut k = play_kernel(true, false, sync);
+            let decoder = k.decoder.clone();
+            let held = crate::lock(&decoder);
+            let submit = hand_over(&mut k, 1, PUSHBUFFERS, &[semaphore(WORDS, 1, true)]);
+            let submit = std::thread::spawn(move || submit.run());
+            if sync {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                assert!(!submit.is_finished(), "--gpu-sync: the handing thread decodes");
+                drop(held);
+                assert!(matches!(submit.join().unwrap(), Ok(After::Nothing)));
+                continue;
+            }
+            assert!(finishes(&submit), "a submit returns undecoded");
+            let first = hand_present(&mut k, (!CHANNEL_SYNCPT, 0));
+            let second = hand_present(&mut k, (!CHANNEL_SYNCPT, 0));
+            let first = std::thread::spawn(move || first.run());
+            assert!(finishes(&first), "the first present returns undecoded");
+            let second = std::thread::spawn(move || second.run());
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(!second.is_finished(), "present 2 waits until present 1 is done");
+            drop(held);
+            assert!(matches!(submit.join().unwrap(), Ok(After::Nothing)));
+            assert!(matches!(first.join().unwrap(), Ok(After::Present { n: 1, .. })));
+            assert!(matches!(second.join().unwrap(), Ok(After::Present { n: 2, waited: Some(_), .. })));
+            assert_eq!(k.drain_gpu(), None);
+            assert_eq!(word(&k, WORDS), 1);
+        }
+    }
+
+    /// A panic on the decoder thread leaves its stop: the drain ends with it at
+    /// once, and the next hand-over returns it, instead of waiting for good.
+    #[test]
+    fn a_decoder_thread_panic_ends_the_waits() {
+        let mut k = play_kernel(true, false, false);
+        k.count("submits");
+        let phase = Phase { thread: PANIC_THREAD, submits: 1, ..Phase::default() };
+        k.decoding.as_ref().expect("the decoder thread").jobs.send((phase, GpuJob::Submit { fd: 1, space: 0, entries: Vec::new() }, None)).unwrap();
+        let since = Instant::now();
+        assert_eq!(k.drain_gpu(), Some(decoder_thread_ended()));
+        assert!(since.elapsed() < std::time::Duration::from_secs(2), "the drain did not wait GPU_WAIT");
+        let present = hand_present(&mut k, (!CHANNEL_SYNCPT, 0));
+        assert_eq!(present.run().err(), Some(decoder_thread_ended()));
+    }
+
+    /// The decoder thread ends with its kernel, and the GPU thread after it.
+    #[test]
+    fn the_decoder_thread_ends_with_its_kernel() {
+        let mut k = play_kernel(true, false, false);
+        let job = hand_over(&mut k, 1, PUSHBUFFERS, &[semaphore(WORDS, 1, true)]);
+        assert!(matches!(job.run(), Ok(After::Nothing)));
+        assert_eq!(k.drain_gpu(), None);
+        let progress = k.gpu_progress.clone().expect("the GPU thread");
+        drop(k);
+        assert_eq!(progress.drain(u64::MAX, std::time::Duration::from_secs(5)).0, Some(gpu_thread_ended()));
+    }
+
     /// A present's acquire fence is checked once its frame's ops are applied:
     /// NVN's increment, queued in a submit before it, counts.
     #[test]
     fn the_present_fence_is_checked_after_the_frames_ops() {
         let mut k = play_kernel(true, true, false);
-        let submit = hand_over(&mut k, 1, PUSHBUFFERS, &[semaphore(0, 1, true)]);
-        let present = hand_present(&mut k, (!CHANNEL_SYNCPT, 1));
         let side = k.gpu_side.clone();
         let held = crate::lock(&side);
+        let submit = hand_over(&mut k, 1, PUSHBUFFERS, &[semaphore(0, 1, true)]);
+        let present = hand_present(&mut k, (!CHANNEL_SYNCPT, 1));
         assert!(matches!(submit.run(), Ok(After::Nothing)));
         assert!(matches!(present.run(), Ok(After::Present { n: 1, .. })));
         assert_eq!(syncpoint(&k), 0, "nothing applied yet");
@@ -1835,10 +2017,10 @@ mod tests {
     #[test]
     fn a_gpu_thread_stop_reaches_the_next_job() {
         let mut k = play_kernel(true, false, false);
-        // SEMAPHORED with an operation no one implements: an ignored method.
-        let first = hand_over(&mut k, 1, PUSHBUFFERS, &[vec![header(1, 1, 0, 0x1c), 0x10], semaphore(WORDS + 8, 2, true)]);
         let side = k.gpu_side.clone();
         let held = crate::lock(&side);
+        // SEMAPHORED with an operation no one implements: an ignored method.
+        let first = hand_over(&mut k, 1, PUSHBUFFERS, &[vec![header(1, 1, 0, 0x1c), 0x10], semaphore(WORDS + 8, 2, true)]);
         assert!(matches!(first.run(), Ok(After::Nothing)), "returns before the GPU thread meets the anomaly");
         drop(held);
         let stop = k.drain_gpu().expect("the GPU thread's stop");
@@ -1854,15 +2036,15 @@ mod tests {
     #[test]
     fn an_acquire_waits_for_the_ops_sent_before_it() {
         let segments = [semaphore(WORDS, 1, true), [semaphore(WORDS, 1, false), semaphore(WORDS + 8, 2, true)].concat()];
-        let (mut k, job) = play_submit(true, false, &segments);
+        let mut k = play_kernel(true, false, false);
         // The GPU thread cannot apply anything while the test holds the GPU side.
         let side = k.gpu_side.clone();
         let held = crate::lock(&side);
-        let running = std::thread::spawn(move || job.run());
+        let job = hand_over(&mut k, 1, PUSHBUFFERS, &segments);
+        assert!(matches!(job.run(), Ok(After::Nothing)), "the handing thread goes on");
         std::thread::sleep(std::time::Duration::from_millis(100));
-        assert!(!running.is_finished());
+        assert_eq!(word(&k, WORDS + 8), 0);
         drop(held);
-        assert!(matches!(running.join().unwrap(), Ok(After::Nothing)));
         assert_eq!(k.drain_gpu(), None);
         assert_eq!(word(&k, WORDS + 8), 2, "the acquire was met: the release after it ran");
         assert!(crate::lock(&k.decoder).waiting().is_empty());
@@ -1888,39 +2070,63 @@ mod tests {
         assert!(since.elapsed() < std::time::Duration::from_secs(1));
     }
 
-    /// The drain waits for every job handed over, even one whose ops are not
-    /// sent yet: here the submit runs 100 ms after the drain starts.
+    /// The drain waits for every job handed over, even one not decoded yet:
+    /// here the decoder lock is held for 100 ms from before the hand-over.
     #[test]
-    fn a_drain_waits_for_a_job_handed_over_but_not_yet_run() {
-        let (mut k, job) = play_submit(true, false, &[semaphore(WORDS, 1, true)]);
+    fn a_drain_waits_for_a_job_handed_over_but_not_yet_decoded() {
+        let mut k = play_kernel(true, false, false);
+        let decoder = k.decoder.clone();
         let since = Instant::now();
-        let running = std::thread::spawn(move || {
+        let (taken, wait) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _held = crate::lock(&decoder);
+            let _ = taken.send(());
             std::thread::sleep(std::time::Duration::from_millis(100));
-            job.run()
         });
+        let _ = wait.recv();
+        let job = hand_over(&mut k, 1, PUSHBUFFERS, &[semaphore(WORDS, 1, true)]);
+        assert!(matches!(job.run(), Ok(After::Nothing)));
         assert_eq!(k.drain_gpu(), None);
         assert!(since.elapsed() >= std::time::Duration::from_millis(100));
         assert_eq!(word(&k, WORDS), 1);
-        assert!(matches!(running.join().unwrap(), Ok(After::Nothing)));
+        holder.join().unwrap();
     }
 
-    /// A submit that a decode stop ends still ends its job: the drain does
-    /// not wait GPU_WAIT for it, and the ops sent before the stop are applied.
+    /// A decode stop rides in its job's `End`, after the ops sent before it:
+    /// the release before the unreadable entry is applied, the stop names that
+    /// `End`, the drain and the next hand-over return it, and the job after it
+    /// is ended undecoded.
     #[test]
     fn a_decode_stop_still_ends_its_job() {
         let mut k = play_kernel(true, false, false);
         let words = semaphore(WORDS, 1, true);
         k.mem.write(PUSHBUFFERS, &words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
-        // The second entry's pushbuffer is not mapped.
-        let entries = [PUSHBUFFERS | (words.len() as u64) << 42, 0x7000_0000 | 4 << 42].iter().flat_map(|e| e.to_le_bytes()).collect();
-        k.count("submits");
-        k.gpu_work(GpuJob::Submit { fd: 1, space: 0, entries });
-        let done = k.deferred.take().expect("a deferred job").run();
-        assert!(matches!(done, Err((crate::STOP_EXIT, line)) if line.contains("gpfifo unreadable")));
+        let side = k.gpu_side.clone();
+        let held = crate::lock(&side);
+        // Job 1: the release, then an entry whose pushbuffer is not mapped; job 2: another such entry.
+        let unmapped = (0x7000_0000u64 | 4 << 42).to_le_bytes();
+        for entries in [[(PUSHBUFFERS | (words.len() as u64) << 42).to_le_bytes(), unmapped].concat(), unmapped.to_vec()] {
+            k.count("submits");
+            k.gpu_work(GpuJob::Submit { fd: 1, space: 0, entries });
+            assert!(matches!(k.deferred.take().expect("a deferred job").run(), Ok(After::Nothing)), "returns before its stop is applied");
+        }
+        // The decoder is done with both jobs: Begin, Effects, End (the stop), End.
+        let sent = || crate::lock(&k.decoder).gpu.as_ref().map_or(0, |t| t.sent);
         let since = Instant::now();
-        assert_eq!(k.drain_gpu(), None);
-        assert!(since.elapsed() < std::time::Duration::from_secs(1));
-        assert_eq!(word(&k, WORDS), 1);
+        while sent() < 4 && since.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // Time to decode job 2 if it were decoded.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(sent(), 4);
+        drop(held);
+        let stop = k.drain_gpu().expect("the decoder's stop");
+        assert!(stop.1.contains("gpfifo unreadable") && stop.1.contains("(GPU op 2,"), "{stop:?}");
+        assert_eq!(word(&k, WORDS), 1, "the release before the stop is applied");
+        assert_eq!(k.tally().anomalies.get("gpfifo unreadable").copied(), Some(1), "job 2 is not decoded");
+        assert_eq!(k.gpu_progress.as_ref().and_then(|p| p.stopped()).as_ref(), Some(&stop));
+        let next = hand_over(&mut k, 1, PUSHBUFFERS + 0x100, &[semaphore(WORDS, 1, true)]);
+        assert_eq!(next.run().err(), Some(stop));
     }
 
     /// A GPU write into a pushbuffer decoded before the write was applied
@@ -1931,10 +2137,11 @@ mod tests {
         let second = PUSHBUFFERS + 5 * 4;
         let segments = [semaphore(second + 3 * 4, 7, true), semaphore(WORDS + 8, 2, true)];
         for threaded in [false, true] {
-            let (mut k, job) = play_submit(threaded, true, &segments);
+            let mut k = play_kernel(threaded, true, false);
             // The GPU thread applies nothing before the second pushbuffer is read.
             let side = k.gpu_side.clone();
             let held = threaded.then(|| crate::lock(&side));
+            let job = hand_over(&mut k, 1, PUSHBUFFERS, &segments);
             let running = std::thread::spawn(move || job.run());
             std::thread::sleep(std::time::Duration::from_millis(100));
             drop(held);
@@ -2001,12 +2208,14 @@ mod tests {
             assert!(matches!(first.run(), Ok(After::Nothing)));
             let second = hand_over(&mut k, 2, PUSHBUFFERS + 0x100, &[[semaphore(w2, 1, false), semaphore(w3, 1, true)].concat()]);
             assert!(matches!(second.run(), Ok(After::Nothing)));
+            // Decoded (by the decoder thread, when there is one): both channels wait.
+            assert_eq!(k.drain_gpu(), None);
             assert_eq!(crate::lock(&k.decoder).waiting(), [1, 2]);
             k.mem.write(w1, &1u32.to_le_bytes()).unwrap();
-            let present = hand_present(&mut k, (!CHANNEL_SYNCPT, 0));
             // The GPU thread applies nothing for 100 ms.
             let side = k.gpu_side.clone();
             let held = threaded.then(|| crate::lock(&side));
+            let present = hand_present(&mut k, (!CHANNEL_SYNCPT, 0));
             let running = std::thread::spawn(move || present.run());
             std::thread::sleep(std::time::Duration::from_millis(100));
             drop(held);
@@ -2069,14 +2278,19 @@ mod tests {
         Gs::GpuMemory.request(&mut k, &tipc(213, &unmap(3))).unwrap();
         assert!(k.events[e].signaled && k.gs.armed.is_empty());
 
-        let (mut k, job) = play_submit(true, false, &[semaphore(WORDS, 1, true)]);
+        let mut k = play_kernel(true, false, false);
         Gs::Gpu.request(&mut k, &tipc(12, &3u32.to_le_bytes())).unwrap();
         let e = k.gs.gpu_events[3].unwrap();
         // Signaled, as the earlier calls on this id leave it.
         Gs::Gpu.request(&mut k, &tipc(21, &3u32.to_le_bytes())).unwrap();
+        // The decoder thread decodes nothing while the test holds it.
+        let decoder = k.decoder.clone();
+        let held = crate::lock(&decoder);
+        let job = hand_over(&mut k, 1, PUSHBUFFERS, &[semaphore(WORDS, 1, true)]);
         Gs::GpuMemory.request(&mut k, &tipc(213, &unmap(3))).unwrap();
         assert!(!k.events[e].signaled, "the submit handed over before the unmap is not applied yet");
         assert!(matches!(job.run(), Ok(After::Nothing)));
+        drop(held);
         assert!(woken(), "the GPU thread wakes the boot thread once the submit is done");
         k.check_gpu_waits();
         assert!(k.events[e].signaled && k.gs.armed.is_empty());
@@ -2087,10 +2301,12 @@ mod tests {
         assert!(k.events[e].signaled);
         assert_eq!(k.tally().counts.get("gpu waits armed").copied(), Some(1));
         // A present handed over before: its resumed channels may read through the old mapping too.
+        let held = crate::lock(&decoder);
         let present = hand_present(&mut k, (!CHANNEL_SYNCPT, 0));
         Gs::GpuMemory.request(&mut k, &tipc(102, &destroy)).unwrap();
         assert!(!k.events[e].signaled, "the present handed over before the destroy is not applied yet");
         assert!(matches!(present.run(), Ok(After::Present { n: 1, .. })));
+        drop(held);
         assert!(woken(), "the GPU thread wakes the boot thread once the present is done");
         k.check_gpu_waits();
         assert!(k.events[e].signaled && k.gs.armed.is_empty());
@@ -2146,7 +2362,11 @@ mod tests {
     fn an_overdue_syncpoint_wait_is_raised_once_the_gpu_thread_is_idle() {
         use crate::gs::Gs;
         const S: u64 = 31_250_000;
-        let (mut k, job) = play_submit(true, true, &[semaphore(WORDS, 1, true)]);
+        let mut k = play_kernel(true, true, false);
+        // The decoder thread decodes nothing while the test holds it: the jobs stay queued.
+        let decoder = k.decoder.clone();
+        let held = crate::lock(&decoder);
+        let job = hand_over(&mut k, 1, PUSHBUFFERS, &[semaphore(WORDS, 1, true)]);
         Gs::Syncpt.request(&mut k, &tipc(22, &0u32.to_le_bytes())).unwrap();
         let e = k.gs.syncpt_waits[0].unwrap();
         Gs::Syncpt.request(&mut k, &tipc(201, &arm_wait(0, 5))).unwrap();
@@ -2154,11 +2374,14 @@ mod tests {
         k.check_gpu_waits();
         assert!(!k.events[e].signaled && syncpoint(&k) == 0, "not while a submit is queued");
         assert!(matches!(job.run(), Ok(After::Nothing)));
+        drop(held);
         assert_eq!(k.drain_gpu(), None);
+        let held = crate::lock(&decoder);
         let present = hand_present(&mut k, (!CHANNEL_SYNCPT, 0));
         k.check_gpu_waits();
         assert!(!k.events[e].signaled && syncpoint(&k) == 0, "not while a present is queued");
         assert!(matches!(present.run(), Ok(After::Present { n: 1, .. })));
+        drop(held);
         assert_eq!(k.drain_gpu(), None);
         k.check_gpu_waits();
         assert!(k.events[e].signaled && k.gs.armed.is_empty());
