@@ -436,9 +436,7 @@ impl GpuSide {
             }
             GpuOp::Acquired => {
                 crate::lock(&self.tally).count("acquires after the take");
-                if let Some(s) = self.surfaces.as_mut() {
-                    s.kept_unsure();
-                }
+                retake_kept(self);
                 Ok(())
             }
             GpuOp::Effects { space, effects, read } => self.check_read(read).and_then(|()| {
@@ -1295,6 +1293,17 @@ fn forget_written_textures(k: &mut GpuSide, space: u32) {
     pages.dedup();
     s.kept_taken(crate::gs::foreign(&k.at.maps), &changed, &pages);
     rewritten(k, written);
+}
+
+/// An acquire was met after the submit's take (`GpuOp::Acquired`): what the
+/// CPU wrote before releasing it may lie under the kept reads, which are taken
+/// again, alone (their pages owed as at a submit's take). The textures wait for
+/// the next submit's take, as before.
+fn retake_kept(k: &mut GpuSide) {
+    let Some(s) = k.surfaces.as_mut() else { return };
+    let (_, taken, watched) = written_textures(&k.mem, &members(Vec::new(), s.kept_ranges()), &mut k.owed);
+    k.watched += watched;
+    s.kept_rewritten(&taken);
 }
 
 /// Drops the textures (GPU start, GPU end) the CPU wrote.

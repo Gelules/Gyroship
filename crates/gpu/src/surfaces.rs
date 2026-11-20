@@ -802,7 +802,7 @@ pub struct Staging {
     /// Draws whose pipeline was looked up, then those whose key was the last draw's.
     pub pipeline_repeats: [u64; 2],
     /// Reads served from those kept across submits ([`Kept`]) and their bytes,
-    /// reads kept, and acquires met after a take (no read kept until the next submit).
+    /// reads kept, and acquires met after a take (the kept ranges taken again).
     pub kept: [u64; 4],
     /// Textures uploaded from guest memory: bytes, and host nanoseconds (read,
     /// deswizzle, copy, and the wait after a large one).
@@ -993,10 +993,10 @@ pub(crate) type KeptKey = (u64, usize, usize, Option<u32>);
 /// are read again every frame, unchanged. An entry holds while its pages go
 /// unwritten: the HLE's write-watch take before each submit reports the pages
 /// written since the one before (`Surfaces::kept_taken`), the memo's pages
-/// those the GPU writes in the job. Used and made only while `live`: in a job
-/// that began with a take (`Surfaces::new_submit`), until an acquire is met
-/// after the take (`Surfaces::kept_unsure`); and only where a GPU address is
-/// its CPU address, which the take watches.
+/// those the GPU writes in the job; an acquire met after the take has their
+/// ranges taken again (`Surfaces::kept_rewritten`). Used and made only while
+/// `live`, in a job that began with a take (`Surfaces::new_submit`), and only
+/// where a GPU address is its CPU address, which the take watches.
 #[derive(Default)]
 pub(crate) struct Kept {
     /// The bytes as staged, their highest index, the memo epoch they were read
@@ -1494,13 +1494,16 @@ impl Surfaces {
         self.kept.written(written, self.present);
     }
 
-    /// An acquire was met after this job's take: the CPU may have written
-    /// under the reads before releasing it. This job's are forgotten (the
-    /// memo, as at a new submit), and no kept one is used or made until the
-    /// next submit.
-    pub fn kept_unsure(&mut self) {
-        self.memo.clear();
-        self.kept.live = false;
+    /// An acquire was met after this job's take (the CPU may have written
+    /// under the kept reads before releasing it), and their ranges were taken
+    /// again: those on `written` pages (sorted guest page addresses, written
+    /// since) drop, counted against them, and this job's reads of those pages
+    /// are read again, as after a GPU write.
+    pub fn kept_rewritten(&mut self, written: &[u64]) {
+        self.kept.written(written, self.present);
+        for &page in written {
+            self.memo.wrote(page, 0x1000);
+        }
         self.staging.kept[3] += 1;
     }
 
@@ -2783,9 +2786,10 @@ mod tests {
 
     /// Vertices kept from one submit to the next are not read again: a new
     /// block each submit, with the same bytes. They are read again after a GPU
-    /// write in the job (across a flush too), a mark, a page found written, a
-    /// changed range, in a job without a take or after an acquire, and where
-    /// their GPU addresses are mapped elsewhere; another length is its own read.
+    /// write in the job (across a flush too), a mark, a page found written (at
+    /// a submit, or taken again after an acquire, this job's reads too), a
+    /// changed range, in a job without a take, and where their GPU addresses
+    /// are mapped elsewhere; another length is its own read.
     #[test]
     fn kept_vertices_are_read_again_once_they_may_have_changed() {
         let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
@@ -2828,11 +2832,19 @@ mod tests {
         s.new_submit(false);
         assert_eq!(read(&mut s, 16), 1, "a job without a take");
         s.new_submit(true);
-        assert_eq!(read(&mut s, 16), 0, "kept");
-        s.kept_unsure();
-        assert_eq!(read(&mut s, 16), 1, "an acquire after the take: this job's reads too");
-        s.new_submit(true);
         assert_eq!(read(&mut s, 16), 0, "neither replaced the entry");
+        s.kept_rewritten(&[]);
+        assert_eq!(read(&mut s, 16), 0, "an acquire after the take, nothing written since: kept");
+        // Presents apart, so that the writes below are no refusal.
+        s.present = 2 * STRIKES;
+        s.kept_rewritten(&[0x1000]);
+        s.new_submit(true);
+        assert_eq!(read(&mut s, 16), 1, "written before an acquire: dropped");
+        s.present = 4 * STRIKES;
+        s.kept_rewritten(&[0x1000]);
+        assert_eq!(read(&mut s, 16), 1, "and this job's read of it read again");
+        s.new_submit(true);
+        assert_eq!(read(&mut s, 16), 0, "kept again");
         s.new_submit(true);
         assert_eq!(read(&mut s, 6), 1);
         s.new_submit(true);
@@ -2844,7 +2856,7 @@ mod tests {
         s.new_submit(true);
         assert_eq!(read(&mut s, 16), 1, "none was kept");
         // Hits, their bytes, reads kept, acquires.
-        assert_eq!(s.staging.kept, [4, 64, 8, 1]);
+        assert_eq!(s.staging.kept, [4, 64, 10, 3]);
     }
 
     /// Vertices read exactly, then staged as they are: the guest's bytes then
