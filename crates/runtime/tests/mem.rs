@@ -23,6 +23,32 @@ fn walk(m: &Memory) -> Vec<Info> {
     }
 }
 
+/// The access checks follow every change of the block table though a thread
+/// remembers the blocks it found: after protect, unmap, map and map_move, and
+/// between two memories that map the same address differently.
+#[test]
+fn access_checks_follow_every_change_of_the_table() {
+    let (m, other) = (Memory::new().unwrap(), Memory::new().unwrap());
+    m.map(HEAP, 0x4000, Block::new(state::NORMAL, perm::RW)).unwrap();
+    let mut b = [7u8; 4];
+    // Found and remembered: one block of four pages.
+    assert!(m.read(HEAP + 0x1000, &mut b).is_ok());
+    assert!(other.read(HEAP + 0x1000, &mut b).is_err(), "not mapped in the other memory");
+    assert!(m.write(HEAP + 0x1000, &b).is_ok());
+    m.protect(HEAP + 0x1000, 0x1000, perm::R).unwrap();
+    assert!(m.write(HEAP + 0x1000, &b).is_err(), "protected");
+    assert!(m.read(HEAP + 0x1000, &mut b).is_ok() && m.write(HEAP + 0x2000, &b).is_ok());
+    m.unmap(HEAP + 0x1000, 0x1000).unwrap();
+    assert!(m.read(HEAP + 0x1000, &mut b).is_err(), "unmapped");
+    m.map(HEAP + 0x1000, 0x1000, Block::new(state::NORMAL, perm::RW)).unwrap();
+    assert!(m.write(HEAP + 0x1000, &b).is_ok(), "mapped again");
+    // Moved away: the source refuses, the destination takes it.
+    m.map_move(STACK, HEAP + 0x2000, 0x1000, state::NORMAL).unwrap();
+    assert!(m.read(STACK, &mut b).is_ok());
+    let moved = m.query(HEAP + 0x2000);
+    assert_eq!(m.write(HEAP + 0x2000, &b).is_ok(), moved.block.perm & perm::W != 0, "{moved:?}");
+}
+
 /// Several host threads check and copy while another one splits and merges
 /// the next page's block: every check sees whole blocks (the table lock), and
 /// `Memory` is Sync (the scoped threads share it).

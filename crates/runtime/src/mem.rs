@@ -154,6 +154,16 @@ unsafe impl Sync for Memory {}
 #[derive(Default)]
 struct Table(BTreeMap<u64, (u64, Block)>);
 
+/// Bumped at every change of a block table (under its write lock) and every new
+/// table: a block a thread found (`RECENT`) holds while the count stays.
+static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    /// The mapped blocks this thread's checks found last, as (table, generation,
+    /// start, end, block): most accesses land in the block of the one before.
+    static RECENT: std::cell::Cell<[Option<(usize, u64, u64, u64, Block)>; 4]> = const { std::cell::Cell::new([None; 4]) };
+}
+
 /// HLE copies run in chunks of this size, each checked and copied under the
 /// table's read lock: an unmap on another host thread (play mode) waits for one
 /// chunk at most, and a copy of 128 MiB never holds the lock throughout.
@@ -261,6 +271,8 @@ impl Memory {
             return Err(Error::Host(last_error()));
         }
         RESERVATION.store(base as usize, Ordering::Release);
+        // A new table may sit where a dropped one did: what threads found there goes.
+        GENERATION.fetch_add(1, Ordering::Relaxed);
         Ok(Memory { base, blocks: RwLock::default(), armed: OnceLock::new(), changed: Mutex::default() })
     }
 
@@ -314,8 +326,12 @@ impl Memory {
         self.blocks.read().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// The table to change: under the write lock, the blocks threads found go
+    /// (readers, under the read lock, see the count before or after the change).
     fn table_mut(&self) -> RwLockWriteGuard<'_, Table> {
-        self.blocks.write().unwrap_or_else(|e| e.into_inner())
+        let t = self.blocks.write().unwrap_or_else(|e| e.into_inner());
+        GENERATION.fetch_add(1, Ordering::Relaxed);
+        t
     }
 
     /// The pages of `[addr, addr + len)` written since they were last taken
@@ -672,11 +688,28 @@ impl Table {
         Info { base: start, size: end - start, block: Block::new(state::FREE, 0) }
     }
 
+    /// [`Table::query`] for the access checks (under the read lock), through the
+    /// blocks this thread found last.
+    fn found(&self, addr: u64) -> Info {
+        let (me, generation) = (std::ptr::from_ref(self) as usize, GENERATION.load(Ordering::Relaxed));
+        let mut recent = RECENT.get();
+        if let Some((_, _, base, end, block)) = recent.iter().flatten().find(|e| e.0 == me && e.1 == generation && (e.2..e.3).contains(&addr)) {
+            return Info { base: *base, size: end - base, block: *block };
+        }
+        let info = self.query(addr);
+        if info.block.state != state::FREE && info.base < SPACE {
+            recent.rotate_right(1);
+            recent[0] = Some((me, generation, info.base, info.base + info.size, info.block));
+            RECENT.set(recent);
+        }
+        info
+    }
+
     fn accessible(&self, addr: u64, len: u64, need: u32) -> Result<(), Error> {
         let end = addr.checked_add(len).filter(|&e| e <= SPACE).ok_or(Error::InvalidRange)?;
         let mut at = addr;
         while at < end {
-            let info = self.query(at);
+            let info = self.found(at);
             if info.block.state == state::FREE || info.block.perm & need != need {
                 return Err(Error::InvalidState);
             }
@@ -689,7 +722,7 @@ impl Table {
         let end = addr.checked_add(len).filter(|&e| e <= SPACE).ok_or(Error::InvalidRange)?;
         let mut at = addr;
         while at < end {
-            let info = self.query(at);
+            let info = self.found(at);
             if info.block.state == state::FREE || info.block.host_protection() != protection {
                 return Err(Error::InvalidState);
             }
