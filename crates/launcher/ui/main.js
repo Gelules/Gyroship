@@ -28,7 +28,7 @@ async function refreshBuilds() {
   // a new port, deleted) gives way to the first one found.
   const found = await invoke('list_builds', { settings });
   if (found.length && !found.includes(settings.build)) {
-    if (settings.build) notice(`The chosen build is gone (${settings.build}): ${found[0]} takes its place.`);
+    if (settings.build) notice(`Build not found (${settings.build}): using ${found[0]}.`);
     settings.build = found[0];
     await save();
   }
@@ -40,7 +40,7 @@ async function refreshLayers() {
   const found = await invoke('list_layers', { settings });
   // A layer chosen elsewhere (in the settings file, by hand) stays offered.
   if (settings.layer && !found.some(([path]) => path === settings.layer)) found.push([settings.layer, settings.layer]);
-  $('layers').replaceChildren(new Option("none: the game's own files", ''), ...found.map(([path, about]) => new Option(about, path, false, path === settings.layer)));
+  $('layers').replaceChildren(new Option('None', ''), ...found.map(([path, about]) => new Option(about, path, false, path === settings.layer)));
 }
 
 async function changed(field) {
@@ -67,7 +67,7 @@ async function lastSession() {
   const r = await invoke('last_session', { settings });
   // A session whose end was not recorded has no exit code and no duration to show.
   const end = r && r.ended ? [['Ended', `${r.outcome} (exit code ${r.code})`], ['Lasted', `${Math.floor(r.seconds / 60)} min ${r.seconds % 60} s`]] : [['Ended', r && r.outcome]];
-  const rows = r ? [['Session', r.session], ...end, ['Summary', r.summary || 'none in the journal'], ['Journals', r.folder]] : [['Session', 'none yet']];
+  const rows = r ? [['Session', r.session], ...end, ['Summary', r.summary || 'none'], ['Logs', r.folder]] : [['Session', 'none yet']];
   $('last').replaceChildren(...rows.flatMap(([k, v]) => [Object.assign(document.createElement('dt'), { textContent: k }), Object.assign(document.createElement('dd'), { textContent: v })]));
   $('messages').textContent = r ? r.messages || 'No message kept (the game ran in a console, or said nothing).' : '';
 }
@@ -100,6 +100,9 @@ async function main() {
   const [loaded, problem] = await invoke('get_settings');
   settings = loaded;
   notice(problem || window.__NOTICE__);
+  // A language code the list does not name (en-US, pt, ru..., or one written by hand) stays offered.
+  const language = document.querySelector('[data-key=language]');
+  if (settings.language && ![...language.options].some((o) => o.value === settings.language)) language.add(new Option(settings.language, settings.language));
   show();
   // A text field is saved as it is typed: closing the window right after loses nothing.
   for (const f of fields) f.addEventListener(f.matches('select, [type=checkbox]') ? 'change' : 'input', () => changed(f));

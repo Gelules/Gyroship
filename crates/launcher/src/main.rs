@@ -102,7 +102,7 @@ fn last_session(settings: Settings) -> Option<Report> {
 fn open_logs(settings: Settings) -> Result<(), String> {
     let folder = std::path::absolute(journals(&settings)?).map_err(|e| e.to_string())?;
     if !folder.is_dir() {
-        return Err(format!("{} does not exist yet: it comes with the first game", folder.display()));
+        return Err(format!("{} does not exist yet: play a game first", folder.display()));
     }
     Command::new("explorer.exe").arg(folder).spawn().map(drop).map_err(|e| e.to_string())
 }
@@ -254,7 +254,7 @@ fn main() {
         use std::os::windows::fs::OpenOptionsExt;
         match std::fs::OpenOptions::new().write(true).create(true).truncate(false).share_mode(0).open(folder().join("launcher.lock")) {
             // 32: a sharing violation, the other launcher holds the file.
-            Err(e) if e.raw_os_error() == Some(32) => return say("The launcher is already running: use its window, or close it first.\n\nWhile a game it started runs, it has no window: it comes back when the game ends."),
+            Err(e) if e.raw_os_error() == Some(32) => return say("The launcher is already running: use its window, or close it first.\n\nDuring a game it has no window: it comes back when the game ends."),
             lock => lock.ok(),
         }
     };
@@ -277,7 +277,7 @@ fn main() {
                 && window.state::<Busy>().0.load(Relaxed)
             {
                 api.prevent_close();
-                let _ = window.emit("notice", "A setup step is running: the window can close when it ends.");
+                let _ = window.emit("notice", "A setup step is running: close the window once it ends.");
             }
         })
         .invoke_handler(tauri::generate_handler![get_settings, set_settings, list_builds, list_layers, last_session, open_logs, play, run_step])

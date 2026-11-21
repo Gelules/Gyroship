@@ -16,32 +16,43 @@
 <section id="play">
   <h2>Game</h2>
   <label>Build <select data-key="build" id="builds"></select></label>
-  <label>Dump's exefs folder <input data-key="exefs" placeholder="the exefs folder of your dump, with its romfs folder next to it"></label>
+  <label>Dump's exefs folder <input data-key="exefs" placeholder="its romfs folder must be next to it"></label>
   <label>Save folder <input data-key="save" placeholder="empty: nothing is kept between sessions"></label>
-  <label>The game plays on <select data-key="save_mode">
-    <option value="">this save folder, which it writes</option>
-    <option value="copy">a copy of it, made again at each start (the folder itself is never written)</option>
-    <option value="new">a new, empty save at each start (the game begins with its tutorial)</option>
+  <label>Play on <select data-key="save_mode">
+    <option value="">the save folder itself</option>
+    <option value="copy">a fresh copy at each start (folder untouched)</option>
+    <option value="new">a new save at each start (tutorial first)</option>
   </select></label>
   <label>Shader cache folder <input data-key="cache" placeholder="empty: every session compiles its shaders again"></label>
+  <!-- One entry per text region of the game; the value is the console language code given to
+       --language (the empty one: the game's default, en-US). -->
   <label>Language <select data-key="language">
-    <option value="">the game's default (US English)</option>
-    <option>ja</option><option>en-US</option><option>fr</option><option>de</option><option>it</option>
-    <option>es</option><option>zh-CN</option><option>ko</option><option>nl</option><option>pt</option>
-    <option>ru</option><option>zh-TW</option><option>en-GB</option><option>fr-CA</option><option>es-419</option>
-    <option>zh-Hans</option><option>zh-Hant</option><option>pt-BR</option><option>pl</option><option>th</option>
+    <option value="zh-CN">Chinese (Simplified)</option>
+    <option value="zh-TW">Chinese (Traditional)</option>
+    <option value="nl">Dutch</option>
+    <option value="en-GB">English (UK)</option>
+    <option value="">English (US)</option>
+    <option value="fr-CA">French (Canada)</option>
+    <option value="fr">French (France)</option>
+    <option value="de">German</option>
+    <option value="it">Italian</option>
+    <option value="ja">Japanese</option>
+    <option value="ko">Korean</option>
+    <option value="pt-BR">Portuguese (Brazil)</option>
+    <option value="es-419">Spanish (Latin America)</option>
+    <option value="es">Spanish (Spain)</option>
   </select></label>
   <div class="checks">
     <label><input type="checkbox" data-key="fullscreen"> Fullscreen</label>
     <label><input type="checkbox" data-key="joycon"> Switch 2 Joy-Con (hold each one's sync button at start)</label>
-    <label><input type="checkbox" data-key="joycon_mouse"> The Joy-Con's mice too, for the game's mouse mode (connects the Joy-Con by itself)</label>
+    <label><input type="checkbox" data-key="joycon_mouse"> Switch 2 Joy-Con with mouse mode</label>
     <label><input type="checkbox" data-key="record"> Record the inputs</label>
-    <label><input type="checkbox" data-key="console"> Show the game's messages in a console (they say when each Joy-Con is connected)</label>
+    <label><input type="checkbox" data-key="console"> Show the game's messages in a console (says when each Joy-Con connects)</label>
   </div>
   <label>SDL3 library <input data-key="sdl" placeholder="empty: SDL3.dll next to the build"></label>
 
   <h2>Practice</h2>
-  <label>Practice file <input data-key="practice" placeholder="empty: no practice tool; the boost mode and the markers below are then left out"></label>
+  <label>Practice file <input data-key="practice" placeholder="empty: the two options below do nothing"></label>
   <label>Boost <select data-key="boost">
     <option value="">as in the game</option>
     <option value="perfect">perfect release</option>
@@ -50,9 +61,9 @@
   <div class="checks">
     <label><input type="checkbox" data-key="hud"> Speed, frame rate and release markers on screen</label>
   </div>
-  <label>Replacement files <select data-key="layer" id="layers"></select></label>
-  <p class="hint">The layers of the data folder's practice folder, one at a time: a forced vehicle, the store demo's lines in the main menu, the tutorial from its mouse question.</p>
-  <label>Hooks file <input data-key="hooks" placeholder="empty: the game's own functions"></label>
+  <label>Mod <select data-key="layer" id="layers"></select></label>
+  <p class="hint">The folders named layer… in the data folder's practice folder.</p>
+  <label>Hooks file <input data-key="hooks" placeholder="empty: debug menu locked; QUIT GAME in the title menu does nothing"></label>
 
   <p><button id="go" class="main">Play</button> <span id="state"></span></p>
   <p class="hint">The window closes while the game runs and comes back when it ends.</p>
@@ -61,17 +72,17 @@
 <section id="setup" hidden>
   <h2>Folders</h2>
   <label>Repository <input data-key="repo" placeholder="where Gyroship's sources and tools are"></label>
-  <label>Data folder <input data-key="data" placeholder="where builds (bin) and journals (logs) are kept"></label>
-  <p><button id="usual">Fill the empty fields from these two</button></p>
+  <label>Data folder <input data-key="data" placeholder="where builds (bin) and logs are kept"></label>
+  <p><button id="usual">Fill in the save and cache folders</button></p>
 
   <h2>Porting the game</h2>
-  <p class="hint">From the exefs folder set in the Play tab to the generated build.</p>
-  <label>Probe list <input data-key="probes" placeholder="empty: no practice probe in the port"></label>
+  <p class="hint">Uses the exefs folder set in the Play tab.</p>
+  <label>Probe list <input data-key="probes" placeholder="empty: the build cannot use a practice file"></label>
   <p>
     <button data-step="recompile">1. Recompile the game</button>
     <button data-step="build">2. Build it</button>
   </p>
-  <p class="hint">One step at a time, never during a game: each takes minutes and gigabytes of memory. The build fetches nothing: a missing crate is an error.</p>
+  <p class="hint">Each step takes minutes and gigabytes of memory. The build downloads nothing: build the tools first.</p>
   <pre id="output"></pre>
 </section>
 
@@ -79,7 +90,7 @@
   <h2>Last session</h2>
   <dl id="last"></dl>
   <pre id="messages"></pre>
-  <p><button id="folder">Open the journals' folder</button></p>
+  <p><button id="folder">Open the logs folder</button></p>
 </section>
 
 <script src="main.js"></script>

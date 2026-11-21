@@ -67,8 +67,8 @@ pub fn load(file: &Path) -> (Settings, Option<String>) {
         }
         Err(e) => {
             let bad = PathBuf::from(format!("{}.bad", file.display()));
-            let kept = if fs::copy(file, &bad).is_ok() { format!("kept as {}", bad.display()) } else { "which could not be kept aside".into() };
-            (Settings::default(), Some(format!("{} does not parse ({e}): {kept}, the defaults are used", file.display())))
+            let kept = if fs::copy(file, &bad).is_ok() { format!("kept as {}", bad.display()) } else { "not kept aside".into() };
+            (Settings::default(), Some(format!("{} is invalid ({e}): {kept}, the defaults are used", file.display())))
         }
     }
 }
@@ -201,7 +201,7 @@ pub fn prepare_save(s: &Settings) -> Result<String, String> {
             pairs.push((lower(save), lower(data.join(name))));
         }
         if pairs.iter().any(|(save, fresh)| save.starts_with(fresh) || fresh.starts_with(save)) {
-            return Err(format!("the save folder {} is where the launcher makes its {name} folder: choose another save folder", s.save));
+            return Err(format!("the save folder {} overlaps the launcher's {name} folder: choose another save folder", s.save));
         }
     }
     match fs::remove_dir_all(&to) {
@@ -232,16 +232,16 @@ fn copy_folder(from: &Path, to: &Path) -> std::io::Result<()> {
 /// The code recorded when a game starts, until its end replaces it.
 pub const RUNNING: i32 = i32::MIN;
 
-/// What the game's exit code means.
+/// What the game's exit code means, shown after "Ended".
 pub fn outcome(code: i32) -> &'static str {
     match code {
-        RUNNING => "its end was not recorded: the launcher stopped before the game did",
-        0 => "the game ended normally",
-        2 => "a bad command line, or a start that could not go on: see the messages",
+        RUNNING => "not recorded (the launcher stopped first)",
+        0 => "normally",
+        2 => "bad command line or failed start: see the messages",
         3 => "this GPU cannot run the game: see the messages",
         71 => "a fault in the recompiled game",
-        72 => "the emulation stopped the run (the game aborted, or something it asked for failed): see the messages",
-        _ => "an unexpected end",
+        72 => "the emulation stopped the game: see the messages",
+        _ => "unexpectedly",
     }
 }
 
