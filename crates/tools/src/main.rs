@@ -531,7 +531,8 @@ fn functions(path: &Path, compare: Option<&Path>) -> Result<()> {
 fn nso_info(path: &Path, symbols: bool) -> Result<()> {
     let m = Module::parse_nso(&std::fs::read(path)?)?;
     println!("module      {}", path.display());
-    println!("build id    {}", m.build_id.iter().map(|b| format!("{b:02x}")).collect::<String>());
+    // The module ID's first 0x14 bytes are the build ID (D6); the rest is zero.
+    println!("build id    {}", m.build_id[..20].iter().map(|b| format!("{b:02x}")).collect::<String>());
     println!("flags       {:#x} (compressed {:03b}, hashed {:03b})", m.flags, m.flags & 7, (m.flags >> 3) & 7);
     for (name, s) in [("text", m.text), ("ro", m.ro), ("data", m.data)] {
         println!("{name:<11} {:#010x}..{:#010x}  {} bytes", s.addr, s.end(), s.size);

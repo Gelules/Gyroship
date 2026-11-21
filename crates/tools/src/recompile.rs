@@ -8,7 +8,7 @@
 //! indirect jump to one runs the real code, which reads its GOT slot. A slot
 //! that rtld binds lazily points at PLT0 until then.
 
-use crate::experiment::{crate_path, plain, runtime_path, vendor_path};
+use crate::experiment::{crate_path, plain, repository, runtime_path, vendor_path};
 use gyroship_analysis::{cfg, decode, discover};
 use gyroship_recomp::ir::Op;
 use gyroship_recomp::{Callee, Input, clif, lift};
@@ -27,6 +27,8 @@ struct Part {
 }
 
 pub fn run(exefs: &Path, out: &Path, threads: usize, verify: bool, probes: Option<&Path>) -> super::Result<()> {
+    // The repository first: a misplaced executable fails before minutes of work.
+    let (naga, runtime, game, lock) = (vendor_path("naga")?, runtime_path()?, crate_path("gyroship")?, repository()?.join("Cargo.lock"));
     let p = super::load(exefs)?;
     let d = discover::discover(&p)?;
     let probes = match probes {
@@ -157,17 +159,15 @@ pub fn run(exefs: &Path, out: &Path, threads: usize, verify: bool, probes: Optio
     // repository's patched naga, as in its own workspace.
     std::fs::write(
         out.join("Cargo.toml"),
-        format!(
-            "[workspace]\nresolver = \"3\"\nmembers = [\"harness\"]\n\n[profile.release]\ndebug = \"line-tables-only\"\nincremental = false\n\n[patch.crates-io]\nnaga = {{ path = \"{}\" }}\n",
-            vendor_path("naga")
-        ),
+        format!("[workspace]\nresolver = \"3\"\nmembers = [\"harness\"]\n\n[profile.release]\ndebug = \"line-tables-only\"\nincremental = false\n\n[patch.crates-io]\nnaga = {{ path = \"{naga}\" }}\n"),
     )?;
+    // The repository's lock, at each port: the game builds with the crate versions its replays
+    // checked, not the newest ones (Cargo adds `harness` to it).
+    std::fs::copy(&lock, out.join("Cargo.lock"))?;
     std::fs::write(
         out.join("harness/Cargo.toml"),
         format!(
-            "[package]\nname = \"harness\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n[[bin]]\nname = \"gyroship\"\npath = \"src/main.rs\"\n\n[dependencies]\ngyroship-runtime = {{ path = \"{}\" }}\ngyroship = {{ path = \"{}\" }}\n",
-            runtime_path(),
-            crate_path("gyroship")
+            "[package]\nname = \"harness\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n[[bin]]\nname = \"gyroship\"\npath = \"src/main.rs\"\n\n[dependencies]\ngyroship-runtime = {{ path = \"{runtime}\" }}\ngyroship = {{ path = \"{game}\" }}\n"
         ),
     )?;
     std::fs::write(out.join("harness/build.rs"), build)?;

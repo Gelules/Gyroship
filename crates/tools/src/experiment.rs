@@ -8,7 +8,7 @@ use gyroship_recomp::ir::Op;
 use gyroship_recomp::{Callee, Input, lift, rust};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub struct Sample<'a> {
     pub program: &'a Program,
@@ -131,21 +131,32 @@ pub fn plain(p: &Path) -> String {
     p.display().to_string().replace('\\', "/").trim_start_matches("//?/").to_string()
 }
 
-pub fn runtime_path() -> String {
+/// The repository whose crates a generated project builds on, found at run time: the first
+/// folder above this executable (`<repo>/target/release/gyroship-tools.exe`) that holds
+/// `crates/runtime/Cargo.toml`. Found at run time, from no compiled-in path: the tools work
+/// wherever the repository is.
+pub fn repository() -> super::Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    exe.ancestors().find(|d| d.join("crates").join("runtime").join("Cargo.toml").is_file()).map(Path::to_path_buf).ok_or_else(|| {
+        format!("{}: not inside Gyroship's repository (no crates/runtime above it): put gyroship-tools.exe in the repository's target/release", exe.display()).into()
+    })
+}
+
+pub fn runtime_path() -> super::Result<String> {
     crate_path("runtime")
 }
 
 /// A patched dependency in the repository's `vendor` folder, for generated
 /// projects (never committed).
-pub fn vendor_path(name: &str) -> String {
-    let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join("vendor").join(name);
-    plain(&p.canonicalize().unwrap_or(p))
+pub fn vendor_path(name: &str) -> super::Result<String> {
+    let p = repository()?.join("vendor").join(name);
+    Ok(plain(&p.canonicalize().unwrap_or(p)))
 }
 
-/// A crate next to this one, for generated projects (never committed).
-pub fn crate_path(name: &str) -> String {
-    let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join(name);
-    plain(&p.canonicalize().unwrap_or(p))
+/// A crate of the repository, for generated projects (never committed).
+pub fn crate_path(name: &str) -> super::Result<String> {
+    let p = repository()?.join("crates").join(name);
+    Ok(plain(&p.canonicalize().unwrap_or(p)))
 }
 
 /// Writes a cargo workspace: crates `g0`, `g1`... of `files_per_crate` files of
@@ -153,7 +164,7 @@ pub fn crate_path(name: &str) -> String {
 /// the dispatch table. Returns the bytes of Rust written.
 pub fn write_rust(s: &Sample, out: &Path, per_file: usize, files_per_crate: usize, opt_level: u8) -> super::Result<u64> {
     std::fs::create_dir_all(out)?;
-    let runtime = runtime_path();
+    let runtime = runtime_path()?;
     let chunks: Vec<&[(&discover::Function, cfg::Cfg)]> = s.functions.chunks(per_file.max(1)).collect();
     let crates: Vec<&[&[(&discover::Function, cfg::Cfg)]]> = chunks.chunks(files_per_crate.max(1)).collect();
     let mut bytes = 0u64;
@@ -218,6 +229,8 @@ pub fn write_rust(s: &Sample, out: &Path, per_file: usize, files_per_crate: usiz
 /// and the code generation time in seconds.
 pub fn write_clif(s: &Sample, out: &Path, verify: bool) -> super::Result<(u64, f64)> {
     use gyroship_recomp::clif;
+    // The repository first: a misplaced executable fails before the code generation.
+    let runtime = runtime_path()?;
     std::fs::create_dir_all(out.join("harness/src"))?;
     let start = std::time::Instant::now();
     let defined: Vec<(u64, u64)> = s.functions.iter().map(|(f, _)| (f.start, f.len)).collect();
@@ -232,7 +245,6 @@ pub fn write_clif(s: &Sample, out: &Path, verify: bool) -> super::Result<(u64, f
     let path = out.join("guest.obj");
     std::fs::write(&path, &bytes)?;
     let object = plain(&path.canonicalize()?);
-    let runtime = runtime_path();
     std::fs::write(
         out.join("Cargo.toml"),
         "[workspace]\nresolver = \"3\"\nmembers = [\"harness\"]\n\n[profile.release]\ndebug = false\nincremental = false\n",
@@ -256,4 +268,17 @@ pub fn write_clif(s: &Sample, out: &Path, verify: bool) -> super::Result<(u64, f
         harness_main(&format!("\nunsafe extern \"C\" {{\n{decls}}}\n\nstatic TABLE: &[rt::Entry] = &[\n{table}];\n"), "TABLE.to_vec()"),
     )?;
     Ok((bytes.len() as u64, seconds))
+}
+
+#[cfg(test)]
+mod tests {
+    /// The test binary runs from the repository's target folder, as the tools do: the repository
+    /// is found above it, with no path compiled in.
+    #[test]
+    fn the_repository_is_found_above_the_executable() {
+        let repo = super::repository().unwrap();
+        assert!(repo.join("crates").join("tools").join("Cargo.toml").is_file(), "{}", repo.display());
+        assert!(super::crate_path("runtime").unwrap().ends_with("crates/runtime"));
+        assert!(super::vendor_path("naga").unwrap().ends_with("vendor/naga"));
+    }
 }
