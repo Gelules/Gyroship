@@ -32,6 +32,9 @@ pub fn run(exefs: &Path, out: &Path, threads: usize, verify: bool, probes: Optio
     if !lock.is_file() {
         return Err(format!("{}: not found (is the repository whole?)", lock.display()).into());
     }
+    // The game's icon is the launcher's: both executables show the same logo.
+    let icon = repository()?.join("crates").join("launcher").join("icons").join("icon.ico");
+    let icon = icon_res(&std::fs::read(&icon).map_err(|e| format!("{}: {e}", icon.display()))?).map_err(|e| format!("{}: {e}", icon.display()))?;
     let p = super::load(exefs)?;
     let d = discover::discover(&p)?;
     let probes = match probes {
@@ -149,6 +152,10 @@ pub fn run(exefs: &Path, out: &Path, threads: usize, verify: bool, probes: Optio
         let _ = writeln!(decls, "    static gyroship_table_{i}: rt::Entry;\n    static gyroship_table_{i}_len: u64;");
         parts_expr.push(format!("rt::entries(&raw const gyroship_table_{i}, gyroship_table_{i}_len)"));
     }
+    // The icon as a resource file, which link.exe takes as it takes the objects.
+    std::fs::write(out.join("gyroship.res"), &icon)?;
+    let res = plain(&out.join("gyroship.res").canonicalize()?);
+    let _ = writeln!(build, "    println!(\"cargo:rustc-link-arg={res}\");\n    println!(\"cargo:rerun-if-changed={res}\");");
     build.push_str("}\n");
     decls.push_str("}\n");
     let names: String = probes.iter().map(|(a, n)| format!("({a:#x}, {n:?}.to_string()), ")).collect();
@@ -209,4 +216,77 @@ fn plt_functions(d: &discover::Discovery, word: &dyn Fn(u64) -> u32) -> Vec<disc
         }
     }
     out
+}
+
+/// An .ico file as a Windows resource file (.res): each image an icon (RT_ICON, from 1), and
+/// the group of them as icon 1 (RT_GROUP_ICON), the one Explorer shows for the executable and
+/// the game's window loads (`Icon::from_resource(1, …)`).
+fn icon_res(ico: &[u8]) -> Result<Vec<u8>, String> {
+    let word = |at: usize| ico.get(at..at + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
+    if (word(0), word(2)) != (Some(0), Some(1)) {
+        return Err("not an icon file".into());
+    }
+    let count = word(4).ok_or("not an icon file")?;
+    // A resource file starts with an empty entry.
+    let mut res = resource(0, 0, 0, &[]);
+    let mut group = [0u16, 1, count].iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>();
+    for id in 1..=count {
+        let entry = ico.get(6 + 16 * usize::from(id - 1)..).and_then(|e| e.get(..16)).ok_or("icon directory cut short")?;
+        let [size, at] = [8, 12].map(|i| u32::from_le_bytes(entry[i..i + 4].try_into().expect("4 bytes")) as usize);
+        res.extend(resource(3, id, 0x1010, ico.get(at..at + size).ok_or("icon image cut short")?));
+        // The group's entry: the directory's, with the image's id in place of its offset.
+        group.extend(&entry[..12]);
+        group.extend(id.to_le_bytes());
+    }
+    res.extend(resource(14, 1, 0x1030, &group));
+    Ok(res)
+}
+
+/// One entry of a resource file: its header (data size, header size, type and name as numbers,
+/// data version, memory flags, language neutral, version, characteristics), then its data,
+/// padded to 4 bytes.
+fn resource(kind: u16, name: u16, flags: u16, data: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = [data.len() as u32, 32].iter().flat_map(|d| d.to_le_bytes()).collect();
+    out.extend([0xffff, kind, 0xffff, name].iter().flat_map(|w| w.to_le_bytes()));
+    out.extend([0u8; 4]);
+    out.extend(flags.to_le_bytes());
+    out.extend([0u8; 10]);
+    out.extend(data);
+    out.resize(out.len().next_multiple_of(4), 0);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    /// Two images become two icons and a group that names them, each entry where a resource
+    /// file puts it; a file that is no icon is refused.
+    #[test]
+    fn an_icon_becomes_a_resource_file() {
+        let images: [&[u8]; 2] = [b"first image", b"second"];
+        let mut ico = vec![0, 0, 1, 0, 2, 0];
+        let mut at = 6 + 2 * 16;
+        for (size, image) in [16u8, 32].into_iter().zip(images) {
+            ico.extend([size, size, 0, 0, 1, 0, 32, 0]);
+            ico.extend((image.len() as u32).to_le_bytes());
+            ico.extend((at as u32).to_le_bytes());
+            at += image.len();
+        }
+        ico.extend(images.concat());
+        let res = super::icon_res(&ico).unwrap();
+        // The entries in order: (data size, type, name, data), each from a 4-byte boundary.
+        let mut entries = Vec::new();
+        let mut at = 0;
+        while at < res.len() {
+            let dword = |i: usize| u32::from_le_bytes(res[at + i..at + i + 4].try_into().unwrap());
+            let (size, header) = (dword(0) as usize, dword(4) as usize);
+            assert_eq!((header, dword(8) & 0xffff, dword(12) & 0xffff), (32, 0xffff, 0xffff), "header at {at}");
+            entries.push((size, dword(8) >> 16, dword(12) >> 16, res[at + header..at + header + size].to_vec()));
+            at = (at + header + size).next_multiple_of(4);
+        }
+        assert_eq!(entries[..3], [(0, 0, 0, vec![]), (11, 3, 1, b"first image".to_vec()), (6, 3, 2, b"second".to_vec())]);
+        let group = &entries[3];
+        assert_eq!((group.1, group.2), (14, 1));
+        assert_eq!(group.3, [&[0u8, 0, 1, 0, 2, 0][..], &[16, 16, 0, 0, 1, 0, 32, 0, 11, 0, 0, 0, 1, 0], &[32, 32, 0, 0, 1, 0, 32, 0, 6, 0, 0, 0, 2, 0]].concat());
+        assert!(super::icon_res(b"PNG, not an icon").is_err());
+    }
 }

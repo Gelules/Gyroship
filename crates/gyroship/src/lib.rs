@@ -121,6 +121,14 @@ impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let Some(table) = self.table.take() else { return };
         let attributes = Window::default_attributes().with_title("Gyroship").with_inner_size(winit::dpi::PhysicalSize::new(WIDTH, HEIGHT));
+        // The executable's icon (resource 1, linked in by the recompile), in the title bar and
+        // on the taskbar; none when the executable has no icon.
+        #[cfg(windows)]
+        let attributes = {
+            use winit::platform::windows::{IconExtWindows, WindowAttributesExtWindows};
+            let icon = || winit::window::Icon::from_resource(1, None).ok();
+            attributes.with_window_icon(icon()).with_taskbar_icon(icon())
+        };
         let window = Arc::new(event_loop.create_window(attributes).unwrap_or_else(|e| fail(&format!("cannot open a window: {e}"))));
         if std::env::args().any(|a| a == "--fullscreen") {
             set_fullscreen(&window, true);
