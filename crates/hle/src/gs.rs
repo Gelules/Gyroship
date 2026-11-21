@@ -112,38 +112,57 @@ pub struct Mappings {
 
 /// Disjoint GPU ranges by address space, sorted: (space, first) -> (last, CPU
 /// address of first). A later mapping wins where it overlaps an earlier one.
-pub type Table = std::collections::BTreeMap<(u32, u64), (u64, u64)>;
+type Map = std::collections::BTreeMap<(u32, u64), (u64, u64)>;
+
+/// The mappings flattened: `map`, and its ranges not mapped to themselves
+/// (space, first, last, CPU address of first), sorted, refreshed with it.
+#[derive(Debug, Default, Clone)]
+pub struct Table {
+    map: Map,
+    foreign: Vec<(u32, u64, u64, u64)>,
+}
 
 /// Paints mapping `space`, `first..=last` -> `cpu` over `table`: the ranges it
 /// overlaps keep only their parts outside it.
 fn paint(table: &mut Table, space: u32, first: u64, last: u64, cpu: u64) {
+    paint_map(&mut table.map, space, first, last, cpu);
+    table.foreign = foreign_of(&table.map);
+}
+
+/// [`paint`] on the map alone.
+fn paint_map(map: &mut Map, space: u32, first: u64, last: u64, cpu: u64) {
     let mut hit = Vec::new();
-    if let Some((&(s, f), &(l, c))) = table.range(..(space, first)).next_back()
+    if let Some((&(s, f), &(l, c))) = map.range(..(space, first)).next_back()
         && s == space
         && l >= first
     {
         hit.push((f, l, c));
     }
-    hit.extend(table.range((space, first)..=(space, last)).map(|(&(_, f), &(l, c))| (f, l, c)));
+    hit.extend(map.range((space, first)..=(space, last)).map(|(&(_, f), &(l, c))| (f, l, c)));
     for (f, l, c) in hit {
-        table.remove(&(space, f));
+        map.remove(&(space, f));
         if f < first {
-            table.insert((space, f), (first - 1, c));
+            map.insert((space, f), (first - 1, c));
         }
         if l > last {
-            table.insert((space, last + 1), (l, c + (last + 1 - f)));
+            map.insert((space, last + 1), (l, c + (last + 1 - f)));
         }
     }
-    table.insert((space, first), (last, cpu));
+    map.insert((space, first), (last, cpu));
+}
+
+/// The ranges of `map` not mapped to themselves.
+fn foreign_of(map: &Map) -> Vec<(u32, u64, u64, u64)> {
+    map.iter().filter(|&(&(_, first), &(_, cpu))| first != cpu).map(|(&(space, first), &(last, cpu))| (space, first, last, cpu)).collect()
 }
 
 /// The table of `maps`, painted in order.
 fn flatten(maps: &[(u32, u64, u64, u64)]) -> Table {
-    let mut table = Table::new();
+    let mut map = Map::new();
     for &(space, first, last, cpu) in maps {
-        paint(&mut table, space, first, last, cpu);
+        paint_map(&mut map, space, first, last, cpu);
     }
-    table
+    Table { foreign: foreign_of(&map), map }
 }
 
 /// The CPU address of `gpu` in `space` through `table`; itself when no range has it.
@@ -151,23 +170,41 @@ fn lookup(table: &Table, space: u32, gpu: u64) -> u64 {
     span(table, space, gpu).0
 }
 
-/// The CPU address of `gpu` in `space` and how many bytes from it stay in one
-/// range of `table`: to its end, or, outside every range, to the next one's start.
-fn span(table: &Table, space: u32, gpu: u64) -> (u64, u64) {
-    match mapping(table, space, gpu) {
-        Some((first, last, cpu)) => (cpu + (gpu - first), (last - gpu).saturating_add(1)),
-        None => {
-            let next = table.range((space, gpu)..).next().filter(|((s, _), _)| *s == space).map_or(u64::MAX, |((_, f), _)| *f);
-            (gpu, next - gpu)
+/// The range of `table` that holds `gpu` in `space`, as (first, last, CPU
+/// address of first): a range mapped elsewhere, or the identity between two of
+/// them (all of NVN's mappings but a few, and what no mapping covers).
+fn range(table: &Table, space: u32, gpu: u64) -> (u64, u64, u64) {
+    let f = &table.foreign;
+    let i = f.partition_point(|&(s, first, ..)| (s, first) <= (space, gpu));
+    let before = i.checked_sub(1).map(|i| f[i]).filter(|e| e.0 == space);
+    match before {
+        Some((_, first, last, cpu)) if gpu <= last => (first, last, cpu),
+        _ => {
+            let first = before.map_or(0, |e| e.2 + 1);
+            (first, f.get(i).filter(|e| e.0 == space).map_or(u64::MAX, |e| e.1 - 1), first)
         }
     }
 }
 
-/// The range of `table` that holds `gpu` in `space`: its first and last GPU
-/// addresses and the CPU address of its first.
-fn mapping(table: &Table, space: u32, gpu: u64) -> Option<(u64, u64, u64)> {
-    let (&(s, first), &(last, cpu)) = table.range(..=(space, gpu)).next_back()?;
-    (s == space && gpu <= last).then_some((first, last, cpu))
+/// The CPU address of `gpu` in `space` and how many bytes from it translate
+/// contiguously: to the end of its [`range`].
+fn span(table: &Table, space: u32, gpu: u64) -> (u64, u64) {
+    let (first, last, cpu) = range(table, space, gpu);
+    (cpu + (gpu - first), (last - gpu).saturating_add(1))
+}
+
+/// [`span`] cut at every mapping's bounds, as writes go (a partial write stops
+/// at a mapping): to the end of the mapped range, or, outside every range, to
+/// the next one's start.
+fn split_span(table: &Table, space: u32, gpu: u64) -> (u64, u64) {
+    let map = &table.map;
+    match map.range(..=(space, gpu)).next_back().filter(|&(&(s, _), &(last, _))| s == space && gpu <= last) {
+        Some((&(_, first), &(last, cpu))) => (cpu + (gpu - first), (last - gpu).saturating_add(1)),
+        None => {
+            let next = map.range((space, gpu)..).next().filter(|((s, _), _)| *s == space).map_or(u64::MAX, |((_, f), _)| *f);
+            (gpu, next - gpu)
+        }
+    }
 }
 
 /// The CPU address of a GPU address in address space `space`, through the
@@ -181,7 +218,7 @@ pub fn gpu_to_cpu(maps: &Mappings, space: u32, gpu: u64) -> u64 {
 /// any address space: everywhere else a GPU address is its CPU address (all
 /// of NVN's mappings but a few large pools at high GPU addresses).
 pub fn foreign(maps: &Mappings) -> Vec<(u64, u64)> {
-    maps.table.iter().filter(|&(&(_, first), &(_, cpu))| first != cpu).map(|(&(_, first), &(last, _))| (first, last.saturating_add(1))).collect()
+    maps.table.foreign.iter().map(|&(_, first, last, _)| (first, last.saturating_add(1))).collect()
 }
 
 /// `GYROSHIP_PROFILE_THREAD=gpu`: `--profile` samples the thread that applies
@@ -257,17 +294,12 @@ pub struct GpuReader<'a> {
 impl GpuReader<'_> {
     /// [`span`], through the range of the last read when it holds `gpu`.
     fn span(&mut self, gpu: u64) -> (u64, u64) {
-        let range = match self.last {
-            Some(r @ (first, last, _)) if (first..=last).contains(&gpu) => Some(r),
-            _ => mapping(&self.maps.table, self.space, gpu),
+        let r @ (first, last, cpu) = match self.last {
+            Some(r @ (first, last, _)) if (first..=last).contains(&gpu) => r,
+            _ => range(&self.maps.table, self.space, gpu),
         };
-        match range {
-            Some(r @ (first, last, cpu)) => {
-                self.last = Some(r);
-                (cpu + (gpu - first), (last - gpu).saturating_add(1))
-            }
-            None => span(&self.maps.table, self.space, gpu),
-        }
+        self.last = Some(r);
+        (cpu + (gpu - first), (last - gpu).saturating_add(1))
     }
 }
 
@@ -288,7 +320,7 @@ impl gyroship_gpu::draw::GuestMem for GpuReader<'_> {
 pub fn cpu_ranges(maps: &Mappings, space: u32, mut gpu: u64, mut len: u64) -> Vec<(u64, u64)> {
     let mut out = Vec::new();
     while len > 0 {
-        let (at, room) = span(&maps.table, space, gpu);
+        let (at, room) = split_span(&maps.table, space, gpu);
         let n = len.min(room.max(1));
         out.push((at, at + n));
         (gpu, len) = (gpu + n, len - n);
@@ -307,7 +339,7 @@ impl GpuSide {
     /// Err with the CPU address of a part that is not writable.
     pub fn write_gpu(&mut self, space: u32, mut gpu: u64, mut bytes: &[u8]) -> Result<(), u64> {
         while !bytes.is_empty() {
-            let (at, room) = span(&self.at.maps.table, space, gpu);
+            let (at, room) = split_span(&self.at.maps.table, space, gpu);
             let n = bytes.len().min(usize::try_from(room).unwrap_or(usize::MAX));
             self.mem.write_object(at, &bytes[..n]).map_err(|_| at)?;
             (gpu, bytes) = (gpu + n as u64, &bytes[n..]);
@@ -1298,7 +1330,8 @@ mod tests {
 
     /// The flattened table answers what a scan of the mappings from the last one
     /// does, over random overlapping, nested, adjacent and removed mappings in
-    /// two address spaces, at random addresses and at each mapping's bounds.
+    /// two address spaces, at random addresses and at each mapping's bounds; a
+    /// read's span translates contiguously across the bounds it spans.
     #[test]
     fn the_mapping_table_matches_the_reverse_scan() {
         let mut seed = 0x9e37_79b9_7f4a_7c15u64;
@@ -1331,10 +1364,17 @@ mod tests {
             }
             for (space, gpu) in probes {
                 let (cpu, room) = span(&table, space, gpu);
-                assert_eq!(cpu, scan(&maps, space, gpu), "round {round}: space {space}, gpu {gpu:#x}");
-                // The span's last byte is still contiguous with its first.
-                if room < 1 << 32 {
-                    assert_eq!(scan(&maps, space, gpu + room - 1), cpu + room - 1, "round {round}: space {space}, gpu {gpu:#x}, span {room:#x}");
+                assert!(cpu == scan(&maps, space, gpu) && room >= 1, "round {round}: space {space}, gpu {gpu:#x}, span {room:#x}");
+                // Each part of the span, cut at the mappings' bounds as writes go, continues it.
+                let mut off = 0;
+                while off < room.min(1 << 20) {
+                    let (at, n) = split_span(&table, space, gpu + off);
+                    assert_eq!((at, scan(&maps, space, gpu + off)), (cpu + off, cpu + off), "round {round}: space {space}, gpu {gpu:#x}, part at {off:#x} of {room:#x}");
+                    // The part's last byte is still contiguous with its first.
+                    if (1..1 << 32).contains(&n) {
+                        assert_eq!(scan(&maps, space, gpu + off + n - 1), at + n - 1, "round {round}: space {space}, gpu {gpu:#x}, part at {off:#x}");
+                    }
+                    off += n.max(1);
                 }
             }
         }
