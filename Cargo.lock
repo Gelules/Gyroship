@@ -1017,6 +1017,7 @@ dependencies = [
 name = "gyroship-gpu"
 version = "0.1.0"
 dependencies = [
+ "ash",
  "lz4_flex",
  "naga",
  "png",

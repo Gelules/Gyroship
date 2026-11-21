@@ -296,6 +296,8 @@ pub struct Surfaces {
     pub(crate) dynamic_max: u32,
     /// Whether the device has Features::CLIP_DISTANCES (user clip planes).
     pub(crate) clip_distances: bool,
+    /// What the Vulkan device has beyond wgpu's extensions and features (D110).
+    pub(crate) vulkan: crate::vk::Extras,
 }
 
 /// A pipeline cache kept in a file between runs (`--pipeline-cache`): the
@@ -1118,6 +1120,27 @@ pub fn check_adapter(features: wgpu::Features, subgroup_min: u32, subgroup_max: 
     Ok(())
 }
 
+/// The device the game asks for: the adapter's own limits (targets reach 11264 pixels)
+/// and, when available, the 16-bit normalized, D32S8 and BC formats, filterable f32
+/// textures, border-color clamping and subgroup (quad) operations.
+pub(crate) fn descriptor(adapter: &wgpu::Adapter) -> wgpu::DeviceDescriptor<'static> {
+    // 16-bit normalized targets are renderable only through the adapter's own
+    // format features (wgpu guarantees them as storage only).
+    let wanted = wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
+        | wgpu::Features::DEPTH32FLOAT_STENCIL8
+        | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
+        | wgpu::Features::RG11B10UFLOAT_RENDERABLE
+        | wgpu::Features::TEXTURE_COMPRESSION_BC
+        | wgpu::Features::FLOAT32_FILTERABLE
+        | wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER
+        | wgpu::Features::SUBGROUP
+        | wgpu::Features::PIPELINE_CACHE
+        | wgpu::Features::TEXTURE_ATOMIC
+        | wgpu::Features::CLIP_DISTANCES
+        | crate::timing::Timing::wanted();
+    wgpu::DeviceDescriptor { required_features: (adapter.features() & wanted) | NEEDED, required_limits: adapter.limits(), ..Default::default() }
+}
+
 /// A uniform binding of a range of the upload arena.
 pub(crate) fn uniform((buffer, at, size): &(wgpu::Buffer, u64, u64)) -> wgpu::BindingResource<'_> {
     wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer, offset: *at, size: wgpu::BufferSize::new(*size) })
@@ -1154,24 +1177,9 @@ impl Surfaces {
             apply_limit_buckets: false,
         }))
         .map_err(|e| format!("no suitable GPU adapter: {e}"))?;
-        // 16-bit normalized targets are renderable only through the adapter's own
-        // format features (wgpu guarantees them as storage only).
-        let wanted = wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
-            | wgpu::Features::DEPTH32FLOAT_STENCIL8
-            | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
-            | wgpu::Features::RG11B10UFLOAT_RENDERABLE
-            | wgpu::Features::TEXTURE_COMPRESSION_BC
-            | wgpu::Features::FLOAT32_FILTERABLE
-            | wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER
-            | wgpu::Features::SUBGROUP
-            | wgpu::Features::PIPELINE_CACHE
-            | wgpu::Features::TEXTURE_ATOMIC
-            | wgpu::Features::CLIP_DISTANCES
-            | crate::timing::Timing::wanted();
         let info = adapter.get_info();
         check_adapter(adapter.features(), info.subgroup_min_size, info.subgroup_max_size).map_err(|e| format!("{} ({:?}): {e}", info.name, info.backend))?;
-        let descriptor = wgpu::DeviceDescriptor { required_features: (adapter.features() & wanted) | NEEDED, required_limits: adapter.limits(), ..Default::default() };
-        let (device, queue) = pollster::block_on(adapter.request_device(&descriptor)).map_err(|e| format!("cannot open the GPU device: {e}"))?;
+        let (device, queue, vulkan) = crate::vk::open(&adapter, &descriptor(&adapter)).map_err(|e| format!("cannot open the GPU device: {e}"))?;
         let errors = Arc::new(Mutex::new(Vec::new()));
         let sink = errors.clone();
         device.on_uncaptured_error(Arc::new(move |e: wgpu::Error| {
@@ -1224,7 +1232,7 @@ impl Surfaces {
         let timed = timing.is_some();
         let rec = Arc::new(Mutex::new(crate::record::Recorder::new(&device, &queue, timing)));
         let renderable = (0..=0xff).filter_map(color_format).chain((0..=0xff).filter_map(depth_format)).map(|f| (f, renderable_on(&adapter, &device, f))).collect();
-        Ok(Surfaces { renderable, adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, rec, batch: Vec::with_capacity(BATCH), recorder: None, recorder_ended: false, timed, open: None, sets: 0, empty_set: None, present: 0, readbacks: Default::default(), hasher: None, belt, big_upload: false, texture_belt, uploads: None, global_bytes: Vec::new(), staging: Staging::default(), last_color: None, window, submit: None, submit_ended: false, memo: Memo::default(), kept: Kept::default(), compile: Compile::default(), compile_total: Compile::default(), background: false, wait_left: PIPELINE_WAIT, workers: None, finished: Default::default(), disk_cache: None, shader_cache: None, views: Aged::default(), dynamic_max, clip_distances })
+        Ok(Surfaces { renderable, adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, rec, batch: Vec::with_capacity(BATCH), recorder: None, recorder_ended: false, timed, open: None, sets: 0, empty_set: None, present: 0, readbacks: Default::default(), hasher: None, belt, big_upload: false, texture_belt, uploads: None, global_bytes: Vec::new(), staging: Staging::default(), last_color: None, window, submit: None, submit_ended: false, memo: Memo::default(), kept: Kept::default(), compile: Compile::default(), compile_total: Compile::default(), background: false, wait_left: PIPELINE_WAIT, workers: None, finished: Default::default(), disk_cache: None, shader_cache: None, views: Aged::default(), dynamic_max, clip_distances, vulkan })
     }
 
     /// Shows the presented image (the color target written last, its top-left

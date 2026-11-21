@@ -16,6 +16,7 @@ pub mod shader;
 pub mod state;
 pub mod surfaces;
 mod timing;
+pub mod vk;
 
 pub const WIDTH: u32 = 640;
 pub const HEIGHT: u32 = 360;

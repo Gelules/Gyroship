@@ -9,7 +9,7 @@
 
 use crate::draw::{BankIds, Bindings, Mem};
 use crate::pushbuf::Pools;
-use crate::shader::{self, Handle, IMAGE_BINDING, Options, Translation};
+use crate::shader::{self, Handle, IMAGE_BINDING, Options};
 use crate::sass::memory::ImageDim;
 use crate::sass::texture::TexDim;
 use crate::state::qmd::Launch;
