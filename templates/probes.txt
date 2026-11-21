@@ -1,44 +1,35 @@
-# Gyroship probe list: a template, for the practice file (practice.txt, next to this template).
-# Copy it outside the repository, replace every <address> and delete the lines you do not use.
-# Compile it into the game, then build the game again (README.md, Building):
-#   gyroship-tools recompile <exefs> --out generated/game --probes <this file>
-# or the launcher's Probe list field, then its two Setup steps. Any change means both again.
-#
-# Every address comes from your own copy of the game and holds for one build only
-# (gyroship-tools nso info <exefs>/main prints its build ID): never commit a filled copy.
-# Build: <build ID>
+# Gyroship probe list, ready for the game's update that Gyroship targets: main's build ID
+# a7730d0f74d168d90422354c8317f76ff78ad938. These are the trace: probes templates/practice.txt
+# names. Compile them into the game, then build it again:
+#   gyroship-tools recompile <exefs> --out generated/game --probes templates/probes.txt
+# or name the file in the launcher's Practice probes field (Setup), then Recompile and Build. Another
+# build has other addresses: docs/practice.md says how to find them.
 #
 # One "<address> <name>" per line: the address in hex (0x allowed here, unlike in the practice
 # file), the name the rest of the line; # starts a comment anywhere. A probe runs before the
 # instruction at its address, which must lie in a function the recompiler found: elsewhere it
-# never runs. Ghidra shows the same addresses when the modules are imported with
-# tools/ghidra/analyze_modules.sh.
-#
-# A practice line can only name a probe whose name starts with trace:
-#   trace:<label> [<item>...] [if <register>[&0x<mask>]=0x<value>[,0x<value>...]]
-# The labels below are the author's; any label works. Items and the condition only shape the
-# --trace file, one line per pass: give a probe the items of its practice line without their
-# names (f32@<EXPR>, not gauge=f32@<EXPR>: a probe with a bad item traces nothing) to check their
-# values, for example
-#   <address> trace:aw-update f32@<EXPR> u8@<EXPR>
+# never runs, and nothing says so. The labels are free; a practice line names a probe by address.
+# A name is trace:<label> [<item>...] [if <register>[&0x<mask>]=0x<value>[,0x<value>...]]: with
+# the if part, only the passes where that register, masked, holds one of the values go to the
+# --trace file.
 
 # Each vehicle's per-frame boost update, at its first instruction (practice: boost lines).
-<address> trace:aw-update
-<address> trace:bm-update
-<address> trace:lm-tick
+7108e5d8f0 trace:aw-update
+71094d1290 trace:bm-update
+7109ba7880 trace:lm-tick
 
 # Each vehicle's movement code, where its base speed, speed multiplier and boost speed can be read
 # (practice: hud-speed lines).
-<address> trace:aw-move-out
-<address> trace:bm-move
-<address> trace:lm-move
+7108f7d568 trace:aw-move-out
+7109502d6c trace:bm-move
+7109c216a0 trace:lm-move
 
 # The results screen's time (practice: ms-keep, then ms).
-<address> trace:results-ms
-<address> trace:results-ss
+71009149fc trace:results-ms
+7100914ab8 trace:results-ss
 
-# The game's mission timer: the two entries of its time string, then the seconds inside the
+# The game's mission timer: the two entries of its time string, then the seconds inside its
 # minutes-and-seconds formatter (practice: ms-keep, ms-keep, ms).
-<address> trace:hud-time
-<address> trace:hud-time-generic
-<address> trace:hud-ss
+7100914684 trace:hud-time
+71009206f4 trace:hud-time-generic
+7100914270 trace:hud-ss

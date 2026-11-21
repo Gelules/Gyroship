@@ -1,0 +1,17 @@
+# Gyroship hooks file, ready for the game's update that Gyroship targets: main's build ID
+# a7730d0f74d168d90422354c8317f76ff78ad938. Give it with
+#   gyroship boot <exefs> --play --explore --hooks templates/hooks.txt
+# or tick the launcher's "Unlock the game's debug menu" box, which passes this file.
+# One "<hex address> <hook> [<hex address of a byte>]" per
+# line; # starts a comment anywhere. Each address is a game function reached by indirect calls,
+# which the hook replaces. Another build has other addresses.
+
+# The game's debug menu: the check of its buttons' requirements, at its two entries, always met.
+# The debug menu writes to the save: play on a copy of it.
+710aaec620 requirement-met
+710aaec800 requirement-met
+
+# QUIT GAME in the title menu: an empty handler of the main menu, which the title menu of a
+# QUIT GAME layer calls from its sixth line, now ends the game. The third word is the byte the
+# game's frame loop polls to close. Without such a layer, this line changes nothing you can see.
+710817ef90 quit 710f0e3b0c
