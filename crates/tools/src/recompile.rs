@@ -29,6 +29,9 @@ struct Part {
 pub fn run(exefs: &Path, out: &Path, threads: usize, verify: bool, probes: Option<&Path>) -> super::Result<()> {
     // The repository first: a misplaced executable fails before minutes of work.
     let (naga, runtime, game, lock) = (vendor_path("naga")?, runtime_path()?, crate_path("gyroship")?, repository()?.join("Cargo.lock"));
+    if !lock.is_file() {
+        return Err(format!("{}: not found (is the repository whole?)", lock.display()).into());
+    }
     let p = super::load(exefs)?;
     let d = discover::discover(&p)?;
     let probes = match probes {
