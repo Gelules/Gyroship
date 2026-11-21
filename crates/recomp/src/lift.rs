@@ -1,6 +1,6 @@
 //! From a decoded instruction to one IR operation.
 
-use crate::ir::{Addr, Alu, Cond, FBin, FUn, Op, Operand, Reg, Rmw, Select, Shift, Unary, VCmp, VFp, VInt, Writeback, W, ZERO};
+use crate::ir::{Addr, Alu, Cond, FBin, FUn, Op, Operand, Reduce, Reg, Rmw, Select, Shift, Unary, VCmp, VFp, VInt, VIntUn, Writeback, W, ZERO};
 use gyroship_analysis::decode::{decode, Instruction, Opcode, Operand as O, SIMDSizeCode, ShiftStyle, SizeCode};
 
 /// MRS/MSR encodings of TPIDR_EL0 and TPIDRRO_EL0 as yaxpeax numbers them.
@@ -550,6 +550,54 @@ fn lift_lanes(i: &Instruction) -> Option<Op> {
             let ((dst, q, e), (src, _, _)) = (vector(&o[0])?, vector(&o[1])?);
             Op::VIntToF { f64: fp_lanes(e, q)?, q, signed: i.opcode == C::SCVTF, dst, src }
         }
+        // The low half of each lane, into the low 8 bytes (XTN2: the high 8, the low kept).
+        C::XTN | C::XTN2 => {
+            let ((dst, _, e), (src, _, _)) = (vector(&o[0])?, vector(&o[1])?);
+            let eb = 1u32 << e;
+            if e > 2 {
+                return None;
+            }
+            if i.opcode == C::XTN {
+                shuffle(dst, src, src, eb, 8, |j| 2 * j * eb)
+            } else {
+                let mask = std::array::from_fn(|k| if k < 8 { k as u8 } else { (16 + 2 * ((k as u32 - 8) / eb) * eb + (k as u32 - 8) % eb) as u8 });
+                Op::VShuffle { dst, a: dst, b: src, mask }
+            }
+        }
+        C::CNT if vec_op => {
+            let ((dst, q, size), (src, _, _)) = (vector(&o[0])?, vector(&o[1])?);
+            (size == 0).then_some(Op::VIntUn { op: VIntUn::Cnt, size, q, dst, src })?
+        }
+        C::SHL if vec_op => {
+            let ((dst, q, size), (src, _, _)) = (vector(&o[0])?, vector(&o[1])?);
+            let k = u8::try_from(imm(&o[2])?).ok()?;
+            (k < 8 << size && (size < 3 || q)).then_some(Op::VIntUn { op: VIntUn::Shl(k), size, q, dst, src })?
+        }
+        C::CMEQ | C::CMGE | C::CMGT | C::CMLE | C::CMLT if vec_op && matches!(o[2], O::Imm64(0)) => {
+            let ((dst, q, size), (src, _, _)) = (vector(&o[0])?, vector(&o[1])?);
+            let cmp = match i.opcode {
+                C::CMEQ => VCmp::Eq,
+                C::CMGE => VCmp::Ge,
+                C::CMGT => VCmp::Gt,
+                C::CMLE => VCmp::Le,
+                _ => VCmp::Lt,
+            };
+            (size < 3 || q).then_some(Op::VIntUn { op: VIntUn::CmpZero(cmp), size, q, dst, src })?
+        }
+        C::ADDV | C::UMAXV | C::UMINV | C::SMAXV | C::SMINV | C::UADDLV | C::SADDLV => {
+            let ((dst, _), (src, q, size)) = (vreg(&o[0])?, vector(&o[1])?);
+            let op = match i.opcode {
+                C::ADDV => Reduce::Add,
+                C::UMAXV => Reduce::UMax,
+                C::UMINV => Reduce::UMin,
+                C::SMAXV => Reduce::SMax,
+                C::SMINV => Reduce::SMin,
+                C::UADDLV => Reduce::UAddL,
+                _ => Reduce::SAddL,
+            };
+            // Four lanes at least: 4S takes 16 bytes; no 64-bit lanes.
+            (size < 2 || (size == 2 && q)).then_some(Op::VReduce { op, size, q, dst, src })?
+        }
         _ => return None,
     })
 }
@@ -701,12 +749,18 @@ fn lift_simd(i: &Instruction) -> Option<Op> {
             (d != s).then_some(Op::FCvt { dst, src, to_f64: d })?
         }
         C::SCVTF | C::UCVTF => {
-            if !matches!(o[2], O::Nothing) {
-                return None; // fixed-point form
-            }
             let (dst, d) = freg(&o[0])?;
             let (src, w) = reg(&o[1])?;
-            Op::IntToF { dst, src, w, f64: d, signed: i.opcode == C::SCVTF }
+            let fbits = match o[2] {
+                O::Nothing => 0,
+                ref x => u8::try_from(imm(x)?).ok()?,
+            };
+            // A fixed-point 64-bit integer to a single stays interpreted: the interpreter
+            // rounds it twice (through a double), which a native conversion would not.
+            if fbits > 0 && w == W::W64 && !d {
+                return None;
+            }
+            Op::IntToF { dst, src, w, f64: d, signed: i.opcode == C::SCVTF, fbits }
         }
         C::FCVTZS | C::FCVTZU => {
             if !matches!(o[2], O::Nothing) {

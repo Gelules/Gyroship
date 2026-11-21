@@ -183,8 +183,9 @@ pub enum Op {
     FCondSel { f64: bool, dst: u8, a: u8, b: u8, cond: u8 },
     /// FCVT between single and double.
     FCvt { dst: u8, src: u8, to_f64: bool },
-    /// SCVTF/UCVTF from a general register.
-    IntToF { dst: u8, src: Reg, w: W, f64: bool, signed: bool },
+    /// SCVTF/UCVTF from a general register, divided by 2^fbits (the fixed-point
+    /// forms; 0 otherwise).
+    IntToF { dst: u8, src: Reg, w: W, f64: bool, signed: bool, fbits: u8 },
     /// FCVTZS/FCVTZU to a general register (saturating, NaN gives 0).
     FToInt { dst: Reg, w: W, src: u8, f64: bool, signed: bool },
     // Vector lanes. `q` false: 8-byte forms, which zero the upper 8 bytes.
@@ -207,6 +208,11 @@ pub enum Op {
     VInt { op: VInt, size: u8, q: bool, pairwise: bool, dst: u8, a: u8, b: u8 },
     /// SCVTF/UCVTF of 32-bit (`f64` false) or 64-bit integer lanes.
     VIntToF { f64: bool, q: bool, signed: bool, dst: u8, src: u8 },
+    /// Integer lanes of 1 << size bytes, one operand.
+    VIntUn { op: VIntUn, size: u8, q: bool, dst: u8, src: u8 },
+    /// ADDV, UMAXV and the like: the lanes (of 1 << size bytes) combined into one
+    /// element, in a scalar register (the long sums twice as wide).
+    VReduce { op: Reduce, size: u8, q: bool, dst: u8, src: u8 },
     // Control flow: the last operation of a block.
     Jump(u64),
     Branch(Cond, u64),
@@ -290,6 +296,28 @@ pub enum VInt {
     UMax,
     SMin,
     SMax,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VIntUn {
+    /// SHL: left by this many bits (fewer than the lane's).
+    Shl(u8),
+    /// CMEQ...CMLT against zero, signed: all ones where true.
+    CmpZero(VCmp),
+    /// CNT: the bits set in each byte.
+    Cnt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reduce {
+    Add,
+    UMax,
+    UMin,
+    SMax,
+    SMin,
+    /// UADDLV, SADDLV: the sum of the lanes widened to twice their size.
+    UAddL,
+    SAddL,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

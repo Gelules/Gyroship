@@ -14,7 +14,7 @@
 //! load or store; caching them in SSA values between calls is the upgrade if
 //! this backend wins.
 
-use crate::ir::{Addr, Alu, Cond, FBin, FUn, Op, Operand, Reg, Rmw, Select, Shift, Unary, VCmp, VFp, VInt, Writeback, W, ZERO};
+use crate::ir::{Addr, Alu, Cond, FBin, FUn, Op, Operand, Reduce, Reg, Rmw, Select, Shift, Unary, VCmp, VFp, VInt, VIntUn, Writeback, W, ZERO};
 use crate::{Callee, Input};
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types::{F32, F32X4, F64, F64X2, I8, I8X16, I16, I16X8, I32, I32X4, I64, I64X2, Type};
@@ -1025,10 +1025,15 @@ impl<M: Module> Emit<'_, '_, M> {
                 let r = if to_f64 { self.b.ins().fpromote(F64, x) } else { self.b.ins().fdemote(F32, x) };
                 self.vset(dst, r);
             }
-            Op::IntToF { dst, src, w, f64, signed } => {
+            Op::IntToF { dst, src, w, f64, signed, fbits } => {
                 let x = self.get(src, w);
                 let t = if f64 { F64 } else { F32 };
-                let r = if signed { self.b.ins().fcvt_from_sint(t, x) } else { self.b.ins().fcvt_from_uint(t, x) };
+                let mut r = if signed { self.b.ins().fcvt_from_sint(t, x) } else { self.b.ins().fcvt_from_uint(t, x) };
+                // Fixed point: times 2^-fbits, exact (a normal power of two, the result at least 2^-64).
+                if fbits > 0 {
+                    let scale = if f64 { self.b.ins().f64const(2f64.powi(-i32::from(fbits))) } else { self.b.ins().f32const(2f32.powi(-i32::from(fbits))) };
+                    r = self.b.ins().fmul(r, scale);
+                }
                 self.vset(dst, r);
             }
             Op::FToInt { dst, w, src, f64, signed } => {
@@ -1141,6 +1146,65 @@ impl<M: Module> Emit<'_, '_, M> {
                 let x = self.vload(it, src);
                 let r = if signed { self.b.ins().fcvt_from_sint(ft, x) } else { self.b.ins().fcvt_from_uint(ft, x) };
                 self.vput(dst, r, q);
+            }
+            Op::VIntUn { op, size, q, dst, src } => {
+                let t = lanes_type(size);
+                let x = self.vload(t, src);
+                let r = match op {
+                    VIntUn::Shl(k) => self.b.ins().ishl_imm_s(x, i64::from(k)),
+                    VIntUn::CmpZero(cmp) => {
+                        let zero = self.vconst(t, [0; 16]);
+                        let cc = match cmp {
+                            VCmp::Eq => IntCC::Equal,
+                            VCmp::Ge => IntCC::SignedGreaterThanOrEqual,
+                            VCmp::Gt => IntCC::SignedGreaterThan,
+                            VCmp::Le => IntCC::SignedLessThanOrEqual,
+                            VCmp::Lt => IntCC::SignedLessThan,
+                        };
+                        self.b.ins().icmp(cc, x, zero)
+                    }
+                    VIntUn::Cnt => self.b.ins().popcnt(x),
+                };
+                self.vput(dst, r, q);
+            }
+            Op::VReduce { op, size, q, dst, src } => {
+                let x = self.vload(lanes_type(size), src);
+                // The lanes left, of `eb` bytes, in the low `span` bytes of v. The long sums
+                // widen first: the low 8 bytes, or the sum of both halves widened.
+                let (mut v, eb, mut span) = match op {
+                    Reduce::UAddL | Reduce::SAddL => {
+                        let unsigned = op == Reduce::UAddL;
+                        let low = if unsigned { self.b.ins().uwiden_low(x) } else { self.b.ins().swiden_low(x) };
+                        let v = if q {
+                            let high = if unsigned { self.b.ins().uwiden_high(x) } else { self.b.ins().swiden_high(x) };
+                            self.b.ins().iadd(low, high)
+                        } else {
+                            low
+                        };
+                        (v, 2u32 << size, 16)
+                    }
+                    _ => (x, 1u32 << size, if q { 16 } else { 8 }),
+                };
+                let t = lanes_type(eb.trailing_zeros() as u8);
+                // Halving: the upper half of the span folded onto the lower.
+                while span > eb {
+                    span /= 2;
+                    let bytes = self.cast(I8X16, v);
+                    let idx: Vec<u8> = (0..16).map(|i| ((i + span) % 16) as u8).collect();
+                    let imm = self.b.func.dfg.immediates.push(ConstantData::from(idx));
+                    let upper = self.b.ins().shuffle(bytes, bytes, imm);
+                    let upper = self.cast(t, upper);
+                    let i = self.b.ins();
+                    v = match op {
+                        Reduce::UMax => i.umax(v, upper),
+                        Reduce::UMin => i.umin(v, upper),
+                        Reduce::SMax => i.smax(v, upper),
+                        Reduce::SMin => i.smin(v, upper),
+                        _ => i.iadd(v, upper),
+                    };
+                }
+                let r = self.b.ins().extractlane(v, 0);
+                self.vset(dst, r);
             }
             _ => unreachable!("control flow is emitted by the block"),
         }

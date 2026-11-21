@@ -59,6 +59,18 @@ const INT_MINMAX: [u32; 8] = [0x0E20_6400, 0x0E20_6C00, 0x2E20_6400, 0x2E20_6C00
 const PERMUTE: [u32; 6] = [0x0E00_1800, 0x0E00_2800, 0x0E00_3800, 0x0E00_5800, 0x0E00_6800, 0x0E00_7800];
 /// REV64, REV32, REV16, with the largest element size each allows.
 const REV: [(u32, u32); 3] = [(0x0E20_0800, 2), (0x2E20_0800, 1), (0x0E20_1800, 0)];
+/// XTN (XTN2 with Q), CNT.
+const XTN: u32 = 0x0E21_2800;
+const CNT: u32 = 0x0E20_5800;
+/// CMGT, CMEQ, CMLT, CMGE, CMLE against zero.
+const CMP_ZERO: [u32; 5] = [0x0E20_8800, 0x0E20_9800, 0x0E20_A800, 0x2E20_8800, 0x2E20_9800];
+/// ADDV, SADDLV, UADDLV, SMAXV, UMAXV, SMINV, UMINV.
+const REDUCE: [u32; 7] = [0x0E31_B800, 0x0E30_3800, 0x2E30_3800, 0x0E30_A800, 0x2E30_A800, 0x0E31_A800, 0x2E31_A800];
+
+/// SHL (vector, immediate): immh:immb holds the lane's bits plus the shift.
+fn shl_imm(qv: bool, immhb: u32, d: u32, n: u32) -> u32 {
+    0x0F00_5400 | q(qv) | immhb << 16 | n << 5 | d
+}
 
 /// By element (S: index H:L, D: index H), register m of 5 bits.
 fn by_elem(base: u32, qv: bool, sz: u32, d: u32, n: u32, m: u32, idx: u32) -> u32 {
@@ -113,6 +125,12 @@ fn ld1_lane(size: u32, idx: u32, t: u32, n: u32, post: bool) -> u32 {
 fn ld1r(qv: bool, size: u32, t: u32, n: u32, post: bool) -> u32 {
     let post = if post { 1 << 23 | 31 << 16 } else { 0 };
     0x0D40_C000 | q(qv) | post | size << 10 | n << 5 | t
+}
+
+/// SCVTF/UCVTF (scalar, fixed-point): wn (`sf` false) or xn to a single
+/// (`ftype` 0) or a double, divided by 2^fbits.
+fn cvtf_fixed(unsigned: bool, sf: bool, ftype: u32, fbits: u32, d: u32, n: u32) -> u32 {
+    0x1E02_0000 | u32::from(sf) << 31 | ftype << 22 | u32::from(unsigned) << 16 | (64 - fbits) << 10 | n << 5 | d
 }
 
 /// CRC32B/H/W/X, or CRC32C* (`castagnoli`): wd, wn, wm (xm for X).
@@ -210,7 +228,60 @@ fn cases() -> Vec<Case> {
             }
         }
     }
+    // Narrowing, bit counts, shifts left, compares with zero, reductions across lanes.
+    for qv in [false, true] {
+        for size in 0..3 {
+            for (d, n) in [(1, 1), (4, 3), (0, 31)] {
+                add(rrr(XTN, qv, size, d, n, 0), None);
+            }
+        }
+        for (d, n) in [(3, 3), (16, 2)] {
+            add(rrr(CNT, qv, 0, d, n, 0), None);
+        }
+        for size in 0..4u32 {
+            if size == 3 && !qv {
+                continue;
+            }
+            let bits = 8 << size;
+            for shift in [0, 1, bits / 2, bits - 1] {
+                add(shl_imm(qv, bits + shift, 1, 2), None);
+            }
+            for base in CMP_ZERO {
+                add(rrr(base, qv, size, 4, 4, 0), None);
+                add(rrr(base, qv, size, 2, 7, 0), None);
+            }
+        }
+        for size in 0..3 {
+            if size == 2 && !qv {
+                continue;
+            }
+            for base in REDUCE {
+                add(rrr(base, qv, size, 1, 1, 0), None);
+                add(rrr(base, qv, size, 5, 30, 0), None);
+            }
+        }
+    }
+    // Fixed point, but from xn to a single (left to the interpreter).
+    for unsigned in [false, true] {
+        for (sf, ftype) in [(false, 0), (false, 1), (true, 1)] {
+            let fbits: &[u32] = if sf { &[1, 16, 32, 33, 63, 64] } else { &[1, 2, 16, 31, 32] };
+            for &f in fbits {
+                for (d, n) in [(1, 0), (2, 17), (31, 31)] {
+                    add(cvtf_fixed(unsigned, sf, ftype, f, d, n), None);
+                }
+            }
+        }
+    }
     c
+}
+
+/// A fixed-point 64-bit integer to a single stays with the interpreter, which
+/// rounds it twice (through a double).
+#[test]
+fn a_fixed_point_long_to_single_stays_interpreted() {
+    for unsigned in [false, true] {
+        assert_eq!(lift(cvtf_fixed(unsigned, true, 0, 16, 1, 0), CODE), Op::Unhandled);
+    }
 }
 
 // ---- random contexts ----

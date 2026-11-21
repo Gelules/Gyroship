@@ -384,7 +384,7 @@ fn data(op: &Op, pc: u64, word: u32) -> String {
             let e = if to_f64 { format!("{} as f64", fread(src, false)) } else { format!("{} as f32", fread(src, true)) };
             format!("{{ let r = {e}; {} }}", fwrite(dst, "r"))
         }
-        Op::IntToF { dst, src, w, f64, signed } => {
+        Op::IntToF { dst, src, w, f64, signed, fbits } => {
             let t = if f64 { "f64" } else { "f32" };
             let v = match (signed, w) {
                 (true, W::W32) => format!("({} as u32 as i32)", rd(src, W::W32)),
@@ -392,7 +392,9 @@ fn data(op: &Op, pc: u64, word: u32) -> String {
                 (false, W::W32) => format!("({} as u32)", rd(src, W::W32)),
                 (false, W::W64) => rd(src, W::W64),
             };
-            format!("{{ let r = {v} as {t}; {} }}", fwrite(dst, "r"))
+            // Fixed point: times 2^-fbits, by its bits (exact).
+            let scale = if f64 { format!("f64::from_bits({:#x})", (1023 - u64::from(fbits)) << 52) } else { format!("f32::from_bits({:#x})", (127 - u32::from(fbits)) << 23) };
+            format!("{{ let r = {v} as {t} * {scale}; {} }}", fwrite(dst, "r"))
         }
         Op::FToInt { dst, w, src, f64, signed } => {
             let t = match (signed, w) {
@@ -509,7 +511,9 @@ pub fn function(out: &mut String, input: &Input) {
                 | Op::VFUn { .. }
                 | Op::VFCmp { .. }
                 | Op::VInt { .. }
-                | Op::VIntToF { .. } => format!("rt::gyroship_unhandled(c, {pc:#x}, {word:#x});"),
+                | Op::VIntToF { .. }
+                | Op::VIntUn { .. }
+                | Op::VReduce { .. } => format!("rt::gyroship_unhandled(c, {pc:#x}, {word:#x});"),
                 ref op => data(op, pc, word),
             };
             if !s.is_empty() {
