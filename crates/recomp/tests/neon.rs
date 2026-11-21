@@ -42,6 +42,10 @@ const FMUL: u32 = 0x2E20_DC00;
 const FMLA: u32 = 0x0E20_CC00;
 const FMLS: u32 = 0x0EA0_CC00;
 const FADDP: u32 = 0x2E20_D400;
+const FDIV: u32 = 0x2E20_FC00;
+/// Scalar by element: FMLA, FMLS, FMUL; scalar FADDP.
+const FP_ELEM_SCALAR: [u32; 3] = [0x5F80_1000, 0x5F80_5000, 0x5F80_9000];
+const FADDP_SCALAR: u32 = 0x7E30_D800;
 const FMAX: u32 = 0x0E20_F400;
 const FMIN: u32 = 0x0EA0_F400;
 const FMAXNM: u32 = 0x0E20_C400;
@@ -49,8 +53,12 @@ const FMINNM: u32 = 0x0EA0_C400;
 const FCMEQ: u32 = 0x0E20_E400;
 const FCMGE: u32 = 0x2E20_E400;
 const FCMGT: u32 = 0x2EA0_E400;
-/// Two-register misc: compares with zero, FABS/FNEG, SCVTF/UCVTF.
-const FP_UNARY: [u32; 9] = [0x0EA0_C800, 0x0EA0_D800, 0x0EA0_E800, 0x2EA0_C800, 0x2EA0_D800, 0x0EA0_F800, 0x2EA0_F800, 0x0E21_D800, 0x2E21_D800];
+/// Two-register misc: compares with zero, FABS/FNEG, SCVTF/UCVTF, FSQRT,
+/// FRINTM/FRINTP/FRINTZ/FRINTN.
+const FP_UNARY: [u32; 14] = [
+    0x0EA0_C800, 0x0EA0_D800, 0x0EA0_E800, 0x2EA0_C800, 0x2EA0_D800, 0x0EA0_F800, 0x2EA0_F800, 0x0E21_D800, 0x2E21_D800, 0x2EA1_F800, 0x0E21_9800, 0x0EA1_8800,
+    0x0EA1_9800, 0x0E21_8800,
+];
 /// By element: FMLA, FMLS, FMUL.
 const FP_ELEM: [u32; 3] = [0x0F80_1000, 0x0F80_5000, 0x0F80_9000];
 /// Scalar FADD, FSUB, FMUL, FDIV (ftype in the size field).
@@ -159,7 +167,7 @@ fn cases() -> Vec<Case> {
     let fp_regs = [(0, 1, 2), (8, 8, 10), (8, 8, 8), (31, 30, 29)];
     for (qv, sz) in [(false, 0), (true, 0), (true, 1)] {
         for (d, n, m) in fp_regs {
-            for base in [FADD, FSUB, FMUL, FMLA, FMLS, FADDP, FCMEQ, FCMGE, FCMGT, FMAX, FMIN, FMAXNM, FMINNM] {
+            for base in [FADD, FSUB, FMUL, FDIV, FMLA, FMLS, FADDP, FCMEQ, FCMGE, FCMGT, FMAX, FMIN, FMAXNM, FMINNM] {
                 add(rrr(base, qv, sz, d, n, m), None);
             }
             for base in FP_UNARY {
@@ -177,6 +185,12 @@ fn cases() -> Vec<Case> {
             for base in FP_SCALAR {
                 add(rrr(base, false, ftype, d, n, m), None);
             }
+            for base in FP_ELEM_SCALAR {
+                for idx in 0..4 >> ftype {
+                    add(by_elem(base, false, ftype, d, n, m, idx), None);
+                }
+            }
+            add(FADDP_SCALAR | ftype << 22 | n << 5 | d, None);
         }
     }
     for qv in [false, true] {

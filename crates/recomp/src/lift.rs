@@ -496,10 +496,10 @@ fn lift_lanes(i: &Instruction) -> Option<Op> {
                 })
             })
         }
-        C::FADD | C::FSUB | C::FMUL | C::FMLA | C::FMLS | C::FADDP if vec_op => {
+        C::FADD | C::FSUB | C::FMUL | C::FDIV | C::FMLA | C::FMLS | C::FADDP if vec_op => {
             let ((dst, q, e), (a, _, _)) = (vector(&o[0])?, vector(&o[1])?);
             let (b, lane) = match o[2] {
-                O::SIMDRegisterElementsLane(_, m, _, l) if i.opcode != C::FADDP => (m as u8, Some(l)),
+                O::SIMDRegisterElementsLane(_, m, _, l) if !matches!(i.opcode, C::FADDP | C::FDIV) => (m as u8, Some(l)),
                 O::SIMDRegisterElements(_, m, _) => (m as u8, None),
                 _ => return None,
             };
@@ -507,11 +507,28 @@ fn lift_lanes(i: &Instruction) -> Option<Op> {
                 C::FADD => VFp::Add,
                 C::FSUB => VFp::Sub,
                 C::FMUL => VFp::Mul,
+                C::FDIV => VFp::Div,
                 C::FMLA => VFp::Mla,
                 C::FMLS => VFp::Mls,
                 _ => VFp::AddP,
             };
-            Op::VFp { op, f64: fp_lanes(e, q)?, q, dst, a, b, lane }
+            Op::VFp { op, f64: fp_lanes(e, q)?, q, dst, a, b, lane, scalar: false }
+        }
+        // Scalar by element: FMUL s0, s1, v2.s[1] and the like.
+        C::FMUL | C::FMLA | C::FMLS if matches!((&o[0], &o[2]), (O::SIMDRegister(..), O::SIMDRegisterElementsLane(..))) => {
+            let ((dst, d), (a, _)) = (freg(&o[0])?, freg(&o[1])?);
+            let O::SIMDRegisterElementsLane(_, b, _, lane) = o[2] else { return None };
+            let op = match i.opcode {
+                C::FMUL => VFp::Mul,
+                C::FMLA => VFp::Mla,
+                _ => VFp::Mls,
+            };
+            Op::VFp { op, f64: d, q: false, dst, a, b: b as u8, lane: Some(lane), scalar: true }
+        }
+        // Scalar pairwise: FADDP s0, v1.2s (d0, v1.2d: 16 bytes).
+        C::FADDP if matches!(o[0], O::SIMDRegister(..)) => {
+            let ((dst, d), (src, _, _)) = (freg(&o[0])?, vector(&o[1])?);
+            Op::VFp { op: VFp::AddP, f64: d, q: d, dst, a: src, b: src, lane: None, scalar: true }
         }
         C::FMAX | C::FMIN | C::FMAXNM | C::FMINNM if vec_op => {
             let ((dst, q, e), (a, _, _), (b, _, _)) = (vector(&o[0])?, vector(&o[1])?, vector(&o[2])?);
@@ -521,11 +538,20 @@ fn lift_lanes(i: &Instruction) -> Option<Op> {
                 C::FMAXNM => VFp::MaxNm,
                 _ => VFp::MinNm,
             };
-            Op::VFp { op, f64: fp_lanes(e, q)?, q, dst, a, b, lane: None }
+            Op::VFp { op, f64: fp_lanes(e, q)?, q, dst, a, b, lane: None, scalar: false }
         }
-        C::FNEG | C::FABS if vec_op => {
+        C::FNEG | C::FABS | C::FSQRT | C::FRINTM | C::FRINTP | C::FRINTZ | C::FRINTN if vec_op => {
             let ((dst, q, e), (src, _, _)) = (vector(&o[0])?, vector(&o[1])?);
-            Op::VFUn { op: if i.opcode == C::FNEG { FUn::Neg } else { FUn::Abs }, f64: fp_lanes(e, q)?, q, dst, src }
+            let op = match i.opcode {
+                C::FNEG => FUn::Neg,
+                C::FABS => FUn::Abs,
+                C::FSQRT => FUn::Sqrt,
+                C::FRINTM => FUn::Floor,
+                C::FRINTP => FUn::Ceil,
+                C::FRINTZ => FUn::Trunc,
+                _ => FUn::Nearest,
+            };
+            Op::VFUn { op, f64: fp_lanes(e, q)?, q, dst, src }
         }
         C::FCMEQ | C::FCMGE | C::FCMGT | C::FCMLE | C::FCMLT if vec_op => {
             let ((dst, q, e), (a, _, _)) = (vector(&o[0])?, vector(&o[1])?);

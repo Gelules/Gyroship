@@ -92,8 +92,13 @@ fn lifts_the_vector_lane_forms() {
     assert_eq!(lift(0x4e0c1d00, pc), Op::ToLane { dst: 0, src: Reg::X(8), size: 2, lane: Some(1), q: true }, "mov v0.s[1], w8");
     assert_eq!(
         lift(0x4f831368, pc),
-        Op::VFp { op: VFp::Mla, f64: false, q: true, dst: 8, a: 27, b: 3, lane: Some(0) },
+        Op::VFp { op: VFp::Mla, f64: false, q: true, dst: 8, a: 27, b: 3, lane: Some(0), scalar: false },
         "fmla v8.4s, v27.4s, v3.s[0]"
+    );
+    assert_eq!(
+        lift(0x5fa21020, pc),
+        Op::VFp { op: VFp::Mla, f64: false, q: false, dst: 0, a: 1, b: 2, lane: Some(1), scalar: true },
+        "fmla s0, s1, v2.s[1]"
     );
     assert_eq!(
         lift(0x2eaaad08, pc),
@@ -115,7 +120,6 @@ fn lifts_the_vector_lane_forms() {
         (0x0d829000, "st1 {v0.s}[1], [x0], x2"),
         (0x4e421420, "fadd v0.8h, v1.8h, v2.8h"),
         (0x4f3de420, "scvtf v0.4s, v1.4s, #0x3"),
-        (0x5fa21020, "fmla s0, s1, v2.s[1]"),
         (0x4e22dc20, "fmulx v0.4s, v1.4s, v2.4s"),
         (0x6ea2d420, "fabd v0.4s, v1.4s, v2.4s"),
     ] {

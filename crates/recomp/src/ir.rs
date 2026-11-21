@@ -200,9 +200,10 @@ pub enum Op {
     /// from b), or 0 for [`ZERO`]: EXT, REV*, ZIP/UZP/TRN, DUP and INS of an element.
     VShuffle { dst: u8, a: u8, b: u8, mask: [u8; 16] },
     /// Lane-wise FP on singles (`f64` false) or doubles; `lane` gives every
-    /// lane element `lane` of b (the by-element forms).
-    VFp { op: VFp, f64: bool, q: bool, dst: u8, a: u8, b: u8, lane: Option<u8> },
-    /// FNEG/FABS of every lane.
+    /// lane element `lane` of b (the by-element forms); `scalar`: element 0
+    /// alone is written (the scalar by-element forms, scalar FADDP).
+    VFp { op: VFp, f64: bool, q: bool, dst: u8, a: u8, b: u8, lane: Option<u8>, scalar: bool },
+    /// FNEG/FABS/FSQRT/FRINTM/FRINTP/FRINTZ/FRINTN of every lane.
     VFUn { op: FUn, f64: bool, q: bool, dst: u8, src: u8 },
     /// FCMEQ...FCMLT against a register or (None) +0.0: all ones where true.
     VFCmp { cmp: VCmp, f64: bool, q: bool, dst: u8, a: u8, b: Option<u8> },
@@ -274,6 +275,7 @@ pub enum VFp {
     Add,
     Sub,
     Mul,
+    Div,
     /// dst + a * b, dst - a * b: fused, one rounding.
     Mla,
     Mls,

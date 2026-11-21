@@ -1075,7 +1075,7 @@ impl<M: Module> Emit<'_, '_, M> {
                 }
                 self.b.ins().store(self.cpu_flags, r, self.cpu, vr_offset(dst));
             }
-            Op::VFp { op, f64, q, dst, a, b, lane } => {
+            Op::VFp { op, f64, q, dst, a, b, lane, scalar } => {
                 let (t, eb) = if f64 { (F64X2, 8) } else { (F32X4, 4) };
                 let (x, y) = if op == VFp::AddP {
                     let (even, odd) = self.pairs(a, b, eb, q);
@@ -1090,30 +1090,48 @@ impl<M: Module> Emit<'_, '_, M> {
                     };
                     (self.vload(t, a), y)
                 };
-                if matches!(op, VFp::Max | VFp::Min | VFp::MaxNm | VFp::MinNm) {
-                    // Arm's NaN rules, native: no rescue.
-                    let r = self.vminmax(op, f64, x, y);
-                    self.vput(dst, r, q);
+                // The interpreter's NaNs (Arm's, but for FMAX/FMIN), native: no rescue.
+                let r = match op {
+                    VFp::Max | VFp::Min | VFp::MaxNm | VFp::MinNm => self.vminmax(op, f64, x, y),
+                    VFp::Mla | VFp::Mls => {
+                        let acc = self.vload(t, dst);
+                        // FMLS negates the first factor, NaN or not, before FPMulAdd.
+                        let x = if op == VFp::Mls { self.b.ins().fneg(x) } else { x };
+                        let r = self.b.ins().fma(x, y, acc);
+                        self.fma_nan(f64, acc, x, y, r)
+                    }
+                    _ => {
+                        let i = self.b.ins();
+                        let r = match op {
+                            VFp::Add | VFp::AddP => i.fadd(x, y),
+                            VFp::Sub => i.fsub(x, y),
+                            VFp::Mul => i.fmul(x, y),
+                            _ => i.fdiv(x, y),
+                        };
+                        self.arm_nan(f64, &[x, y], r)
+                    }
+                };
+                if scalar {
+                    let e = self.b.ins().extractlane(r, 0);
+                    self.vset(dst, e);
                 } else {
-                    let r = match op {
-                        VFp::Add | VFp::AddP => self.b.ins().fadd(x, y),
-                        VFp::Sub => self.b.ins().fsub(x, y),
-                        VFp::Mul => self.b.ins().fmul(x, y),
-                        _ => {
-                            let acc = self.vload(t, dst);
-                            let x = if op == VFp::Mls { self.b.ins().fneg(x) } else { x };
-                            self.b.ins().fma(x, y, acc)
-                        }
-                    };
-                    let nan = self.b.ins().fcmp(FloatCC::Unordered, r, r);
-                    let lanes = self.b.ins().vhigh_bits(I32, nan);
-                    let lanes = if q { lanes } else { self.b.ins().band_imm_s(lanes, 0b11) };
-                    self.unless_nan(lanes, pc, word, |e| e.vput(dst, r, q));
+                    self.vput(dst, r, q);
                 }
             }
             Op::VFUn { op, f64, q, dst, src } => {
+                // As the interpreter: the host's results, NaNs included.
                 let x = self.vload(if f64 { F64X2 } else { F32X4 }, src);
-                let r = if op == FUn::Neg { self.b.ins().fneg(x) } else { self.b.ins().fabs(x) };
+                let i = self.b.ins();
+                let r = match op {
+                    FUn::Neg => i.fneg(x),
+                    FUn::Abs => i.fabs(x),
+                    FUn::Sqrt => i.sqrt(x),
+                    FUn::Floor => i.floor(x),
+                    FUn::Ceil => i.ceil(x),
+                    FUn::Trunc => i.trunc(x),
+                    FUn::Nearest => i.nearest(x),
+                    FUn::Round => unreachable!("FRINTA of a vector is not lifted"),
+                };
                 self.vput(dst, r, q);
             }
             Op::VFCmp { cmp, f64, q, dst, a, b } => {
@@ -1344,6 +1362,71 @@ impl<M: Module> Emit<'_, '_, M> {
             r = self.b.ins().bitselect(y_only, xi, r);
             r = self.b.ins().bitselect(x_only, yi, r);
         }
+        self.cast(t, r)
+    }
+
+    /// `v` in every lane of integer vector type `it`.
+    fn splat_int(&mut self, it: Type, v: i64) -> Value {
+        let c = self.b.ins().iconst(it.lane_type(), v);
+        self.b.ins().splat(it, c)
+    }
+
+    /// Arm's result (FPCR.DN = 0) in every lane whose host result is `r`, from the
+    /// operands `ops` in order, as the interpreter's `arm_nan`: the first signalling
+    /// NaN operand quieted, else the first NaN operand, else the default NaN where
+    /// `r` is NaN (an invalid operation), else `r`.
+    fn arm_nan(&mut self, f64: bool, ops: &[Value], r: Value) -> Value {
+        let (t, it) = if f64 { (F64X2, I64X2) } else { (F32X4, I32X4) };
+        let (quiet, inf) = if f64 { (1i64 << 51, 0x7FFi64 << 52) } else { (1i64 << 22, 0x7F80_0000) };
+        let (q, inf) = (self.splat_int(it, quiet), self.splat_int(it, inf));
+        let zero = self.vconst(it, [0; 16]);
+        let default = self.b.ins().bor(inf, q);
+        let r_nan = self.b.ins().fcmp(FloatCC::Unordered, r, r);
+        let ri = self.cast(it, r);
+        let mut out = self.b.ins().bitselect(r_nan, default, ri);
+        let mut nans = Vec::new();
+        for &x in ops {
+            let nan = self.b.ins().fcmp(FloatCC::Unordered, x, x);
+            let xi = self.cast(it, x);
+            let xq = self.b.ins().bor(xi, q);
+            nans.push((nan, xi, xq));
+        }
+        // The first NaN operand, then the first signalling one over it.
+        for &(nan, _, xq) in nans.iter().rev() {
+            out = self.b.ins().bitselect(nan, xq, out);
+        }
+        for &(nan, xi, xq) in nans.iter().rev() {
+            let bit = self.b.ins().band(xi, q);
+            let loud = self.b.ins().icmp(IntCC::Equal, bit, zero);
+            let snan = self.b.ins().band(nan, loud);
+            out = self.b.ins().bitselect(snan, xq, out);
+        }
+        self.cast(t, out)
+    }
+
+    /// FPMulAdd(acc, a, b)'s NaNs, as the interpreter's `fma_nan`: `arm_nan` on
+    /// (acc, a, b), except the default NaN where the addend is a quiet NaN and
+    /// a * b is inf * 0.
+    fn fma_nan(&mut self, f64: bool, acc: Value, a: Value, b: Value, r: Value) -> Value {
+        let (t, it) = if f64 { (F64X2, I64X2) } else { (F32X4, I32X4) };
+        let (quiet, inf, abs) = if f64 { (1i64 << 51, 0x7FFi64 << 52, i64::MAX) } else { (1i64 << 22, 0x7F80_0000, 0x7FFF_FFFF) };
+        let out = self.arm_nan(f64, &[acc, a, b], r);
+        let (q, inf, abs) = (self.splat_int(it, quiet), self.splat_int(it, inf), self.splat_int(it, abs));
+        let zero = self.vconst(it, [0; 16]);
+        let (ai, bi, acci) = (self.cast(it, a), self.cast(it, b), self.cast(it, acc));
+        let (am, bm) = (self.b.ins().band(ai, abs), self.b.ins().band(bi, abs));
+        let (a_inf, a_zero) = (self.b.ins().icmp(IntCC::Equal, am, inf), self.b.ins().icmp(IntCC::Equal, am, zero));
+        let (b_inf, b_zero) = (self.b.ins().icmp(IntCC::Equal, bm, inf), self.b.ins().icmp(IntCC::Equal, bm, zero));
+        let (ab, ba) = (self.b.ins().band(a_inf, b_zero), self.b.ins().band(a_zero, b_inf));
+        let inf_zero = self.b.ins().bor(ab, ba);
+        let acc_nan = self.b.ins().fcmp(FloatCC::Unordered, acc, acc);
+        let acc_bit = self.b.ins().band(acci, q);
+        let acc_quiet = self.b.ins().icmp(IntCC::NotEqual, acc_bit, zero);
+        let quiet_acc = self.b.ins().band(acc_nan, acc_quiet);
+        let special = self.b.ins().band(quiet_acc, inf_zero);
+        let default = self.b.ins().bor(inf, q);
+        let outi = self.cast(it, out);
+        let r = self.b.ins().bitselect(special, default, outi);
         self.cast(t, r)
     }
 
