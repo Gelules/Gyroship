@@ -230,6 +230,9 @@ pub struct Surfaces {
     pub(crate) open: Option<crate::draw::PassKey>,
     /// The ids the next texture slot set announced takes (from 0 at each flush).
     pub(crate) sets: u32,
+    /// The empty slot set that every stage without textures takes until the
+    /// next flush, once announced.
+    pub(crate) empty_set: Option<(Arc<[crate::draw::Slot]>, Arc<[u32]>, u32)>,
     /// Whether each target format is renderable here, asked once (a driver query per draw otherwise).
     renderable: Vec<(wgpu::TextureFormat, bool)>,
     /// The present the work recorded now belongs to (set by the caller at each present).
@@ -1217,7 +1220,7 @@ impl Surfaces {
         let timed = timing.is_some();
         let rec = Arc::new(Mutex::new(crate::record::Recorder::new(&device, &queue, timing)));
         let renderable = (0..=0xff).filter_map(color_format).chain((0..=0xff).filter_map(depth_format)).map(|f| (f, renderable_on(&adapter, &device, f))).collect();
-        Ok(Surfaces { renderable, adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, rec, batch: Vec::with_capacity(BATCH), recorder: None, recorder_ended: false, timed, open: None, sets: 0, present: 0, readbacks: Default::default(), hasher: None, belt, big_upload: false, texture_belt, uploads: None, global_bytes: Vec::new(), staging: Staging::default(), last_color: None, window, submit: None, submit_ended: false, memo: Memo::default(), kept: Kept::default(), compile: Compile::default(), compile_total: Compile::default(), background: false, wait_left: PIPELINE_WAIT, workers: None, finished: Default::default(), disk_cache: None, shader_cache: None, views: Aged::default(), dynamic_max, clip_distances })
+        Ok(Surfaces { renderable, adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, rec, batch: Vec::with_capacity(BATCH), recorder: None, recorder_ended: false, timed, open: None, sets: 0, empty_set: None, present: 0, readbacks: Default::default(), hasher: None, belt, big_upload: false, texture_belt, uploads: None, global_bytes: Vec::new(), staging: Staging::default(), last_color: None, window, submit: None, submit_ended: false, memo: Memo::default(), kept: Kept::default(), compile: Compile::default(), compile_total: Compile::default(), background: false, wait_left: PIPELINE_WAIT, workers: None, finished: Default::default(), disk_cache: None, shader_cache: None, views: Aged::default(), dynamic_max, clip_distances })
     }
 
     /// Shows the presented image (the color target written last, its top-left
@@ -1647,6 +1650,7 @@ impl Surfaces {
         // The frame's blocks and sets end here, on both sides: their ids start again.
         self.memo.blocks.clear();
         self.sets = 0;
+        self.empty_set = None;
         // The recorder has applied everything (play mode: its thread waits for the next batch).
         self.drain_recorder();
         let rec = self.rec.clone();

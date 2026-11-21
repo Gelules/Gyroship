@@ -1226,6 +1226,16 @@ impl Surfaces {
     /// slots and swizzles by (a set made here is announced: `Rec::Set`).
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     pub(crate) fn texture_slots(&mut self, t: &Translation, banks: &[(u8, u32)], headers: Pool, samplers: Pool, binding: SamplerBinding, attached: &[u64], mem: Mem) -> Result<(std::sync::Arc<[Slot]>, std::sync::Arc<[u32]>, u32), String> {
+        // No textures: the frame's one empty set, whatever the banks, pools and targets.
+        if t.interface.textures.is_empty() {
+            if self.empty_set.is_none() {
+                let (textures, swizzles, id) = (std::sync::Arc::from(Vec::new()), std::sync::Arc::from(Vec::new()), self.sets);
+                self.sets += 1;
+                self.push(Rec::Set(id, std::sync::Arc::clone(&textures), std::sync::Arc::clone(&swizzles)));
+                self.empty_set = Some((textures, swizzles, id));
+            }
+            return Ok(self.empty_set.clone().expect("announced above"));
+        }
         // Each slot's handle, from the banks' bytes in this submit's blocks (by bank,
         // no search per word); None when it cannot be read, its error left to the loop
         // below, in slot order (computing them first changes nothing: no side effect).
@@ -2226,7 +2236,9 @@ mod tests {
 
     /// A stage's texture slots are taken again for the same handles, read from
     /// another bank, and journaled again; another handle, a GPU write on the
-    /// headers or forgotten slots resolve them afresh.
+    /// headers or forgotten slots resolve them afresh. Stages without textures
+    /// take one empty set until the next flush, whatever their banks, pools and
+    /// targets, a stage with textures between them making its own.
     #[test]
     fn texture_slots_are_taken_again_for_the_same_handles() {
         let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
@@ -2275,6 +2287,18 @@ mod tests {
         assert_eq!(slots(&mut s, 0).1, [5, 2]);
         s.memo.forget_slots();
         assert_eq!(slots(&mut s, 0).1, [6, 2], "the slots forgotten");
+        let none = |key| Translation { key, stage: Stage::Pixel, wgsl: String::new(), interface: Interface::default() };
+        let (a, b) = (none(1), none(2));
+        let empty = s.texture_slots(&a, &[], headers, samplers, binding, &[], &mut mem).unwrap();
+        // Handle 1, whose set the slots forgotten above dropped: a new one.
+        let banks: BankIds = smallvec![(0u8, s.block(1u32.to_le_bytes().to_vec()))];
+        let textured = s.texture_slots(&t, &banks, headers, samplers, binding, &[], &mut mem).unwrap();
+        let again = s.texture_slots(&b, &banks, resources::header_pool(&|_| 0), samplers, binding, &[0x1000], &mut mem).unwrap();
+        assert!(empty.0.is_empty() && empty.1.is_empty() && std::sync::Arc::ptr_eq(&empty.0, &again.0));
+        assert_eq!((again.2, textured.2, s.sets), (empty.2, empty.2 + 1, empty.2 + 2), "one empty set, announced once");
+        s.flush();
+        let after = s.texture_slots(&b, &[], headers, samplers, binding, &[], &mut mem).unwrap();
+        assert_eq!((after.2, s.sets), (0, 1), "announced again after a flush");
     }
 
     /// A handle that cannot be read stops the slots with its error in slot
