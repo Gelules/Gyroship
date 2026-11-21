@@ -126,11 +126,13 @@ pub struct Draw {
     /// SASS): 0 vertex before fetch, 1 vertex, 2 tessellation init, 3
     /// tessellation, 4 geometry, 5 pixel.
     pub programs: [Option<u64>; 6],
-    pub streams: Vec<Stream>,
-    pub attributes: Vec<Attribute>,
+    /// Kept inline (every Corneria draw programs attributes 0 to 19): no
+    /// allocation per draw on the decoder, no free on the GPU thread.
+    pub streams: smallvec::SmallVec<[Stream; 4]>,
+    pub attributes: smallvec::SmallVec<[Attribute; 24]>,
     pub render: RenderState,
     /// The color target of each output location (SET_CT_SELECT).
-    pub targets: Vec<Surface>,
+    pub targets: smallvec::SmallVec<[Surface; 4]>,
     /// The depth-stencil target, when SET_ZT_SELECT enables one.
     pub depth: Option<Surface>,
     /// Constant buffers by bank, of the vertex stage then the pixel stage.

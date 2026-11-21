@@ -112,9 +112,9 @@ pub struct Attribute {
 /// never-written register reads 0). Constant attributes are kept so the
 /// shader translator can substitute their value; which of them the shader
 /// actually reads is in its header, not in this state.
-pub fn vertex_input<R: Fn(u32) -> u32 + ?Sized>(r: &R) -> (Vec<Stream>, Vec<Attribute>) {
-    // Plain loops into lists sized once (a filtered chain grew them 4, 8, 16, 32).
-    let mut streams = Vec::with_capacity(COUNT as usize);
+pub fn vertex_input<R: Fn(u32) -> u32 + ?Sized>(r: &R) -> (smallvec::SmallVec<[Stream; 4]>, smallvec::SmallVec<[Attribute; 24]>) {
+    // Plain loops into inline lists (a filtered chain grew them 4, 8, 16, 32).
+    let mut streams = smallvec::SmallVec::new();
     for j in 0..COUNT {
         let format = r(0x1c00 + 16 * j);
         if field(format, 12, 12) != 1 {
@@ -131,7 +131,7 @@ pub fn vertex_input<R: Fn(u32) -> u32 + ?Sized>(r: &R) -> (Vec<Stream>, Vec<Attr
             divisor: r(0x1c0c + 16 * j),
         });
     }
-    let mut attributes = Vec::with_capacity(COUNT as usize);
+    let mut attributes = smallvec::SmallVec::new();
     for i in 0..COUNT {
         let v = r(0x1160 + 4 * i);
         if field(v, 26, 21) == 0 {
@@ -326,8 +326,8 @@ mod tests {
         );
         assert!(a.is_empty());
         assert_eq!(
-            s,
-            vec![
+            s[..],
+            [
                 Stream { index: 5, address: 0xab_8765_4320, stride: 4095, end: 0xab_8765_4320 + 0x1_0000_0010 - 1, per_instance: true, divisor: 3 },
                 Stream { index: 17, address: 0x1000, stride: 20, end: 0xfff, per_instance: false, divisor: 0 },
             ]
@@ -444,7 +444,8 @@ mod tests {
                 })
                 .collect();
             let r = |m: u32| regs[(m / 4) as usize];
-            assert_eq!(vertex_input(&r), chains(&r));
+            let ((s, a), (cs, ca)) = (vertex_input(&r), chains(&r));
+            assert_eq!((&s[..], &a[..]), (&cs[..], &ca[..]));
         }
     }
 }

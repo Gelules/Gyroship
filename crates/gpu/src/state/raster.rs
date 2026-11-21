@@ -558,8 +558,8 @@ pub struct RenderState {
     pub blend_per_target: bool,
     /// SET_SINGLE_CT_WRITE_CONTROL_ENABLE.
     pub single_ct_write: bool,
-    /// One entry per selected output location, in location order.
-    pub outputs: Vec<ColorOutput>,
+    /// One entry per selected output location, in location order (inline).
+    pub outputs: smallvec::SmallVec<[ColorOutput; 4]>,
     /// SET_BLEND_CONST_RED/GREEN/BLUE/ALPHA_V (f32): wgpu set_blend_constant.
     pub blend_constant: [f32; 4],
     pub depth_stencil: DepthStencil,
