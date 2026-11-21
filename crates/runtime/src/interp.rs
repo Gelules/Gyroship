@@ -1117,12 +1117,12 @@ fn exec(c: &mut Cpu, _pc: u64, i: &Instruction) -> Result {
             let (d, _) = scalar(&o[0])?;
             let (s, q, e) = vec(&o[1])?;
             let signed = matches!(i.opcode, C::SMAXV | C::SMINV | C::SADDLV);
-            let vals: Vec<i128> = (0..lanes(q, e)).map(|j| ival(lane(c.vr[s], j, e), e, signed)).collect();
+            let vals = (0..lanes(q, e)).map(|j| ival(lane(c.vr[s], j, e), e, signed));
             let r = match i.opcode {
-                C::ADDV => (vals.iter().sum::<i128>() as u64) & mask(e),
-                C::UADDLV | C::SADDLV => (vals.iter().sum::<i128>() as u64) & mask(2 * e),
-                C::UMAXV | C::SMAXV => (*vals.iter().max().expect("lanes") as u64) & mask(e),
-                _ => (*vals.iter().min().expect("lanes") as u64) & mask(e),
+                C::ADDV => (vals.sum::<i128>() as u64) & mask(e),
+                C::UADDLV | C::SADDLV => (vals.sum::<i128>() as u64) & mask(2 * e),
+                C::UMAXV | C::SMAXV => (vals.max().expect("lanes") as u64) & mask(e),
+                _ => (vals.min().expect("lanes") as u64) & mask(e),
             };
             c.vr[d] = u128::from(r);
             Ok(())

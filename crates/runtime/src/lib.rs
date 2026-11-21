@@ -128,9 +128,31 @@ pub fn lookup(addr: u64) -> Option<Guest> {
 
 /// The function whose body contains `pc`.
 pub fn containing(pc: u64) -> Option<Entry> {
-    let t = DISPATCH.get()?;
-    let e = t[..t.partition_point(|e| e.addr <= pc)].last()?;
-    (pc - e.addr < e.len).then_some(*e)
+    RECENT.with(|recent| find(DISPATCH.get()?, recent, pc))
+}
+
+const RECENT_SLOTS: usize = 1024;
+
+thread_local! {
+    /// The entries this thread found last, by a hash of the address: indirect
+    /// calls and resumes mostly go back to functions reached recently.
+    static RECENT: [std::cell::Cell<Option<Entry>>; RECENT_SLOTS] = const { [const { std::cell::Cell::new(None) }; RECENT_SLOTS] };
+}
+
+/// The entry of `table` (sorted, no overlap) whose body contains `pc`: from
+/// `recent` when its slot for `pc` holds it, else searched and kept there.
+fn find(table: &[Entry], recent: &[std::cell::Cell<Option<Entry>>; RECENT_SLOTS], pc: u64) -> Option<Entry> {
+    let slot = &recent[((pc >> 2).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 54) as usize];
+    if let Some(e) = slot.get()
+        && pc.wrapping_sub(e.addr) < e.len
+    {
+        return Some(e);
+    }
+    let e = *table[..table.partition_point(|e| e.addr <= pc)].last()?;
+    (pc - e.addr < e.len).then(|| {
+        slot.set(Some(e));
+        e
+    })
 }
 
 /// The guest function whose recompiled code starts closest below host address
@@ -643,5 +665,35 @@ pub fn fmin32(a: f32, b: f32) -> f32 {
         a
     } else {
         b
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The recent entries answer as the search does, over adjacent functions,
+    /// gaps, addresses inside functions and slots that many addresses share.
+    #[test]
+    fn recent_entries_answer_as_the_search() {
+        unsafe extern "C" fn f(_: *mut Cpu, _: u64) {}
+        let mut table = Vec::new();
+        let mut at = 0x1000u64;
+        for i in 0..400u64 {
+            let len = 4 * (1 + i % 7);
+            table.push(Entry { addr: at, len, function: f });
+            // A gap after every third function.
+            at += len + if i % 3 == 0 { 8 } else { 0 };
+        }
+        let recent = [const { std::cell::Cell::new(None) }; RECENT_SLOTS];
+        let search = |pc: u64| table[..table.partition_point(|e| e.addr <= pc)].last().filter(|e| pc - e.addr < e.len).map(|e| e.addr);
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        for _ in 0..50_000 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let pc = 0xff0 + seed % (at - 0xff0 + 0x10);
+            assert_eq!(find(&table, &recent, pc).map(|e| e.addr), search(pc), "pc {pc:#x}");
+        }
     }
 }

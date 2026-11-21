@@ -74,6 +74,46 @@ fn vector_lanes() {
     assert_eq!(c.vr[4], lanes32([2, 0x7fff_ffff, 0xffff_fffe, 50]), "saturated left, arithmetic right");
 }
 
+/// Reductions across lanes (ADDV, UADDLV, SADDLV, UMAXV, SMAXV, UMINV, SMINV)
+/// in every arrangement, on random vectors: what the lanes give, computed here;
+/// the rest of the register cleared.
+#[test]
+fn reductions_across_lanes() {
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    // (word with Q, size, Rn and Rd at 0; signed; 0 sum, 1 long sum, 2 max, 3 min)
+    let ops = [(0x0e31_b800u32, false, 0), (0x2e30_3800, false, 1), (0x0e30_3800, true, 1), (0x2e30_a800, false, 2), (0x0e30_a800, true, 2), (0x2e31_a800, false, 3), (0x0e31_a800, true, 3)];
+    let mut c = Cpu::new(std::ptr::null_mut());
+    for (base, signed, kind) in ops {
+        // 8B, 16B, 4H, 8H, 4S.
+        for (q, size) in [(0u32, 0u32), (1, 0), (0, 1), (1, 1), (1, 2)] {
+            let (e, word) = (8u32 << size, base | q << 30 | size << 22 | 1 << 5);
+            for _ in 0..64 {
+                let v = u128::from(next()) << 64 | u128::from(next());
+                (c.vr[0], c.vr[1]) = (u128::MAX, v);
+                run(&mut c, word);
+                let lane = |j: u32| {
+                    let x = (v >> (j * e)) as u64 & u64::MAX >> (64 - e);
+                    if signed { i128::from(((x << (64 - e)) as i64) >> (64 - e)) } else { i128::from(x) }
+                };
+                let lanes = (0..(64 << q) / e).map(lane);
+                let (r, width) = match kind {
+                    0 => (lanes.sum::<i128>(), e),
+                    1 => (lanes.sum::<i128>(), 2 * e),
+                    2 => (lanes.max().unwrap(), e),
+                    _ => (lanes.min().unwrap(), e),
+                };
+                assert_eq!(c.vr[0], r as u128 & u128::MAX >> (128 - width), "{word:08x} on {v:#034x}");
+            }
+        }
+    }
+}
+
 #[test]
 fn reciprocal_estimates_match_the_hardware() {
     let mut c = Cpu::new(std::ptr::null_mut());
