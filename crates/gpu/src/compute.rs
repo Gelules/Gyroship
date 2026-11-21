@@ -59,7 +59,7 @@ fn storage_format(f: wgpu::TextureFormat) -> Option<(wgpu::TextureFormat, &'stat
 }
 
 /// A translated compute program for one block size and set of image formats.
-pub(crate) type Compiled = Result<std::sync::Arc<(Translation, wgpu::ShaderModule)>, String>;
+pub(crate) type Compiled = Result<std::sync::Arc<crate::draw::Built>, String>;
 
 /// What an image slot is bound to: a storage view of its texture, or (`Image::buffer`)
 /// a buffer the texture is copied into before the dispatch, and back out of after it.

@@ -118,9 +118,13 @@ pub(crate) fn read_pages(mem: Mem, addr: u64, out: &mut [u8]) -> usize {
     done
 }
 
+/// A translation, its module, and its serial: the order in which the run made it
+/// (`Surfaces::translated`), one per program and options, which pipelines are keyed by.
+pub(crate) type Built = (Translation, wgpu::ShaderModule, u32);
+
 /// A translation and its module, shared: draws take a reference count, not a copy
 /// of the WGSL (some programs are 300 KB of text, drawn a dozen times a frame).
-type Module = Result<std::sync::Arc<(Translation, wgpu::ShaderModule)>, String>;
+type Module = Result<std::sync::Arc<Built>, String>;
 
 /// Work for the pipeline worker threads (play mode, D42).
 pub(crate) type Job = Box<dyn FnOnce() + Send>;
@@ -235,11 +239,11 @@ pub struct Cache {
     /// The last module each call of `module` found without jump tables (pixel,
     /// then vertex when paired), by (address, pair, mask, clip): programs and
     /// modules are never replaced, so a draw repeating them skips both probes.
-    last_modules: [Option<((u64, Option<u64>, u64, u8), std::sync::Arc<(Translation, wgpu::ShaderModule)>)>; 2],
+    last_modules: [Option<((u64, Option<u64>, u64, u8), std::sync::Arc<Built>)>; 2],
     /// Modules made, by program key and options: pairings that give a program the
     /// same options (a vertex program with pixel programs of the same varyings)
     /// share one (D72).
-    shared: FxMap<(u64, Options), std::sync::Arc<(Translation, wgpu::ShaderModule)>>,
+    shared: FxMap<(u64, Options), std::sync::Arc<Built>>,
     /// Render pipelines with their bind group layouts, their id for the run
     /// (`Rec::Pipeline`; never removed: their count is the next id), and
     /// whether the recorder has them (announced once made).
@@ -476,14 +480,14 @@ type JumpMemo = FxMap<(u64, Option<u64>, u64, u8), (Vec<Vec<u8>>, u64)>;
 type ModuleId = (u64, Option<u64>, u64, u64, u8);
 
 /// What a render pipeline is made from, as a hashable key: the vertex program
-/// (key, WGSL length), the pixel program's, the vertex buffer layouts (stream,
+/// (key, module serial), the pixel program's, the vertex buffer layouts (stream,
 /// step, stride, attributes), the primitive, color and depth states, and the
 /// bind group layouts' ids (`Surfaces::group_id`; u32::MAX past the last
-/// non-empty group). The WGSL lengths tell a program's module with exact
-/// jump-table blocks from its first one.
+/// non-empty group). The serials tell each module of a program apart: its
+/// jump-table variants, its clip planes, its pairings.
 type PipelineKey = (
-    (u64, usize),
-    Option<(u64, usize)>,
+    (u64, u32),
+    Option<(u64, u32)>,
     VertexLayouts,
     wgpu::PrimitiveState,
     SmallVec<[Option<wgpu::ColorTargetState>; 8]>,
@@ -886,7 +890,7 @@ impl Surfaces {
         // Trailing empty groups are left out of the pipeline layout.
         let used = groups.iter().rposition(|&id| id != u32::MAX && !self.cache.group_entries[id as usize].is_empty()).map_or(0, |g| g + 1);
         groups[used..].fill(u32::MAX);
-        let key: PipelineKey = ((vs.0.key, vs.0.wgsl.len()), ps.as_ref().map(|p| (p.0.key, p.0.wgsl.len())), layouts, primitive, color_states, depth_state, groups);
+        let key: PipelineKey = ((vs.0.key, vs.2), ps.as_ref().map(|p| (p.0.key, p.2)), layouts, primitive, color_states, depth_state, groups);
         // Play mode: a pending pipeline is waited for within the frame's budget, from `began`
         // (a pipeline made already reads no clock).
         let budget = if self.background { self.wait_left } else { std::time::Duration::ZERO };
@@ -1102,8 +1106,10 @@ impl Surfaces {
             return Ok(m.clone());
         }
         let (key, options) = id;
+        // The next serial: one per module the run keeps (a failure is not kept).
+        let serial = self.cache.shared.len() as u32;
         let since = std::time::Instant::now();
-        let made = match self.cached(key, &options) {
+        let made = match self.cached(key, &options, serial) {
             Some((m, took)) => {
                 let elapsed = since.elapsed();
                 self.compile.loaded += 1;
@@ -1116,7 +1122,7 @@ impl Surfaces {
                 let made = shader::translate_with(&self.cache.code[&key], &options).map_err(|e| format!("{what} {key:016x}: {e}")).and_then(|mut t| {
                     edit(&mut t);
                     let m = self.shader_module(&format!("{key:016x}"), &t.wgsl).map_err(|()| format!("{what} {key:016x}: invalid WGSL"))?;
-                    Ok(std::sync::Arc::new((t, m)))
+                    Ok(std::sync::Arc::new((t, m, serial)))
                 });
                 let took = since.elapsed();
                 if let (Ok(m), Some(c)) = (&made, &mut self.shader_cache) {
@@ -1135,9 +1141,10 @@ impl Surfaces {
     }
 
     /// The module of program `key` with `options` from the disk cache, if it has the
-    /// entry and wgpu accepts its naga module, and what translating it took. wgpu checks
-    /// it in an error scope: a refusal is no wgpu error, the program is translated.
-    fn cached(&mut self, key: u64, options: &Options) -> Option<(std::sync::Arc<(Translation, wgpu::ShaderModule)>, std::time::Duration)> {
+    /// entry and wgpu accepts its naga module, and what translating it took; `serial` is
+    /// its serial. wgpu checks it in an error scope: a refusal is no wgpu error, the
+    /// program is translated.
+    fn cached(&mut self, key: u64, options: &Options, serial: u32) -> Option<(std::sync::Arc<Built>, std::time::Duration)> {
         let c = self.shader_cache.as_mut()?;
         let (t, ir, took) = c.load(key, &self.cache.code[&key], options)?;
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
@@ -1147,7 +1154,7 @@ impl Surfaces {
             return None;
         }
         c.loaded += 1;
-        Some((std::sync::Arc::new((t, m)), took))
+        Some((std::sync::Arc::new((t, m, serial)), took))
     }
 
     /// A module from translated WGSL, parsed and validated once, by wgpu; refused
@@ -2645,7 +2652,7 @@ mod tests {
             for (pair, mask, clip) in [None, Some(0xa), Some(0xb)].into_iter().flat_map(|p| [(p, 0, 0), (p, 1, 0), (p, 0, 1)]) {
                 let m: Module = match key {
                     3 => Err("refused".into()),
-                    _ => Ok(std::sync::Arc::new((translation(key, Stage::Vertex), s.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl("@compute @workgroup_size(1) fn main() {}".into()) })))),
+                    _ => Ok(std::sync::Arc::new((translation(key, Stage::Vertex), s.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl("@compute @workgroup_size(1) fn main() {}".into()) }), held.len() as u32))),
                 };
                 s.cache.modules.insert((key, pair, mask, 0, clip), m.clone());
                 held.insert((key, pair, mask, clip), m);
