@@ -1085,6 +1085,7 @@ dependencies = [
 name = "gyroship-tools"
 version = "0.1.0"
 dependencies = [
+ "ash",
  "clap",
  "gyroship-analysis",
  "gyroship-gpu",
@@ -1094,6 +1095,7 @@ dependencies = [
  "gyroship-research",
  "gyroship-runtime",
  "memchr",
+ "naga",
  "windows",
  "windows-capture",
 ]

@@ -21,12 +21,26 @@ use std::path::Path;
 /// A program of data.zip: its stage, its code as the GPU reads it (SPH then program for the
 /// graphics stages), the blob's whole code section (the program, padding, then data), its
 /// control section, and how many blobs hold it.
-struct Program {
-    stage: Stage,
-    code: Vec<u8>,
+pub(crate) struct Program {
+    pub(crate) stage: Stage,
+    pub(crate) code: Vec<u8>,
     section: Vec<u8>,
     control: Vec<u8>,
     blobs: usize,
+}
+
+impl Program {
+    /// The offset in the code section where a jump table's bank starts: the first data word
+    /// after the program and its padding (the rule play confirmed, 111 programs of 111).
+    fn data_start(&self) -> usize {
+        let end = self.code.len();
+        end + 16 * sass::words(&self.section[end.min(self.section.len())..]).take_while(|w| w.opcode() == sass::NOP || w.0 == 0).count()
+    }
+
+    /// The targets of `tables` as the blob holds them (the rule of `data_start`).
+    pub(crate) fn blob_targets(&self, tables: &[JumpTable]) -> BTreeSet<usize> {
+        jump_targets(tables, &table_bytes(tables, &self.section, self.data_start()), self.code.len())
+    }
 }
 
 /// Where a program's table bank may start in its blob, by name: the start of the data after
@@ -86,8 +100,7 @@ pub fn run(zip: &Path, root: &Path, exefs: Option<&Path>) -> super::Result<bool>
             continue;
         };
         checked += 1;
-        let end = p.code.len();
-        let data = end + 16 * sass::words(&p.section[end.min(p.section.len())..]).take_while(|w| w.opcode() == sass::NOP || w.0 == 0).count();
+        let (end, data) = (p.code.len(), p.data_start());
         let places = [(&p.section, data), (&p.section, end), (&p.section, 0), (&p.section, end.next_multiple_of(256)), (&p.control, 0)];
         let mut line = String::new();
         for (i, (bytes, at)) in places.into_iter().enumerate() {
@@ -172,7 +185,7 @@ pub fn run(zip: &Path, root: &Path, exefs: Option<&Path>) -> super::Result<bool>
 }
 
 /// The programs of data.zip's shader blobs, by key: the first blob of each, and how many.
-fn inventory(zip: &Path) -> super::Result<BTreeMap<u64, Program>> {
+pub(crate) fn inventory(zip: &Path) -> super::Result<BTreeMap<u64, Program>> {
     let mut z = DataZip::open(zip)?;
     let entries = z.entries.clone();
     let mut programs: BTreeMap<u64, Program> = BTreeMap::new();

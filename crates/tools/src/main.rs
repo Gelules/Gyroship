@@ -14,6 +14,7 @@ mod measure;
 mod recompile;
 mod shaders;
 mod text_sheet;
+mod vkprobe;
 
 #[derive(Parser)]
 #[command(name = "gyroship-tools", version, about = "Gyroship developer tools")]
@@ -144,6 +145,30 @@ enum Command {
         #[arg(long)]
         exefs: Option<PathBuf>,
     },
+    /// What Vulkan pipeline libraries and shader objects cost and give on this GPU, for the
+    /// game's programs: compile times, links, pixels compared, the driver's background work
+    VkProbe {
+        /// The romfs data.zip of the targeted update
+        zip: PathBuf,
+        /// The shader cache's `shaders` folder: the pairs play made, for the link part
+        #[arg(long)]
+        cache: Option<PathBuf>,
+        /// A part to run (compile, link, pixels, vertex-input); all without one
+        #[arg(long = "part")]
+        parts: Vec<String>,
+        /// Threads for the compile part's second half
+        #[arg(long, default_value_t = 3)]
+        threads: usize,
+        /// At most this many programs of each stage (0: all)
+        #[arg(long, default_value_t = 0)]
+        limit: usize,
+        /// Through Khronos' validation layer, with synchronization validation
+        #[arg(long)]
+        validate: bool,
+        /// Keep the entry points' name: the driver's disk cache may then serve the programs
+        #[arg(long)]
+        warm: bool,
+    },
     /// Search every entry of data.zip archives for byte patterns: text, or hex
     /// with a 0x prefix (bytes in file order); print each match's entry, offset
     /// and surrounding bytes, and copy the matching entries to a folder (game
@@ -235,6 +260,7 @@ fn main() -> ExitCode {
         Command::Gpfifo { dir, first, last, methods, listing, bench, profile, repeat } => gpfifo::run(&dir, first, last, methods, listing, bench.then_some((profile, repeat))).map(|_| true),
         Command::Shaders { zip, samples } => shaders::run(&zip, samples.as_deref()),
         Command::ShaderCoverage { zip, cache, exefs } => coverage::run(&zip, &cache, exefs.as_deref()),
+        Command::VkProbe { zip, cache, parts, threads, limit, validate, warm } => vkprobe::run(&vkprobe::Probe { zip: &zip, cache: cache.as_deref(), parts: &parts, threads, limit, validate, warm }),
         Command::DatazipFind { zips, patterns, out, context } => shaders::find(&zips, &patterns, out.as_deref(), context).map(|_| true),
         Command::TextSheet { zip, practice, out } => text_sheet::run(&zip, &practice, &out),
         Command::Sass { file } => shaders::list(&file).map(|_| true),
