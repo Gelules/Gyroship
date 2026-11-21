@@ -1,0 +1,88 @@
+# Gyroship practice file: a template. Copy it outside the repository, replace every <...> and
+# delete the lines and fields you do not use. Use it with
+#   gyroship boot <exefs> --practice <this file> [--boost infinite|perfect] [--hud]
+# or in the launcher's Practice file field. README.md, Practice tools, says how to find the values.
+#
+# Every value comes from your own copy of the game and holds for one build only
+# (gyroship-tools nso info <exefs>/main prints its build ID): never commit a filled copy.
+# Build: <build ID>
+#
+# Rules
+# - One action per line. A comment is a whole line that starts with #: never put one after a
+#   line's words.
+# - <pc> is the address, in hex without 0x, of a trace: probe of the probe list compiled into the
+#   game (probes.txt, next to this template). The probe runs before the instruction at <pc>.
+# - <EXPR> is a register xN (x31 is SP), a hex number written with 0x, or [EXPR], the 64-bit value
+#   stored at that address; then any number of +0xHEX or -0xHEX offsets. For example
+#   f32@[[x0]+0x8]+0x4: read the pointer at x0, then the pointer 8 bytes past it, then the float 4
+#   bytes past that.
+# - A bad line stops the start with exit code 2 and names the line (font lines are read only with
+#   --hud). The start does not check where a field points: check each one first in a --trace run,
+#   the line's probe carrying the same items without their names (f32@<EXPR>, not
+#   gauge=f32@<EXPR>). --boost infinite writes wherever gauge and lock point.
+
+# Boost (--boost, and the vehicle whose markers --hud draws), at the first instruction of the
+# vehicle's per-frame boost update. Fields:
+#   gauge (f32)      the boost meter, a heat: 0 is a full bar
+#   lock (u8)        set while boost and brake are refused, until the meter is back to 0
+#   speed (f32)      the boost speed, added to the vehicle's base speed
+#   boosting (u8)    set while boosting
+#   warp accel decel max brake brake_recover brake_floor gauge_max fill drain (f32)
+#                    the ten settings, as the running boost script holds them
+# --boost infinite needs gauge and lock on each line. --boost perfect needs all 14 on the Arwing's
+# and the Blue-Marine's lines, and acts only while the ten settings read the values of
+# crates/research/src/boost.rs; so do their markers.
+# Probe trace:aw-update
+boost <pc> arwing gauge=f32@<EXPR> lock=u8@<EXPR> speed=f32@<EXPR> boosting=u8@<EXPR> warp=f32@<EXPR> accel=f32@<EXPR> decel=f32@<EXPR> max=f32@<EXPR> brake=f32@<EXPR> brake_recover=f32@<EXPR> brake_floor=f32@<EXPR> gauge_max=f32@<EXPR> fill=f32@<EXPR> drain=f32@<EXPR>
+# Probe trace:bm-update
+boost <pc> blue-marine gauge=f32@<EXPR> lock=u8@<EXPR> speed=f32@<EXPR> boosting=u8@<EXPR> warp=f32@<EXPR> accel=f32@<EXPR> decel=f32@<EXPR> max=f32@<EXPR> brake=f32@<EXPR> brake_recover=f32@<EXPR> brake_floor=f32@<EXPR> gauge_max=f32@<EXPR> fill=f32@<EXPR> drain=f32@<EXPR>
+# Probe trace:lm-tick. The Landmaster needs gauge and lock only: --boost perfect leaves it alone.
+boost <pc> landmaster gauge=f32@<EXPR> lock=u8@<EXPR>
+
+# Speed line (--hud). hud-at: the top-left corner of the texts, in pixels of the image the game
+# draws (the journal's "drawn area" line gives its size); needed with hud-speed lines.
+hud-at <x> <y>
+# The speed shown is m * (s + b): the vehicle's base speed s, its speed multiplier m and its boost
+# speed b, where its movement code has them for the frame. Each <ITEM> is a float register sN or
+# f32@<EXPR>.
+# Probe trace:aw-move-out
+hud-speed <pc> s=<ITEM> m=<ITEM> b=<ITEM>
+# Probe trace:bm-move
+hud-speed <pc> s=<ITEM> m=<ITEM> b=<ITEM>
+# Probe trace:lm-move
+hud-speed <pc> s=<ITEM> m=<ITEM> b=<ITEM>
+
+# Release markers (--hud): a quad over the boost bar, where to let go. Its four corners in order
+# around it (top left, top right, bottom right, bottom left), in pixels of the same image as
+# hud-at, from the image's top-left corner (not from hud-at), decimals allowed. At most four per
+# vehicle are drawn, while that vehicle's boost line passes.
+marker arwing <x0> <y0> <x1> <y1> <x2> <y2> <x3> <y3>
+marker blue-marine <x0> <y0> <x1> <y1> <x2> <y2> <x3> <y3>
+
+# Fonts (--hud): the asset archive entry that holds a font, by its hex name without 0x. The run's
+# text region takes its own line, else the latin one. Regions, not --language codes:
+# en-US en-GB de-DE es-ES es-419 it-IT pt-BR nl-NL fr-FR fr-CA ja-JP ko-KR zh-TW zh-CN.
+# Check them: gyroship-tools text-sheet --zip <archive> --practice <this file> --out <png>
+font latin <entry>
+font ja-JP <entry>
+font ko-KR <entry>
+font zh-TW <entry>
+font zh-CN <entry>
+
+# Level time to the millisecond, active whenever these lines are here. ms-keep: where the game is
+# about to format a level time, its milliseconds in register wN. ms: right after the game's integer
+# formatter returned that time's two-digit seconds, xN holding the string value it returned; "SS"
+# then becomes "SS.mmm", written in place with no check that there is room: 4 bytes past the end
+# of the "SS" string. Point ms only at the value the formatter has just returned, never at a later
+# copy of the seconds, which the game sizes exactly. Text that is not two digits, or not the kept
+# time's seconds, is left as it is (a whole "MM:SS" string too). Lines are not paired by their
+# order: a game thread's ms pass takes the milliseconds its last ms-keep pass kept.
+# The results screen. Probes trace:results-ms, then trace:results-ss
+ms-keep <pc> ms=w<N>
+ms <pc> out=x<N>
+# The game's own mission timer, shown only when a game setting is switched on by a layer
+# (--romfs-layer). Probes trace:hud-time and trace:hud-time-generic (the two entries of its time
+# string), then trace:hud-ss
+ms-keep <pc> ms=w<N>
+ms-keep <pc> ms=w<N>
+ms <pc> out=x<N>
