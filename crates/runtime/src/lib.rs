@@ -218,6 +218,21 @@ pub fn fine_timers() {
 #[cfg(not(windows))]
 pub fn fine_timers() {}
 
+/// `GYROSHIP_PRIORITY=gpu`, an experiment: the calling thread (the GPU thread,
+/// the decoder) runs above normal priority, ahead of the guest's workers when
+/// every core is busy.
+#[cfg(windows)]
+pub fn raise_if_asked() {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL};
+    if std::env::var_os("GYROSHIP_PRIORITY").is_some_and(|v| v == "gpu") {
+        // SAFETY: a plain call on the current thread's pseudo-handle; a failure keeps the default.
+        unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) };
+    }
+}
+
+#[cfg(not(windows))]
+pub fn raise_if_asked() {}
+
 /// Untranslated instructions the interpreter does not cover either (each logged once).
 pub static UNHANDLED: AtomicU64 = AtomicU64::new(0);
 
