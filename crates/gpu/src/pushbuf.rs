@@ -527,6 +527,18 @@ impl Channel {
                 }
                 continue;
             };
+            // Parameters of the call being gathered, on one method: appended at once (each
+            // word would only be pushed by `write`), unless traced word by word.
+            if p.op == 3 && self.trace.is_none() && self.gathers(p.subchannel, p.method * 4) {
+                let n = (p.left as usize).min(words.len() - i);
+                self.params.extend_from_slice(&words[i..i + n]);
+                i += n;
+                p.left -= n as u32;
+                if p.left > 0 {
+                    self.pending = Some(p);
+                }
+                continue;
+            }
             self.write(p.subchannel, p.method * 4, words[i], effects, &mut *read);
             i += 1;
             p.left -= 1;
@@ -569,6 +581,13 @@ impl Channel {
         if let Err(fault) = result {
             effects.push(Effect::MacroFault { index, fault });
         }
+    }
+
+    /// Whether a word to `method` of `subchannel` is only a parameter of the call
+    /// being gathered: CALL_MME_DATA of that call's macro, on its subchannel.
+    fn gathers(&self, subchannel: usize, method: u32) -> bool {
+        let class = self.classes[subchannel] & 0xff;
+        (class == 0x97 || class == 0xc0) && CALL_MME.contains(&method) && method % 8 == 4 && self.call == Some((subchannel, ((method - CALL_MME.start) / 8) as usize))
     }
 
     // Out of line: inlined into the macro interpreter (through `MacroHost::method`),
@@ -1036,6 +1055,53 @@ mod tests {
         let split = call(0x30, 0x3000, 4);
         assert!(c.run(&split[..3]).is_empty());
         assert_eq!(c.run(&split[3..]), [release(0x30_0000_3000, 4)]);
+    }
+
+    /// A call's parameters appended at once give what the traced path gives word
+    /// by word: the same effects, registers, call and statistics, over random
+    /// calls on two subchannels, runs of parameters for them or for another
+    /// macro, incrementing runs from a parameter and other methods between them,
+    /// split at random across segments.
+    #[test]
+    fn bulk_macro_parameters_match_the_traced_path() {
+        // Macro 5 as above.
+        let code = [group((0x16c0 << 30) | (5 << 82) | (3 << 85) | (4 << 92)), group(1 | (3 << 85) | (4 << 92)), group(0)].concat();
+        let mut setup = vec![header(1, 1, 0, SET_OBJECT), 0xc797, header(1, 1, 1, SET_OBJECT), 0xc7c0, header(1, 1, 0, LOAD_MME_INSTRUCTION_RAM_POINTER), 0, header(3, 9, 0, LOAD_MME_INSTRUCTION_RAM)];
+        setup.extend(code);
+        setup.extend([header(1, 2, 0, LOAD_MME_START_ADDRESS_RAM_POINTER), 5, 0]);
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |n: u32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % u64::from(n)) as u32
+        };
+        let data = |index: u32| CALL_MME.start + 8 * index + 4;
+        for round in 0..300 {
+            let mut words = Vec::new();
+            for _ in 0..24 {
+                let (subchannel, n) = (next(2), 1 + next(6));
+                words.push(match next(6) {
+                    0 | 1 => header(5, n, subchannel, CALL_MME.start + 5 * 8),
+                    2 => header(3, n, subchannel, data(5)),
+                    3 => header(3, n, subchannel, data(6)),
+                    4 => header(1, n, subchannel, data(5)),
+                    _ => header(1, n, subchannel, REPORT_SEMAPHORE_A),
+                });
+                words.extend((0..n).map(|_| next(u32::MAX)));
+            }
+            let (mut bulk, mut traced) = (Channel::default(), Channel::default());
+            traced.trace = Some(Vec::new());
+            assert_eq!(bulk.run(&setup), traced.run(&setup));
+            let mut at = 0;
+            while at < words.len() {
+                let end = (at + 1 + next(12) as usize).min(words.len());
+                assert_eq!(bulk.run(&words[at..end]), traced.run(&words[at..end]), "round {round}, words {at}..{end}");
+                at = end;
+            }
+            assert!(bulk.engine == traced.engine && bulk.params == traced.params && bulk.call == traced.call, "round {round}");
+            assert_eq!(bulk.mme.map(|u| u.stats), traced.mme.map(|u| u.stats), "round {round}");
+        }
     }
 
     #[test]
