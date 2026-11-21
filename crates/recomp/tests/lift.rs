@@ -88,6 +88,7 @@ fn lifts_the_vector_lane_forms() {
     let at = |n| Addr { base: Reg::X(n), offset: 0, index: None, writeback: Writeback::None };
     assert_eq!(lift(0x0d409000, pc), Op::LoadLane { dst: 0, size: 2, lane: Some(1), q: true, addr: at(0) }, "ld1 {{v0.s}}[1], [x0]");
     assert_eq!(lift(0x4d40c8e8, pc), Op::LoadLane { dst: 8, size: 2, lane: None, q: true, addr: at(7) }, "ld1r {{v8.4s}}, [x7]");
+    assert_eq!(lift(0x0d009000, pc), Op::StoreLane { src: 0, size: 2, lane: 1, addr: at(0) }, "st1 {{v0.s}}[1], [x0]");
     assert_eq!(lift(0x4e0c1d00, pc), Op::ToLane { dst: 0, src: Reg::X(8), size: 2, lane: Some(1), q: true }, "mov v0.s[1], w8");
     assert_eq!(
         lift(0x4f831368, pc),
@@ -111,7 +112,7 @@ fn lifts_the_vector_lane_forms() {
         (0x0dc29000, "ld1 {v0.s}[1], [x0], x2"),
         (0x4c40a800, "ld1 {v0.4s, v1.4s}, [x0]"),
         (0x0d609000, "ld2 {v0.s, v1.s}[1], [x0]"),
-        (0x0d009000, "st1 {v0.s}[1], [x0]"),
+        (0x0d829000, "st1 {v0.s}[1], [x0], x2"),
         (0x4e421420, "fadd v0.8h, v1.8h, v2.8h"),
         (0x4f3de420, "scvtf v0.4s, v1.4s, #0x3"),
         (0x5fa21020, "fmla s0, s1, v2.s[1]"),

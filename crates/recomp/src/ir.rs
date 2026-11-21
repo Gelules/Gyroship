@@ -192,6 +192,8 @@ pub enum Op {
     /// LD1 of one lane (of 1 << size bytes; the other lanes are kept, `q` unused), or
     /// LD1R (`lane` None): the element in every lane.
     LoadLane { dst: u8, size: u8, lane: Option<u8>, q: bool, addr: Addr },
+    /// ST1 of one lane (of 1 << size bytes).
+    StoreLane { src: u8, size: u8, lane: u8, addr: Addr },
     /// INS of a general register into one lane, or DUP (`lane` None) into every lane, as `LoadLane`.
     ToLane { dst: u8, src: Reg, size: u8, lane: Option<u8>, q: bool },
     /// Each byte of dst is the byte `mask[i]` of a:b (0..16 from a, 16..32
@@ -277,6 +279,13 @@ pub enum VFp {
     Mls,
     /// FADDP: sums of adjacent lanes of a:b.
     AddP,
+    /// FMAX, FMIN: a NaN propagates (the interpreter's: the first NaN operand,
+    /// quieted); +0 > -0.
+    Max,
+    Min,
+    /// FMAXNM, FMINNM: a quiet NaN loses against a number.
+    MaxNm,
+    MinNm,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1046,6 +1046,11 @@ impl<M: Module> Emit<'_, '_, M> {
                 let v = self.b.ins().load(vtype(size), self.heap_flags, host, 0);
                 self.put_lanes(dst, size, lane, q, v);
             }
+            Op::StoreLane { src, size, lane, addr } => {
+                let v = self.b.ins().load(vtype(size), self.cpu_flags, self.cpu, vr_offset(src) + (i32::from(lane) << size));
+                let (_, host) = self.address(&addr);
+                self.b.ins().store(self.heap_flags, v, host, 0);
+            }
             Op::ToLane { dst, src, size, lane, q } => {
                 let v = self.get(src, if size == 3 { W::W64 } else { W::W32 });
                 let v = if size < 2 { self.b.ins().ireduce(vtype(size), v) } else { v };
@@ -1085,20 +1090,26 @@ impl<M: Module> Emit<'_, '_, M> {
                     };
                     (self.vload(t, a), y)
                 };
-                let r = match op {
-                    VFp::Add | VFp::AddP => self.b.ins().fadd(x, y),
-                    VFp::Sub => self.b.ins().fsub(x, y),
-                    VFp::Mul => self.b.ins().fmul(x, y),
-                    VFp::Mla | VFp::Mls => {
-                        let acc = self.vload(t, dst);
-                        let x = if op == VFp::Mls { self.b.ins().fneg(x) } else { x };
-                        self.b.ins().fma(x, y, acc)
-                    }
-                };
-                let nan = self.b.ins().fcmp(FloatCC::Unordered, r, r);
-                let lanes = self.b.ins().vhigh_bits(I32, nan);
-                let lanes = if q { lanes } else { self.b.ins().band_imm_s(lanes, 0b11) };
-                self.unless_nan(lanes, pc, word, |e| e.vput(dst, r, q));
+                if matches!(op, VFp::Max | VFp::Min | VFp::MaxNm | VFp::MinNm) {
+                    // Arm's NaN rules, native: no rescue.
+                    let r = self.vminmax(op, f64, x, y);
+                    self.vput(dst, r, q);
+                } else {
+                    let r = match op {
+                        VFp::Add | VFp::AddP => self.b.ins().fadd(x, y),
+                        VFp::Sub => self.b.ins().fsub(x, y),
+                        VFp::Mul => self.b.ins().fmul(x, y),
+                        _ => {
+                            let acc = self.vload(t, dst);
+                            let x = if op == VFp::Mls { self.b.ins().fneg(x) } else { x };
+                            self.b.ins().fma(x, y, acc)
+                        }
+                    };
+                    let nan = self.b.ins().fcmp(FloatCC::Unordered, r, r);
+                    let lanes = self.b.ins().vhigh_bits(I32, nan);
+                    let lanes = if q { lanes } else { self.b.ins().band_imm_s(lanes, 0b11) };
+                    self.unless_nan(lanes, pc, word, |e| e.vput(dst, r, q));
+                }
             }
             Op::VFUn { op, f64, q, dst, src } => {
                 let x = self.vload(if f64 { F64X2 } else { F32X4 }, src);
@@ -1293,6 +1304,47 @@ impl<M: Module> Emit<'_, '_, M> {
                 self.vput(n, s, q);
             }
         }
+    }
+
+    /// FMAX/FMIN/FMAXNM/FMINNM of every lane, with the interpreter's NaNs: FMAX and
+    /// FMIN give the first NaN operand, quieted (as the host's addition it uses);
+    /// FMAXNM and FMINNM follow Arm (FPCR.DN = 0): a quiet NaN against a number
+    /// gives the number, else the first signalling NaN quieted, else the first quiet one.
+    fn vminmax(&mut self, op: VFp, f64: bool, x: Value, y: Value) -> Value {
+        let (t, it, quiet) = if f64 { (F64X2, I64X2, 1i64 << 51) } else { (F32X4, I32X4, 1i64 << 22) };
+        let m = if matches!(op, VFp::Max | VFp::MaxNm) { self.b.ins().fmax(x, y) } else { self.b.ins().fmin(x, y) };
+        let (xi, yi, mi) = (self.cast(it, x), self.cast(it, y), self.cast(it, m));
+        let q = self.b.ins().iconst(it.lane_type(), quiet);
+        let q = self.b.ins().splat(it, q);
+        let (xq, yq) = (self.b.ins().bor(xi, q), self.b.ins().bor(yi, q));
+        let x_nan = self.b.ins().fcmp(FloatCC::Unordered, x, x);
+        let y_nan = self.b.ins().fcmp(FloatCC::Unordered, y, y);
+        let (x_nan, y_nan) = (self.cast(it, x_nan), self.cast(it, y_nan));
+        // Quiet: the NaN has its top fraction bit; signalling: a NaN without it.
+        let zero = self.vconst(it, [0; 16]);
+        let (xb, yb) = (self.b.ins().band(xi, q), self.b.ins().band(yi, q));
+        let (x_loud, y_loud) = (self.b.ins().icmp(IntCC::Equal, xb, zero), self.b.ins().icmp(IntCC::Equal, yb, zero));
+        let (x_snan, y_snan) = (self.b.ins().band(x_nan, x_loud), self.b.ins().band(y_nan, y_loud));
+        let first = self.b.ins().bitselect(x_nan, xq, yq);
+        let nm = matches!(op, VFp::MaxNm | VFp::MinNm);
+        let nan = if nm {
+            let r = self.b.ins().bitselect(y_snan, yq, first);
+            self.b.ins().bitselect(x_snan, xq, r)
+        } else {
+            first
+        };
+        let any = self.b.ins().bor(x_nan, y_nan);
+        let mut r = self.b.ins().bitselect(any, nan, mi);
+        if nm {
+            // A quiet NaN against a number: the number.
+            let x_qnan = self.b.ins().band_not(x_nan, x_loud);
+            let x_only = self.b.ins().band_not(x_qnan, y_nan);
+            let y_qnan = self.b.ins().band_not(y_nan, y_loud);
+            let y_only = self.b.ins().band_not(y_qnan, x_nan);
+            r = self.b.ins().bitselect(y_only, xi, r);
+            r = self.b.ins().bitselect(x_only, yi, r);
+        }
+        self.cast(t, r)
     }
 
     /// Stores an FP result with `store` unless `nan` (nonzero: a live lane is NaN).

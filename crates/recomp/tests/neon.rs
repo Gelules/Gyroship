@@ -42,6 +42,10 @@ const FMUL: u32 = 0x2E20_DC00;
 const FMLA: u32 = 0x0E20_CC00;
 const FMLS: u32 = 0x0EA0_CC00;
 const FADDP: u32 = 0x2E20_D400;
+const FMAX: u32 = 0x0E20_F400;
+const FMIN: u32 = 0x0EA0_F400;
+const FMAXNM: u32 = 0x0E20_C400;
+const FMINNM: u32 = 0x0EA0_C400;
 const FCMEQ: u32 = 0x0E20_E400;
 const FCMGE: u32 = 0x2E20_E400;
 const FCMGT: u32 = 0x2EA0_E400;
@@ -122,6 +126,11 @@ fn ld1_lane(size: u32, idx: u32, t: u32, n: u32, post: bool) -> u32 {
     0x0D40_0000 | qv << 30 | post | opcode << 13 | s << 12 | sz << 10 | n << 5 | t
 }
 
+/// ST1 of one lane: LD1's encoding without the load bit.
+fn st1_lane(size: u32, idx: u32, t: u32, n: u32, post: bool) -> u32 {
+    ld1_lane(size, idx, t, n, post) & !(1 << 22)
+}
+
 fn ld1r(qv: bool, size: u32, t: u32, n: u32, post: bool) -> u32 {
     let post = if post { 1 << 23 | 31 << 16 } else { 0 };
     0x0D40_C000 | q(qv) | post | size << 10 | n << 5 | t
@@ -150,7 +159,7 @@ fn cases() -> Vec<Case> {
     let fp_regs = [(0, 1, 2), (8, 8, 10), (8, 8, 8), (31, 30, 29)];
     for (qv, sz) in [(false, 0), (true, 0), (true, 1)] {
         for (d, n, m) in fp_regs {
-            for base in [FADD, FSUB, FMUL, FMLA, FMLS, FADDP, FCMEQ, FCMGE, FCMGT] {
+            for base in [FADD, FSUB, FMUL, FMLA, FMLS, FADDP, FCMEQ, FCMGE, FCMGT, FMAX, FMIN, FMAXNM, FMINNM] {
                 add(rrr(base, qv, sz, d, n, m), None);
             }
             for base in FP_UNARY {
@@ -217,6 +226,7 @@ fn cases() -> Vec<Case> {
             for (t, n) in [(8, 7), (31, 31)] {
                 for post in [false, true] {
                     add(ld1_lane(size, idx, t, n, post), Some(n));
+                    add(st1_lane(size, idx, t, n, post), Some(n));
                 }
             }
         }
@@ -455,6 +465,42 @@ fn vector_lane_forms_match_the_interpreter() {
     }
     eprintln!("{} instructions x {CASES} random contexts", all.len());
     assert!(failures.is_empty(), "{} of {} instructions differ:\n{}", failures.len(), all.len(), failures.join("\n"));
+}
+
+/// ST1 of one lane writes what the interpreter writes, where it writes it, and
+/// moves its base register the same way.
+#[test]
+fn single_lane_stores_write_what_the_interpreter_writes() {
+    let mut r = Rng(0x5701);
+    let m = data_page(&mut r);
+    let page = |m: &Memory| {
+        let mut b = vec![0u8; 0x1000];
+        m.read(DATA, &mut b).unwrap();
+        b
+    };
+    for size in 0..4 {
+        for idx in 0..16 >> size {
+            for (t, n) in [(8, 7), (31, 31)] {
+                for post in [false, true] {
+                    let word = st1_lane(size, idx, t, n, post);
+                    for _ in 0..50 {
+                        let mut cpu = Cpu::new(m.base());
+                        cpu.vr = std::array::from_fn(|_| r.vector(true));
+                        cpu.x = std::array::from_fn(|_| r.next());
+                        cpu.x[n as usize] = DATA + r.below(0xF00);
+                        let before = page(&m);
+                        let (mut jit, mut int) = (clone(&cpu), clone(&cpu));
+                        // SAFETY: the context's memory maps the data page the store writes.
+                        unsafe { compiled()[&word](&mut jit, 0) };
+                        let by_jit = page(&m);
+                        m.write(DATA, &before).unwrap();
+                        interp::execute(&mut int, CODE, word).unwrap();
+                        assert!(by_jit == page(&m) && jit.x == int.x, "{word:08x} ({})", interp::disassemble(word));
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ---- known answers ----

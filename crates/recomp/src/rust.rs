@@ -505,6 +505,7 @@ pub fn function(out: &mut String, input: &Input) {
                 | Op::AtomicCas { .. }
                 | Op::Crc { .. }
                 | Op::LoadLane { .. }
+                | Op::StoreLane { .. }
                 | Op::ToLane { .. }
                 | Op::VShuffle { .. }
                 | Op::VFp { .. }

@@ -433,6 +433,10 @@ fn lift_lanes(i: &Instruction) -> Option<Op> {
                 _ => return None,
             }
         }
+        C::ST1 => match o[0] {
+            O::SIMDRegisterGroupLane(t, e, 1, lane) => Op::StoreLane { src: t as u8, size: simd_size(e), lane, addr: addr(&o[1])? },
+            _ => return None,
+        },
         C::INS => match (&o[0], &o[1]) {
             (&O::SIMDRegisterElementsLane(_, d, e, l), &O::SIMDRegisterElementsLane(_, s, _, k)) => {
                 let eb = 1u32 << simd_size(e);
@@ -508,6 +512,16 @@ fn lift_lanes(i: &Instruction) -> Option<Op> {
                 _ => VFp::AddP,
             };
             Op::VFp { op, f64: fp_lanes(e, q)?, q, dst, a, b, lane }
+        }
+        C::FMAX | C::FMIN | C::FMAXNM | C::FMINNM if vec_op => {
+            let ((dst, q, e), (a, _, _), (b, _, _)) = (vector(&o[0])?, vector(&o[1])?, vector(&o[2])?);
+            let op = match i.opcode {
+                C::FMAX => VFp::Max,
+                C::FMIN => VFp::Min,
+                C::FMAXNM => VFp::MaxNm,
+                _ => VFp::MinNm,
+            };
+            Op::VFp { op, f64: fp_lanes(e, q)?, q, dst, a, b, lane: None }
         }
         C::FNEG | C::FABS if vec_op => {
             let ((dst, q, e), (src, _, _)) = (vector(&o[0])?, vector(&o[1])?);
