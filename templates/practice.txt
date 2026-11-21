@@ -16,7 +16,8 @@
 #   f32@[[x0]+0x8]+0x4: read the pointer at x0, then the pointer 8 bytes past it, then the float 4
 #   bytes past that.
 # - A bad line stops the start with exit code 2 and names the line (font lines are read only with
-#   an overlay). The start does not check where a field points.
+#   an overlay). The start does not check where a field points: --boost infinite writes wherever
+#   gauge and lock point.
 
 # Boost (--boost, and the vehicle whose markers --hud-markers draws), at the first instruction of
 # each vehicle's per-frame boost update. Fields:
