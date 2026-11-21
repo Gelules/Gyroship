@@ -42,7 +42,7 @@ pub fn run(dir: &Path, first: u32, last: u32, methods: bool, listing: Option<usi
         if submit >= first && before.is_none() {
             before = channel.mme.as_ref().map(|u| u.stats);
             if let Some(path) = profile.take() {
-                gyroship_runtime::profile::start(path);
+                gyroship_runtime::profile::start(path, false);
             }
         }
         let since = std::time::Instant::now();

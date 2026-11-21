@@ -725,7 +725,7 @@ impl Kernel {
             && n == (*from).max(1)
             && !profile_gpu_thread()
         {
-            gyroship_runtime::profile::start(path.clone());
+            gyroship_runtime::profile::start(path.clone(), true);
         }
         if self.config.perf.is_some() {
             gyroship_runtime::profile::mark_frame();
@@ -811,7 +811,7 @@ impl GpuSide {
             && let Some((path, from)) = &self.config.profile
             && n == (*from).max(1)
         {
-            gyroship_runtime::profile::start(path.clone());
+            gyroship_runtime::profile::start(path.clone(), false);
         }
     }
 

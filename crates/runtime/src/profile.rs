@@ -26,7 +26,8 @@ struct Profiler {
 }
 
 static PROFILER: Mutex<Option<Profiler>> = Mutex::new(None);
-static ACTIVE: AtomicBool = AtomicBool::new(false);
+/// The interpreter counts its instructions (a profile of a guest thread).
+static COUNTING: AtomicBool = AtomicBool::new(false);
 
 /// The guest thread the guest's host thread runs, and its CPU context: the
 /// sampler tags each sample with the thread and its x30 (the caller, in a
@@ -207,17 +208,20 @@ fn after_call(w: u64) -> bool {
         || b[4] == 0xFF && (b[5] & 0xF8 == 0xD0 || b[5] & 0xF8 == 0x10)
 }
 
-/// Counts an instruction the interpreter runs, while a profile runs.
+/// Counts an instruction the interpreter runs, while a guest thread's profile runs.
 #[inline]
 pub fn count_interpreted(word: u32) {
-    if ACTIVE.load(Ordering::Relaxed) {
+    if COUNTING.load(Ordering::Relaxed) {
         WORDS.with(|w| *w.borrow_mut().entry(word).or_insert(0) += 1);
     }
 }
 
 /// Starts sampling the calling thread; the report goes to `path` at [`finish`].
+/// With `count`, the interpreter counts its instructions meanwhile, a hash per
+/// instruction on every guest thread: only for a profile of the guest thread
+/// that runs them, not of a thread they would slow down.
 #[cfg(windows)]
-pub fn start(path: PathBuf) {
+pub fn start(path: PathBuf, count: bool) {
     use windows_sys::Win32::System::Diagnostics::Debug::{CONTEXT, CONTEXT_CONTROL_AMD64, GetThreadContext};
     use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
     use windows_sys::Win32::System::Threading::{GetCurrentThreadId, OpenThread, ResumeThread, SuspendThread, THREAD_GET_CONTEXT, THREAD_SUSPEND_RESUME};
@@ -278,11 +282,11 @@ pub fn start(path: PathBuf) {
         samples
     });
     *PROFILER.lock().unwrap_or_else(|e| e.into_inner()) = Some(Profiler { path, stop, sampler });
-    ACTIVE.store(true, Ordering::Relaxed);
+    COUNTING.store(count, Ordering::Relaxed);
 }
 
 #[cfg(not(windows))]
-pub fn start(_path: PathBuf) {
+pub fn start(_path: PathBuf, _count: bool) {
     eprintln!("gyroship: --profile is only implemented on Windows");
 }
 
@@ -291,7 +295,7 @@ pub fn start(_path: PathBuf) {
 pub fn finish(guest: &dyn Fn(u64) -> String) {
     let Some(p) = PROFILER.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
     p.stop.store(true, Ordering::Relaxed);
-    ACTIVE.store(false, Ordering::Relaxed);
+    COUNTING.store(false, Ordering::Relaxed);
     let Ok(samples) = p.sampler.join() else { return };
     let total: u64 = samples.values().sum();
     let pct = |n: u64| 100.0 * n as f64 / total.max(1) as f64;
