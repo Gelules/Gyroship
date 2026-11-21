@@ -27,7 +27,8 @@
 //! never runs out, a release never locks, and a big hit's lock is gone by the next update. A
 //! run with practice actions is never a reference: the journal says so at boot.
 //!
-//! `--hud`: at a `hud-speed` line's pc, the vehicle's speed m·(s + b) (multiplier, base speed,
+//! With an overlay option (`--hud-speed`, `--hud-fps`, `--hud-markers`, or `--hud` for all
+//! three): at a `hud-speed` line's pc, the vehicle's speed m·(s + b) (multiplier, base speed,
 //! boost speed; each `sN` or `f32@EXPR`) is read and published with the present it was read
 //! in, for the speed line drawn from `hud-at` (presented-image pixels). No guest write. `font`
 //! lines are `gyroship_practice::font`'s.
@@ -99,11 +100,11 @@ pub struct Practice {
     boost: Option<Boost>,
     /// By pc.
     lines: Vec<Line>,
-    /// `--hud`: the speed is read.
+    /// Any overlay option: the speed is read and the markers' vehicle followed.
     hud: bool,
     /// `hud-speed` lines: the pc, then s, m and b.
     speeds: Vec<(u64, [Item; 3])>,
-    /// `hud-at`: the speed line's origin, in presented-image pixels.
+    /// `hud-at`: the texts' origin, in presented-image pixels.
     hud_at: Option<(u32, u32)>,
     /// The last speed read: its f32 bits << 32 | the low 32 bits of its present; 0: none yet.
     speed: AtomicU64,
@@ -289,7 +290,7 @@ impl Practice {
         }
     }
 
-    /// With `--hud`, a pass at a `hud-speed` line's pc: s, m and b read where the line says,
+    /// With an overlay option, a pass at a `hud-speed` line's pc: s, m and b read where the line says,
     /// and m·(s + b) published with the present it was read in. No guest write. None, and
     /// nothing published, when a read fails; else `[s, m, b, m·(s + b)]`.
     pub(crate) fn read_speed(&self, pc: u64, cpu: &Cpu) -> Option<[f32; 4]> {
@@ -316,12 +317,12 @@ impl Practice {
         (stamp != 0 && stamp + 6 >= shown).then(|| f32::from_bits((w >> 32) as u32))
     }
 
-    /// `hud-at`: the speed line's origin, in presented-image pixels.
+    /// `hud-at`: the texts' origin, in presented-image pixels.
     pub(crate) fn hud_at(&self) -> Option<(u32, u32)> {
         self.hud_at
     }
 
-    /// With `--hud`, a pass at a boost line's pc: that vehicle is the one the markers are
+    /// With an overlay option, a pass at a boost line's pc: that vehicle is the one the markers are
     /// for, from this present on, and its line's settings say whether they apply (the rule's
     /// own guard: an Arwing or a Blue-Marine with other settings gets none). No guest write.
     pub(crate) fn mark_pass(&self, pc: u64, cpu: &Cpu) {
@@ -398,9 +399,9 @@ type Made = (String, Vec<[f32; 8]>, (u32, u32), (u32, u32), Arc<Mask>);
 /// frame (cyan) uses.
 const MARK: [f32; 4] = [1.0, 0.2, 0.8, 1.0];
 
-/// `--hud`'s text: the speed line, then the frame rate. Their labels in the run's language,
-/// the origin (presented-image pixels), the font that draws them, the presents of the last
-/// second, and the last mask made.
+/// The overlays' text: the speed line, then the frame rate, each when chosen. Their labels in
+/// the run's language, the origin (presented-image pixels), the font that draws them, the
+/// presents of the last second, and the last mask made.
 pub struct Hud {
     label: &'static str,
     fps_label: &'static str,
@@ -410,6 +411,15 @@ pub struct Hud {
     /// When the text was loaded: the wall clock's origin.
     born: std::time::Instant,
     last: Option<Made>,
+    /// The lines drawn: the speed's (`--hud-speed`), the frame rate's (`--hud-fps`).
+    speed: bool,
+    fps: bool,
+}
+
+/// The overlays' text: the speed line when chosen (empty while no fresh speed was read, so the
+/// counter below keeps its place), then the frame rate's when chosen.
+fn lines(speed: Option<String>, fps: Option<String>) -> String {
+    [speed, fps].into_iter().flatten().collect::<Vec<_>>().join("\n")
 }
 
 /// Presents per second at `now` (ticks of 32 ns): `now` joins `window`, which keeps the
@@ -428,32 +438,35 @@ fn rate(window: &mut VecDeque<u64>, now: u64) -> u32 {
 }
 
 impl Hud {
-    /// The speed line's font: the `font` line of the run's region (`language`, else en-US),
-    /// read from the dump's `data.zip`. Says on stderr, never in the journal, which font it
-    /// uses and what it cannot draw.
-    pub fn load(practice: &str, origin: Option<(u32, u32)>, zip: &std::path::Path, language: Option<&str>) -> Result<Hud, String> {
+    /// The overlays' font: the `font` line of the run's region (`language`, else en-US), read
+    /// from the dump's `data.zip`; every overlay option needs it. When there is text to draw,
+    /// says on stderr, never in the journal, which font it uses and what it cannot draw.
+    pub fn load(practice: &str, origin: Option<(u32, u32)>, zip: &std::path::Path, language: Option<&str>, overlays: crate::Overlays) -> Result<Hud, String> {
         let region = texts::region(language.unwrap_or("en-US"));
         let id = font::entry(practice, region)?;
         let mut z = DataZip::open(zip).map_err(|e| format!("{}: {e}", zip.display()))?;
         let i = z.entries.iter().position(|e| u64::from_str_radix(&e.name, 16) == Ok(id)).ok_or_else(|| format!("{}: no entry {id:x}", zip.display()))?;
         let entry = z.entries.swap_remove(i);
         let face = font::Face::load(&z.read(&entry).map_err(|e| format!("{}: entry {id:x}: {e}", zip.display()))?)?;
-        let missing: Vec<String> = face.missing(&font::needed(region)).iter().map(|c| format!("U+{:04X}", u32::from(*c))).collect();
-        if !missing.is_empty() {
-            eprintln!("gyroship: --hud: {} cannot draw {}", face.source, missing.join(" "));
+        if overlays.speed || overlays.fps {
+            let missing: Vec<String> = face.missing(&font::needed(region)).iter().map(|c| format!("U+{:04X}", u32::from(*c))).collect();
+            if !missing.is_empty() {
+                eprintln!("gyroship: the --hud options: {} cannot draw {}", face.source, missing.join(" "));
+            }
+            eprintln!("gyroship: the --hud options: {} texts in {}", texts::tag(region), face.source);
         }
-        eprintln!("gyroship: --hud: {} texts in {}", texts::tag(region), face.source);
-        Ok(Hud { label: texts::text(texts::Text::Speed, region), fps_label: texts::text(texts::Text::Fps, region), origin: origin.unwrap_or_default(), face, presents: VecDeque::new(), born: std::time::Instant::now(), last: None })
+        Ok(Hud { label: texts::text(texts::Text::Speed, region), fps_label: texts::text(texts::Text::Fps, region), origin: origin.unwrap_or_default(), face, presents: VecDeque::new(), born: std::time::Instant::now(), last: None, speed: overlays.speed, fps: overlays.fps })
     }
 
-    /// The text to draw with present `n`, handed over at `now` (virtual ticks): the speed line
-    /// while a fresh speed was read (else an empty line, so the counter keeps its place), then
-    /// the frame rate. With a window, on the wall clock: the rate it shows. Without, on the
-    /// virtual clock: the game's own rate, the same in every run, so dumps stay reproducible.
+    /// The text to draw with present `n`, handed over at `now` (virtual ticks), as [`lines`]
+    /// lays it out. The frame rate: with a window, on the wall clock (the rate it shows);
+    /// without, on the virtual clock (the game's own rate, the same in every run, so dumps stay
+    /// reproducible).
     pub(crate) fn text(&mut self, n: u64, now: u64, windowed: bool) -> String {
         let at = if windowed { (self.born.elapsed().as_nanos() / 32) as u64 } else { now };
-        let speed = actions().and_then(|p| p.speed_at(n)).map_or(String::new(), |v| format!("{} {}", self.label, v.round() as i64));
-        format!("{speed}\n{} {}", self.fps_label, rate(&mut self.presents, at))
+        let speed = self.speed.then(|| actions().and_then(|p| p.speed_at(n)).map_or(String::new(), |v| format!("{} {}", self.label, v.round() as i64)));
+        let fps = self.fps.then(|| format!("{} {}", self.fps_label, rate(&mut self.presents, at)));
+        lines(speed, fps)
     }
 
     /// The mask of `text` for an output of `size` pixels showing an image of `area`: the
@@ -468,7 +481,8 @@ impl Hud {
         {
             return Some(m.clone());
         }
-        let m = self.face.mask(text, font::px(size.1));
+        // No text (only the markers, or a speed not read yet): one clear texel carries the markers.
+        let m = if text.is_empty() { font::Mask { width: 1, height: 1, bytes: vec![0] } } else { self.face.mask(text, font::px(size.1)) };
         let rect = [self.origin.0 as f32, self.origin.1 as f32, m.width as f32 * area.0 as f32 / size.0 as f32, m.height as f32 * area.1 as f32 / size.1 as f32];
         let mask = Arc::new(Mask::new(rect, (m.width, m.height), m.bytes, [1.0; 4])?.with_marks(marks, MARK));
         self.last = Some((text.to_string(), marks.to_vec(), area, size, mask.clone()));
@@ -611,7 +625,7 @@ mod tests {
         cpu.x[0] = 0x10;
         assert_eq!(p.read_speed(PC, &cpu), None);
         assert_eq!(p.speed_at(41), Some(615.0));
-        // Without --hud, the same file reads nothing.
+        // Without an overlay option, the same file reads nothing.
         cpu.x[0] = AT;
         assert_eq!(Practice::parse(HUD, None, false, mem, &PROBES).unwrap().read_speed(PC, &cpu), None);
     }
@@ -772,6 +786,16 @@ mod tests {
         let late = [0, 12_000, 5_000, 9_000];
         let counts: Vec<u32> = (0..120u64).map(|k| rate(&mut window, k * second / 30 + late[k as usize % 4])).collect();
         assert!(counts[1..].iter().all(|&c| c == 30), "{counts:?}");
+    }
+
+    #[test]
+    fn the_overlays_draw_the_lines_chosen() {
+        let (speed, fps) = (Some("SPEED 1200".to_string()), Some("FPS 60".to_string()));
+        assert_eq!(lines(speed.clone(), fps.clone()), "SPEED 1200\nFPS 60", "both, as --hud draws them");
+        assert_eq!(lines(Some(String::new()), fps.clone()), "\nFPS 60", "no fresh speed: the counter keeps its place");
+        assert_eq!(lines(None, fps), "FPS 60", "the frame rate alone, on the first line");
+        assert_eq!(lines(speed, None), "SPEED 1200", "the speed alone");
+        assert_eq!(lines(None, None), "", "the markers alone: no text");
     }
 
     #[test]

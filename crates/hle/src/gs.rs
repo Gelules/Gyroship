@@ -990,12 +990,12 @@ impl GpuSide {
         }
         // The host window: show the frame, then wait for its time on the wall clock.
         let now = self.now();
-        // --hud: the speed line while fresh, and the frame rate, in the window and the dumped
-        // frame only (after the hashes and the video).
+        // The overlays: the speed line while fresh, and the frame rate, in the window and the
+        // dumped frame only (after the hashes and the video).
         let windowed = self.window.is_some();
         let text = self.hud.as_mut().map(|h| h.text(n, now, windowed));
-        // And the release markers of the vehicle in flight (step 5).
-        let marks = crate::practice::actions().map(|p| p.marks_at(n)).unwrap_or_default();
+        // And the release markers of the vehicle in flight (step 5), when chosen.
+        let marks = if self.config.hud.markers { crate::practice::actions().map(|p| p.marks_at(n)).unwrap_or_default() } else { Vec::new() };
         let shown = ((area & 0xffff) + 1, (area >> 16) + 1);
         if let (Some(s), Some((pace, size))) = (self.surfaces.as_mut(), self.window.as_mut()) {
             let mask = text.as_deref().and_then(|t| self.hud.as_mut()?.mask(t, &marks, shown, *size));

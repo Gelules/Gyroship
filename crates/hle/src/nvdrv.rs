@@ -333,7 +333,8 @@ pub struct GpuSide {
     pub video: Option<crate::video::Video>,
     /// The host window's pace hook and its last size (`boot::HostWindow`).
     pub window: Option<(crate::Pace, (u32, u32))>,
-    /// `--hud`: the speed line drawn over the shown and dumped frames.
+    /// The overlays (--hud, --hud-speed, --hud-fps, --hud-markers): their texts and the release
+    /// markers, over the shown and dumped frames.
     pub hud: Option<crate::practice::Hud>,
     /// Textures found rewritten by the CPU: (present, GPU address, size), for `--perf`.
     pub rewrites: Vec<(u64, u64, u64)>,

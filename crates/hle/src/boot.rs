@@ -193,7 +193,7 @@ pub(crate) unsafe fn on_probe(cpu: *mut Cpu, pc: u64, name: &str) {
         // SAFETY: the running thread's context, which this hook and the actions only read.
         let cpu = unsafe { &*cpu };
         let practice = crate::practice::actions();
-        // The speed line's reading and the markers' vehicle (--hud) write nothing: they may come
+        // The speed line's reading and the markers' vehicle (any overlay option) write nothing: they may come
         // before the trace line.
         let speed = practice.and_then(|p| p.read_speed(pc, cpu));
         if let Some(p) = practice {
@@ -296,6 +296,9 @@ pub const OPTIONS: &[(&str, bool)] = &[
     ("--practice", true),
     ("--boost", true),
     ("--hud", false),
+    ("--hud-speed", false),
+    ("--hud-fps", false),
+    ("--hud-markers", false),
     // Reports and dumps.
     ("--perf", true),
     ("--hashes", true),
@@ -442,7 +445,8 @@ pub fn run(mut table: Vec<rt::Entry>, window: Option<HostWindow>) {
                 std::process::exit(2);
             })
         }),
-        hud: flag("--hud"),
+        // --hud: the three overlays; the others, one each.
+        hud: crate::Overlays { speed: flag("--hud") || flag("--hud-speed"), fps: flag("--hud") || flag("--hud-fps"), markers: flag("--hud") || flag("--hud-markers") },
         ..Config::default()
     };
     if config.play {
@@ -493,15 +497,15 @@ pub fn run(mut table: Vec<rt::Entry>, window: Option<HostWindow>) {
                 eprintln!("gyroship: --practice {path}: {e}");
                 std::process::exit(2);
             });
-            let practice = crate::practice::Practice::parse(&text, boost, k.config.hud, k.mem.clone(), &rt::probe_counts()).unwrap_or_else(|e| {
+            let practice = crate::practice::Practice::parse(&text, boost, k.config.hud.any(), k.mem.clone(), &rt::probe_counts()).unwrap_or_else(|e| {
                 eprintln!("gyroship: --practice {path}: {e}");
                 std::process::exit(2);
             });
-            // --hud: the font is read once, here; the speed line is drawn on the GPU side.
-            if k.config.hud {
+            // The overlays: the font is read once, here; they are drawn on the GPU side.
+            if k.config.hud.any() {
                 let zip = romfs_dir(Path::new(exefs)).map(|r| r.join("data.zip")).ok_or_else(|| "no romfs folder next to the exefs".to_string());
-                let hud = zip.and_then(|zip| crate::practice::Hud::load(&text, practice.hud_at(), &zip, k.config.language)).unwrap_or_else(|e| {
-                    eprintln!("gyroship: --hud: {e}");
+                let hud = zip.and_then(|zip| crate::practice::Hud::load(&text, practice.hud_at(), &zip, k.config.language, k.config.hud)).unwrap_or_else(|e| {
+                    eprintln!("gyroship: the --hud options: {e}");
                     std::process::exit(2);
                 });
                 k.gpu_side().hud = Some(hud);
@@ -515,8 +519,8 @@ pub fn run(mut table: Vec<rt::Entry>, window: Option<HostWindow>) {
                 k.log(&format!("practice: boost {} (--boost)", b.name()));
             }
         }
-        None if boost.is_some() || k.config.hud => {
-            eprintln!("gyroship: {} needs --practice FILE", if boost.is_some() { "--boost" } else { "--hud" });
+        None if boost.is_some() || k.config.hud.any() => {
+            eprintln!("gyroship: {} --practice FILE", if boost.is_some() { "--boost needs" } else { "the --hud options need" });
             std::process::exit(2);
         }
         None => {}
