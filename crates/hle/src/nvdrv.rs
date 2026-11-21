@@ -130,6 +130,8 @@ pub struct Gpu {
     /// and the keys already seen.
     programs: gyroship_gpu::surfaces::FxMap<u64, u64>,
     keys: std::collections::BTreeSet<u64>,
+    /// Each stage's last program found (address, key): most draws repeat it.
+    last: [Option<(u64, u64)>; 6],
     /// Every channel's compute QMDs and what they wait for.
     scheduler: gyroship_gpu::state::qmd::Scheduler,
 }
@@ -1510,8 +1512,21 @@ impl Gpu {
     /// The key of the graphics program at a GPU address (read from guest
     /// memory once, until its closing self-branch), None when no end is found
     /// in readable memory; new programs are journaled and go to
-    /// `--dump-shaders DIR` (game code: never committed).
-    fn program(&mut self, k: &mut GpuSide, space: u32, gpu: u64) -> Option<u64> {
+    /// `--dump-shaders DIR` (game code: never committed). Found keys never
+    /// change: stage `stage`'s last one is taken again without a probe.
+    fn program(&mut self, k: &mut GpuSide, space: u32, stage: usize, gpu: u64) -> Option<u64> {
+        if let Some((at, key)) = self.last[stage]
+            && at == gpu
+        {
+            return Some(key);
+        }
+        let key = self.program_at(k, space, gpu)?;
+        self.last[stage] = Some((gpu, key));
+        Some(key)
+    }
+
+    /// [`Gpu::program`] through the table.
+    fn program_at(&mut self, k: &mut GpuSide, space: u32, gpu: u64) -> Option<u64> {
         if let Some(key) = self.programs.get(&gpu) {
             return Some(*key);
         }
@@ -1598,7 +1613,7 @@ impl Gpu {
                     let mut programs = d.programs.map(|_| None);
                     for (stage, p) in d.programs.iter().enumerate() {
                         if let &Some(gpu) = p {
-                            programs[stage] = Some((gpu, self.program(k, space, gpu)));
+                            programs[stage] = Some((gpu, self.program(k, space, stage, gpu)));
                         }
                     }
                     let dumped = k.config.dumps(k.at.presents + 1);
@@ -1895,6 +1910,41 @@ mod tests {
         effects.push(Effect::Ignored { class: 0xc797, method: 0x123, value: 1 });
         assert!(k.gpu_side().apply(GpuOp::Effects { space: 0, effects, read: None }).is_err());
         assert_eq!(k.tally().counts.get("draws"), Some(&5), "counted up to the anomaly");
+    }
+
+    /// A stage's program is read once its memory can be, journaled once, and
+    /// its key taken again by the draws at its address; the draws at another
+    /// address read theirs.
+    #[test]
+    fn a_program_is_read_once_readable_then_taken_again() {
+        use gyroship_runtime::mem::{Block, Memory, perm, state};
+        let header = |method: u32| 1 << 29 | 1 << 16 | method / 4;
+        // The 3D class bound, then a draw of 3 vertices, its vertex program at `at`.
+        let draw = |at: u64| -> Vec<Effect> {
+            let mut effects = gyroship_gpu::pushbuf::Channel::default().run(&[header(0), 0xc797, header(0x1618), 4, header(0xd78), 3]);
+            for e in &mut effects {
+                if let Effect::Draw(d) = e {
+                    d.programs[1] = Some(at);
+                }
+            }
+            effects
+        };
+        let page = crate::layout::ALIAS.0;
+        let k = Kernel::new(Memory::new().unwrap(), crate::journal::Journal::memory(), crate::Config::default());
+        let read = || k.journal.text().lines().filter(|l| l.contains("gpu: program ")).count();
+        k.gpu_side().apply(GpuOp::Effects { space: 0, effects: draw(page), read: None }).unwrap();
+        assert_eq!(read(), 0, "not readable yet");
+        // Two programs: a header, EXIT (twice in the second), then the closing self-branch.
+        let w = |op: u128, f: u128| (op | 7 << 12 | f).to_le_bytes();
+        let (exit, bra) = (w(0x94d, 7 << 87), w(0x947, 7 << 87 | ((-16i64 as u64 as u128) & ((1 << 50) - 1)) << 32));
+        let sph = [0u8; gyroship_gpu::sass::SPH_SIZE];
+        k.mem.map(page, 0x1000, Block::new(state::NORMAL, perm::RW)).unwrap();
+        k.mem.write(page, &[&sph[..], &exit, &bra].concat()).unwrap();
+        k.mem.write(page + 0x800, &[&sph[..], &exit, &exit, &bra].concat()).unwrap();
+        for (at, seen) in [(page, 1), (page, 1), (page + 0x800, 2), (page, 2), (page + 0x800, 2)] {
+            k.gpu_side().apply(GpuOp::Effects { space: 0, effects: draw(at), read: None }).unwrap();
+            assert_eq!(read(), seen, "at {at:#x}");
+        }
     }
 
     /// The first 8 releases are journaled, with their text; all are written.

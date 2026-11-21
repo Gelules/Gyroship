@@ -232,6 +232,10 @@ pub struct Cache {
     /// mask of the attributes fetched as integers, hash of the jump targets or
     /// 0, user clip planes enabled).
     modules: FxMap<ModuleId, Module>,
+    /// The last module each call of `module` found without jump tables (pixel,
+    /// then vertex when paired), by (address, pair, mask, clip): programs and
+    /// modules are never replaced, so a draw repeating them skips both probes.
+    last_modules: [Option<((u64, Option<u64>, u64, u8), std::sync::Arc<(Translation, wgpu::ShaderModule)>)>; 2],
     /// Modules made, by program key and options: pairings that give a program the
     /// same options (a vertex program with pixel programs of the same varyings)
     /// share one (D72).
@@ -1010,6 +1014,13 @@ impl Surfaces {
     /// program pairs with its pixel program's varyings and fetches the
     /// attributes of `mask` as integers (`int_mask`).
     fn module(&mut self, mem: Mem, at: u64, pixel: Option<&Translation>, mask: u64, banks: &[Option<(u64, u32)>], clip: u8) -> Module {
+        let pair = pixel.map(|p| p.key);
+        let (site, last) = (usize::from(pixel.is_some()), (at, pair, mask, clip));
+        if let Some((seen, m)) = &self.cache.last_modules[site]
+            && *seen == last
+        {
+            return Ok(m.clone());
+        }
         // A failed read is not kept: play mode may read while guest threads map memory.
         let key = match self.cache.programs.get(&at) {
             Some(&key) => key,
@@ -1020,7 +1031,6 @@ impl Surfaces {
                 key
             }
         };
-        let pair = pixel.map(|p| p.key);
         // Jump tables: the translation without them (variant 0) says where they are;
         // the tables' words give the targets, and the module with exact blocks is
         // keyed by them too. Both are made in one call: variant 0 (every instruction
@@ -1028,10 +1038,12 @@ impl Surfaces {
         // serves only while a table's bank cannot be read.
         let mut id = (key, pair, mask, 0, clip);
         // Most programs have no table: one lookup.
-        if let Some(m) = self.cache.modules.get(&id)
-            && m.as_ref().is_ok_and(|m| m.0.interface.jump_tables.is_none())
+        if let Some(Ok(m)) = self.cache.modules.get(&id)
+            && m.0.interface.jump_tables.is_none()
         {
-            return m.clone();
+            let m = m.clone();
+            self.cache.last_modules[site] = Some((last, m.clone()));
+            return Ok(m);
         }
         if !self.cache.modules.contains_key(&id) {
             self.translate_module(id, pixel, None);
@@ -2612,6 +2624,57 @@ mod tests {
         assert!(s.errors.lock().unwrap().is_empty());
         assert!(s.shader_module("bad", "@compute @workgroup_size(1) fn main() { let x: u32 = 1.5; }").is_err());
         assert_eq!(s.errors.lock().unwrap().len(), 1, "{:?}", s.errors);
+    }
+
+    /// Over draws that repeat or change a program's address, pairing, integer
+    /// attributes and clip planes, at both call sites, each module is the one
+    /// the caches hold for it; a failed one comes back failed.
+    #[test]
+    fn repeated_modules_are_the_ones_the_caches_hold() {
+        let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
+            eprintln!("no GPU adapter: test skipped");
+            return;
+        };
+        let translation = |key, stage| Translation { key, stage, wgsl: String::new(), interface: Interface::default() };
+        let pixels = [translation(0xa, Stage::Pixel), translation(0xb, Stage::Pixel)];
+        // Programs 1 and 2 at 0x1000 and 0x2000, and program 3 at 0x3000, whose translation failed.
+        let mut held = FxMap::default();
+        for key in 1..=3u64 {
+            s.cache.programs.insert(0x1000 * key, key);
+            for (pair, mask, clip) in [None, Some(0xa), Some(0xb)].into_iter().flat_map(|p| [(p, 0, 0), (p, 1, 0), (p, 0, 1)]) {
+                let m: Module = match key {
+                    3 => Err("refused".into()),
+                    _ => Ok(std::sync::Arc::new((translation(key, Stage::Vertex), s.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl("@compute @workgroup_size(1) fn main() {}".into()) })))),
+                };
+                s.cache.modules.insert((key, pair, mask, 0, clip), m.clone());
+                held.insert((key, pair, mask, clip), m);
+            }
+        }
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let mut nothing = |_: u64, _: &mut [u8]| false;
+        let mut call = (1, None, 0, 0);
+        for step in 0..3000 {
+            // Half the draws repeat the call before.
+            if next(2) == 0 {
+                let (key, pixel) = (1 + next(3), next(3));
+                let (mask, clip) = [(0, 0), (1, 0), (0, 1)][next(3) as usize];
+                call = (key, pixel.checked_sub(1).map(|p| p as usize), mask, clip);
+            }
+            let (key, pixel, mask, clip) = call;
+            let pixel = pixel.map(|p| &pixels[p]);
+            let got = s.module(&mut nothing, 0x1000 * key, pixel, mask, &[], clip as u8);
+            match (&got, &held[&(key, pixel.map(|p| p.key), mask, clip as u8)]) {
+                (Ok(a), Ok(b)) => assert!(std::sync::Arc::ptr_eq(a, b), "step {step}: {call:?}"),
+                (Err(a), Err(b)) => assert_eq!(a, b),
+                _ => panic!("step {step}: {call:?}"),
+            }
+        }
     }
 
     #[test]
