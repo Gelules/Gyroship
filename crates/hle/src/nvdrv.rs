@@ -715,7 +715,6 @@ impl GpuThread {
         let syncpts = crate::lock(&side).syncpts.clone();
         // Detached: it ends with its sender, the decoder's `GpuThread`, or on a panic.
         std::thread::Builder::new().name("gpu".into()).stack_size(gyroship_runtime::fiber::STACK_RESERVE).spawn(move || {
-            gyroship_runtime::raise_if_asked();
             /// However the thread ends (a panic too), its waiters wake and see it.
             struct Ended(Arc<Progress>);
             impl Drop for Ended {
@@ -823,10 +822,7 @@ impl Decoding {
     /// MME runs there, and program reads).
     fn start(decoder: Arc<Mutex<Decoder>>, progress: Arc<Progress>) -> std::io::Result<Decoding> {
         let (jobs, rx) = std::sync::mpsc::channel();
-        std::thread::Builder::new().name("decoder".into()).stack_size(gyroship_runtime::fiber::STACK_RESERVE).spawn(move || {
-            gyroship_runtime::raise_if_asked();
-            decode_jobs(rx, &decoder, progress)
-        })?;
+        std::thread::Builder::new().name("decoder".into()).stack_size(gyroship_runtime::fiber::STACK_RESERVE).spawn(move || decode_jobs(rx, &decoder, progress))?;
         Ok(Decoding { jobs, presented: 0 })
     }
 }
