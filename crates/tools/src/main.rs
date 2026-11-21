@@ -7,6 +7,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 mod boost;
+mod coverage;
 mod experiment;
 mod gpfifo;
 mod measure;
@@ -129,6 +130,20 @@ enum Command {
         #[arg(long)]
         samples: Option<PathBuf>,
     },
+    /// How much of the game's shaders can be made before play: data.zip's programs, their
+    /// jump tables read from the blobs against what play found, the programs data.zip lacks
+    ShaderCoverage {
+        /// The romfs data.zip of the targeted update
+        zip: PathBuf,
+        /// The shader cache's `shaders` folder (inside a --pipeline-cache folder): every
+        /// build's entries are read
+        #[arg(long)]
+        cache: PathBuf,
+        /// The exefs folder: the programs play used that data.zip lacks are looked for in
+        /// its modules
+        #[arg(long)]
+        exefs: Option<PathBuf>,
+    },
     /// Search every entry of data.zip archives for byte patterns: text, or hex
     /// with a 0x prefix (bytes in file order); print each match's entry, offset
     /// and surrounding bytes, and copy the matching entries to a folder (game
@@ -219,6 +234,7 @@ fn main() -> ExitCode {
         Command::BoostCheck { traces, apply } => boost::check(&traces, apply),
         Command::Gpfifo { dir, first, last, methods, listing, bench, profile, repeat } => gpfifo::run(&dir, first, last, methods, listing, bench.then_some((profile, repeat))).map(|_| true),
         Command::Shaders { zip, samples } => shaders::run(&zip, samples.as_deref()),
+        Command::ShaderCoverage { zip, cache, exefs } => coverage::run(&zip, &cache, exefs.as_deref()),
         Command::DatazipFind { zips, patterns, out, context } => shaders::find(&zips, &patterns, out.as_deref(), context).map(|_| true),
         Command::TextSheet { zip, practice, out } => text_sheet::run(&zip, &practice, &out),
         Command::Sass { file } => shaders::list(&file).map(|_| true),

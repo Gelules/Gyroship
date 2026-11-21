@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 /// A hash of the sources the entries depend on (build.rs).
-const BUILD: &str = env!("GYROSHIP_SHADER_BUILD");
+pub const BUILD: &str = env!("GYROSHIP_SHADER_BUILD");
 
 /// The largest body decompressed: its size comes first, and a wrong one would be
 /// allocated (only our own writer could get one past the checksum).
@@ -137,6 +137,43 @@ impl ShaderCache {
         let left = self.queued.saturating_sub(w.entries + w.failed);
         format!("{} loaded, {} rejected, {} ms reading; {} written ({} KiB), {} failed, {left} not written", self.loaded, self.rejected, self.read.as_millis(), w.entries, w.bytes / 1024, w.failed)
     }
+}
+
+/// An entry as `gyroship-tools shader-coverage` reads it: its build's folder, the program's
+/// key and code, the options it was made with, and its translation's stage and interface
+/// (not its WGSL, nor its naga module).
+pub struct Stored {
+    pub build: String,
+    pub key: u64,
+    pub code: Vec<u8>,
+    pub options: Options,
+    pub stage: crate::sass::Stage,
+    pub interface: super::Interface,
+}
+
+/// Every entry under `root` (a `--pipeline-cache` folder's `shaders`), of every build: those
+/// whose checksum holds and that decode with this build's types (an older build's may not),
+/// and how many did not.
+pub fn entries(root: &Path) -> (Vec<Stored>, usize) {
+    let (mut out, mut unread) = (Vec::new(), 0);
+    for build in std::fs::read_dir(root).into_iter().flatten().flatten() {
+        let folder = build.file_name().to_string_lossy().into_owned();
+        for file in std::fs::read_dir(build.path()).into_iter().flatten().flatten() {
+            let name = file.file_name().to_string_lossy().into_owned();
+            let Some(key) = name.strip_suffix(".bin").and_then(|n| u64::from_str_radix(n.get(..16)?, 16).ok()) else { continue };
+            // The body's first parts: the naga module after them is left unread.
+            let decoded = std::fs::read(file.path()).ok().and_then(|bytes| {
+                let (sum, body) = bytes.split_at_checked(8)?;
+                (*sum == crate::sass::fnv(body).to_le_bytes()).then_some(())?;
+                postcard::from_bytes::<(Vec<u8>, Options, u64, Translation)>(&lz4_flex::block::decompress_size_prepended(body).ok()?).ok()
+            });
+            match decoded {
+                Some((code, options, _, t)) => out.push(Stored { build: folder.clone(), key, code, options, stage: t.stage, interface: t.interface }),
+                None => unread += 1,
+            }
+        }
+    }
+    (out, unread)
 }
 
 /// An entry's file name: the program key, and a hash of the options.

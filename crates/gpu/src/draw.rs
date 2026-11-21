@@ -300,7 +300,7 @@ pub struct Cache {
 type Aside = (wgpu::Texture, u64, Vec<(u64, u64)>);
 
 /// How far a jump table of unknown length is read: 256 entries.
-const TABLE_MAX: usize = 1024;
+pub const TABLE_MAX: usize = 1024;
 
 /// The bytes of each jump table, in table order, from its offset in its bank as
 /// bound: its entries when known, else up to TABLE_MAX bytes. None if a bank is
@@ -324,8 +324,9 @@ fn jump_banks(tables: &[shader::JumpTable], banks: &[Option<(u64, u32)>], mem: M
 /// The instructions a program's jump tables may send it to: each entry that,
 /// added to the jump's base, is an instruction's byte offset (a 16-byte multiple
 /// inside the program). A table of unknown length ends at its first word that is
-/// not one.
-fn jump_targets(tables: &[shader::JumpTable], bytes: &[Vec<u8>], code_len: usize) -> BTreeSet<usize> {
+/// not one. Public for `gyroship-tools shader-coverage`, which reads tables from
+/// the game's shader blobs.
+pub fn jump_targets(tables: &[shader::JumpTable], bytes: &[Vec<u8>], code_len: usize) -> BTreeSet<usize> {
     let mut targets = BTreeSet::new();
     for (&(_, base, _, entries), data) in tables.iter().zip(bytes) {
         for w in data.as_chunks::<4>().0 {
