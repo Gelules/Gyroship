@@ -244,6 +244,9 @@ pub struct Cache {
     /// same options (a vertex program with pixel programs of the same varyings)
     /// share one (D72).
     shared: FxMap<(u64, Options), std::sync::Arc<Built>>,
+    /// Under `GYROSHIP_PASSTHROUGH` only: each module's naga module and validation, by serial
+    /// (`Surfaces::keep_ir`).
+    pub(crate) ir: FxMap<u32, (naga::Module, naga::valid::ModuleInfo)>,
     /// Render pipelines with their bind group layouts, their id for the run
     /// (`Rec::Pipeline`; never removed: their count is the next id), and
     /// whether the recorder has them (announced once made).
@@ -931,7 +934,12 @@ impl Surfaces {
                 let layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &refs, ..Default::default() });
                 // Owned: a worker thread may make it.
                 let buffers: Vec<(u64, wgpu::VertexStepMode, Vec<wgpu::VertexAttribute>)> = layouts.iter().map(|(_, step, stride, attributes)| (*stride, *step, attributes.to_vec())).collect();
-                let (device, vertex, pixel) = (self.device.clone(), vs.1.clone(), ps.as_ref().map(|p| p.1.clone()));
+                // Under GYROSHIP_PASSTHROUGH, the modules made from our SPIR-V for this layout.
+                let (vertex, pixel) = {
+                    let entries: SmallVec<[&[wgpu::BindGroupLayoutEntry]; 2]> = groups.iter().filter(|&&id| id != u32::MAX).map(|&id| self.cache.group_entries[id as usize].as_slice()).collect();
+                    (self.passthrough(&vs, &entries).unwrap_or_else(|| vs.1.clone()), ps.as_ref().map(|p| self.passthrough(p, &entries).unwrap_or_else(|| p.1.clone())))
+                };
+                let device = self.device.clone();
                 let (primitive, targets, depth_stencil) = (*primitive, color_states.to_vec(), depth_state.clone());
                 let cache = self.disk_cache.as_ref().map(|d| d.cache.clone());
                 let make = move || {
@@ -1136,6 +1144,7 @@ impl Surfaces {
         };
         if let Ok(m) = &made {
             self.cache.shared.insert((key, options), m.clone());
+            self.keep_ir(m);
         }
         made
     }

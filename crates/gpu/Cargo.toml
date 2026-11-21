@@ -11,12 +11,9 @@ wgpu = { version = "30", features = ["naga-ir"] }
 pollster = "1"
 png = "0.18"
 lz4_flex = { version = "0.14", default-features = false, features = ["safe-decode", "std"] }
-naga = { version = "30", features = ["wgsl-in", "serialize", "deserialize"] }
+naga = { version = "30", features = ["wgsl-in", "spv-out", "serialize", "deserialize"] }
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", default-features = false, features = ["use-std"] }
 smallvec = "1"
 # The version wgpu-hal is built on: its device creation callback takes ash's types.
 ash = "=0.38.0"
-
-[dev-dependencies]
-naga = { version = "30", features = ["spv-out"] }

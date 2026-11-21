@@ -298,6 +298,9 @@ pub struct Surfaces {
     pub(crate) clip_distances: bool,
     /// What the Vulkan device has beyond wgpu's extensions and features (D110).
     pub(crate) vulkan: crate::vk::Extras,
+    /// Under `GYROSHIP_PASSTHROUGH` (`vk::PASSTHROUGH`): the SPIR-V options our modules are
+    /// written with, those of wgpu-hal.
+    pub(crate) passthrough: Option<naga::back::spv::Options<'static>>,
 }
 
 /// A pipeline cache kept in a file between runs (`--pipeline-cache`): the
@@ -1137,6 +1140,8 @@ pub(crate) fn descriptor(adapter: &wgpu::Adapter) -> wgpu::DeviceDescriptor<'sta
         | wgpu::Features::PIPELINE_CACHE
         | wgpu::Features::TEXTURE_ATOMIC
         | wgpu::Features::CLIP_DISTANCES
+        // Modules from our own SPIR-V (D110).
+        | wgpu::Features::PASSTHROUGH_SHADERS
         | crate::timing::Timing::wanted();
     wgpu::DeviceDescriptor { required_features: (adapter.features() & wanted) | NEEDED, required_limits: adapter.limits(), ..Default::default() }
 }
@@ -1180,6 +1185,10 @@ impl Surfaces {
         let info = adapter.get_info();
         check_adapter(adapter.features(), info.subgroup_min_size, info.subgroup_max_size).map_err(|e| format!("{} ({:?}): {e}", info.name, info.backend))?;
         let (device, queue, vulkan) = crate::vk::open(&adapter, &descriptor(&adapter)).map_err(|e| format!("cannot open the GPU device: {e}"))?;
+        let passthrough = std::env::var_os(crate::vk::PASSTHROUGH).filter(|_| device.features().contains(wgpu::Features::PASSTHROUGH_SHADERS)).and_then(|_| crate::vk::spirv_options(&adapter, &device));
+        if passthrough.is_some() {
+            eprintln!("gyroship: {}: pipelines made from our SPIR-V", crate::vk::PASSTHROUGH);
+        }
         let errors = Arc::new(Mutex::new(Vec::new()));
         let sink = errors.clone();
         device.on_uncaptured_error(Arc::new(move |e: wgpu::Error| {
@@ -1232,7 +1241,7 @@ impl Surfaces {
         let timed = timing.is_some();
         let rec = Arc::new(Mutex::new(crate::record::Recorder::new(&device, &queue, timing)));
         let renderable = (0..=0xff).filter_map(color_format).chain((0..=0xff).filter_map(depth_format)).map(|f| (f, renderable_on(&adapter, &device, f))).collect();
-        Ok(Surfaces { renderable, adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, rec, batch: Vec::with_capacity(BATCH), recorder: None, recorder_ended: false, timed, open: None, sets: 0, empty_set: None, present: 0, readbacks: Default::default(), hasher: None, belt, big_upload: false, texture_belt, uploads: None, global_bytes: Vec::new(), staging: Staging::default(), last_color: None, window, submit: None, submit_ended: false, memo: Memo::default(), kept: Kept::default(), compile: Compile::default(), compile_total: Compile::default(), background: false, wait_left: PIPELINE_WAIT, workers: None, finished: Default::default(), disk_cache: None, shader_cache: None, views: Aged::default(), dynamic_max, clip_distances, vulkan })
+        Ok(Surfaces { renderable, adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, rec, batch: Vec::with_capacity(BATCH), recorder: None, recorder_ended: false, timed, open: None, sets: 0, empty_set: None, present: 0, readbacks: Default::default(), hasher: None, belt, big_upload: false, texture_belt, uploads: None, global_bytes: Vec::new(), staging: Staging::default(), last_color: None, window, submit: None, submit_ended: false, memo: Memo::default(), kept: Kept::default(), compile: Compile::default(), compile_total: Compile::default(), background: false, wait_left: PIPELINE_WAIT, workers: None, finished: Default::default(), disk_cache: None, shader_cache: None, views: Aged::default(), dynamic_max, clip_distances, vulkan, passthrough })
     }
 
     /// Shows the presented image (the color target written last, its top-left

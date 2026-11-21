@@ -295,10 +295,12 @@ impl Surfaces {
             let since = std::time::Instant::now();
             let layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &layout_entries });
             let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&layout)], ..Default::default() });
+            // Under GYROSHIP_PASSTHROUGH, the module made from our SPIR-V for this layout.
+            let ours = self.passthrough(&compiled, &[&layout_entries]);
             let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(&format!("{key:016x}")),
                 layout: Some(&pipeline_layout),
-                module,
+                module: ours.as_ref().unwrap_or(module),
                 entry_point: Some("main"),
                 compilation_options: Default::default(),
                 cache: self.disk_cache.as_ref().map(|d| &d.cache),
