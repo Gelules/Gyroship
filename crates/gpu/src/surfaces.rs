@@ -820,6 +820,10 @@ pub struct Staging {
     /// Times the frames' encoder was taken (`Surfaces::encoder`): each draw
     /// pass opened, and each other recording (clear, copy, dispatch).
     pub recordings: u64,
+    /// The frames' segments: their runs of draw passes and of other recordings, each
+    /// change from one kind to the other starting one. A draw path of its own beside
+    /// wgpu would hand over at each (D110, step 1).
+    pub segments: u64,
     /// A hash of where each block was written in the arena (offset, bound
     /// size) and of each flushed arena's length, in order: two runs that lay
     /// out their arenas alike match, whatever their memos found.
@@ -838,7 +842,7 @@ impl Staging {
     /// Takes the counters the recorder keeps from its own (`Recorder::staging`).
     pub(crate) fn recorded(&mut self, r: &Staging) {
         (self.calls, self.hits, self.bank_bytes, self.data_bytes, self.zero_bytes, self.flushed, self.flushes) = (r.calls, r.hits, r.bank_bytes, r.data_bytes, r.zero_bytes, r.flushed, r.flushes);
-        (self.bind_groups, self.recordings, self.layout) = (r.bind_groups, r.recordings, r.layout);
+        (self.bind_groups, self.recordings, self.layout, self.segments) = (r.bind_groups, r.recordings, r.layout, r.segments);
     }
 }
 
@@ -2636,6 +2640,7 @@ mod tests {
         let mut r = s.rec();
         assert!(r.stage_raw(1).1 != r.stage_raw(3).1, "identical blocks staged as they are keep their own ranges");
         assert_eq!(r.staging.recordings, 3, "the first two draws shared a pass");
+        assert_eq!(r.staging.segments, 3, "draws, the copy, draws again");
         drop(r);
         s.flush();
         let read = |t: &wgpu::Texture| s.rgba(&Entry { surface: Surface { addr: 0, width: 4, height: 4, format: 0xd5, layers: 1 }, texture: t.clone(), written: 0 }).unwrap();

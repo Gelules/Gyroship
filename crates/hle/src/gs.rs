@@ -895,7 +895,7 @@ impl GpuSide {
                 let recorder_wait = recorder.map(|(_, w)| w).unwrap_or_default();
                 let (st, calls) = (&s.staging, p.macro_calls);
                 let row = format!(
-                    "{n},{cpu:.1},{},{},{},{},{},{},{:.1},{calls},{},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{},{:016x},{:.1},{:.1}\n",
+                    "{n},{cpu:.1},{},{},{},{},{},{},{:.1},{calls},{},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{},{:016x},{:.1},{:.1},{}\n",
                     s.drawn,
                     skipped.values().sum::<u64>(),
                     st.views[0],
@@ -916,7 +916,8 @@ impl GpuSide {
                     st.recordings,
                     st.layout,
                     recorder_cpu.unwrap_or_default().as_secs_f64() * 1e3,
-                    recorder_wait.as_secs_f64() * 1e3
+                    recorder_wait.as_secs_f64() * 1e3,
+                    st.segments
                 );
                 self.frames += &row;
             }

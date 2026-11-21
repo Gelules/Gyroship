@@ -120,6 +120,9 @@ pub(crate) struct Recorder {
     pub(crate) staging: Staging,
     /// Draws that found no pass open: skipped.
     pub(crate) lost: u64,
+    /// The kind of the frame's last recording, for `Staging::segments`: a draw
+    /// pass (true) or anything else (false); none yet in this frame.
+    last: Option<bool>,
     /// Play mode: the submit thread's queue, to sync with before the arena grows,
     /// and whether it ended (then the frames it held are lost).
     pub(crate) submit: Option<std::sync::mpsc::SyncSender<SubmitJob>>,
@@ -145,6 +148,7 @@ impl Recorder {
             timing,
             staging: Staging::default(),
             lost: 0,
+            last: None,
             submit: None,
             submit_ended: false,
         }
@@ -169,7 +173,19 @@ impl Recorder {
                 self.pipelines[id] = Some((pipeline, layouts));
             }
             Rec::Draw(d) => self.draw(d),
-            Rec::Run(run) => run(self),
+            Rec::Run(run) => {
+                self.segment(false);
+                run(self)
+            }
+        }
+    }
+
+    /// A recording of this kind (a draw pass, or anything else): a new segment when the
+    /// last one was of the other kind (`Staging::segments`).
+    fn segment(&mut self, pass: bool) {
+        if self.last != Some(pass) {
+            self.staging.segments += 1;
+            self.last = Some(pass);
         }
     }
 
@@ -177,6 +193,7 @@ impl Recorder {
     /// forgotten (their ids start again).
     pub(crate) fn end_frame(&mut self) {
         self.pass = None;
+        self.last = None;
         self.staged.clear();
         self.blocks.clear();
         self.banks.clear();
@@ -231,6 +248,7 @@ impl Recorder {
             groups.push((group, offsets));
         }
         if let Some(p) = d.pass {
+            self.segment(true);
             let timed = p.timed.and_then(|label| self.timing.as_mut().and_then(|t| t.next(label)));
             let mut encoder = self.encoder();
             let load = wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store };

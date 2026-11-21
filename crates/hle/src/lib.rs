@@ -964,14 +964,15 @@ pub struct Census {
 /// op channel; decoder_cpu_ms: the decoder thread's CPU time, 0 without it;
 /// recordings and arena_layout: `Staging::recordings` and `Staging::layout`;
 /// recorder_cpu_ms: the recorder thread's CPU time, and recorder_wait_ms: the
-/// GPU thread's waits for it, 0 without it).
+/// GPU thread's waits for it, 0 without it; segments: `Staging::segments`, the
+/// frames' runs of draw passes and of other recordings).
 /// macro_calls, decode_ms, gpu_wait_ms and queue_wait_ms are the decoding
 /// thread's (the decoder thread in play mode, else the presenting thread), as
 /// of the present's decoding; the others are read at the frame's end, on the
 /// GPU thread in play mode. Only `skipped` is the present's own. The
 /// presenting thread's wait for the present before it is the census wait
 /// kind "present" (waits.csv).
-pub(crate) const FRAME_COLUMNS: &str = "present,cpu_ms,draws,skipped,views_made,bind_groups_made,flushed_bytes,upload_bytes,upload_ms,macro_calls,watched_pages,flush_ms,submit_ms,decode_ms,effects_ms,submit_cpu_ms,gpu_cpu_ms,gpu_wait_ms,queue_wait_ms,decoder_cpu_ms,recordings,arena_layout,recorder_cpu_ms,recorder_wait_ms\n";
+pub(crate) const FRAME_COLUMNS: &str = "present,cpu_ms,draws,skipped,views_made,bind_groups_made,flushed_bytes,upload_bytes,upload_ms,macro_calls,watched_pages,flush_ms,submit_ms,decode_ms,effects_ms,submit_cpu_ms,gpu_cpu_ms,gpu_wait_ms,queue_wait_ms,decoder_cpu_ms,recordings,arena_layout,recorder_cpu_ms,recorder_wait_ms,segments\n";
 
 const COUNTER: u32 = 0x100;
 const WAIT: u32 = 0x200;
