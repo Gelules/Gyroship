@@ -4,6 +4,7 @@ description = "Function discovery, control-flow graphs, jump tables and call gra
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [dependencies]
 gyroship-loader = { version = "0.1.0", path = "../loader" }

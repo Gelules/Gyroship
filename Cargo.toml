@@ -9,6 +9,7 @@ exclude = ["crates/launcher"]
 version = "0.1.0"
 edition = "2024"
 publish = false
+license = "GPL-3.0-or-later"
 
 # naga 30.0.1 with front::Typifier::grow made linear (it was quadratic in a
 # function's expression count: seconds per large translated shader). The change

@@ -4,6 +4,7 @@ description = "Gyroship: native PC port runtime (window, main loop, config, fram
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [dependencies]
 gyroship-gpu = { path = "../gpu" }

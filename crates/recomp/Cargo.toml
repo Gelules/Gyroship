@@ -4,6 +4,7 @@ description = "AArch64 code generator (backend chosen in M1)"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [dependencies]
 gyroship-analysis = { version = "0.1.0", path = "../analysis" }

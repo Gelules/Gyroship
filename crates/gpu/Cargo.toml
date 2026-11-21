@@ -4,6 +4,7 @@ description = "Rendering on wgpu (Vulkan, DX12 fallback); later the NVN translat
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [dependencies]
 wgpu = { version = "30", features = ["naga-ir"] }
