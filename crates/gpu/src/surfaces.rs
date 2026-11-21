@@ -297,6 +297,8 @@ pub struct Surfaces {
     /// Whether the device has Features::CLIP_DISTANCES (user clip planes).
     pub(crate) clip_distances: bool,
     /// What the Vulkan device has beyond wgpu's extensions and features (D110).
+    // ponytail: read by the tests only until the raw path (D110 step 6a) checks dynamic rendering.
+    #[allow(dead_code)]
     pub(crate) vulkan: crate::vk::Extras,
     /// Under `GYROSHIP_PASSTHROUGH` (`vk::PASSTHROUGH`): the SPIR-V options our modules are
     /// written with, those of wgpu-hal.
