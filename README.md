@@ -8,14 +8,9 @@ your speed and release markers on screen, the level time to the millisecond, the
 menu with mission select and cheats, mods that swap your vehicle, and Switch 2 Joy-Con with their
 mouse controls.
 
-> [!TIP]
-> **Built for speedrunners.** Every practice tool is a switch in the launcher, and the files they
-> need for the game's update come with Gyroship: no reverse engineering.
-
-> [!NOTE]
-> **You bring the game**: your own dump, from your own console. Gyroship holds no game code or
-> assets and decrypts nothing, the game never goes online, and what you build from your dump stays
-> yours alone. It is for practice: official runs are done on the console.
+You bring the game: your own dump, from your own console. Gyroship holds no game code or assets
+and decrypts nothing, the game never goes online, and what you build from your dump stays yours
+alone. It is for practice: official runs are done on the console.
 
 ## What makes Gyroship different
 
@@ -29,6 +24,9 @@ mouse controls.
 | 🔬 **Research you can check** | The boost of each vehicle, taken from the game's code and matched to the running game, bit for bit |
 
 ## Practice like no console lets you
+
+Every practice tool is a switch in the launcher, and the files they need for the game's update come
+with Gyroship: no reverse engineering.
 
 - **A perfect boost, every time.** Hold Boost and each boost ends where the research says to let
   go, in the Arwing and the Blue-Marine. One button turns it off when you want a full boost.
