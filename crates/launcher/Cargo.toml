@@ -4,6 +4,9 @@ description = "Gyroship's launcher: picks a build and its options, starts the ga
 version = "0.1.0"
 edition = "2024"
 publish = false
+license = "GPL-3.0-or-later"
+# Where new versions are published (GitHub Releases): the launcher checks it at start (D109).
+repository = "https://github.com/Gelules/Gyroship"
 
 [build-dependencies]
 tauri-build = "=2.7.5"

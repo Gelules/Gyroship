@@ -1,10 +1,11 @@
 //! Gyroship's launcher (M6 step 9c): a window over the command line. It picks a build
-//! of the game and its options, starts it, says how the last session ended, and runs
-//! the setup steps (recompile the game, build it), one thing at a time. Its settings
-//! and its webview's data live next to its executable.
+//! of the game and its options, starts it, says how the last session ended, runs the
+//! setup steps (the installs, the tools' build, the recompile, the game's build) and
+//! installs new releases (D109), one thing at a time. Its settings and its webview's
+//! data live next to its executable.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use gyroship_launcher::{Last, RUNNING, Report, Settings, builds, flags, layers, load, logs, prepare_save, report, save, session, step};
+use gyroship_launcher::{Checks, LAUNCHER, Last, Needs, RUNNING, Report, Settings, Update, VERSION, builds, checks, flags, install_root, latest_newer, layers, load, logs, needs, prepare_save, report, save, session, step, update_blocker};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -12,10 +13,13 @@ use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
 
-/// A game or a setup step is running: one thing at a time (a port takes gigabytes of
-/// memory, and so does the game).
+/// A game, a setup step or an update is running: one thing at a time (a port takes gigabytes
+/// of memory, and so does the game).
 #[derive(Default)]
 struct Busy(AtomicBool);
+
+/// The copy this launcher was updated from (`--updated-from`): the only one it may delete.
+struct UpdatedFrom(Option<PathBuf>);
 
 /// The launcher's folder: its settings and its webview's data stay with it.
 fn folder() -> PathBuf {
@@ -57,17 +61,29 @@ fn window_of(command: &mut Command, console: bool) {
     let _ = (command, console);
 }
 
-/// The launcher's window. Its page starts with `said`: after a game, how the session
-/// ended (`__AFTER_GAME__`); a word for the player (`__NOTICE__`).
+/// The launcher's window. Its page starts with the launcher's version (`__VERSION__`), whether
+/// it is this run's first window (`__FIRST_WINDOW__`: the page then looks for updates), and
+/// `said`: after a game, how the session ended (`__AFTER_GAME__`); a word for the player
+/// (`__NOTICE__`); after an update, the copy it came from (`__UPDATED_FROM__`).
 fn open_window(app: &AppHandle, said: &str) -> tauri::Result<()> {
+    static OPENED: AtomicBool = AtomicBool::new(false);
+    let first = !OPENED.swap(true, Relaxed);
     let page = tauri::WebviewUrl::App("index.html".into());
-    tauri::WebviewWindowBuilder::new(app, "main", page).title("Gyroship launcher").inner_size(960.0, 820.0).data_directory(folder().join("webview-data")).initialization_script(said).build().map(drop)
+    let script = format!("window.__VERSION__ = {}; window.__FIRST_WINDOW__ = {first}; {said}", serde_json::Value::String(VERSION.into()));
+    tauri::WebviewWindowBuilder::new(app, "main", page).title("Gyroship launcher").inner_size(960.0, 820.0).data_directory(folder().join("webview-data")).initialization_script(script).build().map(drop)
 }
 
-/// The settings, and a word for the player when their file did not parse.
+/// The settings, and a word for the player when their file did not parse. With no repository
+/// set yet, the Gyroship folder the launcher is in, if it is in one (a release's).
 #[tauri::command]
 fn get_settings() -> (Settings, Option<String>) {
-    load(&settings_file())
+    let (mut s, said) = load(&settings_file());
+    if s.repo.is_empty()
+        && let Some(root) = std::env::current_exe().ok().and_then(|e| install_root(&e))
+    {
+        s.repo = root.to_string_lossy().into_owned();
+    }
+    (s, said)
 }
 
 #[tauri::command]
@@ -83,6 +99,93 @@ fn list_builds(settings: Settings) -> Vec<String> {
 #[tauri::command]
 fn list_layers(settings: Settings) -> Vec<(String, String)> {
     layers(&settings)
+}
+
+/// What the page flags: the Setup tab's problems, the dump's, the port's progress.
+#[tauri::command]
+fn check(settings: Settings) -> Checks {
+    checks(&settings)
+}
+
+/// What building and running the game needs on this PC: Rust, the C++ tools, the runtime.
+/// Off the window's thread: the three programs it runs take a moment.
+#[tauri::command(async)]
+fn list_needs() -> Needs {
+    needs()
+}
+
+/// This launcher's version, the latest release when it is newer (D109), and why this copy
+/// cannot install it itself, if it cannot: a Git clone, or a folder already taken (said at
+/// start, rather than downloaded again at each one). An error when GitHub cannot be asked.
+#[tauri::command(async)]
+fn check_update() -> Result<Update, String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let release = latest_newer()?;
+    let taken = || gyroship_launcher::target(&install_root(&exe)?, &release.as_ref()?.tag).err();
+    let blocker = update_blocker(&exe).or_else(taken);
+    Ok(Update { version: VERSION.into(), release, blocker })
+}
+
+/// Installs the latest release next to this copy of Gyroship, in the background, telling the
+/// page how far it went ("update"), then starts the new copy's launcher, which rebuilds the
+/// game, and ends; a failure comes as "update-failed". Never while a game or a step runs.
+#[tauri::command]
+fn apply_update(app: AppHandle, busy: State<Busy>, settings: Settings) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    if let Some(why) = update_blocker(&exe) {
+        return Err(why);
+    }
+    if busy.0.swap(true, Relaxed) {
+        return Err("a game or a setup step is running".into());
+    }
+    std::thread::spawn(move || {
+        let page = app.clone();
+        let started = gyroship_launcher::update(&settings, &exe, |text| drop(page.emit("update", text))).and_then(|(new, old)| {
+            let launcher = new.join(LAUNCHER);
+            let mut child = Command::new(&launcher).arg("--updated-from").arg(&old).current_dir(&new).spawn().map_err(|e| format!("{}: {e}", launcher.display()))?;
+            // A new launcher that ends at once shows no message of its own: said here, and this one stays.
+            std::thread::sleep(Duration::from_secs(3));
+            match child.try_wait() {
+                Ok(Some(status)) => Err(format!("the new launcher stopped at its start ({status}): start {} yourself", launcher.display())),
+                _ => Ok(()),
+            }
+        });
+        match started {
+            Ok(()) => app.exit(0),
+            Err(e) => {
+                app.state::<Busy>().0.store(false, Relaxed);
+                let _ = app.emit("update-failed", e);
+            }
+        }
+    });
+    Ok(())
+}
+
+/// A release's page, in the player's browser: the repository's release pages only.
+#[tauri::command]
+fn open_release(url: String) -> Result<(), String> {
+    if !gyroship_launcher::is_release_page(&url) {
+        return Err(format!("not a release page of {}: {url}", gyroship_launcher::REPOSITORY));
+    }
+    Command::new("explorer.exe").arg(url).spawn().map(drop).map_err(|e| e.to_string())
+}
+
+/// The copy of Gyroship this one was updated from, deleted on the player's click: the one this
+/// launcher was started for, checked against the settings as saved, never what the page says.
+/// Off the window's thread (a copy holds a built game, thousands of files), and busy meanwhile,
+/// so that the window waits for its end.
+#[tauri::command(async)]
+fn delete_previous(app: AppHandle) -> Result<(), String> {
+    let old = app.state::<UpdatedFrom>().0.clone().ok_or("this launcher was not started by an update")?;
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let root = install_root(&exe).ok_or("this launcher is not in a Gyroship folder")?;
+    let busy = app.state::<Busy>();
+    if busy.0.swap(true, Relaxed) {
+        return Err("a game, a setup step or an update is running".into());
+    }
+    let done = gyroship_launcher::delete_previous(&load(&settings_file()).0, &old, &root);
+    busy.0.store(false, Relaxed);
+    done
 }
 
 /// The journals' folder, once the data folder is set: without it, `logs` would be
@@ -117,12 +220,19 @@ fn play(app: AppHandle, settings: Settings) -> Result<(), String> {
 /// shows no window after a game that ended normally: the launcher ends with it.
 fn start(app: &AppHandle, settings: Settings, shortcut: bool) -> Result<(), String> {
     let busy = app.state::<Busy>();
-    for (what, path) in [("build", &settings.build), ("dump's exefs folder", &settings.exefs), ("data folder (Setup tab)", &settings.data)] {
+    for (what, path) in [("game build", &settings.build), ("game's exefs folder", &settings.exefs), ("data folder (Setup tab)", &settings.data)] {
         if path.is_empty() {
             return Err(format!("the {what} is not set"));
         }
         if !Path::new(path).is_absolute() || !Path::new(path).exists() {
             return Err(format!("the {what} does not exist, or is not a full path: {path}"));
+        }
+    }
+    // The game would look for a relative path from the launcher's current folder, which an update
+    // changes: full paths only.
+    for (what, path) in [("save folder", &settings.save), ("shader cache folder", &settings.cache), ("hooks file", &settings.hooks), ("mod", &settings.layer), ("practice file", &settings.practice)] {
+        if !path.is_empty() && !Path::new(path).is_absolute() {
+            return Err(format!("the {what} is not a full path: {path}"));
         }
     }
     if busy.0.swap(true, Relaxed) {
@@ -194,19 +304,19 @@ fn run_step(app: AppHandle, busy: State<Busy>, settings: Settings, kind: String)
     if !folder.is_dir() {
         return Err(format!("{} does not exist{}", folder.display(), if kind == "build" { ": recompile the game first" } else { "" }));
     }
-    // The tools are the repository's own build, the one step the launcher does not do.
+    // Recompile runs the tools: a release brings them, the tools step builds them.
     if kind == "recompile" && !program.is_file() {
-        return Err(format!("{} does not exist: build the tools first (cargo build --release, in the repository)", program.display()));
+        return Err(format!("{} does not exist: build the tools first (Build the tools, above)", program.display()));
     }
     if busy.0.swap(true, Relaxed) {
         return Err("a game or a setup step is already running".into());
     }
     let mut command = Command::new(&program);
     command.args(&arguments).current_dir(&folder).stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
-    // The build fetches nothing: its crates are those of the data folder's `cargo`,
-    // when there is one and cargo's home is not set otherwise.
+    // Cargo's crates go to the data folder's `cargo`, when there is one and cargo's home is
+    // not set otherwise.
     let home = Path::new(&settings.data).join("cargo");
-    if kind == "build" && std::env::var_os("CARGO_HOME").is_none() && home.is_dir() {
+    if ["build", "tools"].contains(&kind.as_str()) && std::env::var_os("CARGO_HOME").is_none() && home.is_dir() {
         command.env("CARGO_HOME", home);
     }
     window_of(&mut command, false);
@@ -260,27 +370,30 @@ fn main() {
     };
     let app = tauri::Builder::default()
         .manage(Busy::default())
+        .manage(UpdatedFrom(std::env::args().skip_while(|a| a != "--updated-from").nth(1).map(PathBuf::from)))
         .setup(|app| {
             // `--play` (a shortcut's argument): the game at once, with the saved settings.
             let direct = std::env::args().any(|a| a == "--play").then(|| start(app.handle(), load(&settings_file()).0, true));
+            // `--updated-from FOLDER`: started by the launcher of that older copy, after an update.
+            let updated = std::env::args().skip_while(|a| a != "--updated-from").nth(1);
             match direct {
                 Some(Ok(())) => {}
                 Some(Err(e)) => open_window(app.handle(), &format!("window.__NOTICE__ = {};", serde_json::Value::String(format!("The game did not start: {e}"))))?,
-                None => open_window(app.handle(), "")?,
+                None => open_window(app.handle(), &updated.map_or(String::new(), |old| format!("window.__UPDATED_FROM__ = {};", serde_json::Value::String(old))))?,
             }
             Ok(())
         })
-        // A setup step half done would leave a half-written folder: the window stays
-        // until it ends. (During a game there is no window to close.)
+        // A setup step or an update half done would leave a half-written folder: the window
+        // stays until it ends. (During a game there is no window to close.)
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event
                 && window.state::<Busy>().0.load(Relaxed)
             {
                 api.prevent_close();
-                let _ = window.emit("notice", "A setup step is running: close the window once it ends.");
+                let _ = window.emit("notice", "A setup step or an update is running: close the window once it ends.");
             }
         })
-        .invoke_handler(tauri::generate_handler![get_settings, set_settings, list_builds, list_layers, last_session, open_logs, play, run_step])
+        .invoke_handler(tauri::generate_handler![get_settings, set_settings, list_builds, list_layers, check, list_needs, check_update, apply_update, open_release, delete_previous, last_session, open_logs, play, run_step])
         .build(tauri::generate_context!())
         .expect("the launcher could not start");
     app.run(|app, event| {

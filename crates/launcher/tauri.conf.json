@@ -1,6 +1,5 @@
 {
   "productName": "Gyroship launcher",
-  "version": "0.1.0",
   "identifier": "dev.gyroship.launcher",
   "build": { "frontendDist": "ui" },
   "app": {
