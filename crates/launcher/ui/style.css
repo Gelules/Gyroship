@@ -95,6 +95,7 @@ button.quiet { background: transparent; }
 .status { display: flex; align-items: center; gap: 10px; margin: 0; flex: 1 1 260px; font: 500 14px var(--display); }
 .go { margin-left: auto; padding: 12px 44px; font: 600 17px var(--display); letter-spacing: .03em; color: var(--amber-ink); background: var(--amber); border-color: var(--amber); }
 .go:hover:not(:disabled) { background: #ffc46e; border-color: #ffc46e; }
+#setup-all { margin-left: 0; }
 #state { color: var(--alert); }
 .hint { color: var(--soft); font-size: 12.5px; margin: 10px 0 24px; }
 

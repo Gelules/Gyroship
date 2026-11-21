@@ -138,7 +138,12 @@
 
     <section id="setup" hidden aria-labelledby="setup-title">
       <h2 id="setup-title">Setup</h2>
-      <p class="intro">Do these steps once, in order, then go back to Play. Each step's light turns green when it is done.</p>
+      <p class="intro">Do these steps once, all at once or one by one in order, then go back to Play. Each step's light turns green when it is done.</p>
+      <div class="row">
+        <button id="setup-all" class="go" disabled>Set up everything</button>
+        <small class="note" id="setup-all-note"></small>
+      </div>
+      <p class="explain">Does the steps below that are not done yet, in order, and stops at the first one that fails. It installs what is missing through winget, as step 2 does: pressing it accepts the same licences, and the C++ tools ask for administrator rights. It then builds the tools, recompiles the game and builds it.</p>
       <div class="problems" id="problems" hidden>
         <svg class="alert-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.5 2.5 20h19z"/><path class="glyph" d="M12 9.5v5M12 17.2v.3"/></svg>
         <div>

@@ -117,7 +117,10 @@ the bottom of Play says so.
   runs, so that its memory is the game's, and comes back with how the session ended.
   `gyroship-launcher --play` starts the game at once with the saved settings, for a shortcut: after
   a game that ended normally, the launcher ends too, without a window.
-- **Setup**, in four steps, each with a lamp (green: done; red: to fix):
+- **Setup**, in four steps, each with a lamp (green: done; red: to fix). Set up everything, at the
+  top, does those not done yet in order, reading the lamps again after each one, and stops at the
+  first that fails or stays undone; it waits for both folders and for the exefs folder set in Play.
+  One by one:
   1. the two folders, with a button that sets the empty Save and Shader cache folders to
      `<data folder>\save` and `<data folder>\pipeline-cache`;
   2. what building and playing need: Rust 1.97 or later, Microsoft's C++ build tools and the

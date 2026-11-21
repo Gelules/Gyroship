@@ -104,8 +104,8 @@ Details and known issues: [docs/status.md](docs/status.md).
    ([docs/building.md](docs/building.md)); the launcher then checks them, with the Visual C++
    runtime, and installs any that goes missing.
 2. **Build** Gyroship and its launcher: [docs/building.md](docs/building.md).
-3. **Open the launcher**: its Setup tab walks you through preparing the game, then press Play
-   ([docs/playing.md](docs/playing.md)).
+3. **Open the launcher**: in its Setup tab, Set up everything prepares the game in one press (or
+   step by step, as you like), then press Play ([docs/playing.md](docs/playing.md)).
 4. **Practise**: turn on the practice tools in the launcher ([docs/practice.md](docs/practice.md)).
 
 ## Documentation

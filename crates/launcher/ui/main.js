@@ -93,8 +93,11 @@ function showNeeds() {
 
 // The Setup tab's state: flagged on its tab, listed on it, a lamp per step; and the launch
 // strip's line.
+let checked = null;
 async function refreshChecks() {
   const c = await invoke('check', { settings });
+  checked = c;
+  showSetupAll();
   const unfinished = c.setup.length > 0;
   $('tab-setup').classList.toggle('alert', unfinished);
   // An SVG element has no hidden property: the attribute itself goes.
@@ -169,6 +172,55 @@ let running = false;
 function busy(on) {
   running = on;
   for (const b of document.querySelectorAll('[data-step], #go, #check-update, #update-retry')) b.disabled = on;
+  showSetupAll();
+}
+
+// Set up everything: the steps not done yet, in order, chosen again from the lamps after each one;
+// it stops at the first that fails, or that ends still undone. The steps it ran, while it runs.
+let all = null;
+let ended = '';
+const DOING = { 'install-rust': 'installing Rust', 'install-cpp': "installing Microsoft's C++ build tools", 'install-runtime': 'installing the Visual C++ runtime', tools: "building Gyroship's tools", recompile: 'recompiling the game', build: 'building the game' };
+
+// The button needs the paths the steps read: the two folders, and the exefs folder for Recompile.
+function showSetupAll() {
+  const c = checked;
+  const why = !c ? '' : !c.folders ? 'Set the repository and the data folder first (step 1).' : c.exefs ? `${c.exefs}. Set it in Play first.` : '';
+  $('setup-all').disabled = running || !c || !!why;
+  if (!all) $('setup-all-note').textContent = why || ended;
+}
+
+// The next step to do, { stop } when one cannot be done from here, or {} when all are done.
+function nextStep() {
+  const n = needs;
+  const c = checked;
+  const install = (ok, kind, what) => (ok ? null : n.winget ? { kind } : { stop: `${what} is missing, and winget is not there to install it (see step 2).` });
+  if (!n.rust_ok && n.rust) return { stop: `Rust ${n.rust} is too old: run rustup update, then press again.` };
+  return install(n.rust_ok, 'install-rust', 'Rust') || install(n.cpp, 'install-cpp', "Microsoft's C++ build tools") || install(n.runtime, 'install-runtime', 'The Visual C++ runtime') || (!c.tools && { kind: 'tools' }) || (!c.recompiled && { kind: 'recompile' }) || (!c.built && { kind: 'build' }) || {};
+}
+
+function setupEnd(text) {
+  all = null;
+  ended = text;
+  busy(false);
+}
+
+// After each step (`code`: its exit code), the lamps are read again before the next one.
+async function setupNext(code) {
+  busy(true);
+  const last = all[all.length - 1];
+  if (code !== 0) return setupEnd(`Stopped while ${DOING[last]}: see its messages below.`);
+  try {
+    await Promise.all([refreshNeeds(), refreshBuilds().then(refreshChecks)]);
+  } catch (e) {
+    return setupEnd(`Stopped: ${e}`);
+  }
+  const next = nextStep();
+  if (next.stop) return setupEnd(`Stopped: ${next.stop}`);
+  if (!next.kind) return setupEnd('Done: the game is built. Go to Play.');
+  if (all.includes(next.kind)) return setupEnd(`Stopped: after ${DOING[next.kind]}, that step is still not done (see its messages below).`);
+  all.push(next.kind);
+  $('setup-all-note').textContent = `Now ${DOING[next.kind]}…`;
+  if (!(await runStep(next.kind))) setupEnd(`Stopped: ${DOING[next.kind]} did not start (see below).`);
 }
 
 // A setup step, its messages below the steps; false when it did not start (said there too).
@@ -277,6 +329,7 @@ async function main() {
     busy(false);
     // A close refused while the step ran was said in the notice: no longer true.
     notice('');
+    if (all) return setupNext(e.payload);
     refreshNeeds();
     if (rebuild) return rebuildNext(e.payload);
     refreshBuilds().then(refreshChecks);
@@ -309,6 +362,10 @@ async function main() {
     }
   });
   for (const b of document.querySelectorAll('[data-step]')) b.addEventListener('click', () => runStep(b.dataset.step));
+  $('setup-all').addEventListener('click', () => {
+    all = [];
+    setupNext(0);
+  });
   $('check-update').addEventListener('click', () => checkUpdate(true));
   $('update-retry').addEventListener('click', applyUpdate);
   $('update-page').addEventListener('click', () => release && invoke('open_release', { url: release.page }).catch(notice));
