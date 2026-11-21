@@ -8,9 +8,10 @@ your speed and release markers on screen, the level time to the millisecond, the
 menu with mission select and cheats, mods that swap your vehicle, and Switch 2 Joy-Con with their
 mouse controls.
 
-You bring the game: your own dump, from your own console. Gyroship holds no game code or assets
-and decrypts nothing, the game never goes online, and what you build from your dump stays yours
-alone. It is for practice: official runs are done on the console.
+You bring the game: your own dump, from your own console, as the plain `exefs` and `romfs` folders
+of the game and its update. NUP files and other unofficial formats are not supported. Gyroship
+holds no game code or assets and decrypts nothing, the game never goes online, and what you build
+from your dump stays yours alone. It is for practice: official runs are done on the console.
 
 ## What makes Gyroship different
 
