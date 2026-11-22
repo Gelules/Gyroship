@@ -66,3 +66,34 @@ mouse.first tutorial_sequence_0.prefab tutorial_sequence_1.prefab
 mouse.sequence 8853952de7ac447f
 mouse.gate requires_clear
 mouse.gates 7
+
+# Forced vehicle (layer-arwing, layer-landmaster, layer-bluemarine, on the practice layer's): in
+# each, every mission whose own vehicle is another spawns the layer's. A mission's root level and
+# its package list are found by their paths; its spawner names a vehicle's prefab level by GUID;
+# what the prefab needs is followed through the package list of the vehicle's home mission.
+vehicle.list arwing landmaster bluemarine
+vehicle.arwing 8d643306-a6a8-11ed-806c-56740fd60f3c corneria
+vehicle.landmaster acaedfc9-c3c2-11ed-8835-56740fd60f3c titania
+vehicle.bluemarine 35caf674-c3c5-11ed-8835-56740fd60f3c aquas
+vehicle.spawner player_prefab_level
+vehicle.level_path data/eclipse/environments/{folder}/{level}.level
+vehicle.package_path out/ship_data/switch2/out/{level_path}.package_list
+vehicle.prefab_path data/eclipse/playable_vehicles/{vehicle}/player_{vehicle}.level
+# The missions: folder, root level, own vehicle.
+vehicle.missions corneria meteo sectorx area6 sectory venom1 solar zoness macbeth titania aquas fichina katina bolse sectorz venom2
+mission.corneria corneria map_corneria arwing
+mission.meteo meteo map_meteo arwing
+mission.sectorx sector_x map_sector_x arwing
+mission.area6 area6 map_area6 arwing
+mission.sectory sector_y map_sector_y arwing
+mission.venom1 venom map_venom arwing
+mission.solar solar map_solar arwing
+mission.zoness zoness map_zoness arwing
+mission.macbeth macbeth map_macbeth landmaster
+mission.titania titania map_titania landmaster
+mission.aquas aquas map_aquas bluemarine
+mission.fichina fichina map_fichina arwing
+mission.katina katina map_katina arwing
+mission.bolse bolse map_bolse arwing
+mission.sectorz sector_z map_sector_z arwing
+mission.venom2 venom2 map_venom_2 arwing

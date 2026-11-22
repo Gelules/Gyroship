@@ -13,6 +13,7 @@ mod demo;
 mod json;
 mod mouse;
 mod quit;
+mod vehicle;
 
 use gyroship_gpu::datazip::DataZip;
 use std::collections::{BTreeMap, HashMap};
@@ -34,6 +35,10 @@ pub fn run(exefs: &Path, out: &Path) -> super::Result<bool> {
     let mouse = mouse::layer(&recipe, &mut zip, &base)?;
     for (folder, layer) in [("layer", &base), ("layer-demo", &demo), ("layer-mouse", &mouse)] {
         layer.write(&out.join(folder))?;
+        println!("mods: {folder}, {} entries: {}", layer.entries.len(), layer.about);
+    }
+    for (folder, layer) in vehicle::layers(&recipe, &mut zip, &base)? {
+        layer.write(&out.join(&folder))?;
         println!("mods: {folder}, {} entries: {}", layer.entries.len(), layer.about);
     }
     Ok(true)
@@ -101,9 +106,19 @@ impl Archive {
 
     /// The name and the decoded bytes of the entry of `path`, the FNV-1a hash of the path without
     /// its first slash.
-    #[allow(dead_code)]
     pub fn at(&mut self, path: &str) -> Result<(String, Vec<u8>), String> {
         self.read(fnv1a(path.trim_start_matches('/')), path)
+    }
+
+    /// The decoded bytes of the entry of `path`, when the archive has one; a file that does not
+    /// start with `first` (after any whitespace in its first bytes) is not decoded whole.
+    pub fn whole_if(&mut self, path: &str, first: u8) -> Result<Option<Vec<u8>>, String> {
+        let Some(e) = self.by_value.get(&fnv1a(path.trim_start_matches('/'))).map(|&i| self.zip.entries[i].clone()) else { return Ok(None) };
+        let head = self.zip.head(&e, 256).map_err(|err| format!("data.zip entry {}: {err}", e.name))?;
+        match head.iter().find(|b| !b" \t\n\r\x0b\x0c".contains(b)) {
+            Some(&b) if b != first => Ok(Some(head)),
+            _ => self.zip.read(&e).map(Some).map_err(|err| format!("data.zip entry {}: {err}", e.name)),
+        }
     }
 
     fn read(&mut self, value: u64, what: &str) -> Result<(String, Vec<u8>), String> {
