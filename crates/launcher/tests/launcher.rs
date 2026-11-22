@@ -97,9 +97,10 @@ fn the_command_line_holds_what_is_set() {
         joycon: true,
         joycon_mouse: true,
         record: true,
+        vulkan: true,
         ..Settings::default()
     };
-    let expected = ["boot", "game/exefs", "--play", "--explore", "--save", "save", "--pipeline-cache", "cache", "--language", "fr", "--sdl", "SDL3.dll", "--hooks", "a.hooks", "--romfs-layer", "layer", "--practice", "practice.txt", "--boost", "perfect", "--log", log, "--record", record, "--fullscreen", "--joycon", "--joycon-mouse", "--hud-speed", "--hud-markers"];
+    let expected = ["boot", "game/exefs", "--play", "--explore", "--save", "save", "--pipeline-cache", "cache", "--language", "fr", "--sdl", "SDL3.dll", "--hooks", "a.hooks", "--romfs-layer", "layer", "--practice", "practice.txt", "--boost", "perfect", "--renderer", "vulkan", "--log", log, "--record", record, "--fullscreen", "--joycon", "--joycon-mouse", "--hud-speed", "--hud-markers"];
     assert_eq!(words(&flags(&full, logs, "play-3")), expected);
     // The debug menu box: the repository's hooks file, unless the player gave one of their own.
     let debug = Settings { exefs: "game/exefs".into(), repo: "repo".into(), debug_menu: true, ..Settings::default() };
@@ -242,8 +243,18 @@ fn checks_say_what_the_setup_and_the_dump_lack() {
     let header = |id: &[u8]| [b"NSO0".as_slice(), &[0; 0x3c], id, &[0; 0x2c]].concat();
     let ours: Vec<u8> = (0..20).map(|i| u8::from_str_radix(&id[2 * i..2 * i + 2], 16).unwrap()).collect();
     fs::write(dump.join("exefs/main"), header(&ours)).unwrap();
-    let everything = gyroship_launcher::Checks { setup: Vec::new(), folders: true, exefs: None, dump: Some(id.into()), dump_known: Some(true), tools: true, recompiled: true, built: true };
+    let everything = gyroship_launcher::Checks { setup: Vec::new(), folders: true, exefs: None, dump: Some(id.into()), dump_known: Some(true), tools: true, recompiled: true, built: true, shaders: false };
     assert_eq!(checks(&s), everything);
+    // The shaders: a precompiler's signature (any shader build's folder) newer than the game.
+    let cache = dir.join("cache");
+    let cached = Settings { cache: text(&cache), ..s.clone() };
+    assert!(!checks(&cached).shaders, "no signature yet");
+    fs::create_dir_all(cache.join("vulkan/0123456789abcdef")).unwrap();
+    fs::write(cache.join("vulkan/0123456789abcdef/precompiled.txt"), "a signature\n").unwrap();
+    assert!(checks(&cached).shaders);
+    let rebuilt = std::time::SystemTime::now() + std::time::Duration::from_secs(30);
+    fs::File::options().write(true).open(repo.join("generated/game/target/release/gyroship.exe")).unwrap().set_modified(rebuilt).unwrap();
+    assert!(!checks(&cached).shaders, "a game built since");
     // A recompile after the build: Build is to do again, Recompile stays done.
     let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
     fs::File::options().write(true).open(repo.join("generated/game/Cargo.toml")).unwrap().set_modified(later).unwrap();
@@ -334,6 +345,14 @@ fn setup_steps_are_the_tools_command_lines() {
     assert_eq!((program, words(&line), folder), (gyroship_launcher::cargo_exe(), vec!["build", "--release", "-j", "4"], generated));
     let (program, line, folder) = step(&s, "tools").unwrap();
     assert_eq!((program, words(&line), folder), (gyroship_launcher::cargo_exe(), vec!["build", "--release", "-j", "4"], PathBuf::from(&repo)));
+    // The shaders: the game built (else the one chosen) precompiles them into the cache folder.
+    let cache = root.join("cache").to_string_lossy().into_owned();
+    let game = PathBuf::from_iter([repo.as_str(), "generated", "game", "target", "release", "gyroship.exe"]);
+    let (program, line, folder) = step(&Settings { cache: cache.clone(), ..s.clone() }, "shaders").unwrap();
+    assert_eq!((program, words(&line), folder), (game, vec!["precompile", exefs.as_str(), "--pipeline-cache", cache.as_str()], PathBuf::from(&repo)));
+    let chosen = step(&Settings { cache: cache.clone(), build: "C:\\kept\\gyroship.exe".into(), ..s.clone() }, "shaders").unwrap().0;
+    assert_eq!(chosen, PathBuf::from("C:\\kept\\gyroship.exe"));
+    assert!(step(&s, "shaders").unwrap_err().contains("the shader cache folder is not set"));
     // The installs, through winget, need no folder of the player's.
     let (program, line, _) = step(&Settings::default(), "install-rust").unwrap();
     let common = ["--exact", "--source", "winget", "--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity"];

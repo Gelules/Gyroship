@@ -80,6 +80,9 @@
             <option value="es">Spanish (Spain)</option>
           </select><small class="help">The game's texts, as on the console.</small></label>
         </div>
+        <div class="switches">
+          <label class="switch"><input type="checkbox" data-key="vulkan"><span>Use the precompiled shaders <small>Fewer shaders to compile while you play: the game draws through Vulkan itself, with those Setup made for your graphics card in the shader cache folder (step 5). New, and less tried than the usual way.</small></span></label>
+        </div>
       </fieldset>
 
       <fieldset>
@@ -143,7 +146,7 @@
         <button id="setup-all" class="go" disabled>Set up everything</button>
         <small class="note" id="setup-all-note"></small>
       </div>
-      <p class="explain">Does the steps below that are not done yet, in order, and stops at the first one that fails. It installs what is missing through winget, as step 2 does: pressing it accepts the same licences, and the C++ tools ask for administrator rights. It then builds the tools, recompiles the game and builds it.</p>
+      <p class="explain">Does the steps below that are not done yet, in order, and stops at the first one that fails. It installs what is missing through winget, as step 2 does: pressing it accepts the same licences, and the C++ tools ask for administrator rights. It then builds the tools, recompiles the game and builds it, and makes its shaders when Play uses the precompiled ones.</p>
       <div class="problems" id="problems" hidden>
         <svg class="alert-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.5 2.5 20h19z"/><path class="glyph" d="M12 9.5v5M12 17.2v.3"/></svg>
         <div>
@@ -188,6 +191,11 @@
           <div class="step-head"><span class="lamp" id="lamp-build" aria-hidden="true"></span><h3>4. Build the game</h3></div>
           <p class="explain">Puts the recompiled code and Gyroship's engine together into gyroship.exe, the game you play. A few minutes the first time, when it also downloads what it is built from; then seconds.</p>
           <div class="row"><button data-step="build">Build</button></div>
+        </li>
+        <li class="step">
+          <div class="step-head"><span class="lamp" id="lamp-shaders" aria-hidden="true"></span><h3>5. Make the shaders</h3></div>
+          <p class="explain">For Play's "Use the precompiled shaders": compiles for your graphics card, into the shader cache folder, the game's shaders that can be made in advance, so that fewer are compiled while you play. A few minutes the first time. Then Play does it again by itself before each game: in seconds, adding those your last games met for the first time, or in minutes after a new graphics driver. A graphics card that cannot use them is told, and the step still ends well.</p>
+          <div class="row"><button data-step="shaders">Make the shaders</button></div>
         </li>
       </ol>
       <p class="hint">One step at a time, never during a game. Their messages show below.</p>

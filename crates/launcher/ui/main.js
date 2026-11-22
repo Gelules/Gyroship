@@ -107,6 +107,7 @@ async function refreshChecks() {
   lamp('lamp-folders', c.folders ? 'on' : 'bad');
   lamp('lamp-recompile', c.recompiled ? 'on' : c.folders && !c.tools ? 'bad' : '');
   lamp('lamp-build', c.built ? 'on' : '');
+  lamp('lamp-shaders', c.shaders ? 'on' : '');
   lamp('lamp-tools', c.tools ? 'on' : c.folders ? 'bad' : '');
   $('tools-state').textContent = c.tools ? "Gyroship's tools are built." : c.folders ? "Gyroship's tools are not built yet." : "Gyroship's tools: set the folders first (step 1).";
   // Offered even once built: a Git clone's tools are built again after each update.
@@ -179,7 +180,7 @@ function busy(on) {
 // it stops at the first that fails, or that ends still undone. The steps it ran, while it runs.
 let all = null;
 let ended = '';
-const DOING = { 'install-rust': 'installing Rust', 'install-cpp': "installing Microsoft's C++ build tools", 'install-runtime': 'installing the Visual C++ runtime', tools: "building Gyroship's tools", recompile: 'recompiling the game', build: 'building the game' };
+const DOING = { 'install-rust': 'installing Rust', 'install-cpp': "installing Microsoft's C++ build tools", 'install-runtime': 'installing the Visual C++ runtime', tools: "building Gyroship's tools", recompile: 'recompiling the game', build: 'building the game', shaders: 'making the shaders' };
 
 // The button needs the paths the steps read: the two folders, and the exefs folder for Recompile.
 function showSetupAll() {
@@ -195,7 +196,9 @@ function nextStep() {
   const c = checked;
   const install = (ok, kind, what) => (ok ? null : n.winget ? { kind } : { stop: `${what} is missing, and winget is not there to install it (see step 2).` });
   if (!n.rust_ok && n.rust) return { stop: `Rust ${n.rust} is too old: run rustup update, then press again.` };
-  return install(n.rust_ok, 'install-rust', 'Rust') || install(n.cpp, 'install-cpp', "Microsoft's C++ build tools") || install(n.runtime, 'install-runtime', 'The Visual C++ runtime') || (!c.tools && { kind: 'tools' }) || (!c.recompiled && { kind: 'recompile' }) || (!c.built && { kind: 'build' }) || {};
+  // The shaders, for Play's precompiled shaders only, in the shader cache folder.
+  const shaders = settings.vulkan && settings.cache && !c.shaders;
+  return install(n.rust_ok, 'install-rust', 'Rust') || install(n.cpp, 'install-cpp', "Microsoft's C++ build tools") || install(n.runtime, 'install-runtime', 'The Visual C++ runtime') || (!c.tools && { kind: 'tools' }) || (!c.recompiled && { kind: 'recompile' }) || (!c.built && { kind: 'build' }) || (shaders && { kind: 'shaders' }) || {};
 }
 
 function setupEnd(text) {
@@ -216,12 +219,25 @@ async function setupNext(code) {
   }
   const next = nextStep();
   if (next.stop) return setupEnd(`Stopped: ${next.stop}`);
-  if (!next.kind) return setupEnd('Done: the game is built. Go to Play.');
+  if (!next.kind) return setupEnd('Done: everything is set up. Go to Play.');
   if (all.includes(next.kind)) return setupEnd(`Stopped: after ${DOING[next.kind]}, that step is still not done (see its messages below).`);
   all.push(next.kind);
   $('setup-all-note').textContent = `Now ${DOING[next.kind]}…`;
   if (!(await runStep(next.kind))) setupEnd(`Stopped: ${DOING[next.kind]} did not start (see below).`);
 }
+
+// Play: the game starts (the window closes until it ends).
+async function play() {
+  $('state').textContent = '';
+  try {
+    await invoke('play', { settings });
+  } catch (e) {
+    $('state').textContent = e;
+  }
+}
+
+// Play waits for the shaders step it started (`done`) before the game.
+let playAfter = false;
 
 // A setup step, its messages below the steps; false when it did not start (said there too).
 async function runStep(kind) {
@@ -329,6 +345,12 @@ async function main() {
     busy(false);
     // A close refused while the step ran was said in the notice: no longer true.
     notice('');
+    // The shaders made again before a game: the game starts whatever came of them.
+    if (playAfter) {
+      playAfter = false;
+      refreshChecks();
+      return play();
+    }
     if (all) return setupNext(e.payload);
     refreshNeeds();
     if (rebuild) return rebuildNext(e.payload);
@@ -354,12 +376,15 @@ async function main() {
   $('usual').addEventListener('click', usual);
   $('folder').addEventListener('click', () => invoke('open_logs', { settings }).catch(notice));
   $('go').addEventListener('click', async () => {
-    $('state').textContent = '';
-    try {
-      await invoke('play', { settings });
-    } catch (e) {
-      $('state').textContent = e;
+    // With the precompiled shaders, they are made again first: at once when nothing changed, a
+    // few minutes after a new graphics driver (their messages in Setup).
+    if (settings.vulkan && settings.cache && checked && checked.built) {
+      $('state').textContent = 'Making the shaders first (see Setup)…';
+      playAfter = true;
+      if (await runStep('shaders')) return;
+      playAfter = false;
     }
+    await play();
   });
   for (const b of document.querySelectorAll('[data-step]')) b.addEventListener('click', () => runStep(b.dataset.step));
   $('setup-all').addEventListener('click', () => {

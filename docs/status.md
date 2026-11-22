@@ -68,6 +68,10 @@ it yet.
   with filled caches, a replay from the title screen into the first mission's city (11,500 frames,
   menus and loadings included) had 13 and 15 frames of 100 ms or more in two runs on the test PC,
   the longest about 1 s.
+- `--renderer vulkan` and the precompiled shaders (the launcher's "Use the precompiled shaders")
+  are new: they ran in replays without a window, with the same images as the usual way, and were
+  never played by hand. On the test PC, the GPU driver's own cache already held every shader those
+  replays met, so how much stutter they spare a first run is not measured yet.
 - Play mode is experimental and says so at start; one memory fault was seen in it, once, cause
   unknown. 18 of the game's 2,828 shader programs do not translate yet; none is used when entering a
   mission. Without `--explore`, the run stops (exit code 72) at the first system call, draw or

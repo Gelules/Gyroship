@@ -26,7 +26,7 @@ value at the end of the line stops the start with exit code 2 (any next word is 
 | `--language CODE` | The console language the game reads at boot to pick one of its 14 text regions; default `en-US`. |
 | `--pipeline-cache DIR` | Keeps between runs the GPU driver's compiled pipelines (one file per GPU, Vulkan only) and, in `DIR/shaders`, the translated shaders; under `--renderer vulkan`, also `DIR/vulkan/libraries.cache`, written when a run ends. |
 | `--backend VALUE` | `auto` (the default: Vulkan and DX12 are both offered to wgpu, which took Vulkan on the test PC), `vulkan` or `dx12`. |
-| `--renderer VALUE` | `wgpu` (the default) or `vulkan`: the game's draws, clears and fills go straight to Vulkan rather than through wgpu, with the same images. The ground for precompiled shaders, still in progress. It takes the Vulkan backend and needs Vulkan's dynamic rendering; without it, the game draws through wgpu and says so. |
+| `--renderer VALUE` | `wgpu` (the default) or `vulkan`: the game's draws, clears and fills go straight to Vulkan rather than through wgpu, with the same images, and its shaders come first from those `gyroship precompile` made (below); one it lacks is compiled at its first draw, holding that frame. It takes the Vulkan backend and needs Vulkan's dynamic rendering; without it, the game draws through wgpu and says so. |
 | `--sdl FILE` | The SDL3 library to load, instead of `SDL3.dll` next to the game's executable. |
 | `--joycon` | Switch 2 Joy-Con over Bluetooth LE, without pairing (Windows 11): see below. |
 | `--joycon-mouse` | `--joycon`, plus each Joy-Con's mouse and accelerometer, for the game's mouse mode: see below. |
@@ -39,6 +39,15 @@ never removed, so delete `shaders` to reclaim space. The cache is derived from t
 `pt`, `ru`, `zh-TW`, `en-GB`, `fr-CA`, `es-419`, `zh-Hans`, `zh-Hant`, `pt-BR`, `pl` or `th`; `ru`,
 `pl` and `th` have no region of their own and give US English. Only English, French and Japanese
 were seen running. The command line and the logs stay in English.
+
+`gyroship precompile <exefs> --pipeline-cache DIR` makes, before playing, the shaders `--renderer
+vulkan` uses, into `DIR/vulkan/libraries.cache`: every pixel shader of the game's data that
+translates (1,118; about two minutes on the test PC), and the vertex shaders earlier runs met (those
+`DIR/shaders` keeps; the others wait for their first draw). It prints its progress as `done/total`,
+then one report line. Run again, it makes only what is new, and ends at once when nothing is ("up to
+date"); after a new GPU driver or a new version of Gyroship, it goes through them all again. On a GPU
+without Vulkan's graphics pipeline libraries, it says they are not used there and ends well. Exit
+code 0 when done, 1 on a failure, 2 for a wrong command line. The launcher's Setup runs it (step 5).
 
 The keyboard always works, by physical key (US labels: the same places on any layout). No key moves
 the right stick or clicks a stick; Alt+Enter and G (the practice switch) never reach the game.
@@ -103,7 +112,9 @@ the bottom of Play says so.
   a chosen build that is gone gives way to the first one found), your dump's `exefs` folder (the
   launcher checks that it holds `main`, with `romfs` next to it, and says whether its build is the
   update the templates are made for), the
-  save and cache folders, the language, full screen, the Joy-Con and their mouse mode, the SDL3
+  save and cache folders, the language, the precompiled shaders (`--renderer vulkan`, off by
+  default: with it on, Play first runs Setup's step 5 again, at once when nothing changed, then
+  starts the game whatever came of it), full screen, the Joy-Con and their mouse mode, the SDL3
   library, the practice tools and the recording of inputs, then Play. Paths are typed or pasted, as
   full paths: Play refuses a save, cache, hooks, mod or practice path that is not one, as the game
   would look for it from wherever the launcher runs. The game plays on the save folder itself, or on a fresh copy of it that the launcher
@@ -118,8 +129,9 @@ the bottom of Play says so.
   runs, so that its memory is the game's, and comes back with how the session ended.
   `gyroship-launcher --play` starts the game at once with the saved settings, for a shortcut: after
   a game that ended normally, the launcher ends too, without a window.
-- **Setup**, in four steps, each with a lamp (green: done; red: to fix). Set up everything, at the
-  top, does those not done yet in order, reading the lamps again after each one, and stops at the
+- **Setup**, in five steps, each with a lamp (green: done; red: to fix). Set up everything, at the
+  top, does those not done yet in order (step 5 only with the precompiled shaders on and a shader
+  cache folder), reading the lamps again after each one, and stops at the
   first that fails or stays undone; it waits for both folders and for the exefs folder set in Play.
   One by one:
   1. the two folders, with a button that sets the empty Save and Shader cache folders to
@@ -135,7 +147,10 @@ the bottom of Play says so.
   3. Recompile, which translates the game's code into object files and a project in
      `generated/game` (about two minutes), with the repository's `Cargo.lock`;
   4. Build, which compiles Gyroship's runtime and links it with them into `gyroship.exe` (minutes
-     the first time, then about 16 s).
+     the first time, then about 16 s);
+  5. Make the shaders, for Play's precompiled shaders: `gyroship precompile` (above), by the game
+     Play starts, into the shader cache folder. Its lamp is green when they were made after that
+     game was built.
 
   One step at a time, its output on the page. The builds use four jobs (`-j 4`, for 16 GB of RAM)
   and download the crates they lack, at the versions of that lock; they take

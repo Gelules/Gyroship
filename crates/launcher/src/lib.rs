@@ -55,6 +55,9 @@ pub struct Settings {
     pub console: bool,
     /// No look for a new release at start (D109): the check is on unless turned off.
     pub no_update_check: bool,
+    /// The game draws through Vulkan itself, with the shaders the Shaders step precompiled into
+    /// the cache folder (`--renderer vulkan`, D110).
+    pub vulkan: bool,
     /// Setup: the probe list compiled into a port.
     pub probes: String,
 }
@@ -125,6 +128,7 @@ pub fn flags(s: &Settings, logs: &Path, session: &str) -> Vec<String> {
         ("--romfs-layer", s.layer.clone()),
         ("--practice", s.practice.clone()),
         ("--boost", if practice { s.boost.clone() } else { String::new() }),
+        ("--renderer", if s.vulkan { "vulkan".into() } else { String::new() }),
         ("--log", file("log")),
         ("--record", if s.record { file("txt") } else { String::new() }),
     ];
@@ -159,7 +163,7 @@ pub const INSTALLS: [(&str, &str, &[&str]); 3] = [
 
 /// A setup step: its program, its arguments and the folder it runs in. An install through
 /// winget; the tools' build; the game's recompile, then its build (the first builds download
-/// the crates they need).
+/// the crates they need); its shaders precompiled into the cache folder (D110).
 // ponytail: 4 build jobs, for 16 GB of RAM; a setting when another machine needs another.
 pub fn step(s: &Settings, kind: &str) -> Result<(PathBuf, Vec<String>, PathBuf), String> {
     if let Some((_, id, extra)) = INSTALLS.iter().find(|i| i.0 == kind) {
@@ -189,8 +193,21 @@ pub fn step(s: &Settings, kind: &str) -> Result<(PathBuf, Vec<String>, PathBuf),
             (tools, line, repo.into())
         }
         "build" => (cargo_exe(), build, generated),
+        "shaders" => {
+            let line = vec!["precompile".to_string(), need("the exefs folder", &s.exefs)?, "--pipeline-cache".into(), need("the shader cache folder", &s.cache)?];
+            (game_exe(s, &repo), line, repo.into())
+        }
         _ => return Err(format!("{kind} is no setup step")),
     })
+}
+
+/// The game the Shaders step precompiles for and Play plays: the build chosen, else the one the
+/// Build step makes.
+pub fn game_exe(s: &Settings, repo: &str) -> PathBuf {
+    match s.build.as_str() {
+        "" => PathBuf::from_iter([repo, "generated", "game", "target", "release", "gyroship.exe"]),
+        build => build.into(),
+    }
 }
 
 /// The tools of the repository `repo`: those its tools step built (`target/release`), else
@@ -314,10 +331,12 @@ pub struct Checks {
     /// (the repository not set, or no templates/practice.txt).
     pub dump: Option<String>,
     pub dump_known: Option<bool>,
-    /// The tools built, the game recompiled (its project there), the game built.
+    /// The tools built, the game recompiled (its project there), the game built, its shaders
+    /// precompiled (since that game was built).
     pub tools: bool,
     pub recompiled: bool,
     pub built: bool,
+    pub shaders: bool,
 }
 
 /// Where new versions are published, the repository on GitHub (its Releases), and this
@@ -691,6 +710,10 @@ pub fn checks(s: &Settings) -> Checks {
     // A folder with no game module (a romfs folder, the dump's root) is no exefs folder.
     let exefs = exefs.or_else(|| dump.is_none().then(|| "Your game's exefs folder: no main module in it (is it the exefs folder?)".to_string()));
     let templates = if repo.is_none() { templates_build(&s.repo) } else { None };
+    // The precompiler's signature (one per shader build, which the game names): written at each of
+    // its runs, so newer than the game it ran for once done.
+    let precompiled = if s.cache.is_empty() { None } else { fs::read_dir(Path::new(&s.cache).join("vulkan")).into_iter().flatten().flatten().filter_map(|d| time(d.path().join("precompiled.txt"))).max() };
+    let played = if repo.is_none() { time(game_exe(s, &s.repo)) } else { None };
     Checks {
         setup,
         folders,
@@ -700,6 +723,7 @@ pub fn checks(s: &Settings) -> Checks {
         tools: tools.is_some(),
         recompiled: project.is_some() && project >= tools.max(probes) && probed,
         built: game.is_some() && game >= project,
+        shaders: played.is_some() && precompiled >= played,
     }
 }
 
