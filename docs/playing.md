@@ -142,8 +142,9 @@ the bottom of Play says so.
      (`Rustlang.Rustup`; `Microsoft.VisualStudio.BuildTools` with the x64 C++ compiler and the
      Windows SDK, behind an administrator prompt, never restarting the PC by itself;
      `Microsoft.VCRedist.2015+.x64`). Clicking accepts the package's licence. Then Build the
-     tools, `cargo build --release` in the repository: a release brings them, a Git clone builds
-     them, and again after each update;
+     tools, `cargo build --release` in the repository. A release brings them, and so do tools of
+     the same version downloaded next to the launcher (they take the repository they run in); a
+     Git clone builds them, and again after each update;
   3. Recompile, which translates the game's code into object files and a project in
      `generated/game` (about two minutes), with the repository's `Cargo.lock`;
   4. Build, which compiles Gyroship's runtime and links it with them into `gyroship.exe` (minutes

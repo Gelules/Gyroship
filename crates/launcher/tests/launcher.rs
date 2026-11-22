@@ -274,6 +274,27 @@ fn checks_say_what_the_setup_and_the_dump_lack() {
     assert_eq!(checks(&Settings { repo: "repo".into(), ..s }).setup[0], "Repository: not a full path");
 }
 
+/// The tools: the repository's own build, else a release's at its top, else those downloaded next
+/// to the launcher, else where the tools step puts them.
+#[test]
+fn the_tools_are_found_in_the_repository_then_next_to_the_launcher() {
+    let dir = scratch("tools");
+    let (repo, launcher) = (dir.join("repo"), dir.join("launcher"));
+    fs::create_dir_all(repo.join("target/release")).unwrap();
+    fs::create_dir_all(&launcher).unwrap();
+    let repo_text = repo.to_string_lossy().into_owned();
+    let tools = || gyroship_launcher::tools_in(&repo_text, Some(&launcher));
+    let built = PathBuf::from_iter([repo_text.as_str(), "target", "release", "gyroship-tools.exe"]);
+    assert_eq!(tools(), built, "none yet: where the tools step puts them");
+    fs::write(launcher.join("gyroship-tools.exe"), "").unwrap();
+    assert_eq!(tools(), launcher.join("gyroship-tools.exe"));
+    fs::write(repo.join("gyroship-tools.exe"), "").unwrap();
+    assert_eq!(tools(), repo.join("gyroship-tools.exe"));
+    fs::write(&built, "").unwrap();
+    assert_eq!(tools(), built);
+    assert_eq!(gyroship_launcher::tools_in(&repo_text, None), built);
+}
+
 /// The save the game gets: the folder itself, a fresh copy of it, or a fresh empty one; the
 /// chosen folder is never written by the last two, nor emptied when it overlaps theirs.
 #[test]

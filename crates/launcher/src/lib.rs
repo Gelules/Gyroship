@@ -211,11 +211,17 @@ pub fn game_exe(s: &Settings, repo: &str) -> PathBuf {
 }
 
 /// The tools of the repository `repo`: those its tools step built (`target/release`), else
-/// those a release brings at its top, else where the tools step will put them.
+/// those a release brings at its top, else those downloaded next to this launcher (run in the
+/// repository, they take it as theirs), else where the tools step will put them.
 pub fn tools_exe(repo: &str) -> PathBuf {
+    tools_in(repo, std::env::current_exe().ok().as_deref().and_then(Path::parent))
+}
+
+/// [`tools_exe`] for a launcher in the folder `launcher`.
+pub fn tools_in(repo: &str, launcher: Option<&Path>) -> PathBuf {
     let built = PathBuf::from_iter([repo, "target", "release", "gyroship-tools.exe"]);
-    let brought = Path::new(repo).join("gyroship-tools.exe");
-    if !built.is_file() && brought.is_file() { brought } else { built }
+    let (brought, beside) = (Path::new(repo).join("gyroship-tools.exe"), launcher.map(|l| l.join("gyroship-tools.exe")));
+    [Some(&built), Some(&brought), beside.as_ref()].into_iter().flatten().find(|p| p.is_file()).unwrap_or(&built).clone()
 }
 
 /// Cargo's program: CARGO_HOME's, then the user's `.cargo` (where rustup puts it, before a new

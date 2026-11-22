@@ -132,14 +132,21 @@ pub fn plain(p: &Path) -> String {
 }
 
 /// The repository whose crates a generated project builds on, found at run time: the first
-/// folder above this executable (`<repo>/target/release/gyroship-tools.exe`) that holds
-/// `crates/runtime/Cargo.toml`. Found at run time, from no compiled-in path: the tools work
-/// wherever the repository is.
+/// folder above this executable (`<repo>/target/release/gyroship-tools.exe`, or a release's top)
+/// that holds `crates/runtime/Cargo.toml`; for tools kept outside any repository (downloaded next
+/// to the launcher), the first one above the folder they run in, where the launcher runs them.
+/// Found at run time, from no compiled-in path: the tools work wherever the repository is.
 pub fn repository() -> super::Result<PathBuf> {
-    let exe = std::env::current_exe()?;
-    exe.ancestors().find(|d| d.join("crates").join("runtime").join("Cargo.toml").is_file()).map(Path::to_path_buf).ok_or_else(|| {
-        format!("{}: not inside Gyroship's repository (no crates/runtime above it): put gyroship-tools.exe in the repository's target/release", exe.display()).into()
+    let (exe, here) = (std::env::current_exe()?, std::env::current_dir()?);
+    repository_above(&exe, &here).ok_or_else(|| {
+        format!("{}: neither it nor the folder it runs in ({}) is inside Gyroship's repository (no crates/runtime above them): run it from the repository", exe.display(), here.display()).into()
     })
+}
+
+/// The first folder above `exe`, else above `here`, that holds `crates/runtime/Cargo.toml`.
+fn repository_above(exe: &Path, here: &Path) -> Option<PathBuf> {
+    let above = |p: &Path| p.ancestors().find(|d| d.join("crates").join("runtime").join("Cargo.toml").is_file()).map(Path::to_path_buf);
+    above(exe).or_else(|| above(here))
 }
 
 pub fn runtime_path() -> super::Result<String> {
@@ -280,5 +287,16 @@ mod tests {
         assert!(repo.join("crates").join("tools").join("Cargo.toml").is_file(), "{}", repo.display());
         assert!(super::crate_path("runtime").unwrap().ends_with("crates/runtime"));
         assert!(super::vendor_path("naga").unwrap().ends_with("vendor/naga"));
+    }
+
+    /// Inside the repository, the executable's own place decides; outside any (tools downloaded
+    /// next to the launcher), the folder they run in. Only paths: nothing is written.
+    #[test]
+    fn tools_outside_the_repository_take_the_folder_they_run_in() {
+        let repo = super::repository().unwrap();
+        let outside = std::env::temp_dir().join("gyroship-nowhere").join("gyroship-tools.exe");
+        assert_eq!(super::repository_above(&repo.join("target/release/gyroship-tools.exe"), outside.parent().unwrap()), Some(repo.clone()));
+        assert_eq!(super::repository_above(&outside, &repo.join("generated")), Some(repo.clone()));
+        assert_eq!(super::repository_above(&outside, outside.parent().unwrap()), None);
     }
 }

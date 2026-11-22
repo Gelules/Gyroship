@@ -40,8 +40,10 @@ named in its Setup tab: leave `CARGO_TARGET_DIR` unset.
 This builds every crate of the repository but the launcher, and gives one executable,
 `target/release/gyroship-tools.exe`: not the game yet. Build the whole workspace this way, not
 `-p gyroship-tools`: it also downloads every crate the game is built from. The tools find the
-repository from their own place, in its `target/release` (or at its top, in a release): they work
-wherever the repository is, as long as they stay there. A launcher already built, on this PC or
+repository from their own place, in its `target/release` (or at its top, in a release); kept
+outside any repository (downloaded next to the launcher, say), they take the one they run in, as
+the launcher runs them there. They work wherever the repository is, but must come from the same
+version as its sources. A launcher already built, on this PC or
 another, can install Rust and the C++ build tools through winget, and build the tools, on your
 click ([playing.md](playing.md)).
 
@@ -96,7 +98,9 @@ game.
 A release is what players download, and what the launcher's updates install
 ([playing.md](playing.md)): one archive, `gyroship-<version>-windows-x64.zip`, holding a folder
 `Gyroship-<version>` with the repository's files at the release's tag, and the two executables at
-its top. A launcher looks for its updates in the repository its `Cargo.toml` names, through
+its top. The two executables are also published on their own, for players who keep them next to
+each other, apart from the sources (the launcher's Setup then names the repository; only a
+launcher inside a Gyroship folder updates itself). A launcher looks for its updates in the repository its `Cargo.toml` names, through
 GitHub's API: the repository must be public for that. For version 0.2.0, from the repository root:
 
 1. Set `version = "0.2.0"` in `crates/launcher/Cargo.toml`. The tag must be `v` and exactly that
@@ -116,4 +120,4 @@ GitHub's API: the repository must be public for that. For version 0.2.0, from th
    another commit:
 
        git archive --format=zip --prefix=Gyroship-0.2.0/ --add-file=crates/launcher/target/release/gyroship-launcher.exe --add-file=target/release/gyroship-tools.exe -o gyroship-0.2.0-windows-x64.zip v0.2.0
-       gh release create v0.2.0 gyroship-0.2.0-windows-x64.zip --verify-tag --title "Gyroship 0.2.0" --notes "What changed, for the players."
+       gh release create v0.2.0 gyroship-0.2.0-windows-x64.zip crates/launcher/target/release/gyroship-launcher.exe target/release/gyroship-tools.exe --verify-tag --title "Gyroship 0.2.0" --notes "What changed, for the players."
