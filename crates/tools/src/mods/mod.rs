@@ -9,7 +9,9 @@
 //! and that the result still reads as JSON. The values read in the game that the edits need (entry
 //! names, GUIDs, the entities' names) are in templates/mods.txt (D106), none in this code.
 
+mod demo;
 mod json;
+mod mouse;
 mod quit;
 
 use gyroship_gpu::datazip::DataZip;
@@ -26,9 +28,14 @@ pub fn run(exefs: &Path, out: &Path) -> super::Result<bool> {
     let cvar_file = romfs.join("veclipse_build.cvar");
     let cvar = fs::read_to_string(&cvar_file).map_err(|e| format!("{}: {e}", cvar_file.display()))?;
     fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
+    // The practice layer first: every other mod is made on it, and adds QUIT GAME and the timer too.
     let base = quit::layer(&recipe, &mut zip, &cvar)?;
-    base.write(&out.join("layer"))?;
-    println!("mods: layer, {} entries: {}", base.entries.len(), base.about);
+    let demo = demo::layer(&recipe, &base)?;
+    let mouse = mouse::layer(&recipe, &mut zip, &base)?;
+    for (folder, layer) in [("layer", &base), ("layer-demo", &demo), ("layer-mouse", &mouse)] {
+        layer.write(&out.join(folder))?;
+        println!("mods: {folder}, {} entries: {}", layer.entries.len(), layer.about);
+    }
     Ok(true)
 }
 

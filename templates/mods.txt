@@ -47,3 +47,22 @@ title.behind Bottom_Menu_Frame Lower_Menu_BG_Contrast Glow_BL
 
 # The mission timer: the build setting veclipse_build.cvar turns on.
 timer.cvar eclipse.hud_show_mission_timer
+
+# The store demo's lines in the main menu (layer-demo, on the practice layer's): the three lines
+# only the demo shows, in the menu's order, a line's height each (60.67); CAMPAIGN's explicit Up,
+# which went to the top bar's options icon, goes to the lowest of them, by its button widget.
+demo.lines eshop_meteo_button_prefab eshop_prologue_button_prefab eshop_options_button_prefab
+demo.height 60.67
+demo.up_field explicit_up_focus
+demo.up_old options_button_prefab.MainMenu_smallbutton.
+demo.widget .MainMenu_button.eclipse_ui_button_widget.vscript
+
+# The tutorial's mouse question within a minute or two (layer-mouse): the tutorial's root level,
+# whose sequence list then starts with sequence 1, and sequence 1, whose seven lessons before the
+# mouse introduction no longer require their objectives.
+mouse.root f0174e329fcd6d5e
+mouse.list sequences
+mouse.first tutorial_sequence_0.prefab tutorial_sequence_1.prefab
+mouse.sequence 8853952de7ac447f
+mouse.gate requires_clear
+mouse.gates 7

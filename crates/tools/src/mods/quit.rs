@@ -305,7 +305,7 @@ pub fn edit_prefab(text: &str, r: &Recipe) -> Result<String, String> {
 }
 
 /// The leading tabs of a line.
-fn indent_of(line: &str) -> &str {
+pub(super) fn indent_of(line: &str) -> &str {
     &line[..line.len() - line.trim_start_matches('\t').len()]
 }
 
