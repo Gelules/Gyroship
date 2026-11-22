@@ -1,7 +1,7 @@
 [package]
 name = "gyroship-launcher"
 description = "Gyroship's launcher: picks a build and its options, starts the game, runs the setup steps"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 publish = false
 license = "GPL-3.0-or-later"
