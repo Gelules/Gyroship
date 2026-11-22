@@ -8,8 +8,17 @@
 
 use crate::draw::Slot;
 use crate::surfaces::{ARENA_ALIGN, Bound, FxMap, GroupKey, Groups, Slice, Staging, SubmitJob, Submitter, arena_buffer};
+use ash::vk;
 use smallvec::SmallVec;
 use std::sync::Arc;
+use wgpu::hal::api::Vulkan;
+
+/// A render pipeline as the recorder binds it: wgpu's, or a raw one (D110 step 6).
+#[derive(Clone)]
+pub(crate) enum Pipeline {
+    Wgpu(wgpu::RenderPipeline),
+    Raw(Arc<crate::raw::RawPipeline>),
+}
 
 /// A command for the recorder, in stream order.
 pub(crate) enum Rec {
@@ -18,7 +27,7 @@ pub(crate) enum Rec {
     /// A stage's texture slots and swizzle codes, before their first use.
     Set(u32, Arc<[Slot]>, Arc<[u32]>),
     /// A render pipeline and its bind group layouts, before its first use (ids last the run).
-    Pipeline(u32, wgpu::RenderPipeline, [Option<wgpu::BindGroupLayout>; 2]),
+    Pipeline(u32, Pipeline, [Option<wgpu::BindGroupLayout>; 2]),
     Draw(DrawRec),
     /// Anything else recorded into the frame's encoder; it ends the open pass.
     Run(Box<dyn FnOnce(&mut Recorder) + Send>),
@@ -64,6 +73,70 @@ pub(crate) struct PassOpen {
     pub(crate) timed: Option<String>,
 }
 
+/// The attachments of the open pass, whichever API it is in: a draw of the other API reopens it
+/// there, as they are (LOAD, STORE).
+#[derive(Clone)]
+struct Attachments {
+    colors: Vec<Option<wgpu::TextureView>>,
+    depth: Option<(wgpu::TextureView, wgpu::TextureFormat)>,
+}
+
+/// The raw path's side of the recorder (`GYROSHIP_RAW`, D110 step 6).
+pub(crate) struct RawRec {
+    pools: crate::raw::Pools,
+    /// Descriptor sets made once while the frames use them, as `Recorder::bind_groups`; aged out,
+    /// they wait in `keep` for the GPU to be done with them, then are freed.
+    sets: Groups<GroupKey, (vk::DescriptorPool, vk::DescriptorSet)>,
+    /// The arena buffers' raw handles.
+    buffers: FxMap<wgpu::Buffer, vk::Buffer>,
+    segment: Option<Segment>,
+    /// What this frame's raw commands use, until its GPU work is done.
+    keep: Keep,
+    /// Sets whose frames are done, sent by the frames' callbacks (which never lock the recorder:
+    /// a flush holds it while it submits).
+    freed: (std::sync::mpsc::Sender<Vec<(vk::DescriptorPool, vk::DescriptorSet)>>, std::sync::mpsc::Receiver<Vec<(vk::DescriptorPool, vk::DescriptorSet)>>),
+    /// Whether a timed pass was left untimed (said once).
+    untimed: bool,
+}
+
+/// What a frame's raw commands use (wgpu does not see them): kept until its GPU work is done.
+#[derive(Default)]
+struct Keep {
+    views: Vec<wgpu::TextureView>,
+    textures: Vec<wgpu::Texture>,
+    buffers: Vec<wgpu::Buffer>,
+    groups: Vec<GroupKey>,
+    sets: Vec<(vk::DescriptorPool, vk::DescriptorSet)>,
+}
+
+/// A raw segment: the wgpu encoder before it (which gets the transitions to the states the
+/// segment begins with), the raw encoder, each texture's format with its state when the segment
+/// began and now, the arena buffers it reads, and the attachments of its open rendering, if any,
+/// with whether it began.
+struct Segment {
+    before: wgpu::CommandEncoder,
+    raw: wgpu::CommandEncoder,
+    states: FxMap<wgpu::Texture, (wgpu::TextureFormat, wgpu::TextureUses, wgpu::TextureUses)>,
+    buffers: Vec<wgpu::Buffer>,
+    rendering: Option<(Attachments, bool)>,
+}
+
+impl RawRec {
+    pub(crate) fn new(device: &wgpu::Device) -> Option<RawRec> {
+        Some(RawRec { pools: crate::raw::Pools::new(device)?, sets: Groups::default(), buffers: FxMap::default(), segment: None, keep: Keep::default(), freed: std::sync::mpsc::channel(), untimed: false })
+    }
+}
+
+/// The raw image view of `view` (its guard dropped at once: it holds wgpu's snatch lock).
+fn raw_view(view: &wgpu::TextureView) -> vk::ImageView {
+    unsafe { view.as_hal::<Vulkan>().map_or(vk::ImageView::null(), |v| v.raw_handle()) }
+}
+
+/// The raw image of `texture`.
+fn raw_image(texture: &wgpu::Texture) -> vk::Image {
+    unsafe { texture.as_hal::<Vulkan>().map_or(vk::Image::null(), |t| t.raw_handle()) }
+}
+
 /// What the open pass was last given: a draw sets only what changed (wgpu
 /// validates and encodes each call again, and consecutive draws mostly repeat).
 /// Pipelines and bind groups wgpu already skips when repeated.
@@ -92,8 +165,16 @@ pub(crate) struct Recorder {
     /// frame); anything else recorded ends it first ([`Recorder::encoder`]).
     /// Declared before `encoder`, so that it ends before its encoder is dropped.
     pass: Option<(wgpu::RenderPass<'static>, PassState)>,
-    /// The work recorded since the last flush, in order.
+    /// The work recorded since the last flush, in order: the finished recordings (wgpu's and raw
+    /// segments', D110), then the wgpu one being recorded.
+    encoders: Vec<wgpu::CommandEncoder>,
     pub(crate) encoder: Option<wgpu::CommandEncoder>,
+    /// Whether this frame's first encoder was made (it carries the frame clock's opening).
+    opened: bool,
+    /// The open pass's attachments, whichever API it is in.
+    open: Option<Attachments>,
+    /// The raw path's side (`GYROSHIP_RAW`).
+    pub(crate) raw: Option<RawRec>,
     pub(crate) device: wgpu::Device,
     queue: wgpu::Queue,
     /// This frame's vertex, index and constant data: one buffer, written at flush.
@@ -108,7 +189,7 @@ pub(crate) struct Recorder {
     data: FxMap<u32, Slice>,
     /// The frame's texture slot sets, and the run's pipelines with their bind group layouts, by id.
     sets: Vec<(Arc<[Slot]>, Arc<[u32]>)>,
-    pipelines: Vec<Option<(wgpu::RenderPipeline, [Option<wgpu::BindGroupLayout>; 2])>>,
+    pipelines: Vec<Option<(Pipeline, [Option<wgpu::BindGroupLayout>; 2])>>,
     /// Bind groups, made once while the frames use them: a bind group per draw
     /// cost wgpu and the driver more than the rest of the draw.
     bind_groups: Groups<GroupKey, wgpu::BindGroup>,
@@ -133,7 +214,11 @@ impl Recorder {
     pub(crate) fn new(device: &wgpu::Device, queue: &wgpu::Queue, timing: Option<crate::timing::Timing>) -> Recorder {
         Recorder {
             pass: None,
+            encoders: Vec::new(),
             encoder: None,
+            opened: false,
+            open: None,
+            raw: None,
             device: device.clone(),
             queue: queue.clone(),
             arena: (arena_buffer(device, 16 << 20), Vec::new()),
@@ -189,36 +274,135 @@ impl Recorder {
         }
     }
 
-    /// The frame was flushed: its pass ends, and its blocks and sets are
-    /// forgotten (their ids start again).
+    /// The frame was flushed: its pass and raw segment end, and its blocks and sets
+    /// are forgotten (their ids start again). Raw sets whose frames are done are freed.
     pub(crate) fn end_frame(&mut self) {
         self.pass = None;
+        self.close_segment();
+        self.open = None;
         self.last = None;
         self.staged.clear();
         self.blocks.clear();
         self.banks.clear();
         self.data.clear();
         self.sets.clear();
+        if let Some(r) = &mut self.raw {
+            while let Ok(sets) = r.freed.1.try_recv() {
+                r.pools.free(&sets);
+            }
+        }
     }
 
-    /// A frame was presented: the bind groups neither it nor the one before used are dropped.
+    /// A frame was presented: the bind groups neither it nor the one before used are dropped
+    /// (raw sets: once the GPU is done with the next frame, which they go with).
     pub(crate) fn next_frame(&mut self) {
         self.bind_groups.age();
+        if let Some(r) = &mut self.raw {
+            for (key, set) in r.sets.age().into_values().flatten() {
+                r.keep.groups.push(key);
+                r.keep.sets.push(set);
+            }
+        }
     }
 
     /// The encoder that collects a frame's passes: one submit per frame
     /// instead of one per operation. Give it back with [`Recorder::record`].
     pub(crate) fn encoder(&mut self) -> wgpu::CommandEncoder {
-        // A pass left open for the next draw ends before anything else is recorded.
+        // A pass left open for the next draw ends before anything else is recorded, as
+        // does a raw segment.
         self.pass = None;
+        self.close_segment();
         self.staging.recordings += 1;
-        self.encoder.take().unwrap_or_else(|| {
-            let mut encoder = self.device.create_command_encoder(&Default::default());
-            if let Some(c) = &self.clock {
-                c.open(&mut encoder);
+        match self.encoder.take() {
+            Some(e) => e,
+            None => self.new_encoder(),
+        }
+    }
+
+    /// A new wgpu encoder; the frame's first carries the frame clock's opening.
+    fn new_encoder(&mut self) -> wgpu::CommandEncoder {
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        if !std::mem::replace(&mut self.opened, true)
+            && let Some(c) = &self.clock
+        {
+            c.open(&mut encoder);
+        }
+        encoder
+    }
+
+    /// The frame's recordings to submit, in order: the last is wgpu's (an empty one follows a
+    /// raw segment, for the frame clock and the queries), and carries what the raw ones use,
+    /// released, and their sets sent back to be freed, once the GPU is done with the frame.
+    pub(crate) fn take_encoders(&mut self) -> Vec<wgpu::CommandEncoder> {
+        self.close_segment();
+        let mut list = std::mem::take(&mut self.encoders);
+        match self.encoder.take() {
+            Some(e) => list.push(e),
+            None if self.raw.is_some() && !list.is_empty() => list.push(self.device.create_command_encoder(&Default::default())),
+            None => {}
+        }
+        self.opened = false;
+        if let (Some(r), Some(last)) = (&mut self.raw, list.last()) {
+            let keep = std::mem::take(&mut r.keep);
+            if !(keep.views.is_empty() && keep.textures.is_empty() && keep.buffers.is_empty() && keep.sets.is_empty()) {
+                let freed = r.freed.0.clone();
+                last.on_submitted_work_done(move || {
+                    let Keep { views, textures, buffers, groups, sets } = keep;
+                    drop((views, textures, buffers, groups));
+                    let _ = freed.send(sets);
+                });
             }
-            encoder
-        })
+        }
+        list
+    }
+
+    /// Opens a raw segment unless one is: a wgpu pass ends first, and the wgpu encoder recorded
+    /// so far (or a new one) waits before it, for the transitions.
+    fn open_segment(&mut self) {
+        if self.raw.as_ref().is_none_or(|r| r.segment.is_some()) {
+            return;
+        }
+        self.pass = None;
+        let before = match self.encoder.take() {
+            Some(e) => e,
+            None => self.new_encoder(),
+        };
+        let raw = self.device.create_command_encoder(&Default::default());
+        self.staging.recordings += 1;
+        if let Some(r) = &mut self.raw {
+            r.segment = Some(Segment { before, raw, states: FxMap::default(), buffers: Vec::new(), rendering: None });
+        }
+    }
+
+    /// Ends the open raw segment, if any: its rendering ends, its textures go back to the states
+    /// it found them in, the encoder before it transitions what it uses to those states, and
+    /// both join the frame's recordings. What it used waits in `keep`.
+    fn close_segment(&mut self) {
+        let Some(r) = &mut self.raw else { return };
+        let Some(mut s) = r.segment.take() else { return };
+        let ash = &r.pools.ash;
+        let back: Vec<_> = s.states.iter().filter(|(_, (_, entry, now))| entry != now).map(|(t, &(format, entry, now))| (raw_image(t), format, now, entry)).collect();
+        unsafe {
+            s.raw.as_hal_mut::<Vulkan, _, _>(|e| {
+                let Some(e) = e else { return };
+                let cb = e.raw_handle();
+                if s.rendering.as_ref().is_some_and(|(_, begun)| *begun) {
+                    ash.cmd_end_rendering(cb);
+                }
+                for &(image, format, now, entry) in &back {
+                    crate::raw::barrier(ash, cb, image, format, now, entry);
+                }
+            })
+        };
+        let uses = wgpu::BufferUses::VERTEX | wgpu::BufferUses::INDEX | wgpu::BufferUses::UNIFORM;
+        s.before.transition_resources(
+            s.buffers.iter().map(|buffer| wgpu::BufferTransition { buffer, state: uses }),
+            s.states.iter().map(|(texture, &(_, entry, _))| wgpu::TextureTransition { texture, selector: None, state: entry }),
+        );
+        r.keep.textures.extend(s.states.into_keys());
+        r.keep.buffers.extend(s.buffers);
+        self.encoders.push(s.before);
+        self.encoders.push(s.raw);
     }
 
     pub(crate) fn record(&mut self, encoder: wgpu::CommandEncoder) {
@@ -226,16 +410,20 @@ impl Recorder {
     }
 
     fn draw(&mut self, d: DrawRec) {
-        if !matches!(self.pipelines.get(d.pipeline as usize), Some(Some(_))) {
+        let raw = match self.pipelines.get(d.pipeline as usize) {
+            Some(Some((Pipeline::Raw(p), _))) => Some(p.clone()),
+            Some(Some((Pipeline::Wgpu(_), _))) => None,
             // Never announced: the GPU thread's bookkeeping went wrong.
-            self.lost += 1;
-            return;
-        }
+            _ => {
+                self.lost += 1;
+                return;
+            }
+        };
         // In the arena, in this order: indices, vertices, then each group's banks and swizzles.
         let index = d.index.map(|(id, raw, format)| (if raw { self.stage_raw(id) } else { self.stage_data(id) }, format));
         let vertex: SmallVec<[Slice; 8]> = d.vertex.iter().map(|&id| self.stage_raw(id)).collect();
-        let mut groups: SmallVec<[(wgpu::BindGroup, SmallVec<[u32; 16]>); 2]> = SmallVec::new();
-        for (g, r) in d.groups.iter().enumerate() {
+        let mut staged: SmallVec<[(SmallVec<[(u32, Slice); 16]>, SmallVec<[u32; 16]>); 2]> = SmallVec::new();
+        for r in &d.groups {
             let mut buffers: SmallVec<[(u32, Slice); 16]> = r.banks.iter().map(|&(b, id, window)| (u32::from(b), self.stage_bank(id, window as usize))).collect();
             if r.swizzles {
                 let bytes: SmallVec<[u8; 256]> = self.sets[r.set as usize].1.iter().flat_map(|c| c.to_le_bytes()).collect();
@@ -243,33 +431,66 @@ impl Recorder {
             }
             // In binding order, as wgpu takes them: the banks', then the swizzles' (binding 999).
             let offsets: SmallVec<[u32; 16]> = if r.dynamic { buffers.iter().map(|(_, (_, at, _))| u32::try_from(*at).unwrap_or(u32::MAX)).collect() } else { SmallVec::new() };
+            staged.push((buffers, offsets));
+        }
+        match raw {
+            Some(p) => self.raw_draw(d, &p, index, vertex, staged),
+            None => self.wgpu_draw(d, index, vertex, staged),
+        }
+    }
+
+    /// Opens a wgpu pass over `colors` and `depth`, as they are, timed as `timed` says.
+    fn open_pass(&mut self, colors: &[Option<wgpu::TextureView>], depth: Option<&(wgpu::TextureView, wgpu::TextureFormat)>, timed: Option<u32>) {
+        let mut encoder = self.encoder();
+        let load = wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store };
+        let attachments: Vec<Option<wgpu::RenderPassColorAttachment>> = colors.iter().map(|v| v.as_ref().map(|view| wgpu::RenderPassColorAttachment { view, depth_slice: None, resolve_target: None, ops: load })).collect();
+        let timestamp_writes = timed.zip(self.timing.as_ref()).map(|(i, t)| wgpu::RenderPassTimestampWrites { query_set: &t.set, beginning_of_pass_write_index: Some(i), end_of_pass_write_index: Some(i + 1) });
+        let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("draw"),
+            timestamp_writes,
+            color_attachments: &attachments,
+            depth_stencil_attachment: depth.map(|(view, f)| wgpu::RenderPassDepthStencilAttachment {
+                view,
+                depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                stencil_ops: f.has_stencil_aspect().then_some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+            }),
+            ..Default::default()
+        });
+        let pass = pass.forget_lifetime();
+        self.record(encoder);
+        self.pass = Some((pass, PassState::default()));
+    }
+
+    fn wgpu_draw(&mut self, d: DrawRec, index: Option<(Slice, wgpu::IndexFormat)>, vertex: SmallVec<[Slice; 8]>, staged: SmallVec<[(SmallVec<[(u32, Slice); 16]>, SmallVec<[u32; 16]>); 2]>) {
+        let mut groups: SmallVec<[(wgpu::BindGroup, SmallVec<[u32; 16]>); 2]> = SmallVec::new();
+        for (g, (r, (buffers, offsets))) in d.groups.iter().zip(staged).enumerate() {
             let Some(layout) = self.pipelines[d.pipeline as usize].as_ref().and_then(|(_, l)| l.iter().flatten().nth(g)) else { continue };
-            let group = bind_group(&self.device, &mut self.bind_groups, &mut self.staging.bind_groups, layout, &buffers, &self.sets[r.set as usize].0, r.dynamic);
+            let device = &self.device;
+            let group = group(&mut self.bind_groups, &mut self.staging.bind_groups, layout, &buffers, &self.sets[r.set as usize].0, r.dynamic, |bound| {
+                let entries: Vec<wgpu::BindGroupEntry> = bound
+                    .iter()
+                    .map(|b| match b {
+                        Bound::Buffer(binding, buffer, at, size) => wgpu::BindGroupEntry { binding: *binding, resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer, offset: *at, size: wgpu::BufferSize::new(*size) }) },
+                        Bound::View(binding, view) => wgpu::BindGroupEntry { binding: *binding, resource: wgpu::BindingResource::TextureView(view) },
+                        Bound::Sampler(binding, sampler) => wgpu::BindGroupEntry { binding: *binding, resource: wgpu::BindingResource::Sampler(sampler) },
+                    })
+                    .collect();
+                device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout, entries: &entries })
+            });
             groups.push((group, offsets));
         }
         if let Some(p) = d.pass {
             self.segment(true);
             let timed = p.timed.and_then(|label| self.timing.as_mut().and_then(|t| t.next(label)));
-            let mut encoder = self.encoder();
-            let load = wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store };
-            let attachments: Vec<Option<wgpu::RenderPassColorAttachment>> = p.colors.iter().map(|v| v.as_ref().map(|view| wgpu::RenderPassColorAttachment { view, depth_slice: None, resolve_target: None, ops: load })).collect();
-            let timestamp_writes = timed.zip(self.timing.as_ref()).map(|(i, t)| wgpu::RenderPassTimestampWrites { query_set: &t.set, beginning_of_pass_write_index: Some(i), end_of_pass_write_index: Some(i + 1) });
-            let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("draw"),
-                timestamp_writes,
-                color_attachments: &attachments,
-                depth_stencil_attachment: p.depth.as_ref().map(|(view, f)| wgpu::RenderPassDepthStencilAttachment {
-                    view,
-                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
-                    stencil_ops: f.has_stencil_aspect().then_some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
-                }),
-                ..Default::default()
-            });
-            let pass = pass.forget_lifetime();
-            self.record(encoder);
-            self.pass = Some((pass, PassState::default()));
+            self.open_pass(&p.colors, p.depth.as_ref(), timed);
+            self.open = Some(Attachments { colors: p.colors, depth: p.depth });
+        } else if self.pass.is_none()
+            && let Some(a) = self.open.clone()
+        {
+            // The pass went on in raw Vulkan: it goes on here, as it is.
+            self.open_pass(&a.colors, a.depth.as_ref(), None);
         }
-        let (Some((pass, last)), Some((pipeline, _))) = (self.pass.as_mut(), &self.pipelines[d.pipeline as usize]) else {
+        let (Some((pass, last)), Some((Pipeline::Wgpu(pipeline), _))) = (self.pass.as_mut(), &self.pipelines[d.pipeline as usize]) else {
             self.lost += 1;
             return;
         };
@@ -308,6 +529,162 @@ impl Recorder {
             (_, &Call::Direct { first, count, instance }) => pass.draw(first..first + count, instance..instance + 1),
             (None, Call::Indexed { .. }) => self.lost += 1,
         }
+    }
+
+    /// A draw of a raw pipeline, in the raw segment (opened if needed): its sets (made once while
+    /// the frames use them), its pass (begun anew, or the open one reopened here from wgpu), the
+    /// textures it reads and the attachments it writes in their states (a barrier between two
+    /// renderings when one changes within the segment), then its state, bindings and call.
+    fn raw_draw(&mut self, d: DrawRec, p: &crate::raw::RawPipeline, index: Option<(Slice, wgpu::IndexFormat)>, vertex: SmallVec<[Slice; 8]>, staged: SmallVec<[(SmallVec<[(u32, Slice); 16]>, SmallVec<[u32; 16]>); 2]>) {
+        // The sets, in the pipeline's group order, and their dynamic offsets.
+        let mut sets: SmallVec<[vk::DescriptorSet; 2]> = SmallVec::new();
+        let mut offsets: SmallVec<[u32; 32]> = SmallVec::new();
+        let mut reads: SmallVec<[Arc<[Slot]>; 2]> = SmallVec::new();
+        for (g, (r, (buffers, offs))) in d.groups.iter().zip(&staged).enumerate() {
+            let (Some(layout), Some((set_layout, entries)), Some(rr)) = (self.pipelines[d.pipeline as usize].as_ref().and_then(|(_, l)| l.iter().flatten().nth(g)), p.sets.get(g), self.raw.as_mut()) else { continue };
+            let slots = self.sets[r.set as usize].0.clone();
+            let RawRec { pools, sets: cache, buffers: handles, .. } = rr;
+            let set = group(cache, &mut self.staging.bind_groups, layout, buffers, &slots, r.dynamic, |bound| {
+                let resources: Vec<crate::raw::Resource> = bound
+                    .iter()
+                    .map(|b| match b {
+                        Bound::Buffer(_, buffer, at, size) => crate::raw::Resource::Buffer(raw_buffer(handles, buffer), *at, *size),
+                        Bound::View(_, view) => crate::raw::Resource::Texture(raw_view(view), wgpu::hal::vulkan::conv::derive_image_layout(wgpu::TextureUses::RESOURCE, view.texture().format())),
+                        Bound::Sampler(binding, _) => crate::raw::Resource::Sampler(slots[((binding - 33) / 2) as usize].raw_sampler),
+                    })
+                    .collect();
+                pools.set(*set_layout, entries, &resources).unwrap_or_else(|e| {
+                    eprintln!("gyroship: {e}");
+                    (vk::DescriptorPool::null(), vk::DescriptorSet::null())
+                })
+            });
+            if set.1 == vk::DescriptorSet::null() {
+                self.lost += 1;
+                return;
+            }
+            sets.push(set.1);
+            offsets.extend_from_slice(offs);
+            reads.push(slots);
+        }
+        // The pass: a new one, or the open one, reopened here when it was wgpu's.
+        let mut end_first = false;
+        let attachments = match d.pass {
+            Some(pass) => {
+                self.segment(true);
+                if pass.timed.is_some()
+                    && let Some(r) = self.raw.as_mut()
+                    && !std::mem::replace(&mut r.untimed, true)
+                {
+                    eprintln!("gyroship: raw Vulkan passes are not timed (GYROSHIP_GPU_TIMES)");
+                }
+                let a = Attachments { colors: pass.colors, depth: pass.depth };
+                self.open = Some(a.clone());
+                Some(a)
+            }
+            None => None,
+        };
+        self.open_segment();
+        let Some(r) = self.raw.as_mut() else {
+            self.lost += 1;
+            return;
+        };
+        let RawRec { pools, segment, buffers: handles, keep, .. } = r;
+        let Some(s) = segment.as_mut() else {
+            self.lost += 1;
+            return;
+        };
+        if let Some(a) = attachments {
+            end_first = s.rendering.as_ref().is_some_and(|(_, begun)| *begun);
+            s.rendering = Some((a, false));
+        } else if s.rendering.is_none() {
+            // The open pass was wgpu's: it goes on here.
+            match &self.open {
+                Some(a) => s.rendering = Some((a.clone(), false)),
+                None => {
+                    self.lost += 1;
+                    return;
+                }
+            }
+        }
+        let Some((a, begun)) = s.rendering.as_mut() else { return };
+        // Each texture in the state this draw needs it in: attachments written, textures read.
+        let texture = |v: &wgpu::TextureView| (v.texture().clone(), v.texture().format());
+        let mut needs: SmallVec<[(wgpu::Texture, wgpu::TextureFormat, wgpu::TextureUses); 16]> = a.colors.iter().flatten().map(|v| { let (t, f) = texture(v); (t, f, wgpu::TextureUses::COLOR_TARGET) }).collect();
+        needs.extend(a.depth.as_ref().map(|(v, _)| { let (t, f) = texture(v); (t, f, wgpu::TextureUses::DEPTH_STENCIL_WRITE) }));
+        needs.extend(reads.iter().flat_map(|slots| slots.iter()).map(|slot| { let (t, f) = texture(&slot.view); (t, f, wgpu::TextureUses::RESOURCE) }));
+        let mut barriers: SmallVec<[(vk::Image, wgpu::TextureFormat, wgpu::TextureUses, wgpu::TextureUses); 4]> = SmallVec::new();
+        for (t, f, need) in needs {
+            match s.states.get_mut(&t) {
+                None => {
+                    s.states.insert(t, (f, need, need));
+                }
+                Some((_, _, now)) if *now != need => {
+                    barriers.push((raw_image(&t), f, *now, need));
+                    *now = need;
+                }
+                Some(_) => {}
+            }
+        }
+        if !barriers.is_empty() && *begun {
+            end_first = true;
+        }
+        if end_first {
+            *begun = false;
+        }
+        // What the commands name, read before the encoder is borrowed.
+        let colors: SmallVec<[Option<vk::ImageView>; 8]> = a.colors.iter().map(|v| v.as_ref().map(raw_view)).collect();
+        let depth = a.depth.as_ref().map(|(v, f)| (raw_view(v), *f));
+        let size = a.colors.iter().flatten().chain(a.depth.as_ref().map(|(v, _)| v)).next().map_or((1, 1), |v| (v.texture().width(), v.texture().height()));
+        if !*begun {
+            keep.views.extend(a.colors.iter().flatten().cloned().chain(a.depth.as_ref().map(|(v, _)| v.clone())));
+        }
+        let slices = index.iter().map(|(b, _)| b).chain(&vertex).chain(staged.iter().flat_map(|(buffers, _)| buffers.iter().map(|(_, b)| b)));
+        for (buffer, _, _) in slices {
+            if !s.buffers.contains(buffer) {
+                s.buffers.push(buffer.clone());
+            }
+        }
+        let vertex: SmallVec<[(vk::Buffer, u64); 8]> = vertex.iter().map(|(b, at, _)| (raw_buffer(handles, b), *at)).collect();
+        let index = index.map(|((b, at, _), format)| (raw_buffer(handles, &b), at, format));
+        let begin = !*begun;
+        *begun = true;
+        self.staging.raw_draws += 1;
+        let ash = &pools.ash;
+        unsafe {
+            s.raw.as_hal_mut::<Vulkan, _, _>(|e| {
+                let Some(e) = e else { return };
+                let cb = e.raw_handle();
+                // An instance open over other attachments, or over textures changing state, ends first.
+                if end_first {
+                    ash.cmd_end_rendering(cb);
+                }
+                for &(image, format, from, to) in &barriers {
+                    crate::raw::barrier(ash, cb, image, format, from, to);
+                }
+                if begin {
+                    crate::raw::begin_rendering(ash, cb, size, &colors, depth);
+                }
+                crate::raw::viewport(ash, cb, d.viewport);
+                crate::raw::scissor(ash, cb, d.scissor);
+                ash.cmd_set_blend_constants(cb, &d.blend);
+                ash.cmd_set_stencil_reference(cb, vk::StencilFaceFlags::FRONT_AND_BACK, d.stencil);
+                ash.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, p.pipeline);
+                if !sets.is_empty() {
+                    ash.cmd_bind_descriptor_sets(cb, vk::PipelineBindPoint::GRAPHICS, p.layout, 0, &sets, &offsets);
+                }
+                for (slot, &(buffer, at)) in vertex.iter().enumerate() {
+                    ash.cmd_bind_vertex_buffers(cb, slot as u32, &[buffer], &[at]);
+                }
+                match (index, &d.call) {
+                    (Some((buffer, at, format)), &Call::Indexed { count, base_vertex, instance }) => {
+                        ash.cmd_bind_index_buffer(cb, buffer, at, wgpu::hal::vulkan::conv::map_index_format(format));
+                        ash.cmd_draw_indexed(cb, count, 1, 0, base_vertex, instance);
+                    }
+                    (_, &Call::Direct { first, count, instance }) => ash.cmd_draw(cb, count, 1, first, instance),
+                    (None, Call::Indexed { .. }) => {}
+                }
+            })
+        };
     }
 
     /// Copies `bytes` (padded to 4) into this frame's upload arena; returns
@@ -439,10 +816,18 @@ impl Recorder {
     }
 }
 
-/// The bind group of `buffers` and `textures` with `layout` from `groups`, made
-/// there if needed (`made`: made, asked for). The entries are hashed and
-/// compared as they are, borrowed; cloned into a key only for a group made here.
-fn bind_group(device: &wgpu::Device, groups: &mut Groups<GroupKey, wgpu::BindGroup>, made: &mut [u64; 2], layout: &wgpu::BindGroupLayout, buffers: &[(u32, Slice)], textures: &[Slot], dynamic: bool) -> wgpu::BindGroup {
+/// The raw buffer of `buffer`, kept in `handles`.
+// ponytail: the arena's buffers stay in `handles` once used raw (a few, doubling in size); dropped
+// with their frames if their memory ever counts.
+fn raw_buffer(handles: &mut FxMap<wgpu::Buffer, vk::Buffer>, buffer: &wgpu::Buffer) -> vk::Buffer {
+    *handles.entry(buffer.clone()).or_insert_with(|| unsafe { buffer.as_hal::<Vulkan>().map_or(vk::Buffer::null(), |b| b.raw_handle()) })
+}
+
+/// The group (a wgpu bind group, or a raw descriptor set) of `buffers` and `textures` with
+/// `layout` from `groups`, made there by `make` from its entries if needed (`made`: made, asked
+/// for). The entries are hashed and compared as they are, borrowed; cloned into a key only for a
+/// group made here.
+fn group<V: Clone>(groups: &mut Groups<GroupKey, V>, made: &mut [u64; 2], layout: &wgpu::BindGroupLayout, buffers: &[(u32, Slice)], textures: &[Slot], dynamic: bool, make: impl FnOnce(&[Bound]) -> V) -> V {
     use std::hash::{Hash, Hasher};
     // The entries: a buffer at offset 0 when the offset is dynamic, then each
     // texture slot's view and sampler.
@@ -479,15 +864,7 @@ fn bind_group(device: &wgpu::Device, groups: &mut Groups<GroupKey, wgpu::BindGro
                 bound.push(Bound::Sampler(33 + 2 * slot as u32, sampler.clone()));
             }
         }
-        let entries: Vec<wgpu::BindGroupEntry> = bound
-            .iter()
-            .map(|b| match b {
-                Bound::Buffer(binding, buffer, at, size) => wgpu::BindGroupEntry { binding: *binding, resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer, offset: *at, size: wgpu::BufferSize::new(*size) }) },
-                Bound::View(binding, view) => wgpu::BindGroupEntry { binding: *binding, resource: wgpu::BindingResource::TextureView(view) },
-                Bound::Sampler(binding, sampler) => wgpu::BindGroupEntry { binding: *binding, resource: wgpu::BindingResource::Sampler(sampler) },
-            })
-            .collect();
-        let group = device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout, entries: &entries });
+        let group = make(&bound);
         ((layout.clone(), bound), group)
     })
 }

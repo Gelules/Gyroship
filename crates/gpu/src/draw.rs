@@ -250,7 +250,7 @@ pub struct Cache {
     /// Render pipelines with their bind group layouts, their id for the run
     /// (`Rec::Pipeline`; never removed: their count is the next id), and
     /// whether the recorder has them (announced once made).
-    pipelines: FxMap<PipelineKey, (Made<wgpu::RenderPipeline>, [Option<wgpu::BindGroupLayout>; 2], u32, bool)>,
+    pipelines: FxMap<PipelineKey, (Made<crate::record::Pipeline>, [Option<wgpu::BindGroupLayout>; 2], u32, bool)>,
     /// The key and id of the last draw's pipeline, made (and so announced): a
     /// draw with the same key (consecutive draws often share one) takes it
     /// without a hash, a probe or a wait.
@@ -266,7 +266,7 @@ pub struct Cache {
     /// Uploaded textures by address and header, with the end of the memory they came from.
     textures: FxMap<(u64, [u8; 32]), (wgpu::Texture, u64)>,
     /// Samplers by header, filtering and compare.
-    samplers: FxMap<([u8; 32], bool, bool), wgpu::Sampler>,
+    samplers: FxMap<([u8; 32], bool, bool), (wgpu::Sampler, ash::vk::Sampler)>,
     /// Stand-ins for textures only queried, by width, height, depth and levels.
     queried: FxMap<(u32, u32, u32, u32), wgpu::Texture>,
     /// The pass that writes R32Float texels as depth (ZF32 uploads).
@@ -571,7 +571,10 @@ pub(crate) struct Resolved {
 pub(crate) struct Slot {
     pub(crate) view: wgpu::TextureView,
     pub(crate) sampler: Option<wgpu::Sampler>,
-    depth: bool,
+    /// The same sampler for the raw path (`GYROSHIP_RAW`): wgpu's VkSampler is out of reach. Null
+    /// without a sampler or without the raw path.
+    pub(crate) raw_sampler: ash::vk::Sampler,
+    pub(crate) depth: bool,
     compare: bool,
     dimension: wgpu::TextureViewDimension,
 }
@@ -930,34 +933,43 @@ impl Surfaces {
                     let entries = &self.cache.group_entries[id as usize];
                     *made = Some(self.cache.layouts.entry(entries.clone()).or_insert_with(|| self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries })).clone());
                 }
-                let refs: Vec<Option<&wgpu::BindGroupLayout>> = bind_layouts.iter().flatten().map(Some).collect();
-                let layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &refs, ..Default::default() });
                 // Owned: a worker thread may make it.
                 let buffers: Vec<(u64, wgpu::VertexStepMode, Vec<wgpu::VertexAttribute>)> = layouts.iter().map(|(_, step, stride, attributes)| (*stride, *step, attributes.to_vec())).collect();
-                // Under GYROSHIP_PASSTHROUGH, the modules made from our SPIR-V for this layout.
-                let (vertex, pixel) = {
-                    let entries: SmallVec<[&[wgpu::BindGroupLayoutEntry]; 2]> = groups.iter().filter(|&&id| id != u32::MAX).map(|&id| self.cache.group_entries[id as usize].as_slice()).collect();
-                    (self.passthrough(&vs, &entries).unwrap_or_else(|| vs.1.clone()), ps.as_ref().map(|p| self.passthrough(p, &entries).unwrap_or_else(|| p.1.clone())))
-                };
-                let device = self.device.clone();
-                let (primitive, targets, depth_stencil) = (*primitive, color_states.to_vec(), depth_state.clone());
-                let cache = self.disk_cache.as_ref().map(|d| d.cache.clone());
-                let make = move || {
-                    let buffers: Vec<Option<wgpu::VertexBufferLayout>> = buffers.iter().map(|(stride, step, attributes)| Some(wgpu::VertexBufferLayout { array_stride: *stride, step_mode: *step, attributes })).collect();
-                    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                        label: None,
-                        layout: Some(&layout),
-                        vertex: wgpu::VertexState { module: &vertex, entry_point: Some("main"), compilation_options: Default::default(), buffers: &buffers },
-                        fragment: pixel.as_ref().map(|module| wgpu::FragmentState { module, entry_point: Some("main"), compilation_options: Default::default(), targets: &targets }),
-                        primitive,
-                        depth_stencil,
-                        multisample: Default::default(),
-                        multiview_mask: None,
-                        cache: cache.as_ref(),
-                    })
-                };
                 let label = format!("p{:016x}+{}", vs.0.key, ps.as_ref().map_or("none".into(), |p| format!("{:016x}", p.0.key)));
-                let mut made = self.make(make, label.clone());
+                let mut made = if self.raw.as_ref().is_some_and(|m| m.wants(vs.0.key, ps.as_ref().map(|p| p.0.key))) {
+                    // Under GYROSHIP_RAW, a raw pipeline (D110 step 6), made here at once.
+                    let entries: SmallVec<[Vec<wgpu::BindGroupLayoutEntry>; 2]> = groups.iter().filter(|&&id| id != u32::MAX).map(|&id| self.cache.group_entries[id as usize].clone()).collect();
+                    let entries: SmallVec<[&[wgpu::BindGroupLayoutEntry]; 2]> = entries.iter().map(Vec::as_slice).collect();
+                    let buffers: Vec<Option<wgpu::VertexBufferLayout>> = buffers.iter().map(|(stride, step, attributes)| Some(wgpu::VertexBufferLayout { array_stride: *stride, step_mode: *step, attributes })).collect();
+                    let p = self.raw_pipeline(&vs, ps.as_deref(), &buffers, *primitive, color_states, depth_state.as_ref(), &entries)?;
+                    Made::Ready(crate::record::Pipeline::Raw(std::sync::Arc::new(p)))
+                } else {
+                    let refs: Vec<Option<&wgpu::BindGroupLayout>> = bind_layouts.iter().flatten().map(Some).collect();
+                    let layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &refs, ..Default::default() });
+                    // Under GYROSHIP_PASSTHROUGH, the modules made from our SPIR-V for this layout.
+                    let (vertex, pixel) = {
+                        let entries: SmallVec<[&[wgpu::BindGroupLayoutEntry]; 2]> = groups.iter().filter(|&&id| id != u32::MAX).map(|&id| self.cache.group_entries[id as usize].as_slice()).collect();
+                        (self.passthrough(&vs, &entries).unwrap_or_else(|| vs.1.clone()), ps.as_ref().map(|p| self.passthrough(p, &entries).unwrap_or_else(|| p.1.clone())))
+                    };
+                    let device = self.device.clone();
+                    let (primitive, targets, depth_stencil) = (*primitive, color_states.to_vec(), depth_state.clone());
+                    let cache = self.disk_cache.as_ref().map(|d| d.cache.clone());
+                    let make = move || {
+                        let buffers: Vec<Option<wgpu::VertexBufferLayout>> = buffers.iter().map(|(stride, step, attributes)| Some(wgpu::VertexBufferLayout { array_stride: *stride, step_mode: *step, attributes })).collect();
+                        crate::record::Pipeline::Wgpu(device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                            label: None,
+                            layout: Some(&layout),
+                            vertex: wgpu::VertexState { module: &vertex, entry_point: Some("main"), compilation_options: Default::default(), buffers: &buffers },
+                            fragment: pixel.as_ref().map(|module| wgpu::FragmentState { module, entry_point: Some("main"), compilation_options: Default::default(), targets: &targets }),
+                            primitive,
+                            depth_stencil,
+                            multisample: Default::default(),
+                            multiview_mask: None,
+                            cache: cache.as_ref(),
+                        }))
+                    };
+                    self.make(make, label.clone())
+                };
                 let ready = made.waited(since + budget);
                 let id = self.cache.pipelines.len() as u32;
                 let announce = if ready { made.made().map(|p| (p.clone(), bind_layouts.clone())) } else { None };
@@ -1415,7 +1427,7 @@ impl Surfaces {
                     device.create_texture(&wgpu::TextureDescriptor { label: Some("queried"), size, mip_level_count: levels, sample_count: 1, dimension: dim, format: wgpu::TextureFormat::R8Unorm, usage: wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[] })
                 }).clone();
                 let dimension = if three_d { V::D3 } else { V::D2 };
-                textures.push(Slot { view: self.view(&texture, &Default::default()), sampler: None, depth: false, compare: false, dimension });
+                textures.push(Slot { view: self.view(&texture, &Default::default()), sampler: None, raw_sampler: ash::vk::Sampler::null(), depth: false, compare: false, dimension });
                 continue;
             }
             // An image a compute program wrote, or a render target at that address: its host texture.
@@ -1487,8 +1499,8 @@ impl Surfaces {
             }
             swizzles[slot] = textures::swizzle_code(&tic);
             self.textures_read.push((tic.address, source));
-            let sampler = match x.fetch {
-                true => None,
+            let (sampler, raw_sampler) = match x.fetch {
+                true => (None, ash::vk::Sampler::null()),
                 false => {
                     let index = match binding {
                         SamplerBinding::Independently => handle.sampler,
@@ -1496,10 +1508,11 @@ impl Surfaces {
                     };
                     let bytes = self.descriptor(samplers.entry(index).ok_or("sampler index past the pool")?, mem).ok_or("sampler header not readable")?;
                     // A comparison sampler filters (PCF) whatever the depth format.
-                    Some(self.sampler(bytes, !depth || x.compare, x.compare))
+                    let (s, raw) = self.sampler(bytes, !depth || x.compare, x.compare);
+                    (Some(s), raw)
                 }
             };
-            let resolved = Slot { view, sampler, depth, compare: x.compare, dimension };
+            let resolved = Slot { view, sampler, raw_sampler, depth, compare: x.compare, dimension };
             if let Some(k) = key {
                 self.memo.slots.insert(k, Resolved { slot: resolved.clone(), swizzle: swizzles[slot], address: tic.address, source, target });
             }
@@ -1907,7 +1920,8 @@ impl Surfaces {
     /// unfilterable textures; with `compare`, a comparison sampler with the
     /// header's TEXSAMP0_DEPTH_COMPARE_FUNC (taken even when its
     /// TEXSAMP0_DEPTH_COMPARE bit is clear: the program asked for a compare).
-    fn sampler(&mut self, bytes: [u8; 32], filtering: bool, compare: bool) -> wgpu::Sampler {
+    /// With the raw path, the same sampler for it too (else a null one).
+    fn sampler(&mut self, bytes: [u8; 32], filtering: bool, compare: bool) -> (wgpu::Sampler, ash::vk::Sampler) {
         if let Some(s) = self.cache.samplers.get(&(bytes, filtering, compare)) {
             return s.clone();
         }
@@ -1925,7 +1939,7 @@ impl Surfaces {
         };
         let linear = mag == wgpu::FilterMode::Linear && min == wgpu::FilterMode::Linear && mip == wgpu::MipmapFilterMode::Linear;
         let (lod_min_clamp, lod_max_clamp) = t.wgpu_lod_clamp();
-        let s = self.device.create_sampler(&wgpu::SamplerDescriptor {
+        let d = wgpu::SamplerDescriptor {
             label: None,
             address_mode_u: address[0],
             address_mode_v: address[1],
@@ -1938,7 +1952,15 @@ impl Surfaces {
             compare: compare.then(|| t.compare_func.wgpu()),
             anisotropy_clamp: if linear { t.max_anisotropy.clamp(1, 16) } else { 1 },
             border_color: address.contains(&wgpu::AddressMode::ClampToBorder).then(|| t.wgpu_border_color().unwrap_or(wgpu::SamplerBorderColor::TransparentBlack)),
-        });
+        };
+        let raw = match &mut self.raw {
+            Some(m) => m.raw.sampler(&d).unwrap_or_else(|e| {
+                eprintln!("gyroship: {e}");
+                ash::vk::Sampler::null()
+            }),
+            None => ash::vk::Sampler::null(),
+        };
+        let s = (self.device.create_sampler(&d), raw);
         self.cache.samplers.insert((bytes, filtering, compare), s.clone());
         s
     }
@@ -2094,7 +2116,7 @@ mod tests {
         let texture = s.device.create_texture(&wgpu::TextureDescriptor { label: None, size, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::R8Unorm, usage: wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[] });
         let view = texture.create_view(&Default::default());
         let sampler = s.device.create_sampler(&Default::default());
-        let slot = |depth: bool, sampled: bool| Slot { view: view.clone(), sampler: sampled.then(|| sampler.clone()), depth, compare: false, dimension: wgpu::TextureViewDimension::D2 };
+        let slot = |depth: bool, sampled: bool| Slot { view: view.clone(), sampler: sampled.then(|| sampler.clone()), raw_sampler: ash::vk::Sampler::null(), depth, compare: false, dimension: wgpu::TextureViewDimension::D2 };
         let sizes = BTreeMap::new();
         let bindings = |slots: Vec<Slot>| Bindings { cbufs: smallvec![(0, 0), (3, 1)], textures: slots.into(), swizzles: Some(vec![0u32; 4].into()), set: 0, sizes: &sizes };
         let translation = |key| Translation { key, stage: Stage::Pixel, wgsl: String::new(), interface: Interface::default() };

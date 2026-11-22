@@ -235,7 +235,8 @@ impl crate::surfaces::Surfaces {
     /// Under [`PASSTHROUGH`]: `made`'s naga module and its validation, kept for its pipelines'
     /// SPIR-V, parsed from its WGSL (as wgpu and the disk cache parse it).
     pub(crate) fn keep_ir(&mut self, made: &crate::draw::Built) {
-        if self.passthrough.is_none() {
+        // The raw path writes its modules from it too.
+        if self.passthrough.is_none() && self.raw.is_none() {
             return;
         }
         let parsed = naga::front::wgsl::parse_str(&made.0.wgsl).map_err(|e| e.message().to_string()).and_then(|module| {

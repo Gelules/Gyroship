@@ -47,7 +47,92 @@ pub(crate) struct Raw {
     modules: Vec<vk::ShaderModule>,
     pipelines: Vec<vk::Pipeline>,
     samplers: Vec<vk::Sampler>,
-    pools: Vec<vk::DescriptorPool>,
+}
+
+/// A raw pipeline as the recorder binds it: the pipeline, its layout, and each group's set
+/// layout with the entries its sets are written in.
+pub(crate) struct RawPipeline {
+    pub(crate) pipeline: vk::Pipeline,
+    pub(crate) layout: vk::PipelineLayout,
+    pub(crate) sets: smallvec::SmallVec<[(vk::DescriptorSetLayout, std::sync::Arc<[wgpu::BindGroupLayoutEntry]>); 2]>,
+}
+
+/// `GYROSHIP_RAW=<program key>` (D110 step 6a): the draws of the pipelines that take this vertex
+/// or pixel program are recorded in raw Vulkan; `all`: every draw's. Read at the device's opening.
+pub(crate) const RAW: &str = "GYROSHIP_RAW";
+
+/// The raw path when it is on: its objects, the program whose pipelines are raw (None: all),
+/// the SPIR-V options of the device, and each module's raw module by serial.
+pub(crate) struct RawMode {
+    pub(crate) raw: Raw,
+    pub(crate) program: Option<u64>,
+    pub(crate) options: naga::back::spv::Options<'static>,
+    pub(crate) modules: FxMap<u32, vk::ShaderModule>,
+}
+
+impl RawMode {
+    /// The raw path asked for by `value` (`RAW`'s), when the device can: Vulkan with dynamic
+    /// rendering; else none, said on stderr.
+    pub(crate) fn new(adapter: &wgpu::Adapter, device: &wgpu::Device, extras: crate::vk::Extras, value: &str) -> Option<RawMode> {
+        let program = match value {
+            "all" => None,
+            key => match u64::from_str_radix(key.trim_start_matches("0x"), 16) {
+                Ok(key) => Some(key),
+                Err(_) => {
+                    eprintln!("gyroship: {RAW}={key}: not a program key (hex) nor `all`: the raw path stays off");
+                    return None;
+                }
+            },
+        };
+        let mode = Raw::new(adapter, device).filter(|_| extras.dynamic_rendering).zip(crate::vk::spirv_options(adapter, device)).map(|(raw, options)| RawMode { raw, program, options, modules: FxMap::default() });
+        match (&mode, program) {
+            (None, _) => eprintln!("gyroship: {RAW}: this device has no Vulkan dynamic rendering: the raw path stays off"),
+            (Some(_), Some(key)) => eprintln!("gyroship: {RAW}: the draws of program {key:016x} recorded in raw Vulkan"),
+            (Some(_), None) => eprintln!("gyroship: {RAW}: every draw recorded in raw Vulkan"),
+        }
+        mode
+    }
+
+    /// Whether the pipeline of these programs is raw.
+    pub(crate) fn wants(&self, vertex: u64, pixel: Option<u64>) -> bool {
+        self.program.is_none_or(|p| p == vertex || pixel == Some(p))
+    }
+}
+
+impl crate::surfaces::Surfaces {
+    /// The raw pipeline of these modules and states: each module's SPIR-V written once (by
+    /// serial), its bindings numbered for these groups (which a module's own interface fixes), a
+    /// set layout per group, the pipeline layout, then `Raw::pipeline`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn raw_pipeline(
+        &mut self,
+        vs: &crate::draw::Built,
+        ps: Option<&crate::draw::Built>,
+        buffers: &[Option<wgpu::VertexBufferLayout>],
+        primitive: wgpu::PrimitiveState,
+        targets: &[Option<wgpu::ColorTargetState>],
+        depth: Option<&wgpu::DepthStencilState>,
+        groups: &[&[wgpu::BindGroupLayoutEntry]],
+    ) -> Result<RawPipeline, String> {
+        let (Some(m), ir) = (self.raw.as_mut(), &self.cache.ir) else { return Err("the raw path is off".into()) };
+        let map = crate::vk::binding_map(groups);
+        let mut module = |b: &crate::draw::Built| -> Result<vk::ShaderModule, String> {
+            if let Some(&made) = m.modules.get(&b.2) {
+                return Ok(made);
+            }
+            let (module, info) = ir.get(&b.2).ok_or_else(|| format!("program {:016x}: its naga module was not kept", b.0.key))?;
+            let entry = module.entry_points.first().ok_or("no entry point")?;
+            let made = m.raw.module(&crate::vk::spirv(module, info, entry.stage, &entry.name, &m.options, &map)?)?;
+            m.modules.insert(b.2, made);
+            Ok(made)
+        };
+        let vertex = module(vs)?;
+        let pixel = ps.map(&mut module).transpose()?;
+        let sets = groups.iter().map(|e| Ok((m.raw.set_layout(e)?, std::sync::Arc::from(*e)))).collect::<Result<smallvec::SmallVec<[_; 2]>, String>>()?;
+        let layout = m.raw.pipeline_layout(&sets.iter().map(|s| s.0).collect::<Vec<_>>())?;
+        let pipeline = m.raw.pipeline(&PipelineDesc { vertex, pixel, buffers, primitive, depth_stencil: depth, targets, layout })?;
+        Ok(RawPipeline { pipeline, layout, sets })
+    }
 }
 
 impl Raw {
@@ -65,7 +150,6 @@ impl Raw {
             modules: Vec::new(),
             pipelines: Vec::new(),
             samplers: Vec::new(),
-            pools: Vec::new(),
         })
     }
 
@@ -230,10 +314,27 @@ impl Raw {
         Ok(s)
     }
 
+}
+
+/// The raw path's descriptor sets, made and freed by the recorder alone (a pool is not shared
+/// between threads): pools of `POOL_SETS` sets, a new one when the last is full; destroyed once
+/// the GPU is done with them, before the device.
+pub(crate) struct Pools {
+    device: wgpu::Device,
+    pub(crate) ash: ash::Device,
+    pools: Vec<vk::DescriptorPool>,
+}
+
+impl Pools {
+    pub(crate) fn new(device: &wgpu::Device) -> Option<Pools> {
+        let ash = unsafe { device.as_hal::<Vulkan>() }?.raw_device().clone();
+        Some(Pools { device: device.clone(), ash, pools: Vec::new() })
+    }
+
     /// A descriptor set of `layout` (made from `entries`), with `resources` by entry, in the order
-    /// of `entries`.
-    pub(crate) fn set(&mut self, layout: vk::DescriptorSetLayout, entries: &[wgpu::BindGroupLayoutEntry], resources: &[Resource]) -> Result<vk::DescriptorSet, String> {
-        let set = self.allocate(layout)?;
+    /// of `entries`; and the pool it is from, to free it with.
+    pub(crate) fn set(&mut self, layout: vk::DescriptorSetLayout, entries: &[wgpu::BindGroupLayoutEntry], resources: &[Resource]) -> Result<(vk::DescriptorPool, vk::DescriptorSet), String> {
+        let (pool, set) = self.allocate(layout)?;
         // The binding numbers of the layout: the entries' rank by number.
         let mut order: Vec<(u32, usize)> = entries.iter().enumerate().map(|(i, e)| (e.binding, i)).collect();
         order.sort_unstable();
@@ -260,15 +361,23 @@ impl Raw {
             })
             .collect();
         unsafe { self.ash.update_descriptor_sets(&writes, &[]) };
-        Ok(set)
+        Ok((pool, set))
+    }
+
+    /// Frees sets the GPU is done with.
+    pub(crate) fn free(&mut self, sets: &[(vk::DescriptorPool, vk::DescriptorSet)]) {
+        for &(pool, set) in sets {
+            // ponytail: one call per set; by pool if freeing ever shows in --perf.
+            let _ = unsafe { self.ash.free_descriptor_sets(pool, &[set]) };
+        }
     }
 
     /// A set from the last pool, or from a new one when it is full.
-    fn allocate(&mut self, layout: vk::DescriptorSetLayout) -> Result<vk::DescriptorSet, String> {
+    fn allocate(&mut self, layout: vk::DescriptorSetLayout) -> Result<(vk::DescriptorPool, vk::DescriptorSet), String> {
         for _ in 0..2 {
             if let Some(&pool) = self.pools.last() {
                 match unsafe { self.ash.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&[layout])) } {
-                    Ok(sets) => return Ok(sets[0]),
+                    Ok(sets) => return Ok((pool, sets[0])),
                     Err(vk::Result::ERROR_OUT_OF_POOL_MEMORY | vk::Result::ERROR_FRAGMENTED_POOL) => {}
                     Err(e) => return Err(format!("raw descriptor set: {e}")),
                 }
@@ -281,35 +390,59 @@ impl Raw {
         }
         Err("raw descriptor set: a new pool is full".into())
     }
+}
 
-    /// Starts rendering into `colors` (a hole: None) and `depth`, kept as they are (LOAD, STORE),
-    /// as wgpu's passes over targets in use do.
-    pub(crate) fn begin_rendering(&self, cb: vk::CommandBuffer, (width, height): (u32, u32), colors: &[Option<vk::ImageView>], depth: Option<(vk::ImageView, wgpu::TextureFormat)>) {
-        let kept = |view, layout| vk::RenderingAttachmentInfo::default().image_view(view).image_layout(layout).load_op(vk::AttachmentLoadOp::LOAD).store_op(vk::AttachmentStoreOp::STORE);
-        let colors: Vec<_> = colors.iter().map(|v| v.map_or_else(vk::RenderingAttachmentInfo::default, |v| kept(v, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL))).collect();
-        let none = vk::RenderingAttachmentInfo::default();
-        let (depth_view, stencil_view) = match depth {
-            Some((view, format)) => {
-                let a = kept(view, vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
-                (if format.has_depth_aspect() { a } else { none }, if format.has_stencil_aspect() { a } else { none })
-            }
-            None => (none, none),
-        };
-        let area = vk::Rect2D { offset: vk::Offset2D::default(), extent: vk::Extent2D { width, height } };
-        let info = vk::RenderingInfo::default().render_area(area).layer_count(1).color_attachments(&colors).depth_attachment(&depth_view).stencil_attachment(&stencil_view);
-        unsafe { self.ash.cmd_begin_rendering(cb, &info) };
+impl Drop for Pools {
+    /// The pools go once the GPU is done with their sets, before the device (which `device` holds).
+    fn drop(&mut self) {
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        for &p in &self.pools {
+            unsafe { self.ash.destroy_descriptor_pool(p, None) };
+        }
     }
+}
 
-    /// The viewport `[x, y, width, height, min depth, max depth]` as wgpu-hal sets it: upside
-    /// down, so that clip space has y up as in wgpu.
-    pub(crate) fn viewport(&self, cb: vk::CommandBuffer, [x, y, w, h, min_depth, max_depth]: [f32; 6]) {
-        unsafe { self.ash.cmd_set_viewport(cb, 0, &[vk::Viewport { x, y: y + h, width: w, height: -h, min_depth, max_depth }]) };
-    }
+/// Starts rendering into `colors` (a hole: None) and `depth`, kept as they are (LOAD, STORE), as
+/// wgpu's passes over targets in use do.
+pub(crate) fn begin_rendering(ash: &ash::Device, cb: vk::CommandBuffer, (width, height): (u32, u32), colors: &[Option<vk::ImageView>], depth: Option<(vk::ImageView, wgpu::TextureFormat)>) {
+    let kept = |view, layout| vk::RenderingAttachmentInfo::default().image_view(view).image_layout(layout).load_op(vk::AttachmentLoadOp::LOAD).store_op(vk::AttachmentStoreOp::STORE);
+    let colors: Vec<_> = colors.iter().map(|v| v.map_or_else(vk::RenderingAttachmentInfo::default, |v| kept(v, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL))).collect();
+    let none = vk::RenderingAttachmentInfo::default();
+    let (depth_view, stencil_view) = match depth {
+        Some((view, format)) => {
+            let a = kept(view, vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+            (if format.has_depth_aspect() { a } else { none }, if format.has_stencil_aspect() { a } else { none })
+        }
+        None => (none, none),
+    };
+    let area = vk::Rect2D { offset: vk::Offset2D::default(), extent: vk::Extent2D { width, height } };
+    let info = vk::RenderingInfo::default().render_area(area).layer_count(1).color_attachments(&colors).depth_attachment(&depth_view).stencil_attachment(&stencil_view);
+    unsafe { ash.cmd_begin_rendering(cb, &info) };
+}
 
-    /// The scissor `[x, y, width, height]`.
-    pub(crate) fn scissor(&self, cb: vk::CommandBuffer, [x, y, width, height]: [u32; 4]) {
-        unsafe { self.ash.cmd_set_scissor(cb, 0, &[vk::Rect2D { offset: vk::Offset2D { x: x as i32, y: y as i32 }, extent: vk::Extent2D { width, height } }]) };
-    }
+/// The viewport `[x, y, width, height, min depth, max depth]` as wgpu-hal sets it: upside down,
+/// so that clip space has y up as in wgpu.
+pub(crate) fn viewport(ash: &ash::Device, cb: vk::CommandBuffer, [x, y, w, h, min_depth, max_depth]: [f32; 6]) {
+    unsafe { ash.cmd_set_viewport(cb, 0, &[vk::Viewport { x, y: y + h, width: w, height: -h, min_depth, max_depth }]) };
+}
+
+/// The scissor `[x, y, width, height]`.
+pub(crate) fn scissor(ash: &ash::Device, cb: vk::CommandBuffer, [x, y, width, height]: [u32; 4]) {
+    unsafe { ash.cmd_set_scissor(cb, 0, &[vk::Rect2D { offset: vk::Offset2D { x: x as i32, y: y as i32 }, extent: vk::Extent2D { width, height } }]) };
+}
+
+/// A whole texture (`image`, of `format`) going from use `from` to use `to`, with the layouts,
+/// stages and accesses wgpu-hal gives these uses: what wgpu would put between them.
+pub(crate) fn barrier(ash: &ash::Device, cb: vk::CommandBuffer, image: vk::Image, format: wgpu::TextureFormat, from: wgpu::TextureUses, to: wgpu::TextureUses) {
+    let ((src_stage, src_access), (dst_stage, dst_access)) = (conv::map_texture_usage_to_barrier(from), conv::map_texture_usage_to_barrier(to));
+    let b = vk::ImageMemoryBarrier::default()
+        .src_access_mask(src_access)
+        .dst_access_mask(dst_access)
+        .old_layout(conv::derive_image_layout(from, format))
+        .new_layout(conv::derive_image_layout(to, format))
+        .image(image)
+        .subresource_range(conv::map_subresource_range(&wgpu::ImageSubresourceRange::default(), format));
+    unsafe { ash.cmd_pipeline_barrier(cb, src_stage, dst_stage, vk::DependencyFlags::empty(), &[], &[], &[b]) };
 }
 
 #[cfg(test)]
@@ -420,7 +553,7 @@ mod tests {
         let component = |src, dst| wgpu::BlendComponent { src_factor: src, dst_factor: dst, operation: wgpu::BlendOperation::Add };
         let blend = wgpu::BlendState { color: component(wgpu::BlendFactor::Constant, wgpu::BlendFactor::OneMinusConstant), alpha: component(wgpu::BlendFactor::One, wgpu::BlendFactor::Zero) };
         let targets = [Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba8Unorm, blend: Some(blend), write_mask: wgpu::ColorWrites::ALL })];
-        let (viewport, scissor, constant, reference) = ([4.0, 6.0, 52.0, 50.0, 0.0, 1.0], [2, 3, 58, 55], [0.25, 0.5, 0.75, 1.0], 0x5a);
+        let (vp, sc, constant, reference) = ([4.0, 6.0, 52.0, 50.0, 0.0, 1.0], [2, 3, 58, 55], [0.25, 0.5, 0.75, 1.0], 0x5a);
 
         // wgpu's draw into `a`.
         let layouts: Vec<wgpu::BindGroupLayout> = groups.iter().map(|entries| d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries })).collect();
@@ -457,8 +590,8 @@ mod tests {
             pass.set_pipeline(&pipelines[0]);
             pass.set_bind_group(0, &g0, &[256]);
             pass.set_bind_group(1, &g1, &[]);
-            pass.set_viewport(viewport[0], viewport[1], viewport[2], viewport[3], viewport[4], viewport[5]);
-            pass.set_scissor_rect(scissor[0], scissor[1], scissor[2], scissor[3]);
+            pass.set_viewport(vp[0], vp[1], vp[2], vp[3], vp[4], vp[5]);
+            pass.set_scissor_rect(sc[0], sc[1], sc[2], sc[3]);
             pass.set_blend_constant(wgpu::Color { r: constant[0], g: constant[1], b: constant[2], a: constant[3] });
             pass.set_stencil_reference(reference);
             pass.draw(0..6, 0..1);
@@ -486,16 +619,17 @@ mod tests {
         let handle = |b: &wgpu::Buffer| unsafe { b.as_hal::<Vulkan>().map(|h| h.raw_handle()) }.unwrap();
         let raw_sampler = raw.sampler(&sampling).unwrap();
         let read = conv::derive_image_layout(wgpu::TextureUses::RESOURCE, wgpu::TextureFormat::Rgba8Unorm);
-        let s0 = raw.set(sets[0], &groups[0], &[Resource::Buffer(handle(&bank), 0, 128)]).unwrap();
-        let s1 = raw.set(sets[1], &groups[1], &[Resource::Sampler(raw_sampler), Resource::Buffer(handle(&tint), 0, 16), Resource::Texture(image(&tv), read)]).unwrap();
+        let mut pools = Pools::new(d).unwrap();
+        let (_, s0) = pools.set(sets[0], &groups[0], &[Resource::Buffer(handle(&bank), 0, 128)]).unwrap();
+        let (_, s1) = pools.set(sets[1], &groups[1], &[Resource::Sampler(raw_sampler), Resource::Buffer(handle(&tint), 0, 16), Resource::Texture(image(&tv), read)]).unwrap();
         let (bh, dbh) = (image(&bv), image(&dbv));
         let mut e2 = d.create_command_encoder(&Default::default());
         unsafe {
             e2.as_hal_mut::<Vulkan, _, _>(|e| {
                 let cb = e.expect("a raw encoder").raw_handle();
-                raw.begin_rendering(cb, (64, 64), &[Some(bh)], Some((dbh, wgpu::TextureFormat::Depth24PlusStencil8)));
-                raw.viewport(cb, viewport.map(|x| x as f32));
-                raw.scissor(cb, scissor);
+                begin_rendering(&raw.ash, cb, (64, 64), &[Some(bh)], Some((dbh, wgpu::TextureFormat::Depth24PlusStencil8)));
+                viewport(&raw.ash, cb, vp.map(|x| x as f32));
+                scissor(&raw.ash, cb, sc);
                 raw.ash.cmd_set_blend_constants(cb, &constant.map(|x| x as f32));
                 raw.ash.cmd_set_stencil_reference(cb, vk::StencilFaceFlags::FRONT_AND_BACK, reference);
                 raw.ash.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, raw_pipelines[0]);
@@ -552,9 +686,6 @@ impl Drop for Raw {
             }
             for &s in &self.samplers {
                 self.ash.destroy_sampler(s, None);
-            }
-            for &p in &self.pools {
-                self.ash.destroy_descriptor_pool(p, None);
             }
         }
     }

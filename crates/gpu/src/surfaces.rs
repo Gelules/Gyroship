@@ -97,9 +97,11 @@ impl<K, V: Clone> Groups<K, V> {
         g
     }
 
-    pub(crate) fn age(&mut self) {
+    /// Forgets what two presents in a row left unused; returns it (raw sets are freed only once
+    /// the GPU is done with them).
+    pub(crate) fn age(&mut self) -> FxMap<u64, Vec<(K, V)>> {
         std::mem::swap(&mut self.now, &mut self.before);
-        self.now.clear();
+        std::mem::take(&mut self.now)
     }
 }
 
@@ -303,6 +305,8 @@ pub struct Surfaces {
     /// Under `GYROSHIP_PASSTHROUGH` (`vk::PASSTHROUGH`): the SPIR-V options our modules are
     /// written with, those of wgpu-hal.
     pub(crate) passthrough: Option<naga::back::spv::Options<'static>>,
+    /// Under `GYROSHIP_RAW` (`raw::RAW`, D110 step 6): the raw path's objects and the draws it takes.
+    pub(crate) raw: Option<crate::raw::RawMode>,
 }
 
 /// A pipeline cache kept in a file between runs (`--pipeline-cache`): the
@@ -675,7 +679,8 @@ impl Window {
 struct Frame {
     uploads: Option<wgpu::CommandEncoder>,
     arena: (wgpu::Buffer, Vec<u8>),
-    pending: Option<wgpu::CommandEncoder>,
+    /// The frame's recordings, in order (`Recorder::take_encoders`): the last is wgpu's.
+    pending: Vec<wgpu::CommandEncoder>,
     present: u64,
 }
 
@@ -703,7 +708,8 @@ fn submit_frame(device: &wgpu::Device, queue: &wgpu::Queue, belt: &mut wgpu::uti
         buffers.push(upload.finish());
         bytes.clear();
     }
-    if let Some(mut e) = f.pending {
+    let mut pending = f.pending;
+    if let Some(mut e) = pending.pop() {
         if let Some(t) = &timing {
             t.resolve(&mut e);
         }
@@ -715,6 +721,7 @@ fn submit_frame(device: &wgpu::Device, queue: &wgpu::Queue, belt: &mut wgpu::uti
             }
             c.close(device, &mut e);
         }
+        buffers.extend(pending.into_iter().map(wgpu::CommandEncoder::finish));
         buffers.push(e.finish());
         index = Some(queue.submit(buffers));
         if let Some(t) = timing {
@@ -831,6 +838,8 @@ pub struct Staging {
     /// change from one kind to the other starting one. A draw path of its own beside
     /// wgpu would hand over at each (D110, step 1).
     pub segments: u64,
+    /// Draws recorded in raw Vulkan (`GYROSHIP_RAW`, D110 step 6).
+    pub raw_draws: u64,
     /// A hash of where each block was written in the arena (offset, bound
     /// size) and of each flushed arena's length, in order: two runs that lay
     /// out their arenas alike match, whatever their memos found.
@@ -849,7 +858,7 @@ impl Staging {
     /// Takes the counters the recorder keeps from its own (`Recorder::staging`).
     pub(crate) fn recorded(&mut self, r: &Staging) {
         (self.calls, self.hits, self.bank_bytes, self.data_bytes, self.zero_bytes, self.flushed, self.flushes) = (r.calls, r.hits, r.bank_bytes, r.data_bytes, r.zero_bytes, r.flushed, r.flushes);
-        (self.bind_groups, self.recordings, self.layout, self.segments) = (r.bind_groups, r.recordings, r.layout, r.segments);
+        (self.bind_groups, self.recordings, self.layout, self.segments, self.raw_draws) = (r.bind_groups, r.recordings, r.layout, r.segments, r.raw_draws);
     }
 }
 
@@ -1191,6 +1200,7 @@ impl Surfaces {
         if passthrough.is_some() {
             eprintln!("gyroship: {}: pipelines made from our SPIR-V", crate::vk::PASSTHROUGH);
         }
+        let raw = std::env::var(crate::raw::RAW).ok().and_then(|v| crate::raw::RawMode::new(&adapter, &device, vulkan, &v));
         let errors = Arc::new(Mutex::new(Vec::new()));
         let sink = errors.clone();
         device.on_uncaptured_error(Arc::new(move |e: wgpu::Error| {
@@ -1241,9 +1251,11 @@ impl Surfaces {
         let window = window.map(|(surface, size)| Window::new(&adapter, &device, surface, size));
         let timing = crate::timing::Timing::new(&device, &queue);
         let timed = timing.is_some();
-        let rec = Arc::new(Mutex::new(crate::record::Recorder::new(&device, &queue, timing)));
+        let mut recorder = crate::record::Recorder::new(&device, &queue, timing);
+        recorder.raw = raw.as_ref().and_then(|_| crate::record::RawRec::new(&device));
+        let rec = Arc::new(Mutex::new(recorder));
         let renderable = (0..=0xff).filter_map(color_format).chain((0..=0xff).filter_map(depth_format)).map(|f| (f, renderable_on(&adapter, &device, f))).collect();
-        Ok(Surfaces { renderable, adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, rec, batch: Vec::with_capacity(BATCH), recorder: None, recorder_ended: false, timed, open: None, sets: 0, empty_set: None, present: 0, readbacks: Default::default(), hasher: None, belt, big_upload: false, texture_belt, uploads: None, global_bytes: Vec::new(), staging: Staging::default(), last_color: None, window, submit: None, submit_ended: false, memo: Memo::default(), kept: Kept::default(), compile: Compile::default(), compile_total: Compile::default(), background: false, wait_left: PIPELINE_WAIT, workers: None, finished: Default::default(), disk_cache: None, shader_cache: None, views: Aged::default(), dynamic_max, clip_distances, vulkan, passthrough })
+        Ok(Surfaces { renderable, adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, rec, batch: Vec::with_capacity(BATCH), recorder: None, recorder_ended: false, timed, open: None, sets: 0, empty_set: None, present: 0, readbacks: Default::default(), hasher: None, belt, big_upload: false, texture_belt, uploads: None, global_bytes: Vec::new(), staging: Staging::default(), last_color: None, window, submit: None, submit_ended: false, memo: Memo::default(), kept: Kept::default(), compile: Compile::default(), compile_total: Compile::default(), background: false, wait_left: PIPELINE_WAIT, workers: None, finished: Default::default(), disk_cache: None, shader_cache: None, views: Aged::default(), dynamic_max, clip_distances, vulkan, passthrough, raw })
     }
 
     /// Shows the presented image (the color target written last, its top-left
@@ -1699,7 +1711,7 @@ impl Surfaces {
         } else {
             // The texture staging is closed even with no upload: a refresh may have used it.
             self.texture_belt.finish();
-            let f = Frame { uploads: self.uploads.take(), arena: (r.arena.0.clone(), std::mem::take(&mut r.arena.1)), pending: r.encoder.take(), present: self.present };
+            let f = Frame { uploads: self.uploads.take(), arena: (r.arena.0.clone(), std::mem::take(&mut r.arena.1)), pending: r.take_encoders(), present: self.present };
             let r = &mut *r;
             r.arena.1 = submit_frame(&self.device, &self.queue, &mut self.belt, r.clock.as_mut(), r.timing.as_mut(), false, f).0;
             self.texture_belt.recall();
@@ -1714,18 +1726,19 @@ impl Surfaces {
     /// Play mode: the work recorded so far goes to the submit thread, which
     /// finishes and submits it while this thread records the next frame.
     fn hand_over(&mut self, r: &mut crate::record::Recorder) {
-        if self.uploads.is_none() && r.encoder.is_none() && r.arena.1.is_empty() {
+        let pending = r.take_encoders();
+        if self.uploads.is_none() && pending.is_empty() && r.arena.1.is_empty() {
             return;
         }
         // The texture staging is mapped again right after the submit that carries its
         // copies (each staging allocation records its copy at once: `stage_level`).
-        match r.encoder.as_ref().or(self.uploads.as_ref()) {
+        match pending.last().or(self.uploads.as_ref()) {
             Some(e) => self.texture_belt.finish_and_recall_on_submit(e),
             None => self.texture_belt.finish(),
         }
         let len = r.arena.1.len();
         let spare = self.submit.as_ref().and_then(|t| t.spare.try_recv().ok()).unwrap_or_else(|| Vec::with_capacity(len));
-        let f = Frame { uploads: self.uploads.take(), arena: (r.arena.0.clone(), std::mem::replace(&mut r.arena.1, spare)), pending: r.encoder.take(), present: self.present };
+        let f = Frame { uploads: self.uploads.take(), arena: (r.arena.0.clone(), std::mem::replace(&mut r.arena.1, spare)), pending, present: self.present };
         self.send(Box::new(move |s: &mut Submitter| {
             // A window's swapchain already waits for the GPU (`Window::show`).
             if let Some(i) = due(&mut s.in_flight)
@@ -2018,6 +2031,26 @@ impl Surfaces {
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC | storage,
                 view_formats: if base == format { &[] } else { std::slice::from_ref(&format) },
             });
+            // The raw path (D110): cleared at once with wgpu's zeros, ahead of the frame's commands,
+            // so that wgpu, which does not see raw writes, never clears it after them.
+            if self.raw.is_some() {
+                let e = self.uploads.get_or_insert_with(|| self.device.create_command_encoder(&Default::default()));
+                let (depth, stencil) = (base.has_depth_aspect(), base.has_stencil_aspect());
+                for layer in 0..s.layers {
+                    let view = texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2), base_array_layer: layer, array_layer_count: Some(1), ..Default::default() });
+                    let cleared = |load| wgpu::Operations { load, store: wgpu::StoreOp::Store };
+                    let colors: Vec<Option<wgpu::RenderPassColorAttachment>> = if depth || stencil { Vec::new() } else { vec![Some(wgpu::RenderPassColorAttachment { view: &view, depth_slice: None, resolve_target: None, ops: cleared(wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)) })] };
+                    drop(e.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        color_attachments: &colors,
+                        depth_stencil_attachment: (depth || stencil).then(|| wgpu::RenderPassDepthStencilAttachment {
+                            view: &view,
+                            depth_ops: depth.then(|| wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Store }),
+                            stencil_ops: stencil.then(|| wgpu::Operations { load: wgpu::LoadOp::Clear(0), store: wgpu::StoreOp::Store }),
+                        }),
+                        ..Default::default()
+                    }));
+                }
+            }
             self.map.insert(key, Entry { surface: *s, texture, written: 0 });
             // A slot that read guest memory, or another target, at this address reads this one now.
             self.memo.forget_slots();
@@ -2637,7 +2670,7 @@ mod tests {
         let bytes = |v: &[f32]| Arc::new(v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
         // A triangle over the whole viewport, twice under two ids; a color per draw.
         let corner = bytes(&[-1.0, -1.0, 3.0, -1.0, -1.0, 3.0]);
-        s.push(Rec::Pipeline(1, pipeline, [Some(layout), None]));
+        s.push(Rec::Pipeline(1, crate::record::Pipeline::Wgpu(pipeline), [Some(layout), None]));
         s.push(Rec::Set(0, Arc::from(Vec::<crate::draw::Slot>::new()), Arc::from(Vec::<u32>::new())));
         for (id, block) in [bytes(&[1.0, 0.0, 0.0, 1.0]), corner.clone(), bytes(&[0.0, 1.0, 0.0, 1.0]), corner, bytes(&[0.0, 0.0, 1.0, 1.0])].into_iter().enumerate() {
             s.push(Rec::Block(id as u32, block));
@@ -2667,6 +2700,117 @@ mod tests {
         let halves = |rgba: Vec<u8>| (rgba[0..4].to_vec(), rgba[8..12].to_vec());
         assert_eq!(halves(read(&copy)), (vec![255, 0, 0, 255], vec![0, 255, 0, 255]), "threaded {threaded}: the copy sees both draws before it");
         assert_eq!(halves(read(&target)), (vec![255, 0, 0, 255], vec![0, 0, 255, 255]), "threaded {threaded}: the last draw kept to its viewport");
+        assert!(s.errors.lock().unwrap().is_empty(), "threaded {threaded}: {:?}", s.errors.lock().unwrap());
+    }
+
+    /// Raw draws (D110 step 6) are recorded where wgpu's would be: a raw draw opening a pass,
+    /// a wgpu draw going on in it (the pass reopened in wgpu), a copy reading both, then a raw
+    /// draw in a new pass; the pixels are those of `the_recorder_applies_commands_in_order`.
+    /// The target is cleared first, as targets are at their making on the raw path. Applied here,
+    /// then on the recorder thread. Needs a Vulkan GPU with dynamic rendering.
+    #[test]
+    fn the_recorder_draws_raw_pipelines_where_wgpu_would() {
+        recorder_draws_raw(false);
+        recorder_draws_raw(true);
+    }
+
+    fn recorder_draws_raw(threaded: bool) {
+        use crate::record::{Call, DrawRec, GroupRec, PassOpen, Pipeline, Rec};
+        let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
+            eprintln!("no GPU adapter: test skipped");
+            return;
+        };
+        s.raw = crate::raw::RawMode::new(&s.adapter, &s.device, s.vulkan, "all");
+        if s.raw.is_none() {
+            eprintln!("no raw path: test skipped");
+            return;
+        }
+        s.rec().raw = crate::record::RawRec::new(&s.device);
+        if threaded {
+            s.start_recorder_thread().unwrap();
+            assert!(s.recorder.is_some(), "no recorder thread (GYROSHIP_GPU_TIMES set?)");
+        }
+        let d = s.device.clone();
+        let texture = |usage| d.create_texture(&wgpu::TextureDescriptor { label: None, size: wgpu::Extent3d { width: 4, height: 4, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::Rgba8Unorm, usage: usage | wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[] });
+        let (target, copy) = (texture(wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC), texture(wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC));
+        let vertex = "@vertex fn main(@location(0) p: vec2<f32>) -> @builtin(position) vec4<f32> { return vec4(p, 0.0, 1.0); }";
+        let pixel = "struct C { color: vec4<f32> };
+            @group(0) @binding(0) var<uniform> c: C;
+            @fragment fn main() -> @location(0) vec4<f32> { return c.color; }";
+        let uniform = wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: wgpu::BufferSize::new(16) };
+        let entries = [wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: uniform, count: None }];
+        let layout = d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &entries });
+        let attributes = [wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 0, shader_location: 0 }];
+        let buffers = [Some(wgpu::VertexBufferLayout { array_stride: 8, step_mode: wgpu::VertexStepMode::Vertex, attributes: &attributes })];
+        let targets = [Some(wgpu::TextureFormat::Rgba8Unorm.into())];
+        // The same pipeline both ways: wgpu's (id 2), and raw (id 1).
+        let modules: Vec<(naga::Module, naga::valid::ModuleInfo)> = [vertex, pixel]
+            .iter()
+            .map(|wgsl| {
+                let m = naga::front::wgsl::parse_str(wgsl).unwrap();
+                let i = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all()).validate(&m).unwrap();
+                (m, i)
+            })
+            .collect();
+        let wgpu_modules: Vec<wgpu::ShaderModule> = modules.iter().map(|(m, _)| d.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(m.clone())) })).collect();
+        let pipeline_layout = d.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&layout)], ..Default::default() });
+        let pipeline = d.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: None,
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState { module: &wgpu_modules[0], entry_point: Some("main"), compilation_options: Default::default(), buffers: &buffers },
+            fragment: Some(wgpu::FragmentState { module: &wgpu_modules[1], entry_point: Some("main"), compilation_options: Default::default(), targets: &targets }),
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let raw_pipeline = {
+            let m = s.raw.as_mut().unwrap();
+            let map = crate::vk::binding_map(&[&entries]);
+            let mut module = |(module, info): &(naga::Module, naga::valid::ModuleInfo)| m.raw.module(&crate::vk::spirv(module, info, module.entry_points[0].stage, "main", &m.options, &map).unwrap()).unwrap();
+            let (vm, pm) = (module(&modules[0]), module(&modules[1]));
+            let set_layout = m.raw.set_layout(&entries).unwrap();
+            let pl = m.raw.pipeline_layout(&[set_layout]).unwrap();
+            let p = m.raw.pipeline(&crate::raw::PipelineDesc { vertex: vm, pixel: Some(pm), buffers: &buffers, primitive: Default::default(), depth_stencil: None, targets: &targets, layout: pl }).unwrap();
+            crate::raw::RawPipeline { pipeline: p, layout: pl, sets: smallvec::smallvec![(set_layout, Arc::from(&entries[..]))] }
+        };
+        // The target cleared, as `texture` clears targets on the raw path.
+        let cleared = target.clone();
+        s.run(move |rec| {
+            let mut e = rec.encoder();
+            let view = cleared.create_view(&Default::default());
+            drop(e.begin_render_pass(&wgpu::RenderPassDescriptor { color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &view, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store } })], ..Default::default() }));
+            rec.record(e);
+        });
+        let bytes = |v: &[f32]| Arc::new(v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
+        let corner = bytes(&[-1.0, -1.0, 3.0, -1.0, -1.0, 3.0]);
+        s.push(Rec::Pipeline(1, Pipeline::Raw(Arc::new(raw_pipeline)), [Some(layout.clone()), None]));
+        s.push(Rec::Pipeline(2, Pipeline::Wgpu(pipeline), [Some(layout), None]));
+        s.push(Rec::Set(0, Arc::from(Vec::<crate::draw::Slot>::new()), Arc::from(Vec::<u32>::new())));
+        for (id, block) in [bytes(&[1.0, 0.0, 0.0, 1.0]), corner.clone(), bytes(&[0.0, 1.0, 0.0, 1.0]), corner, bytes(&[0.0, 0.0, 1.0, 1.0])].into_iter().enumerate() {
+            s.push(Rec::Block(id as u32, block));
+        }
+        let draw = |pipeline: u32, color: u32, vertices: u32, x: f32, pass: Option<Box<PassOpen>>| {
+            let groups = smallvec::smallvec![GroupRec { banks: smallvec::smallvec![(0, color, 16)], set: 0, swizzles: false, dynamic: false }];
+            Rec::Draw(DrawRec { pipeline, index: None, vertex: smallvec::smallvec![vertices], groups, viewport: [x, 0.0, 2.0, 4.0, 0.0, 1.0], scissor: [0, 0, 4, 4], blend: [0.0; 4], stencil: 0, call: Call::Direct { first: 0, count: 3, instance: 0 }, pass })
+        };
+        let open = || Some(Box::new(PassOpen { colors: vec![Some(target.create_view(&Default::default()))], depth: None, timed: None }));
+        s.push(draw(1, 0, 1, 0.0, open()));
+        s.push(draw(2, 2, 3, 2.0, None));
+        let (from, to) = (target.clone(), copy.clone());
+        s.run(move |rec| {
+            let mut e = rec.encoder();
+            e.copy_texture_to_texture(from.as_image_copy(), to.as_image_copy(), from.size());
+            rec.record(e);
+        });
+        s.push(draw(1, 4, 1, 2.0, open()));
+        assert_eq!(s.rec().staging.raw_draws, 2, "threaded {threaded}: two draws recorded raw");
+        s.flush();
+        let read = |t: &wgpu::Texture| s.rgba(&Entry { surface: Surface { addr: 0, width: 4, height: 4, format: 0xd5, layers: 1 }, texture: t.clone(), written: 0 }).unwrap();
+        let halves = |rgba: Vec<u8>| (rgba[0..4].to_vec(), rgba[8..12].to_vec());
+        assert_eq!(halves(read(&copy)), (vec![255, 0, 0, 255], vec![0, 255, 0, 255]), "threaded {threaded}: the copy sees the raw draw and the wgpu one before it");
+        assert_eq!(halves(read(&target)), (vec![255, 0, 0, 255], vec![0, 0, 255, 255]), "threaded {threaded}: the last raw draw kept to its viewport");
         assert!(s.errors.lock().unwrap().is_empty(), "threaded {threaded}: {:?}", s.errors.lock().unwrap());
     }
 
