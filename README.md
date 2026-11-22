@@ -1,3 +1,5 @@
+<img src="docs/logo.png" alt="Gyroship logo" width="128">
+
 # Gyroship
 
 **Star Fox (2026) on your PC with the practice tools and mods a speedrunner dreams of.**
