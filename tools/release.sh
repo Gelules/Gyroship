@@ -27,17 +27,20 @@ grep -qx "version = \"$version\"" crates/launcher/Cargo.toml || fail "crates/lau
 [ -z "$(git status --porcelain --untracked-files=no)" ] || fail "the working tree has changes: the programs would not be the tag's"
 
 # Built in target folders of their own, so that the usual builds stay as they are, and without this
-# machine's paths, which panic messages would otherwise carry (encoded flags: a path may hold spaces).
+# machine's paths, which panic messages would otherwise carry: the repository's, Cargo's home's, and
+# the toolchain's, where rustup's rust-src component puts the standard library's sources (encoded
+# flags: a path may hold spaces).
 root=$(cygpath -w "$PWD")
 home=$(cygpath -w "${CARGO_HOME:-$USERPROFILE/.cargo}")
-CARGO_ENCODED_RUSTFLAGS=$(printf '%s\037%s' "--remap-path-prefix=$root=." "--remap-path-prefix=$home=cargo")
+sysroot=$(rustc --print sysroot)
+CARGO_ENCODED_RUSTFLAGS=$(printf '%s\037%s\037%s' "--remap-path-prefix=$root=." "--remap-path-prefix=$home=cargo" "--remap-path-prefix=$sysroot=rust")
 export CARGO_ENCODED_RUSTFLAGS
 cargo build --release -j 4 --target-dir target/dist
 (cd crates/launcher && cargo build --release -j 4 --target-dir target/dist)
 launcher=crates/launcher/target/dist/release/gyroship-launcher.exe
 tools=target/dist/release/gyroship-tools.exe
 for exe in "$launcher" "$tools"; do
-  for path in "$root" "$(cygpath -m "$PWD")" "$home" "$USERPROFILE"; do
+  for path in "$root" "$(cygpath -m "$PWD")" "$home" "$sysroot" "$USERPROFILE"; do
     if grep -qaF "$path" "$exe"; then
       fail "$exe still holds $path"
     fi
