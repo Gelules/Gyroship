@@ -9,9 +9,8 @@ pub mod compute;
 pub mod datazip;
 pub mod draw;
 pub mod mme;
+pub mod precompile;
 pub mod pushbuf;
-// ponytail: only its test uses it until the recorder's raw segments (D110 step 6a).
-#[allow(dead_code)]
 mod raw;
 mod record;
 pub mod sass;

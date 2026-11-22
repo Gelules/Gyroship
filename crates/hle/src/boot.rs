@@ -338,9 +338,42 @@ pub fn check_options(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// `precompile <exefs> --pipeline-cache DIR` (D110 step 8): the shaders of the dump's data.zip,
+/// and those past play translated, made into pipeline libraries in DIR's cache before play.
+/// Progress `done/total` on stdout (the launcher's), the report on stderr. Exit code 0 when done
+/// or when there was nothing to do, 1 on a failure, 2 on a misuse.
+fn precompile(args: &[String]) -> i32 {
+    let cache = args.iter().position(|a| a == "--pipeline-cache").and_then(|i| args.get(i + 1));
+    let (Some(exefs), Some(cache)) = (args.first(), cache) else {
+        eprintln!("usage: gyroship precompile <exefs> --pipeline-cache DIR");
+        return 2;
+    };
+    let Some(zip) = romfs_dir(Path::new(exefs)).map(|r| r.join("data.zip")) else {
+        eprintln!("gyroship: precompile: no romfs folder next to {exefs}");
+        return 2;
+    };
+    // A line per hundredth at most: the launcher shows them all.
+    let mut progress = |done: usize, total: usize| {
+        if done == total || done % (total / 100).max(1) == 0 {
+            println!("{done}/{total}");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
+    };
+    match gyroship_gpu::precompile::run(&zip, Path::new(cache), &mut progress) {
+        Ok(report) => {
+            eprintln!("gyroship: precompile: {report}");
+            0
+        }
+        Err(e) => {
+            eprintln!("gyroship: precompile: {e}");
+            1
+        }
+    }
+}
+
 /// `--help`: the options, one per line.
 pub fn usage() -> String {
-    let mut s = String::from("usage: gyroship boot <exefs> [options]\noptions:\n");
+    let mut s = String::from("usage: gyroship boot <exefs> [options]\n       gyroship precompile <exefs> --pipeline-cache DIR\noptions:\n");
     for (o, valued) in OPTIONS {
         s += &format!("  {o}{}\n", if *valued { " VALUE" } else { "" });
     }
@@ -391,6 +424,9 @@ pub struct HostWindow {
 /// [`main`], showing the frames in a host window when one is given.
 pub fn run(mut table: Vec<rt::Entry>, window: Option<HostWindow>) {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("precompile") {
+        std::process::exit(precompile(&args[1..]));
+    }
     if args.first().map(String::as_str) != Some("boot") {
         return rt::harness::main(table);
     }

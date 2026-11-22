@@ -140,12 +140,31 @@ pub(crate) struct RawMode {
     pub(crate) libraries: Option<FxMap<Part, vk::Pipeline>>,
 }
 
+/// A shaders' library of the game's (D110 step 7b): the vertex program's (its module) or the pixel
+/// program's (its module, or none), with its stage's layout and no other state of the draw's.
+/// The game makes it at its first draw and the precompiler before play (step 8) through this one
+/// description: the driver finds in its cache what the other made.
+pub(crate) fn shader_part(vertex: bool, module: Option<vk::ShaderModule>, layout: vk::PipelineLayout) -> PipelineDesc<'static> {
+    use vk::GraphicsPipelineLibraryFlagsEXT as L;
+    PipelineDesc {
+        vertex: module.filter(|_| vertex).unwrap_or_default(),
+        pixel: module.filter(|_| !vertex),
+        entries: [c"main", c"main"],
+        buffers: &[],
+        primitive: Default::default(),
+        depth_stencil: None,
+        targets: &[],
+        layout,
+        dynamic: true,
+        library: Some(if vertex { L::PRE_RASTERIZATION_SHADERS } else { L::FRAGMENT_SHADER }),
+    }
+}
+
 /// A pipeline library of the game's (D110 step 7b), by what makes it.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) enum Part {
-    /// A vertex module (serial) with its group's set layout (null without one), polygon mode and
-    /// depth clamp: the shaders before rasterization.
-    Vertex(u32, vk::DescriptorSetLayout, wgpu::PolygonMode, bool),
+    /// A vertex module (serial) with its group's set layout: the shaders before rasterization.
+    Vertex(u32, vk::DescriptorSetLayout),
     /// A pixel module (serial; none for a pipeline without one) with its group's set layout.
     Pixel(Option<u32>, vk::DescriptorSetLayout),
     /// The vertex buffers' layouts (stride, step, attributes), the topology and whether indices
@@ -334,22 +353,33 @@ impl crate::surfaces::Surfaces {
             return Ok(RawPipeline { pipeline, layout, sets });
         }
         use vk::GraphicsPipelineLibraryFlagsEXT as L;
+        if primitive.polygon_mode != wgpu::PolygonMode::Fill || primitive.unclipped_depth {
+            return Err("raw pipeline: a polygon mode or a depth clamp the libraries do not take".into());
+        }
         let null = vk::DescriptorSetLayout::null();
-        let (vset, pset) = (handles.first().copied().unwrap_or(null), handles.get(1).copied().unwrap_or(null));
+        // The vertex library's layout is its module's own set, an empty one without bindings,
+        // whatever the pairing (as the precompiler makes it, step 8): the linked layout always
+        // has set 0.
+        let vset = match handles.first() {
+            Some(&s) => s,
+            None => m.raw.set_layout(&[])?,
+        };
+        let pset = handles.get(1).copied().unwrap_or(null);
         let own = |raw: &mut Raw, sets: &[vk::DescriptorSetLayout]| raw.pipeline_layout(sets, true);
         let library = |raw: &mut Raw, part, layout| raw.pipeline(&PipelineDesc { layout, library: Some(part), ..desc });
-        let vertex_part = m.part(Part::Vertex(vs.2, vset, primitive.polygon_mode, primitive.unclipped_depth), |raw| {
-            let layout = own(raw, &if vset == null { Vec::new() } else { vec![vset] })?;
-            library(raw, L::PRE_RASTERIZATION_SHADERS, layout)
+        let vertex_part = m.part(Part::Vertex(vs.2, vset), |raw| {
+            let layout = own(raw, &[vset])?;
+            raw.pipeline(&shader_part(true, Some(vertex), layout))
         })?;
         let pixel_part = m.part(Part::Pixel(ps.map(|p| p.2), pset), |raw| {
             let layout = own(raw, &if pset == null { Vec::new() } else { vec![null, pset] })?;
-            library(raw, L::FRAGMENT_SHADER, layout)
+            raw.pipeline(&shader_part(false, pixel, layout))
         })?;
         let input = Part::Input(buffers.iter().map(|b| b.as_ref().map(|b| (b.array_stride, b.step_mode, b.attributes.to_vec()))).collect(), primitive.topology, primitive.strip_index_format.is_some());
         let input_part = m.part(input, |raw| library(raw, L::VERTEX_INPUT_INTERFACE, vk::PipelineLayout::null()))?;
         let output_part = m.part(Part::Output(targets.to_vec(), depth.map(|d| d.format)), |raw| library(raw, L::FRAGMENT_OUTPUT_INTERFACE, vk::PipelineLayout::null()))?;
-        let layout = m.raw.pipeline_layout(&handles, true)?;
+        let linked: Vec<vk::DescriptorSetLayout> = std::iter::once(vset).chain(handles.get(1).copied()).collect();
+        let layout = m.raw.pipeline_layout(&linked, true)?;
         let pipeline = m.raw.link(&[input_part, vertex_part, pixel_part, output_part], layout)?;
         Ok(RawPipeline { pipeline, layout, sets })
     }
@@ -385,11 +415,6 @@ impl Raw {
             fail_on,
             counts: Counts::default(),
         })
-    }
-
-    /// `format` as wgpu-hal makes it (Depth24PlusStencil8 may be D32_SFLOAT_S8_UINT).
-    pub(crate) fn format(&self, format: wgpu::TextureFormat) -> vk::Format {
-        unsafe { self.adapter.as_hal::<Vulkan>() }.map_or(vk::Format::UNDEFINED, |a| a.texture_format_as_raw(format))
     }
 
     /// A module from SPIR-V words (`vk::spirv`).
@@ -435,10 +460,56 @@ impl Raw {
         Ok(l)
     }
 
-    /// A render pipeline, made as wgpu-hal makes `d` (its states through wgpu-hal's `conv`), for
-    /// dynamic rendering instead of a render pass. No pipeline cache (ours is step 7's).
+    /// A render pipeline or a part of one ([`Maker::make`]), counted and kept until the device goes.
     pub(crate) fn pipeline(&mut self, d: &PipelineDesc) -> Result<vk::Pipeline, String> {
+        let since = std::time::Instant::now();
+        let made = self.maker().make(d)?;
+        match made.shaders {
+            true => {
+                self.counts.shaders += 1;
+                self.counts.compiled += u64::from(made.compiled);
+                self.counts.shader_time += since.elapsed();
+            }
+            false => self.counts.interfaces += 1,
+        }
+        self.pipelines.push(made.pipeline);
+        Ok(made.pipeline)
+    }
+
+    /// What makes pipelines on any thread: the precompiler's (step 8).
+    pub(crate) fn maker(&self) -> Maker {
+        Maker { ash: self.ash.clone(), adapter: self.adapter.clone(), varying: self.varying, cache: self.cache, fail_on: self.fail_on }
+    }
+}
+
+/// A pipeline [`Maker::make`] made: whether it has shaders, and whether they compiled (known only
+/// where a creation may fail rather than compile).
+pub(crate) struct Made {
+    pub(crate) pipeline: vk::Pipeline,
+    pub(crate) shaders: bool,
+    pub(crate) compiled: bool,
+}
+
+/// What makes pipelines, on any thread: the device, its adapter (for the formats), whether stages
+/// may vary their subgroup size, our pipeline cache, and whether a creation may fail rather than
+/// compile. The caller destroys what it makes.
+#[derive(Clone)]
+pub(crate) struct Maker {
+    pub(crate) ash: ash::Device,
+    adapter: wgpu::Adapter,
+    varying: bool,
+    cache: vk::PipelineCache,
+    pub(crate) fail_on: bool,
+}
+
+impl Maker {
+    /// A render pipeline, or one part of one (a library), made as wgpu-hal makes `d` (its states
+    /// through wgpu-hal's `conv`), for dynamic rendering instead of a render pass. What has
+    /// shaders goes through our cache, first without compiling when the device can say so.
+    pub(crate) fn make(&self, d: &PipelineDesc) -> Result<Made, String> {
         use vk::{DynamicState as D, GraphicsPipelineLibraryFlagsEXT as L};
+        // A format as wgpu-hal makes it (Depth24PlusStencil8 may be D32_SFLOAT_S8_UINT).
+        let format = |f| unsafe { self.adapter.as_hal::<Vulkan>() }.map_or(vk::Format::UNDEFINED, |a| a.texture_format_as_raw(f));
         // The part made (a library's), or all of them; each part has its own dynamic states.
         let part = d.library.unwrap_or(L::VERTEX_INPUT_INTERFACE | L::PRE_RASTERIZATION_SHADERS | L::FRAGMENT_SHADER | L::FRAGMENT_OUTPUT_INTERFACE);
         let mut dynamic = Vec::new();
@@ -488,9 +559,13 @@ impl Raw {
         let mut depth = vk::PipelineDepthStencilStateCreateInfo::default();
         let (mut depth_format, mut stencil_format) = (vk::Format::UNDEFINED, vk::Format::UNDEFINED);
         if let Some(ds) = d.depth_stencil {
-            let raw = self.format(ds.format);
+            let raw = format(ds.format);
             depth_format = if ds.format.has_depth_aspect() { raw } else { vk::Format::UNDEFINED };
             stencil_format = if ds.format.has_stencil_aspect() { raw } else { vk::Format::UNDEFINED };
+        }
+        // The game's pipelines take these per draw: their libraries then never depend on the
+        // draw's depth state (step 8: the precompiler has none).
+        if let Some(ds) = d.depth_stencil.filter(|_| !d.dynamic) {
             if ds.is_depth_enabled() {
                 depth = depth.depth_test_enable(true).depth_write_enable(ds.depth_write_enabled.unwrap_or_default()).depth_compare_op(conv::map_comparison(ds.depth_compare.unwrap_or_default()));
             }
@@ -521,7 +596,7 @@ impl Raw {
                 b = b.blend_enable(true).color_blend_op(color_op).src_color_blend_factor(color_src).dst_color_blend_factor(color_dst).alpha_blend_op(alpha_op).src_alpha_blend_factor(alpha_src).dst_alpha_blend_factor(alpha_dst);
             }
             blends.push(b);
-            formats.push(self.format(t.format));
+            formats.push(format(t.format));
         }
         let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blends);
         let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic);
@@ -555,26 +630,20 @@ impl Raw {
         // so: a miss counts as a compile, then compiles.
         let shaders = part.intersects(L::PRE_RASTERIZATION_SHADERS | L::FRAGMENT_SHADER);
         let cache = if shaders { self.cache } else { vk::PipelineCache::null() };
-        let since = std::time::Instant::now();
         let mut made = Err((Vec::new(), vk::Result::PIPELINE_COMPILE_REQUIRED));
         if shaders && self.fail_on {
             made = unsafe { self.ash.create_graphics_pipelines(cache, &[info.flags(create | vk::PipelineCreateFlags::FAIL_ON_PIPELINE_COMPILE_REQUIRED)], None) };
         }
-        if let Err((_, vk::Result::PIPELINE_COMPILE_REQUIRED)) = made {
-            self.counts.compiled += u64::from(shaders && self.fail_on);
+        let compiled = matches!(made, Err((_, vk::Result::PIPELINE_COMPILE_REQUIRED)));
+        if compiled {
             made = unsafe { self.ash.create_graphics_pipelines(cache, &[info.flags(create)], None) };
         }
-        let p = made.map_err(|(_, e)| format!("raw pipeline: {e}"))?[0];
-        match shaders {
-            true => {
-                self.counts.shaders += 1;
-                self.counts.shader_time += since.elapsed();
-            }
-            false => self.counts.interfaces += 1,
-        }
-        self.pipelines.push(p);
-        Ok(p)
+        let pipeline = made.map_err(|(_, e)| format!("raw pipeline: {e}"))?[0];
+        Ok(Made { pipeline, shaders, compiled: compiled && shaders && self.fail_on })
     }
+}
+
+impl Raw {
 
     /// A pipeline linked fast from its parts (step 7b): no link-time optimization, so that the
     /// parts need not keep what it would take.

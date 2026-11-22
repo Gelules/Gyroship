@@ -614,6 +614,28 @@ impl Bindings<'_> {
     }
 }
 
+/// The layout a stage of translation `t` takes in any draw, from its interface alone: the
+/// entries of `Bindings::layout`, in its order, but for what Vulkan does not see (texture sample
+/// types and dimensions, sampler kinds, buffer sizes). The raw path makes its set layouts and
+/// numbers its SPIR-V's bindings from it, so that the precompiler (D110 step 8), which has no
+/// draw, makes the same pipeline libraries. Every bank the program reads is bound (or the draw
+/// fails), and a texture slot has a sampler unless it is fetched or only queried.
+pub(crate) fn interface_layout(t: &Translation, visibility: wgpu::ShaderStages, dynamic: bool) -> Vec<wgpu::BindGroupLayoutEntry> {
+    let buffer = |binding: u32| wgpu::BindGroupLayoutEntry { binding, visibility, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: dynamic, min_binding_size: None }, count: None };
+    let mut entries: Vec<_> = t.interface.cbufs.iter().map(|&bank| buffer(u32::from(bank))).collect();
+    if t.interface.swizzles {
+        entries.push(buffer(shader::SWIZZLE_BINDING));
+    }
+    for (i, x) in t.interface.textures.iter().enumerate() {
+        let texture = wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false };
+        entries.push(wgpu::BindGroupLayoutEntry { binding: 32 + 2 * i as u32, visibility, ty: texture, count: None });
+        if !(x.fetch || x.query) {
+            entries.push(wgpu::BindGroupLayoutEntry { binding: 33 + 2 * i as u32, visibility, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None });
+        }
+    }
+    entries
+}
+
 impl<T> Made<T> {
     /// Its label, the first time it is found still being made `after` it was asked for.
     fn overdue(&mut self, after: std::time::Duration) -> Option<String> {
@@ -955,8 +977,10 @@ impl Surfaces {
                 let buffers: Vec<(u64, wgpu::VertexStepMode, Vec<wgpu::VertexAttribute>)> = layouts.iter().map(|(_, step, stride, attributes)| (*stride, *step, attributes.to_vec())).collect();
                 let label = format!("p{:016x}+{}", vs.0.key, ps.as_ref().map_or("none".into(), |p| format!("{:016x}", p.0.key)));
                 let mut made = if self.raw.as_ref().is_some_and(|m| m.wants(vs.0.key, ps.as_ref().map(|p| p.0.key))) {
-                    // Under GYROSHIP_RAW, a raw pipeline (D110 step 6), made here at once.
-                    let entries: SmallVec<[Vec<wgpu::BindGroupLayoutEntry>; 2]> = groups.iter().filter(|&&id| id != u32::MAX).map(|&id| self.cache.group_entries[id as usize].clone()).collect();
+                    // Under GYROSHIP_RAW, a raw pipeline (D110 step 6), made here at once; its groups'
+                    // layouts from the translations alone (step 8: as the precompiler makes them).
+                    let stages = [(Some(&vs.0), wgpu::ShaderStages::VERTEX), (ps.as_ref().map(|p| &p.0), wgpu::ShaderStages::FRAGMENT)];
+                    let entries: SmallVec<[Vec<wgpu::BindGroupLayoutEntry>; 2]> = groups.iter().zip(stages).zip(&dynamic).filter(|((id, _), _)| **id != u32::MAX).filter_map(|((_, (t, visibility)), &dynamic)| Some(interface_layout(t?, visibility, dynamic))).collect();
                     let entries: SmallVec<[&[wgpu::BindGroupLayoutEntry]; 2]> = entries.iter().map(Vec::as_slice).collect();
                     let buffers: Vec<Option<wgpu::VertexBufferLayout>> = buffers.iter().map(|(stride, step, attributes)| Some(wgpu::VertexBufferLayout { array_stride: *stride, step_mode: *step, attributes })).collect();
                     let p = self.raw_pipeline(&vs, ps.as_deref(), &buffers, *primitive, color_states, depth_state.as_ref(), &entries)?;
@@ -2165,6 +2189,40 @@ mod tests {
         assert_eq!(s.group_id(&t2, 1, false, &wide), many);
         assert_eq!(s.cache.group_ids.len(), memos, "no memo past 64 slots");
         assert_eq!(s.cache.group_entries[many as usize], wide.layout(wgpu::ShaderStages::FRAGMENT));
+    }
+
+    /// A stage's layout from its translation alone (the raw path's and the precompiler's, D110
+    /// step 8) binds what a draw binds: the same bindings, in the same order (the recorder writes
+    /// a set's descriptors in that order), of the same kinds, the buffers at dynamic offsets when
+    /// asked; a texture fetched or only queried has no sampler.
+    #[test]
+    fn the_interface_layout_binds_what_a_draw_binds() {
+        let Ok(s) = Surfaces::headless(crate::Backend::Auto) else {
+            eprintln!("no GPU adapter: test skipped");
+            return;
+        };
+        let size = wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 };
+        let texture = s.device.create_texture(&wgpu::TextureDescriptor { label: None, size, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::R8Unorm, usage: wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[] });
+        let view = texture.create_view(&Default::default());
+        let sampler = s.device.create_sampler(&Default::default());
+        let slot = |sampled: bool| Slot { view: view.clone(), sampler: sampled.then(|| sampler.clone()), raw_sampler: ash::vk::Sampler::null(), depth: false, compare: false, dimension: wgpu::TextureViewDimension::D2 };
+        let read = |fetch, query| shader::Texture { handle: shader::Handle::CBuf { bank: 2, offset: 0x70 }, dim: crate::sass::texture::TexDim::D2, compare: false, fetch, query };
+        let interface = Interface { cbufs: [0, 3].into(), swizzles: true, textures: vec![read(false, false), read(true, false), read(false, true)], ..Default::default() };
+        let t = Translation { key: 1, stage: Stage::Pixel, wgsl: String::new(), interface };
+        let sizes = BTreeMap::new();
+        let drawn = Bindings { cbufs: smallvec![(0, 0), (3, 1)], textures: vec![slot(true), slot(false), slot(false)].into(), swizzles: Some(vec![0u32; 3].into()), set: 0, sizes: &sizes };
+        let kind = |e: &wgpu::BindGroupLayoutEntry| (e.binding, std::mem::discriminant(&e.ty), matches!(e.ty, wgpu::BindingType::Buffer { has_dynamic_offset: true, .. }), e.visibility);
+        for dynamic in [false, true] {
+            let mut want = drawn.layout(wgpu::ShaderStages::FRAGMENT);
+            for e in &mut want {
+                if let wgpu::BindingType::Buffer { has_dynamic_offset, .. } = &mut e.ty {
+                    *has_dynamic_offset = dynamic;
+                }
+            }
+            let got = interface_layout(&t, wgpu::ShaderStages::FRAGMENT, dynamic);
+            assert_eq!(got.iter().map(kind).collect::<Vec<_>>(), want.iter().map(kind).collect::<Vec<_>>(), "dynamic {dynamic}");
+            assert_eq!(got.len(), 7, "two banks, the swizzles, three textures, one sampler");
+        }
     }
 
     /// A texture of 32 MiB or more uploaded while a draw resolves its slots no

@@ -11,37 +11,12 @@
 //!
 //! Its output names programs by their keys and offsets only; keep it under Data all the same.
 
-use gyroship_gpu::datazip::DataZip;
-use gyroship_gpu::draw::{TABLE_MAX, jump_targets};
-use gyroship_gpu::sass::{self, Blob, Stage};
+use gyroship_gpu::draw::jump_targets;
+use gyroship_gpu::precompile::{inventory, table_bytes};
+use gyroship_gpu::sass::{self, Stage};
 use gyroship_gpu::shader::{self, JumpTable, Options, cache, sph::Sph};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
-
-/// A program of data.zip: its stage, its code as the GPU reads it (SPH then program for the
-/// graphics stages), the blob's whole code section (the program, padding, then data), its
-/// control section, and how many blobs hold it.
-pub(crate) struct Program {
-    pub(crate) stage: Stage,
-    pub(crate) code: Vec<u8>,
-    section: Vec<u8>,
-    control: Vec<u8>,
-    blobs: usize,
-}
-
-impl Program {
-    /// The offset in the code section where a jump table's bank starts: the first data word
-    /// after the program and its padding (the rule play confirmed, 111 programs of 111).
-    fn data_start(&self) -> usize {
-        let end = self.code.len();
-        end + 16 * sass::words(&self.section[end.min(self.section.len())..]).take_while(|w| w.opcode() == sass::NOP || w.0 == 0).count()
-    }
-
-    /// The targets of `tables` as the blob holds them (the rule of `data_start`).
-    pub(crate) fn blob_targets(&self, tables: &[JumpTable]) -> BTreeSet<usize> {
-        jump_targets(tables, &table_bytes(tables, &self.section, self.data_start()), self.code.len())
-    }
-}
 
 /// Where a program's table bank may start in its blob, by name: the start of the data after
 /// the program's padding, the program's end, the section's start, the program's end rounded
@@ -189,55 +164,4 @@ pub fn run(zip: &Path, root: &Path, exefs: Option<&Path>) -> super::Result<bool>
         println!("  {key:016x} {stage:?}: {} bytes, {} variants; in the modules: {}", bytes.len(), options.len(), if modules.is_none() { "not looked for".to_string() } else if found.is_empty() { "no".to_string() } else { found.join(" ") });
     }
     Ok(true)
-}
-
-/// The programs of data.zip's shader blobs, by key: the first blob of each, and how many.
-pub(crate) fn inventory(zip: &Path) -> super::Result<BTreeMap<u64, Program>> {
-    let mut z = DataZip::open(zip)?;
-    let entries = z.entries.clone();
-    let mut programs: BTreeMap<u64, Program> = BTreeMap::new();
-    for e in &entries {
-        if e.size < 0x18 || z.head(e, 4)? != sass::BLOB_MAGIC.to_le_bytes() {
-            continue;
-        }
-        let bytes = z.read(e)?;
-        let Some(blob) = Blob::parse(&bytes) else { continue };
-        let stage = blob.stage();
-        let found = if stage == Stage::Compute { sass::compute_key(blob.code) } else { sass::program_key(blob.code) };
-        let Some((key, len)) = found else { continue };
-        programs.entry(key).and_modify(|p| p.blobs += 1).or_insert_with(|| Program { stage, code: blob.code[..len].to_vec(), section: blob.code.to_vec(), control: blob.control.to_vec(), blobs: 1 });
-    }
-    Ok(programs)
-}
-
-/// Each table's bytes when its bank starts at `at` in `data`, read as the renderer reads a
-/// bound bank: its entries when known, else up to `TABLE_MAX` bytes, never past the data.
-fn table_bytes(tables: &[JumpTable], data: &[u8], at: usize) -> Vec<Vec<u8>> {
-    tables
-        .iter()
-        .map(|&(_, _, offset, entries)| {
-            let start = (at + usize::from(offset)).min(data.len());
-            let len = entries.map_or(TABLE_MAX, |n| 4 * n as usize).min(data.len() - start);
-            data[start..start + len].to_vec()
-        })
-        .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A table read where the blob holds it gives the targets; read a word further, others.
-    #[test]
-    fn tables_are_read_where_the_bank_starts() {
-        // Two entries, absolute: instructions 3 and 5 (byte offsets 0x30 and 0x50).
-        let mut data = vec![0u8; 8];
-        data.extend(0x30u32.to_le_bytes());
-        data.extend(0x50u32.to_le_bytes());
-        let tables: Vec<JumpTable> = vec![(1, 0, 0, Some(2))];
-        assert_eq!(jump_targets(&tables, &table_bytes(&tables, &data, 8), 0x100), BTreeSet::from([3, 5]));
-        assert_ne!(jump_targets(&tables, &table_bytes(&tables, &data, 12), 0x100), BTreeSet::from([3, 5]));
-        // Past the data: an empty table, no panic.
-        assert!(jump_targets(&tables, &table_bytes(&tables, &data, 64), 0x100).is_empty());
-    }
 }

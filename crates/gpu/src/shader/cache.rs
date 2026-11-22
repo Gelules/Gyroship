@@ -161,19 +161,34 @@ pub fn entries(root: &Path) -> (Vec<Stored>, usize) {
         for file in std::fs::read_dir(build.path()).into_iter().flatten().flatten() {
             let name = file.file_name().to_string_lossy().into_owned();
             let Some(key) = name.strip_suffix(".bin").and_then(|n| u64::from_str_radix(n.get(..16)?, 16).ok()) else { continue };
-            // The body's first parts: the naga module after them is left unread.
-            let decoded = std::fs::read(file.path()).ok().and_then(|bytes| {
-                let (sum, body) = bytes.split_at_checked(8)?;
-                (*sum == crate::sass::fnv(body).to_le_bytes()).then_some(())?;
-                postcard::from_bytes::<(Vec<u8>, Options, u64, Translation)>(&lz4_flex::block::decompress_size_prepended(body).ok()?).ok()
-            });
-            match decoded {
+            match std::fs::read(file.path()).ok().and_then(|bytes| head(&bytes)) {
                 Some((code, options, _, t)) => out.push(Stored { build: folder.clone(), key, code, options, stage: t.stage, interface: t.interface }),
                 None => unread += 1,
             }
         }
     }
     (out, unread)
+}
+
+/// The names of this build's entries under `root` (a `--pipeline-cache` folder's `shaders`),
+/// without reading them: what the precompiler has seen of past play (D110 step 8).
+pub fn this_build_names(root: &Path) -> std::collections::BTreeSet<String> {
+    std::fs::read_dir(root.join(BUILD)).into_iter().flatten().flatten().map(|f| f.file_name().to_string_lossy().into_owned()).filter(|n| n.ends_with(".bin")).collect()
+}
+
+/// This build's entries under `root` named in `names`: each one's name, the options it was made
+/// with and its translation, WGSL included (the precompiler's vertex programs, D110 step 8). An
+/// entry that does not read is left out.
+pub fn this_build(root: &Path, names: &std::collections::BTreeSet<String>) -> Vec<(String, Options, Translation)> {
+    names.iter().filter_map(|name| std::fs::read(root.join(BUILD).join(name)).ok().and_then(|bytes| head(&bytes)).map(|(_, options, _, t)| (name.clone(), options, t))).collect()
+}
+
+/// An entry's first parts (code, options, making time, translation), when its checksum holds and
+/// they decode with this build's types; the naga module after them is left unread.
+fn head(bytes: &[u8]) -> Option<(Vec<u8>, Options, u64, Translation)> {
+    let (sum, body) = bytes.split_at_checked(8)?;
+    (*sum == crate::sass::fnv(body).to_le_bytes()).then_some(())?;
+    postcard::from_bytes::<(Vec<u8>, Options, u64, Translation)>(&lz4_flex::block::decompress_size_prepended(body).ok()?).ok()
 }
 
 /// An entry's file name: the program key, and a hash of the options.

@@ -72,6 +72,11 @@ fn callback<'a>(f: impl for<'arg, 'pnext> FnOnce(vulkan::CreateDeviceCallbackArg
     Box::new(f)
 }
 
+/// What `adapter`'s device would have beyond wgpu's, without opening it; None off Vulkan.
+pub(crate) fn extras(adapter: &wgpu::Adapter) -> Option<Extras> {
+    unsafe { adapter.as_hal::<Vulkan>() }.map(|hal| supported(&hal))
+}
+
 /// The extras `hal` can have: the extensions it lists, the features it reports.
 fn supported(hal: &vulkan::Adapter) -> Extras {
     let caps = hal.physical_device_capabilities();

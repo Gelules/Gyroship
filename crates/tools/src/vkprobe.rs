@@ -21,7 +21,6 @@
 //! of them: the times are a first run's. The SPIR-V comes from naga's writer. The output names
 //! programs by their keys only; keep it under Data all the same.
 
-use crate::coverage;
 use ash::vk;
 use gyroship_gpu::sass::Stage;
 use gyroship_gpu::shader::sph::Interp;
@@ -101,7 +100,7 @@ pub fn run(a: &Probe) -> super::Result<bool> {
 fn programs(zip: &Path, limit: usize) -> R<Vec<(Translation, bool)>> {
     let mut out = Vec::new();
     let mut counts: HashMap<Stage, usize> = HashMap::new();
-    for (_, p) in coverage::inventory(zip).map_err(|e| e.to_string())? {
+    for (_, p) in gyroship_gpu::precompile::inventory(zip).map_err(|e| e.to_string())? {
         if !matches!(p.stage, Stage::Vertex | Stage::Pixel) || counts.get(&p.stage).is_some_and(|n| *n >= limit) {
             continue;
         }
