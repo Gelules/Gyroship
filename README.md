@@ -104,7 +104,7 @@ card, 16 GB of RAM, and your own dump of the game with its update. What building
 (Rust, Microsoft's C++ build tools, the Visual C++ runtime), the launcher installs on your click
 when it is missing. Here is one install from zero, on drive G:; any folders will do.
 
-**Prefer a video?** [Watch the full install guide on YouTube](https://youtu.be/KbWTHJavYuE): the
+**Prefer a video?** [Watch the full install guide on YouTube](https://www.youtube.com/watch?v=xkPR-b5stLo): the
 same steps, from zero to playing.
 
 1. **Get the sources.** From the
