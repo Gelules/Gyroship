@@ -113,11 +113,11 @@ when it is missing. Here is one install from zero, on drive G:; any folders will
 
 2. **Get the programs** of the same release: unzip `gyroship-<version>-windows-x64.zip` in a
    folder of its own. It holds the launcher, the tools and `SDL3.dll` for gamepads and sound, with
-   their licences: nothing to build. Add an empty folder for your data (saves, shader cache,
-   logs). Here: `G:\Gyroship\Test`, with its folder `data`. The release's `SHA256SUMS.txt` holds
-   both archives' SHA-256; `certutil -hashfile <archive> SHA256` prints an archive's, to compare.
+   their licences: nothing to build. Here: `G:\Gyroship\Test`. The release's `SHA256SUMS.txt`
+   holds both archives' SHA-256; `certutil -hashfile <archive> SHA256` prints an archive's, to
+   compare.
 
-   ![The programs, their licences and the data folder](docs/install/2-programs.png)
+   ![The programs and their licences](docs/install/2-programs.png)
 
 3. **Find your dump's `exefs` folder**, the update's, with its `romfs` folder next to it. Here:
    `G:\Gyroship\Dump\update\exefs`.
@@ -126,8 +126,9 @@ when it is missing. Here is one install from zero, on drive G:; any folders will
 
 4. **Start `gyroship-launcher.exe` and open Setup.** Windows may first warn that it does not know
    the program: More info, then Run anyway. In step 1, give the sources' folder as the Repository
-   and your data folder as the Data folder, then press "Use the data folder for the save and the
-   cache".
+   and a folder for your data (saves, shader cache, mods, logs) as the Data folder, then press "Use
+   the data folder for the save and the cache": the launcher makes the folders. Here:
+   `G:\Gyroship\Test\data`.
 
    ![Setup, step 1: the folders](docs/install/4-folders.png)
 
@@ -143,12 +144,13 @@ when it is missing. Here is one install from zero, on drive G:; any folders will
 
 6. **Back in Setup, press Set up everything.** It installs what is missing (you accept the
    packages' licences, and the C++ tools ask for administrator rights), recompiles the game from
-   your dump (about two minutes) and builds it (a few minutes the first time), until it says Done.
+   your dump (about two minutes), builds it (a few minutes the first time) and builds the mods from
+   your dump (a few seconds), until it says Done.
 
    ![Setup: everything done](docs/install/7-done.png)
 
 7. **Press Play.** To practise, give Play the repository's `templates\practice.txt` as Practice
-   file ([docs/practice.md](docs/practice.md)).
+   file ([docs/practice.md](docs/practice.md)); to play with a mod, pick it in the Mod list.
 
    ![Play: ready](docs/install/8-play.png)
 
