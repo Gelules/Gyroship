@@ -7,8 +7,10 @@ says whether your dump is that update): `probes.txt`, the probe list compiled in
 `practice.txt`, the practice file; `hooks.txt`, which unlocks the game's debug menu. With that
 build, use them as they are. With another one, Making a practice file, below, says how the values
 were found. The
-mods (QUIT GAME, the game's mission timer, another vehicle in a mission) are layer folders of
-replacement files built from your own dump, which the repository does not hold. There are no save
+mods (QUIT GAME, the game's mission timer, another vehicle in a mission, the eShop demo's lines,
+the tutorial's mouse lesson) are layer folders of replacement files that `gyroship-tools mods`
+builds from your own dump (Building the mods, below): the repository holds no file of the game,
+only the values read in it that the builds need, in `templates/mods.txt`. There are no save
 states, no speed change and no menu of Gyroship's own; options are chosen at launch.
 
 ## Using a practice file
@@ -144,8 +146,8 @@ debug menu" box; without it the line shows and does nothing). The game then
 shuts itself down and the process exits with code 0; the save is unchanged. Verified by
 deterministic replays in English, French and Japanese and by a real-time run without a window, then
 used in a window, in French: the title menu line twice and the pause menu choice three times, in
-two missions (not in the tutorial). The repository holds the generic mechanism and the `quit` hook,
-but no script that builds those entries: this is not packaged for other players yet.
+two missions (not in the tutorial). `gyroship-tools mods` builds those entries from your own dump
+(Building the mods, below).
 
 ## Another vehicle in a mission
 
@@ -157,4 +159,25 @@ them. The three levels of Andross and the tutorial keep the Arwing. Tried withou
 mission of each other kind: the vehicle is there, its code runs, the mission goes on and nothing is
 journaled as an anomaly. Then, in a window: the first mission with the Blue-Marine for about 9
 minutes, and with the Landmaster to its results screen, then Meteo with the Landmaster for 2
-minutes. As for QUIT GAME, the repository holds no script that builds those entries.
+minutes. As for QUIT GAME, `gyroship-tools mods` builds those entries from your own dump.
+
+## Building the mods
+
+`gyroship-tools mods <exefs> --out <folder>` builds every mod from your own dump, one layer folder
+each, in a few seconds; the launcher's Setup does it into `<data folder>\practice`, where Play's
+Mod list finds them (step 6, Build the mods). Each layer is the practice layer plus its own changes:
+
+| Folder | Mod |
+|---|---|
+| `layer` | QUIT GAME in the pause and title menus, and the mission timer |
+| `layer-demo` | the eShop demo's lines in the main menu (play on a fresh copy of the save: METEO starts a new campaign) |
+| `layer-mouse` | the tutorial's mouse question within a minute or two of flight |
+| `layer-arwing`, `layer-landmaster`, `layer-bluemarine` | that vehicle in every mission whose own is another |
+
+A layer holds the entries of the game's asset archive it replaces, rebuilt from your own: each edit
+inserts or replaces a few lines of the engine's JSON text, keeps every other byte, and checks what
+it relies on, so a dump of another build stops the build with a message instead of giving a wrong
+layer. The values read in the game that the edits need are in `templates/mods.txt`, for the update
+Gyroship targets. Nothing of the game is in the repository or in a release: each player makes their
+own layers. On the targeted update, every file of the six layers is byte for byte the one the
+scripts that first made them wrote.

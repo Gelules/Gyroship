@@ -197,6 +197,11 @@ pub fn step(s: &Settings, kind: &str) -> Result<(PathBuf, Vec<String>, PathBuf),
             let line = vec!["precompile".to_string(), need("the exefs folder", &s.exefs)?, "--pipeline-cache".into(), need("the shader cache folder", &s.cache)?];
             (game_exe(s, &repo), line, repo.into())
         }
+        // The mods, from the dump, where Play's Mod list looks: the data folder's practice folder.
+        "mods" => {
+            let out = PathBuf::from_iter([need("the data folder", &s.data)?.as_str(), "practice"]);
+            (tools, vec!["mods".to_string(), need("the exefs folder", &s.exefs)?, "--out".into(), out.to_string_lossy().into_owned()], repo.into())
+        }
         _ => return Err(format!("{kind} is no setup step")),
     })
 }
@@ -338,11 +343,12 @@ pub struct Checks {
     pub dump: Option<String>,
     pub dump_known: Option<bool>,
     /// The tools built, the game recompiled (its project there), the game built, its shaders
-    /// precompiled (since that game was built).
+    /// precompiled (since that game was built), the mods built (since the tools were).
     pub tools: bool,
     pub recompiled: bool,
     pub built: bool,
     pub shaders: bool,
+    pub mods: bool,
 }
 
 /// Where new versions are published, the repository on GitHub (its Releases), and this
@@ -841,6 +847,8 @@ pub fn checks(s: &Settings) -> Checks {
     // its runs, so newer than the game it ran for once done.
     let precompiled = if s.cache.is_empty() { None } else { fs::read_dir(Path::new(&s.cache).join("vulkan")).into_iter().flatten().flatten().filter_map(|d| time(d.path().join("precompiled.txt"))).max() };
     let played = if repo.is_none() { time(game_exe(s, &s.repo)) } else { None };
+    // The mods: the practice layer, which every mod comes with, made since the tools were built.
+    let mods = if Path::new(&s.data).is_absolute() { time(PathBuf::from_iter([s.data.as_str(), "practice", "layer", "about.txt"])) } else { None };
     Checks {
         setup,
         folders,
@@ -851,6 +859,7 @@ pub fn checks(s: &Settings) -> Checks {
         recompiled: project.is_some() && project >= tools.max(probes) && probed,
         built: game.is_some() && game >= project,
         shaders: played.is_some() && precompiled >= played,
+        mods: mods.is_some() && mods >= tools,
     }
 }
 

@@ -250,8 +250,13 @@ fn checks_say_what_the_setup_and_the_dump_lack() {
     let header = |id: &[u8]| [b"NSO0".as_slice(), &[0; 0x3c], id, &[0; 0x2c]].concat();
     let ours: Vec<u8> = (0..20).map(|i| u8::from_str_radix(&id[2 * i..2 * i + 2], 16).unwrap()).collect();
     fs::write(dump.join("exefs/main"), header(&ours)).unwrap();
-    let everything = gyroship_launcher::Checks { setup: Vec::new(), folders: true, exefs: None, dump: Some(id.into()), dump_known: Some(true), tools: true, recompiled: true, built: true, shaders: false };
+    let everything = gyroship_launcher::Checks { setup: Vec::new(), folders: true, exefs: None, dump: Some(id.into()), dump_known: Some(true), tools: true, recompiled: true, built: true, shaders: false, mods: false };
     assert_eq!(checks(&s), everything);
+    // The mods: the practice layer made since the tools were built.
+    fs::create_dir_all(data.join("practice/layer")).unwrap();
+    fs::write(data.join("practice/layer/about.txt"), "a layer").unwrap();
+    assert!(checks(&s).mods);
+    fs::remove_dir_all(data.join("practice")).unwrap();
     // The shaders: a precompiler's signature (any shader build's folder) newer than the game.
     let cache = dir.join("cache");
     let cached = Settings { cache: text(&cache), ..s.clone() };
@@ -397,6 +402,12 @@ fn setup_steps_are_the_tools_command_lines() {
     let chosen = step(&Settings { cache: cache.clone(), build: "C:\\kept\\gyroship.exe".into(), ..s.clone() }, "shaders").unwrap().0;
     assert_eq!(chosen, PathBuf::from("C:\\kept\\gyroship.exe"));
     assert!(step(&s, "shaders").unwrap_err().contains("the shader cache folder is not set"));
+    // The mods: the tools build them from the dump, into the data folder's practice folder.
+    let data = root.join("data").to_string_lossy().into_owned();
+    let practice = PathBuf::from_iter([data.as_str(), "practice"]).to_string_lossy().into_owned();
+    let (program, line, folder) = step(&Settings { data: data.clone(), ..s.clone() }, "mods").unwrap();
+    assert_eq!((program, words(&line), folder), (tools.clone(), vec!["mods", exefs.as_str(), "--out", practice.as_str()], PathBuf::from(&repo)));
+    assert!(step(&s, "mods").unwrap_err().contains("the data folder is not set"));
     // The installs, through winget, need no folder of the player's.
     let (program, line, _) = step(&Settings::default(), "install-rust").unwrap();
     let common = ["--exact", "--source", "winget", "--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity"];

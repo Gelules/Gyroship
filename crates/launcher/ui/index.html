@@ -120,7 +120,7 @@
       <fieldset>
         <legend>Mods</legend>
         <div class="grid">
-          <label class="field wide"><span>Mod</span><select data-key="layer" id="layers"></select><small class="help">Changes to the game, built from your own copy: another vehicle, QUIT GAME, the eShop demo's lines. Gyroship cannot build them yet: their build scripts are on their way. One at a time, from the folders named layer… in the data folder's practice folder.</small></label>
+          <label class="field wide"><span>Mod</span><select data-key="layer" id="layers"></select><small class="help">Changes to the game, built from your own copy by Setup (step 6): another vehicle, QUIT GAME and the mission timer, the eShop demo's lines, the tutorial's mouse lesson in a minute or two. One at a time, from the folders named layer… in the data folder's practice folder.</small></label>
         </div>
         <div class="switches">
           <label class="switch"><input type="checkbox" data-key="debug_menu"><span>Unlock the game's debug menu <small>Mission select and cheats, with any mod. It also makes the mods' QUIT GAME work in the title menu. It writes to your save: play on a fresh copy.</small></span></label>
@@ -146,7 +146,7 @@
         <button id="setup-all" class="go" disabled>Set up everything</button>
         <small class="note" id="setup-all-note"></small>
       </div>
-      <p class="explain">Does the steps below that are not done yet, in order, and stops at the first one that fails. It installs what is missing through winget, as step 2 does: pressing it accepts the same licences, and the C++ tools ask for administrator rights. It then builds the tools, recompiles the game and builds it, and makes its shaders when Play uses the precompiled ones.</p>
+      <p class="explain">Does the steps below that are not done yet, in order, and stops at the first one that fails. It installs what is missing through winget, as step 2 does: pressing it accepts the same licences, and the C++ tools ask for administrator rights. It then builds the tools, recompiles the game and builds it, makes its shaders when Play uses the precompiled ones, and builds the mods when your copy is the update they are made for.</p>
       <div class="problems" id="problems" hidden>
         <svg class="alert-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.5 2.5 20h19z"/><path class="glyph" d="M12 9.5v5M12 17.2v.3"/></svg>
         <div>
@@ -196,6 +196,11 @@
           <div class="step-head"><span class="lamp" id="lamp-shaders" aria-hidden="true"></span><h3>5. Make the shaders</h3></div>
           <p class="explain">For Play's "Use the precompiled shaders": compiles for your graphics card, into the shader cache folder, the game's shaders that can be made in advance, so that fewer are compiled while you play. A few minutes the first time. Then Play does it again by itself before each game: in seconds, adding those your last games met for the first time, or in minutes after a new graphics driver. A graphics card that cannot use them is told, and the step still ends well.</p>
           <div class="row"><button data-step="shaders">Make the shaders</button></div>
+        </li>
+        <li class="step">
+          <div class="step-head"><span class="lamp" id="lamp-mods" aria-hidden="true"></span><h3>6. Build the mods</h3></div>
+          <p class="explain">Builds the mods of Play's Mod list from your own copy of the game: another vehicle in a mission, QUIT GAME and the mission timer, the eShop demo's lines, the tutorial's mouse lesson in a minute or two. Nothing of the game comes with Gyroship. A few seconds, for the update the practice files are made for.</p>
+          <div class="row"><button data-step="mods">Build the mods</button></div>
         </li>
       </ol>
       <p class="hint">One step at a time, never during a game. Their messages show below.</p>

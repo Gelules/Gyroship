@@ -124,15 +124,16 @@ the bottom of Play says so.
   and the three overlays, one box each (speed, frame rate, boost release markers); without a
   practice file they are greyed. Mods: Mod picks one layer folder of `<data folder>/practice` (a
   folder whose name starts with `layer`), shown by the first line of its `about.txt` and listed by
-  it, so that alike mods sit together; the repository holds no layer. "Unlock the game's debug
+  it, so that alike mods sit together; Setup's step 6 builds them there from your dump. "Unlock the game's debug
   menu" starts the game with the repository's `templates/hooks.txt`, with any mod, unless the Hooks
   file field names a file of your own, which then always wins. The window closes while the game
   runs, so that its memory is the game's, and comes back with how the session ended.
   `gyroship-launcher --play` starts the game at once with the saved settings, for a shortcut: after
   a game that ended normally, the launcher ends too, without a window.
-- **Setup**, in five steps, each with a lamp (green: done; red: to fix). Set up everything, at the
+- **Setup**, in six steps, each with a lamp (green: done; red: to fix). Set up everything, at the
   top, does those not done yet in order (step 5 only with the precompiled shaders on and a shader
-  cache folder), reading the lamps again after each one, and stops at the
+  cache folder, step 6 only for the update the templates are made for), reading the lamps again
+  after each one, and stops at the
   first that fails or stays undone; it waits for both folders and for the exefs folder set in Play.
   One by one:
   1. the two folders, with a button that sets the empty Save and Shader cache folders to
@@ -154,7 +155,10 @@ the bottom of Play says so.
      the first time, then about 16 s);
   5. Make the shaders, for Play's precompiled shaders: `gyroship precompile` (above), by the game
      Play starts, into the shader cache folder. Its lamp is green when they were made after that
-     game was built.
+     game was built;
+  6. Build the mods: `gyroship-tools mods`, from your dump into `<data folder>\practice`, where the
+     Mod list finds them ([practice.md](practice.md), Building the mods). A few seconds. Its lamp
+     is green when the mods were made after the tools were built.
 
   One step at a time, its output on the page. The builds use four jobs (`-j 4`, for 16 GB of RAM)
   and download the crates they lack, at the versions of that lock; they take

@@ -315,9 +315,9 @@ fn run_step(app: AppHandle, busy: State<Busy>, settings: Settings, kind: String)
     if !folder.is_dir() {
         return Err(format!("{} does not exist{}", folder.display(), if kind == "build" { ": recompile the game first" } else { "" }));
     }
-    // Recompile runs the tools: a release brings them, the tools step builds them, or they were
-    // downloaded next to the launcher.
-    if kind == "recompile" && !program.is_file() {
+    // Recompile and the mods run the tools: a release brings them, the tools step builds them, or
+    // they were downloaded next to the launcher.
+    if ["recompile", "mods"].contains(&kind.as_str()) && !program.is_file() {
         return Err(format!("{} does not exist: build the tools first (Build the tools, above), or put gyroship-tools.exe next to the launcher", program.display()));
     }
     if busy.0.swap(true, Relaxed) {

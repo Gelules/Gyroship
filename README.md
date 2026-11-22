@@ -56,9 +56,9 @@ own code, with the numbers to prove it.
 - **The eShop demo's menu lines** in the full game.
 - **The tutorial's mouse lesson in a minute or two**, to practise the mouse controls.
 
-Pick a mod in the launcher and play; with the debug menu box ticked, the mods' QUIT GAME also works
-from the title menu. Mods are built from your own copy of the game; their build scripts are on
-their way to this repository.
+The launcher's Setup builds them from your own copy of the game, in a few seconds: nothing of the
+game comes with Gyroship. Pick a mod in the launcher and play; with the debug menu box ticked, the
+mods' QUIT GAME also works from the title menu.
 
 ## Switch 2 Joy-Con and mouse controls
 
@@ -89,7 +89,7 @@ its options. Xbox, PlayStation and other gamepads work too, and so does the keyb
 | Frame rate | 60 fps, on both test PCs |
 | Practice tools | Boost modes, on-screen speed, frame rate and markers, millisecond timer |
 | Debug menu | Mission select and cheats, one box in the launcher |
-| Mods | Chosen in the launcher; their build scripts are on their way |
+| Mods | Built from your own copy by the launcher, then chosen in it |
 | Controls | Keyboard, Xbox, PlayStation and other gamepads, Switch 2 Joy-Con |
 | Mouse controls | Through the Joy-Con, as on the console |
 | Sound and languages | The game's audio and its 14 text regions |

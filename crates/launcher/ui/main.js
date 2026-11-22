@@ -108,6 +108,7 @@ async function refreshChecks() {
   lamp('lamp-recompile', c.recompiled ? 'on' : c.folders && !c.tools ? 'bad' : '');
   lamp('lamp-build', c.built ? 'on' : '');
   lamp('lamp-shaders', c.shaders ? 'on' : '');
+  lamp('lamp-mods', c.mods ? 'on' : '');
   lamp('lamp-tools', c.tools ? 'on' : c.folders ? 'bad' : '');
   $('tools-state').textContent = c.tools ? "Gyroship's tools are built." : c.folders ? "Gyroship's tools are not built yet." : "Gyroship's tools: set the folders first (step 1).";
   // Offered even once built: a Git clone's tools are built again after each update.
@@ -183,7 +184,7 @@ function busy(on) {
 // it stops at the first that fails, or that ends still undone. The steps it ran, while it runs.
 let all = null;
 let ended = '';
-const DOING = { 'install-rust': 'installing Rust', 'install-cpp': "installing Microsoft's C++ build tools", 'install-runtime': 'installing the Visual C++ runtime', tools: "building Gyroship's tools", recompile: 'recompiling the game', build: 'building the game', shaders: 'making the shaders' };
+const DOING = { 'install-rust': 'installing Rust', 'install-cpp': "installing Microsoft's C++ build tools", 'install-runtime': 'installing the Visual C++ runtime', tools: "building Gyroship's tools", recompile: 'recompiling the game', build: 'building the game', shaders: 'making the shaders', mods: 'building the mods' };
 
 // The button needs the paths the steps read: the two folders, and the exefs folder for Recompile.
 function showSetupAll() {
@@ -201,7 +202,9 @@ function nextStep() {
   if (!n.rust_ok && n.rust) return { stop: `Rust ${n.rust} is too old: run rustup update, then press again.` };
   // The shaders, for Play's precompiled shaders only, in the shader cache folder.
   const shaders = settings.vulkan && settings.cache && !c.shaders;
-  return install(n.rust_ok, 'install-rust', 'Rust') || install(n.cpp, 'install-cpp', "Microsoft's C++ build tools") || install(n.runtime, 'install-runtime', 'The Visual C++ runtime') || (!c.tools && { kind: 'tools' }) || (!c.recompiled && { kind: 'recompile' }) || (!c.built && { kind: 'build' }) || (shaders && { kind: 'shaders' }) || {};
+  // The mods, for the update the templates are made for only (another one has other values).
+  const mods = c.dump_known === true && !c.mods;
+  return install(n.rust_ok, 'install-rust', 'Rust') || install(n.cpp, 'install-cpp', "Microsoft's C++ build tools") || install(n.runtime, 'install-runtime', 'The Visual C++ runtime') || (!c.tools && { kind: 'tools' }) || (!c.recompiled && { kind: 'recompile' }) || (!c.built && { kind: 'build' }) || (shaders && { kind: 'shaders' }) || (mods && { kind: 'mods' }) || {};
 }
 
 function setupEnd(text) {
@@ -216,7 +219,7 @@ async function setupNext(code) {
   const last = all[all.length - 1];
   if (code !== 0) return setupEnd(`Stopped while ${DOING[last]}: see its messages below.`);
   try {
-    await Promise.all([refreshNeeds(), refreshBuilds().then(refreshChecks)]);
+    await Promise.all([refreshNeeds(), refreshBuilds().then(refreshChecks), refreshLayers()]);
   } catch (e) {
     return setupEnd(`Stopped: ${e}`);
   }
@@ -359,6 +362,8 @@ async function main() {
     refreshNeeds();
     if (rebuild) return rebuildNext(e.payload);
     refreshBuilds().then(refreshChecks);
+    // A step that built the mods: Play's Mod list shows them.
+    refreshLayers().catch(notice);
   });
   await listen('notice', (e) => notice(e.payload));
   await listen('update', (e) => banner(e.payload, ['update-page']));
