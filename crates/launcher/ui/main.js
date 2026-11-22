@@ -407,9 +407,11 @@ async function main() {
   // Running cargo and vswhere takes a moment: the page is already usable meanwhile.
   refreshNeeds();
   // Back in the window after fixing something elsewhere (a folder made, Rust installed, the game
-  // built in a terminal): the checks see it.
+  // built in a terminal, a mod copied): the checks and the lists see it.
   window.addEventListener('focus', () => {
     refreshBuilds(!rebuild).then(refreshChecks).catch(notice);
+    // A mod copied into the data folder's practice folder meanwhile shows in the list.
+    refreshLayers().catch(notice);
     if (!needs || !(needs.rust_ok && needs.cpp && needs.runtime)) refreshNeeds().catch(notice);
   });
   // Back from a game (the launcher says so when it opens this window): how it ended comes first.
