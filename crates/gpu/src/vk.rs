@@ -14,6 +14,9 @@ pub struct Extras {
     pub fast_linking: bool,
     /// Vulkan 1.3's dynamic rendering.
     pub dynamic_rendering: bool,
+    /// Vulkan 1.3's pipeline creation cache control: a creation may fail rather than compile
+    /// (FAIL_ON_PIPELINE_COMPILE_REQUIRED), which counts the compiles a run makes (D110 step 7b).
+    pub cache_control: bool,
 }
 
 /// Opens `adapter`'s device with `descriptor` as `request_device` does, after its checks
@@ -40,6 +43,9 @@ pub(crate) fn open(adapter: &wgpu::Adapter, descriptor: &wgpu::DeviceDescriptor<
         let extras = supported(&hal);
         let mut library = vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT::default().graphics_pipeline_library(true);
         let mut rendering = vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
+        // Each feature in a structure of its own: wgpu-hal chains other promoted ones, which
+        // forbids VkPhysicalDeviceVulkan13Features.
+        let mut control = vk::PhysicalDevicePipelineCreationCacheControlFeatures::default().pipeline_creation_cache_control(true);
         let add = callback(|args| {
             if extras.pipeline_library {
                 args.extensions.extend([ash::khr::pipeline_library::NAME, ash::ext::graphics_pipeline_library::NAME]);
@@ -47,6 +53,9 @@ pub(crate) fn open(adapter: &wgpu::Adapter, descriptor: &wgpu::DeviceDescriptor<
             }
             if extras.dynamic_rendering {
                 *args.create_info = args.create_info.push_next(&mut rendering);
+            }
+            if extras.cache_control {
+                *args.create_info = args.create_info.push_next(&mut control);
             }
         });
         let open = unsafe { hal.open_with_callback(descriptor.required_features, &descriptor.required_limits, &descriptor.memory_hints, Some(add)) }.map_err(|e| e.to_string())?;
@@ -74,13 +83,14 @@ fn supported(hal: &vulkan::Adapter) -> Extras {
     let (instance, device) = (shared.raw_instance(), hal.raw_physical_device());
     let mut gpl = vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT::default();
     let mut rendering = vk::PhysicalDeviceDynamicRenderingFeatures::default();
+    let mut control = vk::PhysicalDevicePipelineCreationCacheControlFeatures::default();
     let mut fast = vk::PhysicalDeviceGraphicsPipelineLibraryPropertiesEXT::default();
     let mut features = vk::PhysicalDeviceFeatures2::default();
     if library {
         features = features.push_next(&mut gpl);
     }
     if core13 {
-        features = features.push_next(&mut rendering);
+        features = features.push_next(&mut rendering).push_next(&mut control);
     }
     unsafe { instance.get_physical_device_features2(device, &mut features) };
     if library {
@@ -90,6 +100,7 @@ fn supported(hal: &vulkan::Adapter) -> Extras {
         pipeline_library: gpl.graphics_pipeline_library == vk::TRUE,
         fast_linking: fast.graphics_pipeline_library_fast_linking == vk::TRUE,
         dynamic_rendering: rendering.dynamic_rendering == vk::TRUE,
+        cache_control: control.pipeline_creation_cache_control == vk::TRUE,
     }
 }
 

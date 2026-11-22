@@ -598,6 +598,10 @@ impl Kernel {
         if let Some(c) = g.as_mut().and_then(|g| g.surfaces.as_mut()).and_then(|s| s.shader_cache.as_mut()) {
             eprintln!("gyroship: shader cache: {}", c.finish(std::time::Duration::from_secs(3)));
         }
+        // D110 step 7b: what the raw path made, and compiled.
+        if let Some(report) = g.as_ref().and_then(|g| g.surfaces.as_ref()).and_then(|s| s.raw_report()) {
+            eprintln!("gyroship: {report}");
+        }
     }
 
     /// The guest call stack at the last SVC: its pc, its lr, then the frame

@@ -1479,6 +1479,14 @@ impl Surfaces {
         let size = data.map_or(0, |d| d.len());
         let written = Arc::new(std::sync::atomic::AtomicUsize::new(size));
         self.disk_cache = Some(DiskCache { cache, file: file.clone(), written, busy: Default::default(), last: std::time::Instant::now() });
+        // The raw path's own (D110 step 7b), said on stderr: one file for every build.
+        if let Some(m) = self.raw.as_mut() {
+            let raw = dir.join("vulkan").join("libraries.cache");
+            match m.raw.load_cache(&raw) {
+                Ok(n) => eprintln!("gyroship: raw pipeline cache {} ({} KiB)", raw.display(), n / 1024),
+                Err(e) => eprintln!("gyroship: raw pipeline cache {}: {e}; raw pipelines are compiled every run", raw.display()),
+            }
+        }
         Ok((file, size))
     }
 
@@ -1524,6 +1532,14 @@ impl Surfaces {
         if let Some(writer) = self.save_pipeline_cache(true) {
             while !writer.is_finished() && since.elapsed() < patience {
                 std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        // The raw path's, at the end of a run only (a write costs its data's size in memory).
+        if let Some(m) = self.raw.as_mut() {
+            match m.raw.save_cache() {
+                Ok(Some(n)) => eprintln!("gyroship: raw pipeline cache written ({} KiB)", n / 1024),
+                Ok(None) => {}
+                Err(e) => eprintln!("gyroship: raw pipeline cache: {e}"),
             }
         }
     }
@@ -2840,8 +2856,8 @@ mod tests {
             let mut module = |(module, info): &(naga::Module, naga::valid::ModuleInfo)| m.raw.module(&crate::vk::spirv(module, info, module.entry_points[0].stage, "main", &m.options, &map).unwrap()).unwrap();
             let (vm, pm) = (module(&modules[0]), module(&modules[1]));
             let set_layout = m.raw.set_layout(&entries).unwrap();
-            let pl = m.raw.pipeline_layout(&[set_layout]).unwrap();
-            let p = m.raw.pipeline(&crate::raw::PipelineDesc { vertex: vm, pixel: Some(pm), entries: [c"main", c"main"], buffers: &buffers, primitive: Default::default(), depth_stencil: None, targets: &targets, layout: pl, dynamic: true }).unwrap();
+            let pl = m.raw.pipeline_layout(&[set_layout], false).unwrap();
+            let p = m.raw.pipeline(&crate::raw::PipelineDesc { vertex: vm, pixel: Some(pm), entries: [c"main", c"main"], buffers: &buffers, primitive: Default::default(), depth_stencil: None, targets: &targets, layout: pl, dynamic: true, library: None }).unwrap();
             crate::raw::RawPipeline { pipeline: p, layout: pl, sets: smallvec::smallvec![(set_layout, Arc::from(&entries[..]))] }
         };
         // The target cleared, as `texture` clears targets on the raw path.

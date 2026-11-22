@@ -24,7 +24,7 @@ value at the end of the line stops the start with exit code 2 (any next word is 
 | `--fullscreen` | Borderless fullscreen from the start; Alt+Enter switches at any time. |
 | `--save DIR` | Saves are loaded from `DIR` and written back there each time the game commits them. |
 | `--language CODE` | The console language the game reads at boot to pick one of its 14 text regions; default `en-US`. |
-| `--pipeline-cache DIR` | Keeps between runs the GPU driver's compiled pipelines (one file per GPU, Vulkan only) and, in `DIR/shaders`, the translated shaders. |
+| `--pipeline-cache DIR` | Keeps between runs the GPU driver's compiled pipelines (one file per GPU, Vulkan only) and, in `DIR/shaders`, the translated shaders; under `--renderer vulkan`, also `DIR/vulkan/libraries.cache`, written when a run ends. |
 | `--backend VALUE` | `auto` (the default: Vulkan and DX12 are both offered to wgpu, which took Vulkan on the test PC), `vulkan` or `dx12`. |
 | `--renderer VALUE` | `wgpu` (the default) or `vulkan`: the game's draws, clears and fills go straight to Vulkan rather than through wgpu, with the same images. The ground for precompiled shaders, still in progress. It takes the Vulkan backend and needs Vulkan's dynamic rendering; without it, the game draws through wgpu and says so. |
 | `--sdl FILE` | The SDL3 library to load, instead of `SDL3.dll` next to the game's executable. |

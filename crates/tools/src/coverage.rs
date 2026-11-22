@@ -63,10 +63,14 @@ pub fn run(zip: &Path, root: &Path, exefs: Option<&Path>) -> super::Result<bool>
     // Each program translated once, as it is: its jump tables, if any.
     let mut tables: BTreeMap<u64, Vec<JumpTable>> = BTreeMap::new();
     let mut failed: Vec<(u64, Stage)> = Vec::new();
+    // Each stage's programs by the uniform buffers they bind (their banks, and their swizzle codes):
+    // what a stage's share of the dynamic offsets must hold (D110 step 7b).
+    let mut uniforms: BTreeMap<Stage, BTreeMap<usize, usize>> = BTreeMap::new();
     for (key, p) in &programs {
         let options = if p.stage == Stage::Compute { Options { workgroup: [32, 1, 1], ..Default::default() } } else { Options::default() };
         match shader::translate_with(&p.code, &options) {
             Ok(t) => {
+                *uniforms.entry(p.stage).or_default().entry(t.interface.cbufs.len() + usize::from(t.interface.swizzles)).or_default() += 1;
                 if let Some(t) = t.interface.jump_tables.filter(|t| !t.is_empty()) {
                     tables.insert(*key, t);
                 }
@@ -77,6 +81,9 @@ pub fn run(zip: &Path, root: &Path, exefs: Option<&Path>) -> super::Result<bool>
     let failed_keys: BTreeSet<u64> = failed.iter().map(|f| f.0).collect();
     println!("translated   {}: {}", programs.len() - failed.len(), by_stage(&|k| !failed_keys.contains(k)));
     println!("not          {}: {}", failed.len(), failed.iter().map(|(k, s)| format!("{k:016x} {s:?}")).collect::<Vec<_>>().join(", "));
+    for (stage, counts) in &uniforms {
+        println!("uniforms     {stage:?}: {}", counts.iter().map(|(n, programs)| format!("{n}: {programs}")).collect::<Vec<_>>().join(", "));
+    }
 
     // Real play: every entry of the cache that decodes.
     let (stored, unread) = cache::entries(root);

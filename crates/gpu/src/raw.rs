@@ -25,6 +25,21 @@ pub(crate) struct PipelineDesc<'a> {
     /// The game's pipelines: cull, front face, depth, stencil and bias set per draw
     /// ([`Dynamic`]), `primitive`'s and `depth_stencil`'s being left aside (but the format).
     pub dynamic: bool,
+    /// One part of a pipeline only, a library (D110 step 7b): its stages, states and dynamic
+    /// states; None, the whole pipeline.
+    pub library: Option<vk::GraphicsPipelineLibraryFlagsEXT>,
+}
+
+/// What a run made of its raw pipelines (D110 step 7b): pipelines and libraries with shaders, those
+/// of them the caches did not have (they compiled: counted when the device can tell), and the time
+/// they took; interface libraries; links.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Counts {
+    pub(crate) shaders: u64,
+    pub(crate) compiled: u64,
+    pub(crate) shader_time: std::time::Duration,
+    pub(crate) interfaces: u64,
+    pub(crate) links: u64,
 }
 
 /// What the game's raw pipelines take per draw (D110 step 7a): wgpu's cull mode, front face and
@@ -85,10 +100,18 @@ pub(crate) struct Raw {
     /// Each stage may run with varying subgroup sizes, as wgpu-hal asks with Features::SUBGROUP.
     varying: bool,
     set_layouts: FxMap<Vec<wgpu::BindGroupLayoutEntry>, vk::DescriptorSetLayout>,
-    pipeline_layouts: FxMap<Vec<vk::DescriptorSetLayout>, vk::PipelineLayout>,
+    /// By their sets and whether these are independent (a library's, a linked pipeline's).
+    pipeline_layouts: FxMap<(Vec<vk::DescriptorSetLayout>, bool), vk::PipelineLayout>,
     modules: Vec<vk::ShaderModule>,
     pipelines: Vec<vk::Pipeline>,
     samplers: Vec<vk::Sampler>,
+    /// Our pipeline cache (`--pipeline-cache DIR`'s `vulkan/libraries.cache`, step 7b), and its
+    /// file with the data size it had; null and none without one.
+    cache: vk::PipelineCache,
+    cache_file: Option<(std::path::PathBuf, usize)>,
+    /// Whether a creation may fail rather than compile ([`crate::vk::Extras::cache_control`]).
+    fail_on: bool,
+    pub(crate) counts: Counts,
 }
 
 /// A raw pipeline as the recorder binds it: the pipeline, its layout, and each group's set
@@ -112,6 +135,24 @@ pub(crate) struct RawMode {
     pub(crate) modules: FxMap<u32, vk::ShaderModule>,
     /// The fill module's raw pipelines, by format and kind (every draw raw: step 6b).
     pub(crate) fills: FxMap<(wgpu::TextureFormat, crate::surfaces::Fill), std::sync::Arc<RawPipeline>>,
+    /// The game's pipelines in parts linked fast (step 7b), on a device that links libraries
+    /// fast: the parts made so far. None: whole pipelines (7a's).
+    pub(crate) libraries: Option<FxMap<Part, vk::Pipeline>>,
+}
+
+/// A pipeline library of the game's (D110 step 7b), by what makes it.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(crate) enum Part {
+    /// A vertex module (serial) with its group's set layout (null without one), polygon mode and
+    /// depth clamp: the shaders before rasterization.
+    Vertex(u32, vk::DescriptorSetLayout, wgpu::PolygonMode, bool),
+    /// A pixel module (serial; none for a pipeline without one) with its group's set layout.
+    Pixel(Option<u32>, vk::DescriptorSetLayout),
+    /// The vertex buffers' layouts (stride, step, attributes), the topology and whether indices
+    /// restart strips: the vertex input interface.
+    Input(Vec<Option<(u64, wgpu::VertexStepMode, Vec<wgpu::VertexAttribute>)>>, wgpu::PrimitiveTopology, bool),
+    /// The color targets' states and the depth format: the fragment output interface.
+    Output(Vec<Option<wgpu::ColorTargetState>>, Option<wgpu::TextureFormat>),
 }
 
 impl RawMode {
@@ -128,13 +169,29 @@ impl RawMode {
                 }
             },
         };
-        let mode = Raw::new(adapter, device).filter(|_| extras.dynamic_rendering).zip(crate::vk::spirv_options(adapter, device)).map(|(raw, options)| RawMode { raw, program, options, modules: FxMap::default(), fills: FxMap::default() });
+        let libraries = (extras.pipeline_library && extras.fast_linking).then(FxMap::default);
+        let mode = Raw::new(adapter, device, extras.cache_control).filter(|_| extras.dynamic_rendering).zip(crate::vk::spirv_options(adapter, device)).map(|(raw, options)| RawMode { raw, program, options, modules: FxMap::default(), fills: FxMap::default(), libraries });
+        let made = match mode.as_ref().is_some_and(|m| m.libraries.is_some()) {
+            true => "in pipeline libraries linked fast",
+            false => "in whole pipelines (no pipeline libraries linked fast here)",
+        };
         match (&mode, program) {
             (None, _) => eprintln!("gyroship: the raw Vulkan path needs Vulkan with dynamic rendering, which this device lacks: the game draws through wgpu"),
-            (Some(_), Some(key)) => eprintln!("gyroship: the draws of program {key:016x} recorded in raw Vulkan"),
-            (Some(_), None) => eprintln!("gyroship: every draw recorded in raw Vulkan"),
+            (Some(_), Some(key)) => eprintln!("gyroship: the draws of program {key:016x} recorded in raw Vulkan, {made}"),
+            (Some(_), None) => eprintln!("gyroship: every draw recorded in raw Vulkan, {made}"),
         }
         mode
+    }
+
+    /// Library `part`, made by `make` the first time it is asked for.
+    fn part(&mut self, part: Part, make: impl FnOnce(&mut Raw) -> Result<vk::Pipeline, String>) -> Result<vk::Pipeline, String> {
+        let Some(libraries) = self.libraries.as_mut() else { return Err("no pipeline libraries".into()) };
+        if let Some(&p) = libraries.get(&part) {
+            return Ok(p);
+        }
+        let p = make(&mut self.raw)?;
+        libraries.insert(part, p);
+        Ok(p)
     }
 
     /// Whether the pipeline of these programs is raw.
@@ -158,8 +215,8 @@ impl RawMode {
             false => Some(self.raw.module(&crate::vk::spirv(&module, &info, naga::ShaderStage::Fragment, "fs", &self.options, &map)?)?),
         };
         let set = self.raw.set_layout(&entries)?;
-        let layout = self.raw.pipeline_layout(&[set])?;
-        let pipeline = self.raw.pipeline(&PipelineDesc { vertex, pixel, entries: [c"vs", c"fs"], buffers: &[], primitive: Default::default(), depth_stencil: depth, targets, layout, dynamic: false })?;
+        let layout = self.raw.pipeline_layout(&[set], false)?;
+        let pipeline = self.raw.pipeline(&PipelineDesc { vertex, pixel, entries: [c"vs", c"fs"], buffers: &[], primitive: Default::default(), depth_stencil: depth, targets, layout, dynamic: false, library: None })?;
         let p = std::sync::Arc::new(RawPipeline { pipeline, layout, sets: smallvec::smallvec![(set, std::sync::Arc::from(&entries[..]))] });
         self.fills.insert(key, p.clone());
         Ok(p)
@@ -236,7 +293,10 @@ pub(crate) fn clear(ash: &ash::Device, cb: vk::CommandBuffer, (width, height): (
 impl crate::surfaces::Surfaces {
     /// The raw pipeline of these modules and states: each module's SPIR-V written once (by
     /// serial), its bindings numbered for these groups (which a module's own interface fixes), a
-    /// set layout per group, the pipeline layout, then `Raw::pipeline`.
+    /// set layout per group, then a whole pipeline (`Raw::pipeline`), or, on a device that links
+    /// libraries fast (step 7b), one linked from its four parts, each made once: the vertex
+    /// module's and the pixel module's (with the layout of their own group only, so that neither
+    /// depends on the other), the vertex input's and the output's.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn raw_pipeline(
         &mut self,
@@ -266,15 +326,48 @@ impl crate::surfaces::Surfaces {
         let vertex = module(vs)?;
         let pixel = ps.map(&mut module).transpose()?;
         let sets = groups.iter().map(|e| Ok((m.raw.set_layout(e)?, std::sync::Arc::from(*e)))).collect::<Result<smallvec::SmallVec<[_; 2]>, String>>()?;
-        let layout = m.raw.pipeline_layout(&sets.iter().map(|s| s.0).collect::<Vec<_>>())?;
-        let pipeline = m.raw.pipeline(&PipelineDesc { vertex, pixel, entries: [c"main", c"main"], buffers, primitive, depth_stencil: depth, targets, layout, dynamic: true })?;
+        let handles: Vec<vk::DescriptorSetLayout> = sets.iter().map(|s| s.0).collect();
+        let desc = PipelineDesc { vertex, pixel, entries: [c"main", c"main"], buffers, primitive, depth_stencil: depth, targets, layout: vk::PipelineLayout::null(), dynamic: true, library: None };
+        if m.libraries.is_none() {
+            let layout = m.raw.pipeline_layout(&handles, false)?;
+            let pipeline = m.raw.pipeline(&PipelineDesc { layout, ..desc })?;
+            return Ok(RawPipeline { pipeline, layout, sets });
+        }
+        use vk::GraphicsPipelineLibraryFlagsEXT as L;
+        let null = vk::DescriptorSetLayout::null();
+        let (vset, pset) = (handles.first().copied().unwrap_or(null), handles.get(1).copied().unwrap_or(null));
+        let own = |raw: &mut Raw, sets: &[vk::DescriptorSetLayout]| raw.pipeline_layout(sets, true);
+        let library = |raw: &mut Raw, part, layout| raw.pipeline(&PipelineDesc { layout, library: Some(part), ..desc });
+        let vertex_part = m.part(Part::Vertex(vs.2, vset, primitive.polygon_mode, primitive.unclipped_depth), |raw| {
+            let layout = own(raw, &if vset == null { Vec::new() } else { vec![vset] })?;
+            library(raw, L::PRE_RASTERIZATION_SHADERS, layout)
+        })?;
+        let pixel_part = m.part(Part::Pixel(ps.map(|p| p.2), pset), |raw| {
+            let layout = own(raw, &if pset == null { Vec::new() } else { vec![null, pset] })?;
+            library(raw, L::FRAGMENT_SHADER, layout)
+        })?;
+        let input = Part::Input(buffers.iter().map(|b| b.as_ref().map(|b| (b.array_stride, b.step_mode, b.attributes.to_vec()))).collect(), primitive.topology, primitive.strip_index_format.is_some());
+        let input_part = m.part(input, |raw| library(raw, L::VERTEX_INPUT_INTERFACE, vk::PipelineLayout::null()))?;
+        let output_part = m.part(Part::Output(targets.to_vec(), depth.map(|d| d.format)), |raw| library(raw, L::FRAGMENT_OUTPUT_INTERFACE, vk::PipelineLayout::null()))?;
+        let layout = m.raw.pipeline_layout(&handles, true)?;
+        let pipeline = m.raw.link(&[input_part, vertex_part, pixel_part, output_part], layout)?;
         Ok(RawPipeline { pipeline, layout, sets })
+    }
+
+    /// What the raw path made in this run, for the end of a run's report; None when it is off.
+    pub fn raw_report(&self) -> Option<String> {
+        let m = self.raw.as_ref()?;
+        let c = m.raw.counts;
+        let kind = if m.libraries.is_some() { "pipeline libraries linked fast" } else { "whole pipelines" };
+        let compiled = if m.raw.fail_on { format!("{} compiled", c.compiled) } else { "compiles not counted on this device".to_string() };
+        Some(format!("raw {kind}: {} with shaders in {:.1} s ({compiled}), {} interface libraries, {} links", c.shaders, c.shader_time.as_secs_f64(), c.interfaces, c.links))
     }
 }
 
 impl Raw {
-    /// The raw path of `device`, off Vulkan none.
-    pub(crate) fn new(adapter: &wgpu::Adapter, device: &wgpu::Device) -> Option<Raw> {
+    /// The raw path of `device`, off Vulkan none; `fail_on`: the device has pipeline creation
+    /// cache control (enabled at its opening).
+    pub(crate) fn new(adapter: &wgpu::Adapter, device: &wgpu::Device, fail_on: bool) -> Option<Raw> {
         let ash = unsafe { device.as_hal::<Vulkan>() }?.raw_device().clone();
         let varying = device.features().contains(wgpu::Features::SUBGROUP);
         Some(Raw {
@@ -287,6 +380,10 @@ impl Raw {
             modules: Vec::new(),
             pipelines: Vec::new(),
             samplers: Vec::new(),
+            cache: vk::PipelineCache::null(),
+            cache_file: None,
+            fail_on,
+            counts: Counts::default(),
         })
     }
 
@@ -325,23 +422,40 @@ impl Raw {
         Ok(l)
     }
 
-    /// The pipeline layout of `sets`, in group order.
-    pub(crate) fn pipeline_layout(&mut self, sets: &[vk::DescriptorSetLayout]) -> Result<vk::PipelineLayout, String> {
-        if let Some(&l) = self.pipeline_layouts.get(sets) {
+    /// The pipeline layout of `sets`, in group order; `independent`: a library's or a linked
+    /// pipeline's (a library's may leave the other stage's set null).
+    pub(crate) fn pipeline_layout(&mut self, sets: &[vk::DescriptorSetLayout], independent: bool) -> Result<vk::PipelineLayout, String> {
+        let key = (sets.to_vec(), independent);
+        if let Some(&l) = self.pipeline_layouts.get(&key) {
             return Ok(l);
         }
-        let l = unsafe { self.ash.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(sets), None) }.map_err(|e| format!("raw pipeline layout: {e}"))?;
-        self.pipeline_layouts.insert(sets.to_vec(), l);
+        let flags = if independent { vk::PipelineLayoutCreateFlags::INDEPENDENT_SETS_EXT } else { vk::PipelineLayoutCreateFlags::empty() };
+        let l = unsafe { self.ash.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().flags(flags).set_layouts(sets), None) }.map_err(|e| format!("raw pipeline layout: {e}"))?;
+        self.pipeline_layouts.insert(key, l);
         Ok(l)
     }
 
     /// A render pipeline, made as wgpu-hal makes `d` (its states through wgpu-hal's `conv`), for
     /// dynamic rendering instead of a render pass. No pipeline cache (ours is step 7's).
     pub(crate) fn pipeline(&mut self, d: &PipelineDesc) -> Result<vk::Pipeline, String> {
-        use vk::DynamicState as D;
-        let mut dynamic = vec![D::VIEWPORT, D::SCISSOR, D::BLEND_CONSTANTS, D::STENCIL_REFERENCE];
-        if d.dynamic {
-            dynamic.extend([D::CULL_MODE, D::FRONT_FACE, D::DEPTH_TEST_ENABLE, D::DEPTH_WRITE_ENABLE, D::DEPTH_COMPARE_OP, D::STENCIL_TEST_ENABLE, D::STENCIL_OP, D::STENCIL_COMPARE_MASK, D::STENCIL_WRITE_MASK, D::DEPTH_BIAS_ENABLE, D::DEPTH_BIAS]);
+        use vk::{DynamicState as D, GraphicsPipelineLibraryFlagsEXT as L};
+        // The part made (a library's), or all of them; each part has its own dynamic states.
+        let part = d.library.unwrap_or(L::VERTEX_INPUT_INTERFACE | L::PRE_RASTERIZATION_SHADERS | L::FRAGMENT_SHADER | L::FRAGMENT_OUTPUT_INTERFACE);
+        let mut dynamic = Vec::new();
+        if part.contains(L::PRE_RASTERIZATION_SHADERS) {
+            dynamic.extend([D::VIEWPORT, D::SCISSOR]);
+            if d.dynamic {
+                dynamic.extend([D::CULL_MODE, D::FRONT_FACE, D::DEPTH_BIAS_ENABLE, D::DEPTH_BIAS]);
+            }
+        }
+        if part.contains(L::FRAGMENT_SHADER) {
+            dynamic.push(D::STENCIL_REFERENCE);
+            if d.dynamic {
+                dynamic.extend([D::DEPTH_TEST_ENABLE, D::DEPTH_WRITE_ENABLE, D::DEPTH_COMPARE_OP, D::STENCIL_TEST_ENABLE, D::STENCIL_OP, D::STENCIL_COMPARE_MASK, D::STENCIL_WRITE_MASK]);
+            }
+        }
+        if part.contains(L::FRAGMENT_OUTPUT_INTERFACE) {
+            dynamic.push(D::BLEND_CONSTANTS);
         }
         let (mut bindings, mut attributes) = (Vec::new(), Vec::new());
         for (slot, b) in (0u32..).zip(d.buffers) {
@@ -357,7 +471,9 @@ impl Raw {
         let assembly = vk::PipelineInputAssemblyStateCreateInfo::default().topology(conv::map_topology(d.primitive.topology)).primitive_restart_enable(d.primitive.strip_index_format.is_some());
         let flags = if self.varying { vk::PipelineShaderStageCreateFlags::ALLOW_VARYING_SUBGROUP_SIZE } else { vk::PipelineShaderStageCreateFlags::empty() };
         let stage = |stage, module, name| vk::PipelineShaderStageCreateInfo::default().flags(flags).stage(stage).module(module).name(name);
-        let stages: Vec<_> = std::iter::once(stage(vk::ShaderStageFlags::VERTEX, d.vertex, d.entries[0])).chain(d.pixel.map(|p| stage(vk::ShaderStageFlags::FRAGMENT, p, d.entries[1]))).collect();
+        let vertex = part.contains(L::PRE_RASTERIZATION_SHADERS).then(|| stage(vk::ShaderStageFlags::VERTEX, d.vertex, d.entries[0]));
+        let pixel = d.pixel.filter(|_| part.contains(L::FRAGMENT_SHADER)).map(|p| stage(vk::ShaderStageFlags::FRAGMENT, p, d.entries[1]));
+        let stages: Vec<_> = vertex.into_iter().chain(pixel).collect();
         let mut raster = vk::PipelineRasterizationStateCreateInfo::default()
             .polygon_mode(conv::map_polygon_mode(d.primitive.polygon_mode))
             .front_face(conv::map_front_face(d.primitive.front_face))
@@ -409,22 +525,118 @@ impl Raw {
         }
         let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blends);
         let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic);
-        let mut rendering = vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&formats).depth_attachment_format(depth_format).stencil_attachment_format(stencil_format);
-        let info = vk::GraphicsPipelineCreateInfo::default()
-            .push_next(&mut rendering)
-            .layout(d.layout)
-            .stages(&stages)
-            .vertex_input_state(&vertex_input)
-            .input_assembly_state(&assembly)
-            .rasterization_state(&raster)
-            .viewport_state(&viewport)
-            .multisample_state(&multisample)
-            .depth_stencil_state(&depth)
-            .color_blend_state(&blend)
-            .dynamic_state(&dynamic);
-        let p = unsafe { self.ash.create_graphics_pipelines(vk::PipelineCache::null(), &[info], None) }.map_err(|(_, e)| format!("raw pipeline: {e}"))?[0];
+        // The attachments' formats are the output's: the shaders' libraries are made without them.
+        let mut rendering = match part.contains(L::FRAGMENT_OUTPUT_INTERFACE) {
+            true => vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&formats).depth_attachment_format(depth_format).stencil_attachment_format(stencil_format),
+            false => vk::PipelineRenderingCreateInfo::default(),
+        };
+        let mut library = vk::GraphicsPipelineLibraryCreateInfoEXT::default().flags(part);
+        // Each part only its own states: a shaders' library is then the same whatever the draw
+        // that first asked for it, and the same as the precompiler's (step 8).
+        let mut info = vk::GraphicsPipelineCreateInfo::default().push_next(&mut rendering).layout(d.layout).stages(&stages).dynamic_state(&dynamic);
+        if part.contains(L::VERTEX_INPUT_INTERFACE) {
+            info = info.vertex_input_state(&vertex_input).input_assembly_state(&assembly);
+        }
+        if part.contains(L::PRE_RASTERIZATION_SHADERS) {
+            info = info.rasterization_state(&raster).viewport_state(&viewport);
+        }
+        if part.contains(L::FRAGMENT_SHADER) {
+            info = info.depth_stencil_state(&depth).multisample_state(&multisample);
+        }
+        if part.contains(L::FRAGMENT_OUTPUT_INTERFACE) {
+            info = info.color_blend_state(&blend).multisample_state(&multisample);
+        }
+        let mut create = vk::PipelineCreateFlags::empty();
+        if d.library.is_some() {
+            info = info.push_next(&mut library);
+            create |= vk::PipelineCreateFlags::LIBRARY_KHR;
+        }
+        // What has shaders goes through our cache, first without compiling when the device can say
+        // so: a miss counts as a compile, then compiles.
+        let shaders = part.intersects(L::PRE_RASTERIZATION_SHADERS | L::FRAGMENT_SHADER);
+        let cache = if shaders { self.cache } else { vk::PipelineCache::null() };
+        let since = std::time::Instant::now();
+        let mut made = Err((Vec::new(), vk::Result::PIPELINE_COMPILE_REQUIRED));
+        if shaders && self.fail_on {
+            made = unsafe { self.ash.create_graphics_pipelines(cache, &[info.flags(create | vk::PipelineCreateFlags::FAIL_ON_PIPELINE_COMPILE_REQUIRED)], None) };
+        }
+        if let Err((_, vk::Result::PIPELINE_COMPILE_REQUIRED)) = made {
+            self.counts.compiled += u64::from(shaders && self.fail_on);
+            made = unsafe { self.ash.create_graphics_pipelines(cache, &[info.flags(create)], None) };
+        }
+        let p = made.map_err(|(_, e)| format!("raw pipeline: {e}"))?[0];
+        match shaders {
+            true => {
+                self.counts.shaders += 1;
+                self.counts.shader_time += since.elapsed();
+            }
+            false => self.counts.interfaces += 1,
+        }
         self.pipelines.push(p);
         Ok(p)
+    }
+
+    /// A pipeline linked fast from its parts (step 7b): no link-time optimization, so that the
+    /// parts need not keep what it would take.
+    pub(crate) fn link(&mut self, parts: &[vk::Pipeline], layout: vk::PipelineLayout) -> Result<vk::Pipeline, String> {
+        let mut libraries = vk::PipelineLibraryCreateInfoKHR::default().libraries(parts);
+        let info = vk::GraphicsPipelineCreateInfo::default().layout(layout).push_next(&mut libraries);
+        let p = unsafe { self.ash.create_graphics_pipelines(vk::PipelineCache::null(), &[info], None) }.map_err(|(_, e)| format!("raw link: {e}"))?[0];
+        self.counts.links += 1;
+        self.pipelines.push(p);
+        Ok(p)
+    }
+
+    /// Our pipeline cache from `file` (step 7b): its data when its header names this GPU and
+    /// driver and its sum holds, else none (it starts empty, without error). Returns the data's
+    /// size. One file for every build: the driver finds an unchanged module whatever the build.
+    pub(crate) fn load_cache(&mut self, file: &std::path::Path) -> Result<usize, String> {
+        let header = self.cache_header();
+        let data = std::fs::read(file).ok().and_then(|bytes| {
+            let (head, data) = bytes.split_at_checked(header.len() + 8)?;
+            let sum = u64::from_le_bytes(head[header.len()..].try_into().ok()?);
+            (head[..header.len()] == header[..] && crate::sass::fnv(data) == sum).then(|| data.to_vec())
+        });
+        let data = data.unwrap_or_default();
+        let cache = unsafe { self.ash.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default().initial_data(&data), None) }.map_err(|e| format!("raw pipeline cache: {e}"))?;
+        if self.cache != vk::PipelineCache::null() {
+            unsafe { self.ash.destroy_pipeline_cache(self.cache, None) };
+        }
+        self.cache = cache;
+        self.cache_file = Some((file.to_path_buf(), data.len()));
+        Ok(data.len())
+    }
+
+    /// Writes our pipeline cache to its file when it grew, through a temporary file and a
+    /// rename (a run killed meanwhile leaves the last whole file). Returns the size written.
+    pub(crate) fn save_cache(&mut self) -> Result<Option<usize>, String> {
+        let Some((file, size)) = &self.cache_file else { return Ok(None) };
+        let data = unsafe { self.ash.get_pipeline_cache_data(self.cache) }.map_err(|e| format!("raw pipeline cache: {e}"))?;
+        if data.len() <= *size {
+            return Ok(None);
+        }
+        let mut bytes = self.cache_header();
+        bytes.extend(crate::sass::fnv(&data).to_le_bytes());
+        bytes.extend(&data);
+        let tmp = file.with_extension(format!("{}.tmp", std::process::id()));
+        file.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::write(&tmp, &bytes)).and_then(|()| std::fs::rename(&tmp, file)).map_err(|e| format!("{}: {e}", file.display()))?;
+        let file = file.clone();
+        self.cache_file = Some((file, data.len()));
+        Ok(Some(data.len()))
+    }
+
+    /// Our cache file's header: a magic, then what makes the driver's data valid: vendor, device,
+    /// driver version and the driver's cache UUID.
+    fn cache_header(&self) -> Vec<u8> {
+        let mut h = b"GYRSPC01".to_vec();
+        if let Some(a) = unsafe { self.adapter.as_hal::<Vulkan>() } {
+            let p = a.physical_device_capabilities().properties();
+            h.extend(p.vendor_id.to_le_bytes());
+            h.extend(p.device_id.to_le_bytes());
+            h.extend(p.driver_version.to_le_bytes());
+            h.extend(p.pipeline_cache_uuid);
+        }
+        h
     }
 
     /// A sampler made as wgpu-core then wgpu-hal make `d`: the anisotropy wgpu-core passes on
@@ -595,8 +807,10 @@ mod tests {
     /// Raw draws paint what wgpu paints: two draws (triangles placed by a bank read at a dynamic
     /// offset, a texture read through a filtering sampler, blending with a constant, a viewport
     /// and a scissor inside the target, bindings listed out of order and numbered as the game's)
-    /// made once by wgpu, once by the raw path with a pipeline per state, and once with one
-    /// pipeline whose states are set per draw (step 7a), read back and compared bit for bit. In the
+    /// made once by wgpu, once by the raw path with a pipeline per state, once with one pipeline
+    /// whose states are set per draw (step 7a), and, on a device that links libraries fast, once
+    /// with that pipeline linked from its four parts (step 7b), read back and compared bit for
+    /// bit. In the
     /// first, the stencil keeps the second triangle, nearer, off the first; in the second, a
     /// triangle just in front of the first is hidden by the depth bias, and shown without the
     /// depth test or the bias.
@@ -606,7 +820,7 @@ mod tests {
             eprintln!("no GPU adapter: test skipped");
             return;
         };
-        let (Some(options), Some(mut raw)) = (spirv_options(&s.adapter, &s.device), Raw::new(&s.adapter, &s.device)) else {
+        let (Some(options), Some(mut raw)) = (spirv_options(&s.adapter, &s.device), Raw::new(&s.adapter, &s.device, s.vulkan.cache_control)) else {
             eprintln!("not Vulkan: test skipped");
             return;
         };
@@ -677,9 +891,9 @@ mod tests {
         let sampler = d.create_sampler(&sampling);
         let target = || texture(wgpu::TextureFormat::Rgba8Unorm, wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC, 64);
         let depth = || texture(wgpu::TextureFormat::Depth24PlusStencil8, wgpu::TextureUsages::RENDER_ATTACHMENT, 64);
-        let (a, da, b, db, c, dc) = (target(), depth(), target(), depth(), target(), depth());
+        let (a, da, b, db, c, dc, l, dl) = (target(), depth(), target(), depth(), target(), depth(), target(), depth());
         let view = |t: &wgpu::Texture| t.create_view(&Default::default());
-        let (av, dav, bv, dbv, cv, dcv, tv) = (view(&a), view(&da), view(&b), view(&db), view(&c), view(&dc), view(&t));
+        let (av, dav, bv, dbv, cv, dcv, lv, dlv, tv) = (view(&a), view(&da), view(&b), view(&db), view(&c), view(&dc), view(&l), view(&dl), view(&t));
 
         // The states both pipelines have.
         let face = wgpu::StencilFaceState { compare: wgpu::CompareFunction::NotEqual, fail_op: wgpu::StencilOperation::Keep, depth_fail_op: wgpu::StencilOperation::Keep, pass_op: wgpu::StencilOperation::Replace };
@@ -744,10 +958,12 @@ mod tests {
         // the states the raw draws use: the boundary before a raw segment.
         drop(cleared(&mut e1, &bv, &dbv));
         drop(cleared(&mut e1, &cv, &dcv));
+        drop(cleared(&mut e1, &lv, &dlv));
         let rt = |texture, state| wgpu::TextureTransition { texture, selector: None, state };
+        let (color, depth) = (wgpu::TextureUses::COLOR_TARGET, wgpu::TextureUses::DEPTH_STENCIL_WRITE);
         e1.transition_resources(
             [&bank, &tint].into_iter().map(|buffer| wgpu::BufferTransition { buffer, state: wgpu::BufferUses::UNIFORM }),
-            [rt(&b, wgpu::TextureUses::COLOR_TARGET), rt(&db, wgpu::TextureUses::DEPTH_STENCIL_WRITE), rt(&c, wgpu::TextureUses::COLOR_TARGET), rt(&dc, wgpu::TextureUses::DEPTH_STENCIL_WRITE), rt(&t, wgpu::TextureUses::RESOURCE)].into_iter(),
+            [rt(&b, color), rt(&db, depth), rt(&c, color), rt(&dc, depth), rt(&l, color), rt(&dl, depth), rt(&t, wgpu::TextureUses::RESOURCE)].into_iter(),
         );
 
         // The raw draw into `b`, from the same modules, states and resources.
@@ -755,12 +971,25 @@ mod tests {
         let mut module = |(m, i): &(naga::Module, naga::valid::ModuleInfo)| raw.module(&spirv(m, i, m.entry_points[0].stage, "main", &options, &map).unwrap()).unwrap();
         let (vm, pm) = (module(&ir[0]), module(&ir[1]));
         let sets = [raw.set_layout(&groups[0]).unwrap(), raw.set_layout(&groups[1]).unwrap()];
-        let raw_layout = raw.pipeline_layout(&sets).unwrap();
-        let mut raw_pipeline = |depth_stencil, dynamic| raw.pipeline(&PipelineDesc { vertex: vm, pixel: Some(pm), entries: [c"main", c"main"], buffers: &[], primitive: Default::default(), depth_stencil: Some(depth_stencil), targets: &targets, layout: raw_layout, dynamic }).unwrap();
+        let raw_layout = raw.pipeline_layout(&sets, false).unwrap();
+        let mut raw_pipeline = |depth_stencil, dynamic| raw.pipeline(&PipelineDesc { vertex: vm, pixel: Some(pm), entries: [c"main", c"main"], buffers: &[], primitive: Default::default(), depth_stencil: Some(depth_stencil), targets: &targets, layout: raw_layout, dynamic, library: None }).unwrap();
         // The game's pipelines since step 7a: one for both draws, its states set per draw.
         let keyed = wgpu::DepthStencilState { format: stenciled.format, depth_write_enabled: None, depth_compare: None, stencil: Default::default(), bias: Default::default() };
         let raw_pipelines = [raw_pipeline(&stenciled, false), raw_pipeline(&biased, false), raw_pipeline(&keyed, true)];
         let per_draw = |depth: &wgpu::DepthStencilState| Dynamic { depth: Some(depth.clone()), ..Default::default() };
+        // Since step 7b, on a device that links libraries fast: the same pipeline linked from its
+        // four parts, each with its own stage's layout.
+        let linked = (s.vulkan.pipeline_library && s.vulkan.fast_linking).then(|| {
+            use vk::GraphicsPipelineLibraryFlagsEXT as L;
+            let null = vk::DescriptorSetLayout::null();
+            let (vertex_layout, pixel_layout, layout) = (raw.pipeline_layout(&[sets[0]], true).unwrap(), raw.pipeline_layout(&[null, sets[1]], true).unwrap(), raw.pipeline_layout(&sets, true).unwrap());
+            let mut part = |library, layout| raw.pipeline(&PipelineDesc { vertex: vm, pixel: Some(pm), entries: [c"main", c"main"], buffers: &[], primitive: Default::default(), depth_stencil: Some(&keyed), targets: &targets, layout, dynamic: true, library: Some(library) }).unwrap();
+            let parts = [part(L::VERTEX_INPUT_INTERFACE, vk::PipelineLayout::null()), part(L::PRE_RASTERIZATION_SHADERS, vertex_layout), part(L::FRAGMENT_SHADER, pixel_layout), part(L::FRAGMENT_OUTPUT_INTERFACE, vk::PipelineLayout::null())];
+            (raw.link(&parts, layout).unwrap(), layout)
+        });
+        if linked.is_none() {
+            eprintln!("no pipeline libraries linked fast: the linked draw skipped");
+        }
         let image = |v: &wgpu::TextureView| unsafe { v.as_hal::<Vulkan>().map(|h| h.raw_handle()) }.unwrap();
         let handle = |b: &wgpu::Buffer| unsafe { b.as_hal::<Vulkan>().map(|h| h.raw_handle()) }.unwrap();
         let raw_sampler = raw.sampler(&sampling).unwrap();
@@ -768,7 +997,7 @@ mod tests {
         let mut pools = Pools::new(d).unwrap();
         let (_, s0) = pools.set(sets[0], &groups[0], &[Resource::Buffer(handle(&bank), 0, 128)]).unwrap();
         let (_, s1) = pools.set(sets[1], &groups[1], &[Resource::Sampler(raw_sampler), Resource::Buffer(handle(&tint), 0, 16), Resource::Texture(image(&tv), read)]).unwrap();
-        let (bh, dbh, ch, dch) = (image(&bv), image(&dbv), image(&cv), image(&dcv));
+        let (bh, dbh, ch, dch, lh, dlh) = (image(&bv), image(&dbv), image(&cv), image(&dcv), image(&lv), image(&dlv));
         let mut e2 = d.create_command_encoder(&Default::default());
         unsafe {
             e2.as_hal_mut::<Vulkan, _, _>(|e| {
@@ -797,12 +1026,23 @@ mod tests {
                 per_draw(&biased).set(&raw.ash, cb);
                 raw.ash.cmd_draw(cb, 3, 1, 6, 0);
                 raw.ash.cmd_end_rendering(cb);
+                // Into `l`, the pipeline linked from its parts, the states set per draw.
+                if let Some((pipeline, layout)) = linked {
+                    begin(lh, dlh);
+                    raw.ash.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pipeline);
+                    raw.ash.cmd_bind_descriptor_sets(cb, vk::PipelineBindPoint::GRAPHICS, layout, 0, &[s0, s1], &[256]);
+                    per_draw(&stenciled).set(&raw.ash, cb);
+                    raw.ash.cmd_draw(cb, 6, 1, 0, 0);
+                    per_draw(&biased).set(&raw.ash, cb);
+                    raw.ash.cmd_draw(cb, 3, 1, 6, 0);
+                    raw.ash.cmd_end_rendering(cb);
+                }
             })
         };
 
         // The targets read back.
         let mut e3 = d.create_command_encoder(&Default::default());
-        let readbacks: Vec<wgpu::Buffer> = [&a, &b, &c]
+        let readbacks: Vec<wgpu::Buffer> = [&a, &b, &c, &l]
             .into_iter()
             .map(|texture| {
                 let out = d.create_buffer(&wgpu::BufferDescriptor { label: None, size: 64 * 64 * 4, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
@@ -821,9 +1061,10 @@ mod tests {
             .collect();
         let shades = pixels[0].chunks(4).collect::<std::collections::BTreeSet<_>>().len();
         assert!(shades > 20, "wgpu's draw shows {shades} shades only");
-        for (name, raw) in [("static", &pixels[1]), ("dynamic", &pixels[2])] {
+        let checked = [("static states", &pixels[1]), ("dynamic states", &pixels[2]), ("linked parts", &pixels[3])];
+        for (name, raw) in &checked[..if linked.is_some() { 3 } else { 2 }] {
             let differ = pixels[0].chunks(4).zip(raw.chunks(4)).filter(|(x, y)| x != y).count();
-            assert_eq!(differ, 0, "{name} states: {differ} of 4096 pixels differ");
+            assert_eq!(differ, 0, "{name}: {differ} of 4096 pixels differ");
         }
     }
 }
@@ -847,6 +1088,9 @@ impl Drop for Raw {
             }
             for &s in &self.samplers {
                 self.ash.destroy_sampler(s, None);
+            }
+            if self.cache != vk::PipelineCache::null() {
+                self.ash.destroy_pipeline_cache(self.cache, None);
             }
         }
     }
