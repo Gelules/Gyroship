@@ -96,28 +96,37 @@ game.
 ## Making a release
 
 A release is what players download, and what the launcher's updates install
-([playing.md](playing.md)): one archive, `gyroship-<version>-windows-x64.zip`, holding a folder
-`Gyroship-<version>` with the repository's files at the release's tag, and the two executables at
-its top. The two executables are also published on their own, for players who keep them next to
-each other, apart from the sources (the launcher's Setup then names the repository; only a
-launcher inside a Gyroship folder updates itself). A launcher looks for its updates in the repository its `Cargo.toml` names, through
-GitHub's API: the repository must be public for that. For version 0.2.0, from the repository root:
+([playing.md](playing.md)): three files.
+
+- `gyroship-<version>-windows-x64.zip`: the programs, at its top: `gyroship-launcher.exe`,
+  `gyroship-tools.exe`, `SDL3.dll`, Gyroship's `LICENSE` and SDL's (`SDL3-LICENSE.txt`).
+- `gyroship-<version>-source.zip`: the repository at the release's tag, in a folder
+  `gyroship-<version>`.
+- `SHA256SUMS.txt`: both archives' SHA-256, as `sha256sum` writes them. GitHub also computes the
+  SHA-256 of every file it publishes, and the launcher's updates check it.
+
+A launcher looks for its updates in the repository its `Cargo.toml` names, through GitHub's API:
+the repository must be public for that. For version 0.2.0, from the repository root:
 
 1. Set `version = "0.2.0"` in `crates/launcher/Cargo.toml`. The tag must be `v` and exactly that
    version: a launcher compares its own version with the latest release's tag, and one that takes
    itself for an older version finds its own release out at each start.
-2. Build the tools and the launcher without this machine's paths, which panic messages would
-   otherwise carry: set `RUSTFLAGS` to
-   `--remap-path-prefix=<repository>=. --remap-path-prefix=<Cargo's home>=cargo`, then run
-   `cargo build --release` at the root and in `crates/launcher`.
-3. Commit `crates/launcher/Cargo.toml` and `crates/launcher/Cargo.lock`, then tag that commit and
+2. Commit `crates/launcher/Cargo.toml` and `crates/launcher/Cargo.lock`, then tag that commit and
    push both:
 
        git tag v0.2.0
        git push origin HEAD v0.2.0
 
-4. Make the archive and publish it; `--verify-tag` stops `gh` from making a tag of its own on
-   another commit:
+3. In Git Bash, make the three files, giving the folder that holds `SDL3.dll` and its
+   `LICENSE.txt` (from the `win32-x64` zip of an SDL 3 release). The script checks the version,
+   the tag and a clean working tree; builds the tools and the launcher in `target/dist` folders of
+   their own, without this machine's paths, which panic messages would otherwise carry (it stops
+   if one is left in them); then writes the files to `artifacts/release/0.2.0`. It publishes
+   nothing:
 
-       git archive --format=zip --prefix=Gyroship-0.2.0/ --add-file=crates/launcher/target/release/gyroship-launcher.exe --add-file=target/release/gyroship-tools.exe -o gyroship-0.2.0-windows-x64.zip v0.2.0
-       gh release create v0.2.0 gyroship-0.2.0-windows-x64.zip crates/launcher/target/release/gyroship-launcher.exe target/release/gyroship-tools.exe --verify-tag --title "Gyroship 0.2.0" --notes "What changed, for the players."
+       sh tools/release.sh 0.2.0 <SDL3 folder>
+
+4. Publish them, as the script prints it; `--verify-tag` stops `gh` from making a tag of its own
+   on another commit:
+
+       gh release create v0.2.0 artifacts/release/0.2.0/gyroship-0.2.0-windows-x64.zip artifacts/release/0.2.0/gyroship-0.2.0-source.zip artifacts/release/0.2.0/SHA256SUMS.txt --verify-tag --title "Gyroship 0.2.0" --notes "What changed, for the players."

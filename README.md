@@ -76,8 +76,8 @@ its options. Xbox, PlayStation and other gamepads work too, and so does the keyb
   your PC.
 - **A launcher that guides you**: it prepares the game step by step, tells you what is missing and
   explains every option.
-- **Always up to date**: the launcher tells you when a new version of Gyroship is out, and a copy
-  from a release downloads it, installs it and builds your game again, by itself.
+- **Always up to date**: when a new version of Gyroship is out, the launcher downloads it, checks
+  it, installs it and builds your game again, by itself.
 - **14 languages** for the game's texts, as on the console.
 - **Offline**: the game talks to no server.
 
@@ -93,30 +93,31 @@ its options. Xbox, PlayStation and other gamepads work too, and so does the keyb
 | Controls | Keyboard, Xbox, PlayStation and other gamepads, Switch 2 Joy-Con |
 | Mouse controls | Through the Joy-Con, as on the console |
 | Sound and languages | The game's audio and its 14 text regions |
-| Launcher | Setup step by step, then Play; a release's copy updates itself |
+| Launcher | Setup step by step, then Play; it updates itself |
 
 Details and known issues: [docs/status.md](docs/status.md).
 
-## Install, step by step
+## Install
 
 You need Windows 11 (or Windows 10 with Microsoft's WebView2 runtime), 64-bit, an NVIDIA graphics
 card, 16 GB of RAM, and your own dump of the game with its update. What building the game takes
 (Rust, Microsoft's C++ build tools, the Visual C++ runtime), the launcher installs on your click
 when it is missing. Here is one install from zero, on drive G:; any folders will do.
 
-1. **Get the sources.** Download the source code of the
-   [latest release](https://github.com/Gelules/Gyroship/releases/latest) and unzip it, or clone
-   this repository at that release's tag. Here: `G:\Gyroship\gyroship`.
+1. **Get the sources.** From the
+   [latest release](https://github.com/Gelules/Gyroship/releases/latest), download
+   `gyroship-<version>-source.zip` and unzip it, or clone this repository at that release's tag.
+   Here: `G:\Gyroship\gyroship`, a clone.
 
    ![The folder of Gyroship's sources](docs/install/1-sources.png)
 
-2. **Download the two programs** of the same release, `gyroship-launcher.exe` and
-   `gyroship-tools.exe`: no need to build them. Put them in a folder of their own, with an empty
-   folder for your data (saves, shader cache, logs). For gamepads and sound, add `SDL3.dll`, from
-   the `win32-x64` zip of an [SDL 3 release](https://github.com/libsdl-org/SDL/releases). Here:
-   `G:\Gyroship\Test`, with its folder `data`.
+2. **Get the programs** of the same release: unzip `gyroship-<version>-windows-x64.zip` in a
+   folder of its own. It holds the launcher, the tools and `SDL3.dll` for gamepads and sound, with
+   their licences: nothing to build. Add an empty folder for your data (saves, shader cache,
+   logs). Here: `G:\Gyroship\Test`, with its folder `data`. The release's `SHA256SUMS.txt` holds
+   both archives' SHA-256; `certutil -hashfile <archive> SHA256` prints an archive's, to compare.
 
-   ![The two programs, SDL3.dll and the data folder](docs/install/2-programs.png)
+   ![The programs, their licences and the data folder](docs/install/2-programs.png)
 
 3. **Find your dump's `exefs` folder**, the update's, with its `romfs` folder next to it. Here:
    `G:\Gyroship\Dump\update\exefs`.
@@ -151,8 +152,9 @@ when it is missing. Here is one install from zero, on drive G:; any folders will
 
    ![Play: ready](docs/install/8-play.png)
 
-When a new version is out, the launcher tells you: get its sources and its two programs the same
-way, then press Set up everything again. Every option of the launcher, and how to build everything
+When a new version is out, the launcher installs it by itself, its sources next to yours, and
+builds your game again; from a clone, it only tells you (update it with `git pull`). Every option
+of the launcher, and how to build everything
 yourself: [docs/playing.md](docs/playing.md) and [docs/building.md](docs/building.md).
 
 ## Documentation

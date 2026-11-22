@@ -1,11 +1,11 @@
 //! Gyroship's launcher (M6 step 9c): a window over the command line. It picks a build
 //! of the game and its options, starts it, says how the last session ended, runs the
 //! setup steps (the installs, the tools' build, the recompile, the game's build) and
-//! installs new releases (D109), one thing at a time. Its settings and its webview's
+//! installs new releases (D109, D112), one thing at a time. Its settings and its webview's
 //! data live next to its executable.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use gyroship_launcher::{Checks, LAUNCHER, Last, Needs, RUNNING, Report, Settings, Update, VERSION, builds, checks, flags, install_root, latest_newer, layers, load, logs, needs, prepare_save, report, save, session, step, update_blocker};
+use gyroship_launcher::{Checks, Last, Needs, RUNNING, Report, Settings, Update, VERSION, builds, checks, flags, install_root, latest_newer, layers, load, logs, needs, prepare_save, report, save, sdl_for, session, step, update_blocker};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -114,25 +114,27 @@ fn list_needs() -> Needs {
     needs()
 }
 
-/// This launcher's version, the latest release when it is newer (D109), and why this copy
-/// cannot install it itself, if it cannot: a Git clone, or a folder already taken (said at
-/// start, rather than downloaded again at each one). An error when GitHub cannot be asked.
+/// This launcher's version, the latest release when it is newer (D109), and why this launcher
+/// cannot install it itself, if it cannot (D112: a Git clone, a launcher inside the sources, a
+/// folder already taken; said at start, rather than downloaded again at each one). An error when
+/// GitHub cannot be asked.
 #[tauri::command(async)]
-fn check_update() -> Result<Update, String> {
+fn check_update(settings: Settings) -> Result<Update, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let release = latest_newer()?;
-    let taken = || gyroship_launcher::target(&install_root(&exe)?, &release.as_ref()?.tag).err();
-    let blocker = update_blocker(&exe).or_else(taken);
+    let taken = || gyroship_launcher::target(Path::new(&settings.repo), &release.as_ref()?.tag).err();
+    let blocker = update_blocker(&exe, &settings).or_else(taken);
     Ok(Update { version: VERSION.into(), release, blocker })
 }
 
-/// Installs the latest release next to this copy of Gyroship, in the background, telling the
-/// page how far it went ("update"), then starts the new copy's launcher, which rebuilds the
-/// game, and ends; a failure comes as "update-failed". Never while a game or a step runs.
+/// Installs the latest release in the background (D112), telling the page how far it went
+/// ("update"): its sources next to the repository's, its programs in place of this launcher's.
+/// Then starts the new launcher, which rebuilds the game, and ends; a failure comes as
+/// "update-failed". Never while a game or a step runs.
 #[tauri::command]
 fn apply_update(app: AppHandle, busy: State<Busy>, settings: Settings) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    if let Some(why) = update_blocker(&exe) {
+    if let Some(why) = update_blocker(&exe, &settings) {
         return Err(why);
     }
     if busy.0.swap(true, Relaxed) {
@@ -140,13 +142,13 @@ fn apply_update(app: AppHandle, busy: State<Busy>, settings: Settings) -> Result
     }
     std::thread::spawn(move || {
         let page = app.clone();
-        let started = gyroship_launcher::update(&settings, &exe, |text| drop(page.emit("update", text))).and_then(|(new, old)| {
-            let launcher = new.join(LAUNCHER);
-            let mut child = Command::new(&launcher).arg("--updated-from").arg(&old).current_dir(&new).spawn().map_err(|e| format!("{}: {e}", launcher.display()))?;
+        let started = gyroship_launcher::update(&settings, &exe, |text| drop(page.emit("update", text))).and_then(|old| {
+            // The new launcher, at this one's place: it waits for this one's lock, freed as it ends.
+            let mut child = Command::new(&exe).arg("--updated-from").arg(&old).current_dir(folder()).spawn().map_err(|e| format!("{}: {e}", exe.display()))?;
             // A new launcher that ends at once shows no message of its own: said here, and this one stays.
             std::thread::sleep(Duration::from_secs(3));
             match child.try_wait() {
-                Ok(Some(status)) => Err(format!("the new launcher stopped at its start ({status}): start {} yourself", launcher.display())),
+                Ok(Some(status)) => Err(format!("the new launcher stopped at its start ({status}): start {} yourself", exe.display())),
                 _ => Ok(()),
             }
         });
@@ -170,20 +172,19 @@ fn open_release(url: String) -> Result<(), String> {
     Command::new("explorer.exe").arg(url).spawn().map(drop).map_err(|e| e.to_string())
 }
 
-/// The copy of Gyroship this one was updated from, deleted on the player's click: the one this
-/// launcher was started for, checked against the settings as saved, never what the page says.
-/// Off the window's thread (a copy holds a built game, thousands of files), and busy meanwhile,
-/// so that the window waits for its end.
+/// The sources the update came from, deleted on the player's click: those this launcher was
+/// started for, checked against the settings as saved, never what the page says. Off the
+/// window's thread (sources hold a built game, thousands of files), and busy meanwhile, so that
+/// the window waits for its end.
 #[tauri::command(async)]
 fn delete_previous(app: AppHandle) -> Result<(), String> {
     let old = app.state::<UpdatedFrom>().0.clone().ok_or("this launcher was not started by an update")?;
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let root = install_root(&exe).ok_or("this launcher is not in a Gyroship folder")?;
     let busy = app.state::<Busy>();
     if busy.0.swap(true, Relaxed) {
         return Err("a game, a setup step or an update is running".into());
     }
-    let done = gyroship_launcher::delete_previous(&load(&settings_file()).0, &old, &root);
+    let s = load(&settings_file()).0;
+    let done = gyroship_launcher::delete_previous(&s, &old, Path::new(&s.repo));
     busy.0.store(false, Relaxed);
     done
 }
@@ -242,8 +243,9 @@ fn start(app: &AppHandle, settings: Settings, shortcut: bool) -> Result<(), Stri
         let logs = logs(&settings);
         std::fs::create_dir_all(&logs).map_err(|e| format!("{}: {e}", logs.display()))?;
         let name = session(&logs);
-        // The save the game gets: the chosen folder, a copy of it, or an empty one.
-        let played = Settings { save: prepare_save(&settings)?, ..settings.clone() };
+        // The save the game gets: the chosen folder, a copy of it, or an empty one; and SDL3, the
+        // one chosen or the one a release puts next to the launcher.
+        let played = Settings { save: prepare_save(&settings)?, sdl: sdl_for(&settings, &folder()), ..settings.clone() };
         let mut game = Command::new(&settings.build);
         game.args(flags(&played, &logs, &name));
         if !settings.console {
@@ -363,12 +365,22 @@ fn main() {
     #[cfg(windows)]
     let _only = {
         use std::os::windows::fs::OpenOptionsExt;
-        match std::fs::OpenOptions::new().write(true).create(true).truncate(false).share_mode(0).open(folder().join("launcher.lock")) {
-            // 32: a sharing violation, the other launcher holds the file.
-            Err(e) if e.raw_os_error() == Some(32) => return say("The launcher is already running: use its window, or close it first.\n\nDuring a game it has no window: it comes back when the game ends."),
-            lock => lock.ok(),
+        // After an update, the launcher that started this one holds the lock until it ends, a few
+        // seconds later: waited for, 30 s at most.
+        let patience = if std::env::args().any(|a| a == "--updated-from") { 150 } else { 0 };
+        let mut tries = 0;
+        loop {
+            match std::fs::OpenOptions::new().write(true).create(true).truncate(false).share_mode(0).open(folder().join("launcher.lock")) {
+                // 32: a sharing violation, the other launcher holds the file.
+                Err(e) if e.raw_os_error() == Some(32) && tries < patience => tries += 1,
+                Err(e) if e.raw_os_error() == Some(32) => return say("The launcher is already running: use its window, or close it first.\n\nDuring a game it has no window: it comes back when the game ends."),
+                lock => break lock.ok(),
+            }
+            std::thread::sleep(Duration::from_millis(200));
         }
     };
+    // The programs an update replaced, now that the launcher they belonged to has ended.
+    gyroship_launcher::remove_replaced(&folder());
     let app = tauri::Builder::default()
         .manage(Busy::default())
         .manage(UpdatedFrom(std::env::args().skip_while(|a| a != "--updated-from").nth(1).map(PathBuf::from)))

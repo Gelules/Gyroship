@@ -262,13 +262,13 @@ function banner(text, buttons = ['update-close']) {
   $('update').hidden = !text;
 }
 
-// GitHub asked for a newer release. A release's copy installs it (`install`); a Git clone, or a
-// launcher outside a Gyroship folder, is only told.
+// GitHub asked for a newer release. A release's programs install it (`install`, D112); a Git
+// clone, or a launcher inside the sources, is only told.
 async function checkUpdate(install) {
   $('update-state').textContent = 'Looking for a new version…';
   $('check-update').disabled = true;
   try {
-    const u = await invoke('check_update');
+    const u = await invoke('check_update', { settings });
     release = u.release;
     if (!release) return void ($('update-state').textContent = `Gyroship ${u.version} is the latest version.`);
     $('update-state').textContent = `Gyroship ${release.tag} is out (this copy is ${u.version}).`;
@@ -282,9 +282,10 @@ async function checkUpdate(install) {
   }
 }
 
-// The launcher downloads the release and installs it next to this copy, then starts the new
-// copy's launcher and ends: this page goes with it. A failure leaves this copy as it was. Not
-// while a step runs: the launcher would refuse, and the page would wrongly free its buttons.
+// The launcher downloads the release, puts its sources next to the repository's and its programs
+// in place of its own, then starts the new launcher and ends: this page goes with it. A failure
+// leaves everything as it was. Not while a step runs: the launcher would refuse, and the page
+// would wrongly free its buttons.
 async function applyUpdate() {
   if (running) return banner(`Gyroship ${release.tag} is out: once this step ends, press Check now in Setup to install it.`, ['update-page', 'update-close']);
   banner(`Updating to Gyroship ${release.tag}: the launcher restarts in the new version once it is installed.`, ['update-page']);
@@ -297,10 +298,10 @@ async function applyUpdate() {
   }
 }
 
-// After an update, the game is built again for the new version: Recompile, then Build. The
-// steps left, while they run. The previous copy can go once it is built, from this window only.
+// After an update, the game is built again from the new sources: Recompile, then Build. The
+// steps left, while they run. The previous sources can go once it is built, from this window only.
 let rebuild = null;
-const leftBehind = () => (from ? ` The previous copy is still in ${from}: delete it here, or later in the file explorer.` : '');
+const leftBehind = () => (from ? ` The previous sources are still in ${from}: delete them here, or later in the file explorer.` : '');
 async function rebuildNext(code) {
   const kind = code === 0 && rebuild.shift();
   if (kind) {
@@ -317,19 +318,19 @@ async function rebuildNext(code) {
   }
   await refreshBuilds();
   await refreshChecks();
-  // Until this copy's game is built, the previous copy keeps the only one: no offer to delete it.
-  if (built) banner(`Gyroship ${window.__VERSION__} is ready to play. Shortcuts to the previous copy's launcher still start it: point them to this one.${leftBehind()}`, ['update-delete', 'update-close']);
-  else banner(`Gyroship ${window.__VERSION__} is installed, but its game is not built yet: see the messages in Setup, then Recompile and Build. Until then, the previous copy's launcher still plays the previous version (${from}).`);
+  // Until the new sources' game is built, the previous sources keep the only one: no offer to delete them.
+  if (built) banner(`Gyroship ${window.__VERSION__} is ready to play.${leftBehind()}`, ['update-delete', 'update-close']);
+  else banner(`Gyroship ${window.__VERSION__} is installed, but its game is not built yet: see the messages in Setup, then Recompile and Build.`);
 }
 
 async function deletePrevious() {
   $('update-delete').disabled = true;
   try {
     await invoke('delete_previous');
-    banner(`The previous copy is deleted (${from}).`);
+    banner(`The previous sources are deleted (${from}).`);
   } catch (e) {
     $('update-delete').disabled = false;
-    banner(`The previous copy is still there: ${e}`, ['update-delete', 'update-close']);
+    banner(`The previous sources are still there: ${e}`, ['update-delete', 'update-close']);
   }
 }
 
@@ -360,7 +361,7 @@ async function main() {
   await listen('update', (e) => banner(e.payload, ['update-page']));
   await listen('update-failed', (e) => {
     busy(false);
-    banner(`The update failed: ${e.payload}. This copy works as before.`, ['update-retry', 'update-page', 'update-close']);
+    banner(`The update failed: ${e.payload}. Gyroship works as before.`, ['update-retry', 'update-page', 'update-close']);
   });
   const [loaded, problem] = await invoke('get_settings');
   settings = loaded;

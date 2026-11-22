@@ -39,7 +39,7 @@
       <p id="update-text"></p>
       <div class="row">
         <button id="update-retry" hidden>Try again</button>
-        <button id="update-delete" hidden>Delete the previous copy</button>
+        <button id="update-delete" hidden>Delete the previous sources</button>
         <button id="update-page" class="quiet" hidden>What's new</button>
         <button id="update-close" class="quiet" hidden>Close</button>
       </div>
@@ -95,7 +95,7 @@
           <label class="switch"><input type="checkbox" data-key="console"><span>Show the game's messages <small>A window that says, for one, when each Joy-Con connects.</small></span></label>
         </div>
         <div class="grid">
-          <label class="field wide"><span>Gamepads and sound (SDL3)</span><input data-key="sdl" placeholder="empty: SDL3.dll next to the game"><small class="help">SDL3.dll, which gamepads and sound need.</small></label>
+          <label class="field wide"><span>Gamepads and sound (SDL3)</span><input data-key="sdl" placeholder="empty: SDL3.dll next to the launcher, else next to the game"><small class="help">SDL3.dll, which gamepads and sound need.</small></label>
         </div>
       </fieldset>
 
@@ -203,7 +203,7 @@
 
       <div class="updates">
         <h3>Updates</h3>
-        <p class="explain">When a new version of Gyroship is out, the launcher downloads it from GitHub and installs it next to this copy, which stays until you delete it. It then builds the game again for it, as in steps 3 and 4. A Git clone is only told: update it with git pull, then build the tools and the game again. The game itself never goes online.</p>
+        <p class="explain">When a new version of Gyroship is out, the launcher downloads it from GitHub: it puts the new programs in place of its own, and the new sources next to yours, which stay until you delete them. It then builds the game again from them, as in steps 3 and 4. A Git clone is only told: update it with git pull, then build the tools and the game again. The game itself never goes online.</p>
         <div class="switches">
           <label class="switch"><input type="checkbox" data-key="no_update_check" data-invert><span>Look for updates at start <small>Asks GitHub when the launcher opens; a newer version is then downloaded, installed and built at once. Check now does the same at any time.</small></span></label>
         </div>

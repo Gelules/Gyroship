@@ -372,15 +372,29 @@ fn folder_tag(tag: &str) -> bool {
     tag.chars().all(|c| c.is_ascii_alphanumeric() || ".-".contains(c))
 }
 
-/// A release newer than this launcher: its tag ("v0.2.0"), its page, and its Windows archive
-/// (`gyroship-<version>-windows-x64.zip`, docs/building.md) with its size in bytes.
+/// A file of a release: where GitHub serves it, its size in bytes, and its SHA-256 in lowercase
+/// hex, as GitHub computed it when it was published (its `digest`), when it gives one.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct Asset {
+    pub url: String,
+    pub size: u64,
+    pub sha256: Option<String>,
+}
+
+/// A release newer than this launcher (D112, docs/building.md): its tag ("v0.2.0"), its page, its
+/// programs (`gyroship-<version>-windows-x64.zip`: the launcher, the tools, SDL3.dll and their
+/// licences, at its top) and its sources (`gyroship-<version>-source.zip`, in their own folder).
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct Release {
     pub tag: String,
     pub page: String,
-    pub zip: String,
-    pub size: u64,
+    pub programs: Asset,
+    pub source: Asset,
 }
+
+/// The files of a release's programs archive, the ones an update puts in place of the launcher's
+/// own: the launcher and the tools, which it must hold, then SDL3.dll and the licences.
+pub const RELEASED: [&str; 5] = [LAUNCHER, "gyroship-tools.exe", "SDL3.dll", "LICENSE", "SDL3-LICENSE.txt"];
 
 /// What the page learns at start: this launcher's version, a newer release if there is one,
 /// and why this copy of Gyroship cannot install it itself, if it cannot.
@@ -392,20 +406,22 @@ pub struct Update {
 }
 
 /// The release in GitHub's answer for the latest one, when it is newer than `current`. Only the
-/// repository's own page and archive are taken, and only a tag that can name a folder.
+/// repository's own page and archives are taken, and only a tag that can name a folder.
 pub fn release_from(json: &str, current: &str) -> Result<Option<Release>, String> {
     #[derive(Deserialize)]
-    struct Asset {
+    struct Found {
         name: String,
         browser_download_url: String,
         size: u64,
+        #[serde(default)]
+        digest: Option<String>,
     }
     #[derive(Deserialize)]
     struct Answer {
         tag_name: String,
         html_url: String,
         #[serde(default)]
-        assets: Vec<Asset>,
+        assets: Vec<Found>,
     }
     let answer: Answer = serde_json::from_str(json).map_err(|e| format!("GitHub's answer: {e}"))?;
     let tag = answer.tag_name;
@@ -415,12 +431,18 @@ pub fn release_from(json: &str, current: &str) -> Result<Option<Release>, String
     if !folder_tag(&tag) || !is_release_page(&answer.html_url) {
         return Err(format!("release {tag}: not one of {REPOSITORY}'s"));
     }
-    // This tag's archive, at the one address GitHub gives it: nothing else is downloaded.
-    let name = format!("gyroship-{}-windows-x64.zip", tag.trim_start_matches(['v', 'V']));
-    let url = format!("{REPOSITORY}/releases/download/{tag}/{name}");
-    let zip = answer.assets.into_iter().find(|a| a.name == name && a.browser_download_url == url);
-    let zip = zip.ok_or_else(|| format!("release {tag} has no {name}: get it from {}", answer.html_url))?;
-    Ok(Some(Release { tag, page: answer.html_url, zip: url, size: zip.size }))
+    // This tag's archives, each at the one address GitHub gives it: nothing else is downloaded.
+    let version = tag.trim_start_matches(['v', 'V']);
+    let take = |kind: &str| {
+        let name = format!("gyroship-{version}-{kind}.zip");
+        let url = format!("{REPOSITORY}/releases/download/{tag}/{name}");
+        let found = answer.assets.iter().find(|a| a.name == name && a.browser_download_url == url);
+        let found = found.ok_or_else(|| format!("release {tag} has no {name}: get it from {}", answer.html_url))?;
+        let sha256 = found.digest.as_deref().and_then(|d| d.strip_prefix("sha256:")).map(str::to_lowercase).filter(|h| h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()));
+        Ok::<_, String>(Asset { url, size: found.size, sha256 })
+    };
+    let (programs, source) = (take("windows-x64")?, take("source")?);
+    Ok(Some(Release { tag, page: answer.html_url, programs, source }))
 }
 
 /// One of Windows' own programs (curl and tar, there since Windows 10 1803): the launcher
@@ -455,15 +477,29 @@ pub fn install_root(exe: &Path) -> Option<PathBuf> {
     exe.ancestors().skip(1).find(|d| d.join("crates").join("runtime").join("Cargo.toml").is_file()).map(Path::to_path_buf)
 }
 
-/// Why the copy of Gyroship that launcher `exe` belongs to cannot install a release itself, if
-/// it cannot: a Git clone updates through Git, and a launcher outside a Gyroship folder has
-/// nothing to update.
-pub fn update_blocker(exe: &Path) -> Option<String> {
-    match install_root(exe) {
-        None => Some("this launcher is not in a Gyroship folder: get the new version from its page".into()),
-        Some(root) if root.join(".git").exists() => Some("this copy is a Git clone: update it with git pull, then build the tools and the game again".into()),
-        Some(_) => None,
+/// Why launcher `exe`, with settings `s`, cannot install a release itself, if it cannot (D112): it
+/// stands in a folder of its own, as a release's programs do, and the repository it plays from
+/// holds a release's sources, not a Git clone's, which updates through Git.
+pub fn update_blocker(exe: &Path, s: &Settings) -> Option<String> {
+    if let Some(root) = install_root(exe) {
+        return Some(if root.join(".git").exists() {
+            "this launcher was built in a Git clone: update the clone with git pull, then build the tools and the game again".into()
+        } else {
+            format!("this launcher is inside Gyroship's sources ({}): keep a release's programs in a folder of their own, or get the new version from its page", root.display())
+        });
     }
+    let repo = Path::new(&s.repo);
+    if !repo.is_absolute() || !repo.join("crates").join("runtime").join("Cargo.toml").is_file() {
+        return Some("the repository (Setup, step 1) is not set, or holds no Gyroship sources: the new sources go next to it".into());
+    }
+    repo.join(".git").exists().then(|| "your repository is a Git clone: update it with git pull, then get the new programs from the release's page".into())
+}
+
+/// The SDL3 library the game gets: the one chosen, else the SDL3.dll next to the launcher (a
+/// release's programs bring it), else none named (the game then looks next to itself).
+pub fn sdl_for(s: &Settings, launcher: &Path) -> String {
+    let beside = launcher.join("SDL3.dll");
+    if !s.sdl.is_empty() || !beside.is_file() { s.sdl.clone() } else { beside.to_string_lossy().into_owned() }
 }
 
 /// `path`'s place inside `folder`, when it lies there as written (letter case aside, as Windows
@@ -512,20 +548,20 @@ fn game_folder(root: &Path) -> PathBuf {
     root.join("generated").join("game").join("target").join("release")
 }
 
-/// Where release `tag` goes next to the copy of Gyroship in `root`, `Gyroship-<version>`, when it
-/// can go there: asked before anything is downloaded.
-pub fn target(root: &Path, tag: &str) -> Result<PathBuf, String> {
+/// Where release `tag`'s sources go, next to the repository `repo`: `gyroship-<version>`, the
+/// folder their archive holds, when they can go there: asked before anything is downloaded.
+pub fn target(repo: &Path, tag: &str) -> Result<PathBuf, String> {
     if !folder_tag(tag) {
         return Err(format!("{tag}: no version a folder can be named after"));
     }
-    let parent = root.parent().ok_or_else(|| format!("{}: no folder above it", root.display()))?;
-    let to = parent.join(format!("Gyroship-{}", tag.trim_start_matches(['v', 'V'])));
+    let parent = repo.parent().ok_or_else(|| format!("{}: no folder above it", repo.display()))?;
+    let to = parent.join(format!("gyroship-{}", tag.trim_start_matches(['v', 'V'])));
     let lower = |p: &Path| PathBuf::from(p.to_string_lossy().to_lowercase());
-    if lower(&to) == lower(root) {
-        return Err(format!("this copy is the release {tag}, but its launcher says {VERSION}: the release was made without setting its version"));
+    if lower(&to) == lower(repo) {
+        return Err(format!("your repository holds release {tag}'s sources, but this launcher says {VERSION}: get the programs of {tag} from its page"));
     }
     if to.exists() {
-        return Err(format!("{} already exists: Gyroship {tag} is installed there; start its launcher (and point your shortcuts to it), or move that folder away", to.display()));
+        return Err(format!("{} already exists: move it away, then look for updates again", to.display()));
     }
     Ok(to)
 }
@@ -534,59 +570,55 @@ pub fn target(root: &Path, tag: &str) -> Result<PathBuf, String> {
 /// launcher's to remove, and a folder of that name without it is not.
 const MARK: &str = ".gyroship-update";
 
-/// Installs a release's archive `zip` (tag `tag`) next to the copy of Gyroship in `root`, as
-/// `Gyroship-<version>`: unpacked into `Gyroship-<version>.part`, given its settings (`rebase`)
-/// and the SDL3.dll put next to the game, then renamed. The rename is the one step that makes the
-/// new copy: a failure before it leaves the current copy as it was, and at most a marked `.part`
-/// that the next update removes. Returns the new folder.
-pub fn install(zip: &Path, tag: &str, root: &Path, s: &Settings) -> Result<PathBuf, String> {
-    let fail = |what: &Path, e: std::io::Error| format!("{}: {e}", what.display());
-    let to = target(root, tag)?;
-    let part = PathBuf::from(format!("{}.part", to.display()));
-    if part.join(MARK).is_file() {
-        fs::remove_dir_all(&part).map_err(|e| fail(&part, e))?;
+/// Renames `from` to `to`, waiting out an antivirus that holds a new file or folder for a moment
+/// while it scans it (5: access denied; 32: in use).
+fn rename_waiting(from: &Path, to: &Path) -> Result<(), String> {
+    let mut tries = 0;
+    loop {
+        match fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(e) if matches!(e.raw_os_error(), Some(5 | 32)) && tries < 4 => tries += 1,
+            Err(e) => return Err(format!("{} -> {}: {e}", from.display(), to.display())),
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
     }
-    fs::create_dir(&part).map_err(|e| fail(&part, e))?;
-    fs::write(part.join(MARK), "").map_err(|e| fail(&part, e))?;
-    let unpacked = run(&windows_program("tar.exe"), &["-x", "-f", &zip.to_string_lossy(), "-C", &part.to_string_lossy()]).and_then(|_| {
-        // The archive's top: the folder itself, or its one folder.
-        let top = if part.join(LAUNCHER).is_file() { Some(part.clone()) } else { fs::read_dir(&part).into_iter().flatten().flatten().map(|e| e.path()).find(|p| p.join(LAUNCHER).is_file()) };
-        top.filter(|t| t.join("crates").join("runtime").join("Cargo.toml").is_file()).ok_or_else(|| format!("{}: no {LAUNCHER} beside Gyroship's sources in it", zip.display()))
-    });
-    let top = match unpacked {
+}
+
+/// Unpacks archive `zip` into the new folder `part`, marked as an update's (`MARK`); a marked folder
+/// of that name, left by an update that stopped, is removed first. Nothing stays on a failure.
+fn unpack(zip: &Path, part: &Path) -> Result<(), String> {
+    let fail = |e: std::io::Error| format!("{}: {e}", part.display());
+    if part.join(MARK).is_file() {
+        fs::remove_dir_all(part).map_err(fail)?;
+    }
+    fs::create_dir(part).map_err(fail)?;
+    fs::write(part.join(MARK), "").map_err(fail)?;
+    let unpacked = run(&windows_program("tar.exe"), &["-x", "-f", &zip.to_string_lossy(), "-C", &part.to_string_lossy()]);
+    unpacked.map(drop).inspect_err(|_| {
+        let _ = fs::remove_dir_all(part);
+    })
+}
+
+/// Installs release `tag`'s source archive `zip` next to the repository `repo` (D112), as
+/// `gyroship-<version>`: unpacked into `gyroship-<version>.part`, then renamed once whole. A
+/// failure leaves the repository as it was, and at most a marked `.part` that the next update
+/// removes. Returns the new sources' folder.
+pub fn install_sources(zip: &Path, tag: &str, repo: &Path) -> Result<PathBuf, String> {
+    let to = target(repo, tag)?;
+    let part = PathBuf::from(format!("{}.part", to.display()));
+    unpack(zip, &part)?;
+    // The archive's top: the folder itself, or its one folder.
+    let sources = |d: &Path| d.join("crates").join("runtime").join("Cargo.toml").is_file();
+    let top = if sources(&part) { Some(part.clone()) } else { fs::read_dir(&part).into_iter().flatten().flatten().map(|e| e.path()).find(|p| sources(p)) };
+    let renamed = top.ok_or_else(|| format!("{}: no Gyroship sources in it", zip.display())).and_then(|top| rename_waiting(&top, &to).map(|()| top));
+    let top = match renamed {
         Ok(top) => top,
         Err(e) => {
             let _ = fs::remove_dir_all(&part);
             return Err(e);
         }
     };
-    // The game resolves these against the launcher's current folder, which the new launcher does not
-    // share (it runs in its copy): made whole here, they keep their meaning. (The tools look for the
-    // probe list from the repository, and SDL3 goes through Windows' search for DLLs.)
-    let whole = |p: &String| if p.is_empty() || Path::new(p).is_absolute() { p.clone() } else { std::path::absolute(p).map_or_else(|_| p.clone(), |a| a.to_string_lossy().into_owned()) };
-    let s = Settings { save: whole(&s.save), cache: whole(&s.cache), hooks: whole(&s.hooks), layer: whole(&s.layer), practice: whole(&s.practice), ..s.clone() };
-    let sdl = game_folder(root).join("SDL3.dll");
-    let ready = (|| -> Result<(), String> {
-        if sdl.is_file() {
-            fs::create_dir_all(game_folder(&top)).and_then(|()| fs::copy(&sdl, game_folder(&top).join("SDL3.dll"))).map_err(|e| fail(&sdl, e))?;
-        }
-        save(&top.join("launcher.json"), &rebase(&s, root, &to, &top))
-    })();
-    // An antivirus scanning the new executables can hold the folder for a moment (5: access denied).
-    let mut tries = 0;
-    let renamed = ready.and_then(|()| loop {
-        match fs::rename(&top, &to) {
-            Ok(()) => break Ok(()),
-            Err(e) if e.raw_os_error() == Some(5) && tries < 4 => tries += 1,
-            Err(e) => break Err(fail(&to, e)),
-        }
-        std::thread::sleep(std::time::Duration::from_secs(1));
-    });
-    if let Err(e) = renamed {
-        let _ = fs::remove_dir_all(&part);
-        return Err(e);
-    }
-    // Leftovers only, now: the mark (in the new copy when the archive had no top folder), and the
+    // Leftovers only, now: the mark (in the new folder when the archive had no top folder), and the
     // `.part` folder, still marked, which a later update removes.
     let _ = fs::remove_file(to.join(MARK));
     if top != part {
@@ -595,69 +627,134 @@ pub fn install(zip: &Path, tag: &str, root: &Path, s: &Settings) -> Result<PathB
     Ok(to)
 }
 
-/// Fetches a release's archive into `to`, and checks it has the size GitHub gave. Bounded: 30 s to
-/// connect, 30 minutes in all, and a transfer slower than 1 KB/s for a minute stops.
-// ponytail: integrity rests on HTTPS, that size and the archive's own checksums (tar checks
-// them); a signature check once releases are signed. 30 minutes are about 30 KB/s for a 50 MB
-// archive: a limit from `r.size` if players need slower links.
-fn download(r: &Release, to: &Path) -> Result<(), String> {
-    let output = to.to_string_lossy();
-    curl(&["--retry", "2", "--connect-timeout", "30", "--max-time", "1800", "--retry-max-time", "1800", "--speed-limit", "1024", "--speed-time", "60", "--output", &output, &r.zip])?;
-    match fs::metadata(to).map(|m| m.len()) {
-        Ok(got) if got == r.size => Ok(()),
-        got => Err(format!("{}: {} bytes received, {} announced", r.zip, got.unwrap_or(0), r.size)),
+/// Puts a release's programs, from its archive `zip`, in place of those in `folder`, the
+/// launcher's (D112): each file of `RELEASED` it holds (the launcher and the tools it must hold)
+/// replaces the one of that name, which stays as `<name>.old` until the next launcher started
+/// there removes it (a running program can be renamed, not overwritten). On a failure, every file
+/// is put back as it was.
+pub fn install_programs(zip: &Path, folder: &Path) -> Result<(), String> {
+    let staged = folder.join(".gyroship-programs");
+    unpack(zip, &staged)?;
+    let names: Vec<&str> = RELEASED.into_iter().filter(|n| staged.join(n).is_file()).collect();
+    let mut done = Vec::new();
+    let swapped = match RELEASED[..2].iter().find(|n| !names.contains(n)) {
+        Some(missing) => Err(format!("{}: no {missing} in it", zip.display())),
+        None => names.iter().try_for_each(|&n| {
+            let (now, old) = (folder.join(n), folder.join(format!("{n}.old")));
+            // An earlier update's leftover, if its launcher has ended.
+            let _ = fs::remove_file(&old);
+            if now.exists() {
+                rename_waiting(&now, &old)?;
+            }
+            done.push(n);
+            rename_waiting(&staged.join(n), &now)
+        }),
+    };
+    if swapped.is_err() {
+        for n in done {
+            let (now, old) = (folder.join(n), folder.join(format!("{n}.old")));
+            let _ = fs::remove_file(&now);
+            if old.exists() {
+                let _ = fs::rename(&old, &now);
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(&staged);
+    swapped
+}
+
+/// Removes the files an update replaced (`<name>.old`, `install_programs`): a launcher does it at
+/// its start, once it holds the lock, so once the launcher they belonged to has ended.
+pub fn remove_replaced(folder: &Path) {
+    for n in RELEASED {
+        let _ = fs::remove_file(folder.join(format!("{n}.old")));
     }
 }
 
-/// Fetches the latest release, when it is newer, and installs it next to the copy of Gyroship
-/// that launcher `exe` belongs to; `say` tells the player how far it went. Asked again here,
-/// not taken from the page: only GitHub's answer says what is downloaded. Returns the new
-/// copy's folder and the current one's.
-pub fn update(s: &Settings, exe: &Path, say: impl Fn(String)) -> Result<(PathBuf, PathBuf), String> {
-    if let Some(why) = update_blocker(exe) {
+/// Fetches a release's file into `to`, and checks its size and, when GitHub gives it, its SHA-256.
+/// Bounded: 30 s to connect, 30 minutes in all, and a transfer slower than 1 KB/s for a minute
+/// stops.
+// ponytail: integrity rests on HTTPS and on the size and SHA-256 GitHub computed when the file was
+// published; a signature check once releases are signed. 30 minutes are about 15 KB/s for the two
+// archives: a limit from their sizes if players need slower links.
+fn download(a: &Asset, to: &Path) -> Result<(), String> {
+    let output = to.to_string_lossy();
+    curl(&["--retry", "2", "--connect-timeout", "30", "--max-time", "1800", "--retry-max-time", "1800", "--speed-limit", "1024", "--speed-time", "60", "--output", &output, &a.url])?;
+    let got = fs::metadata(to).map_or(0, |m| m.len());
+    if got != a.size {
+        return Err(format!("{}: {got} bytes received, {} announced", a.url, a.size));
+    }
+    match &a.sha256 {
+        Some(want) if sha256_of(to)? != *want => Err(format!("{}: its SHA-256 is not the one GitHub gives ({want})", a.url)),
+        _ => Ok(()),
+    }
+}
+
+/// A file's SHA-256, in lowercase hex, as `sha256sum` and GitHub write it.
+pub fn sha256_of(path: &Path) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    let fail = |e: std::io::Error| format!("{}: {e}", path.display());
+    let mut file = fs::File::open(path).map_err(fail)?;
+    let (mut hash, mut chunk) = (Sha256::new(), vec![0u8; 1 << 16]);
+    loop {
+        match file.read(&mut chunk).map_err(fail)? {
+            0 => break,
+            n => hash.update(&chunk[..n]),
+        }
+    }
+    Ok(hash.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Fetches the latest release, when it is newer, and installs it (D112): its sources next to the
+/// repository's, the settings following them (`rebase`), then its programs in place of those of
+/// launcher `exe`; `say` tells the player how far it went. Asked again here, not taken from the
+/// page: only GitHub's answer says what is downloaded. A failure leaves the launcher, its settings
+/// and the repository as they were. Returns the previous sources' folder.
+pub fn update(s: &Settings, exe: &Path, say: impl Fn(String)) -> Result<PathBuf, String> {
+    if let Some(why) = update_blocker(exe, s) {
         return Err(why);
     }
-    let root = install_root(exe).ok_or("no Gyroship folder")?;
+    let (folder, repo) = (exe.parent().ok_or("the launcher is in no folder")?, PathBuf::from(&s.repo));
     let r = latest_newer()?.ok_or("this is the latest version")?;
     // Before the download: nothing is fetched for a folder that is taken.
-    target(&root, &r.tag)?;
-    say(format!("Downloading Gyroship {} ({} MB)…", r.tag, r.size.div_ceil(1 << 20)));
-    let zip = std::env::temp_dir().join(format!("gyroship-{}-windows-x64.zip", r.tag));
-    let installed = download(&r, &zip).and_then(|()| {
-        say(format!("Installing Gyroship {} next to this copy…", r.tag));
-        install(&zip, &r.tag, &root, s)
+    target(&repo, &r.tag)?;
+    say(format!("Downloading Gyroship {} ({} MB)…", r.tag, (r.programs.size + r.source.size).div_ceil(1 << 20)));
+    let temp = std::env::temp_dir();
+    let (programs, source) = (temp.join(format!("gyroship-{}-windows-x64.zip", r.tag)), temp.join(format!("gyroship-{}-source.zip", r.tag)));
+    let settings = folder.join("launcher.json");
+    let installed = download(&r.programs, &programs).and_then(|()| download(&r.source, &source)).and_then(|()| {
+        say(format!("Installing Gyroship {}…", r.tag));
+        let to = install_sources(&source, &r.tag, &repo)?;
+        let placed = save(&settings, &rebase(s, &repo, &to, &to)).and_then(|()| {
+            install_programs(&programs, folder).inspect_err(|_| {
+                let _ = save(&settings, s);
+            })
+        });
+        placed.inspect_err(|_| {
+            let _ = fs::remove_dir_all(&to);
+        })
     });
-    let _ = fs::remove_file(&zip);
-    Ok((installed?, root))
+    let _ = (fs::remove_file(&programs), fs::remove_file(&source));
+    installed.map(|()| repo)
 }
 
-/// Deletes the copy of Gyroship an update came from, `old`: only a release's folder (no Git
-/// clone) next to this copy (`root`), once this copy's game is built, when the old copy's
-/// launcher has ended, and when it holds nothing the player chose.
-pub fn delete_previous(s: &Settings, old: &Path, root: &Path) -> Result<(), String> {
+/// Deletes the sources an update came from, `old`, on the player's click: only a release's (no Git
+/// clone) next to the repository's (`repo`), once the game is built there, and when they hold
+/// nothing the player chose.
+pub fn delete_previous(s: &Settings, old: &Path, repo: &Path) -> Result<(), String> {
     // Component by component: a final separator or a `.` changes nothing.
     let lower = |p: &Path| PathBuf::from(p.to_string_lossy().to_lowercase());
-    let copy = old.join(LAUNCHER).is_file() && old.join("crates").join("runtime").join("Cargo.toml").is_file() && !old.join(".git").exists();
-    if !copy || old.parent().map(lower) != root.parent().map(lower) || lower(old) == lower(root) {
-        return Err(format!("{} is no previous copy of Gyroship next to this one", old.display()));
+    let sources = old.join("crates").join("runtime").join("Cargo.toml").is_file() && !old.join(".git").exists();
+    if !sources || old.parent().map(lower) != repo.parent().map(lower) || lower(old) == lower(repo) {
+        return Err(format!("{} is no previous release's sources next to the repository", old.display()));
     }
     let chosen = [("repository", &s.repo), ("data folder", &s.data), ("game build", &s.build), ("exefs folder", &s.exefs), ("save folder", &s.save), ("shader cache folder", &s.cache), ("SDL3 library", &s.sdl), ("hooks file", &s.hooks), ("mod", &s.layer), ("practice file", &s.practice), ("practice probes", &s.probes)];
     if let Some((what, path)) = chosen.iter().find(|(_, p)| !p.is_empty() && inside(p, old)) {
         return Err(format!("{} holds your {what} ({path}): move it out first", old.display()));
     }
-    // The previous copy keeps a game to play until this one has built its own.
-    if !game_folder(root).join("gyroship.exe").is_file() {
-        return Err(format!("the game is not built in {} yet: build it (Setup), then delete the previous copy", root.display()));
-    }
-    // Its launcher holds launcher.lock while it runs (32: a sharing violation).
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        if let Err(e) = fs::OpenOptions::new().read(true).share_mode(0).open(old.join("launcher.lock"))
-            && e.raw_os_error() == Some(32)
-        {
-            return Err(format!("the launcher in {} is still running: close it first", old.display()));
-        }
+    // The previous sources keep a game to play until the repository has built its own.
+    if !game_folder(repo).join("gyroship.exe").is_file() {
+        return Err(format!("the game is not built in {} yet: build it (Setup), then delete the previous sources", repo.display()));
     }
     fs::remove_dir_all(old).map_err(|e| format!("{}: {e}", old.display()))
 }

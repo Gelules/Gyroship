@@ -25,12 +25,17 @@ fn text(p: &Path) -> String {
     p.to_string_lossy().into_owned()
 }
 
-/// A copy of Gyroship, as far as its launcher can tell: the launcher at its top, beside the
-/// runtime's sources.
-fn copy_of_gyroship(root: &Path) {
+/// Gyroship's sources, as far as the launcher can tell: the runtime's crate.
+fn sources_of_gyroship(root: &Path) {
     fs::create_dir_all(at(root, "crates/runtime")).unwrap();
     fs::write(at(root, "crates/runtime/Cargo.toml"), "").unwrap();
-    fs::write(root.join(LAUNCHER), "").unwrap();
+}
+
+/// Windows' own tar makes the archives, as tools/release.sh does: `what`, taken in `from`.
+#[cfg(windows)]
+fn zip(to: &Path, from: &Path, what: &[&str]) {
+    let tar = at(Path::new(&std::env::var_os("SystemRoot").unwrap()), "System32/tar.exe");
+    assert!(std::process::Command::new(tar).args(["-a", "-c", "-f"]).arg(to).arg("-C").arg(from).args(what).status().unwrap().success());
 }
 
 /// Settings come back as saved; a file that does not parse is kept aside, not lost.
@@ -393,157 +398,229 @@ fn setup_steps_are_the_tools_command_lines() {
     assert!(step(&s, "format-the-disk").unwrap_err().contains("no setup step"));
 }
 
-/// Updates (D109): GitHub's answer for the latest release, read; only a newer one, with the
-/// repository's own page and archive, is taken.
+/// Updates (D109, D112): GitHub's answer for the latest release, read; only a newer one, with the
+/// repository's own page and both its archives, is taken, with the SHA-256 GitHub gives for each.
 #[test]
 fn a_newer_release_is_read_from_githubs_answer() {
-    use gyroship_launcher::{REPOSITORY, is_newer, release_from};
+    use gyroship_launcher::{Asset, REPOSITORY, is_newer, release_from};
     assert!(is_newer("v0.2.0", "0.1.0") && is_newer("0.10.0", "0.9.9") && is_newer("v1.0.0-rc.1", "0.9.0"));
     assert!(!is_newer("v0.1.0", "0.1.0") && !is_newer("v0.1.0-beta", "0.1.0") && !is_newer("v1.0", "0.1.0") && !is_newer("latest", "0.1.0"));
     let answer = |tag: &str, page: &str, assets: &str| format!(r#"{{"tag_name": "{tag}", "html_url": "{page}", "draft": false, "assets": [{assets}]}}"#);
-    let asset = |name: &str, url: &str| format!(r#"{{"name": "{name}", "browser_download_url": "{url}", "size": 1234, "digest": "sha256:00"}}"#);
+    let asset = |name: &str, url: &str, digest: &str| format!(r#"{{"name": "{name}", "browser_download_url": "{url}", "size": 1234, "digest": "{digest}"}}"#);
     let page = format!("{REPOSITORY}/releases/tag/v0.2.0");
-    let zip = format!("{REPOSITORY}/releases/download/v0.2.0/gyroship-0.2.0-windows-x64.zip");
-    let assets = [asset("gyroship-tools.exe", &format!("{REPOSITORY}/releases/download/v0.2.0/gyroship-tools.exe")), asset("gyroship-0.2.0-windows-x64.zip", &zip)].join(",");
+    let url = |name: &str| format!("{REPOSITORY}/releases/download/v0.2.0/{name}");
+    let (programs, source, sum) = ("gyroship-0.2.0-windows-x64.zip", "gyroship-0.2.0-source.zip", "AB".repeat(32));
+    let assets = [asset("SHA256SUMS.txt", &url("SHA256SUMS.txt"), ""), asset(programs, &url(programs), &format!("sha256:{sum}")), asset(source, &url(source), "sha256:not hex")].join(",");
     let r = release_from(&answer("v0.2.0", &page, &assets), "0.1.0").unwrap().unwrap();
-    assert_eq!((r.tag.as_str(), r.page.as_str(), r.zip.as_str(), r.size), ("v0.2.0", page.as_str(), zip.as_str(), 1234));
+    assert_eq!((r.tag.as_str(), r.page.as_str()), ("v0.2.0", page.as_str()));
+    assert_eq!(r.programs, Asset { url: url(programs), size: 1234, sha256: Some(sum.to_lowercase()) });
+    assert_eq!(r.source, Asset { url: url(source), size: 1234, sha256: None }, "a digest that is no SHA-256: none");
     assert_eq!(release_from(&answer("v0.1.0", &page, &assets), "0.1.0").unwrap(), None, "not newer: nothing");
+    // Without its sources' archive: refused, the page named.
+    let alone = asset(programs, &url(programs), "");
+    assert!(release_from(&answer("v0.2.0", &page, &alone), "0.1.0").unwrap_err().contains("no gyroship-0.2.0-source.zip: get it from"));
     // An archive served from elsewhere, another repository's page, a tag that names no folder:
     // refused.
-    let foreign = asset("gyroship-0.2.0-windows-x64.zip", "https://example.com/gyroship-0.2.0-windows-x64.zip");
-    assert!(release_from(&answer("v0.2.0", &page, &foreign), "0.1.0").unwrap_err().contains("no gyroship-"));
+    let with_source = |programs: String| [programs, asset(source, &url(source), "")].join(",");
+    let foreign = with_source(asset(programs, "https://example.com/gyroship-0.2.0-windows-x64.zip", ""));
+    assert!(release_from(&answer("v0.2.0", &page, &foreign), "0.1.0").unwrap_err().contains("no gyroship-0.2.0-windows-x64.zip"));
     // `..` segments, which curl and browsers resolve: another repository's archive or page.
-    let away = asset("gyroship-0.2.0-windows-x64.zip", &format!("{REPOSITORY}/releases/download/../../../../someone/else/releases/download/v0.2.0/gyroship-0.2.0-windows-x64.zip"));
+    let away = with_source(asset(programs, &format!("{REPOSITORY}/releases/download/../../../../someone/else/releases/download/v0.2.0/{programs}"), ""));
     assert!(release_from(&answer("v0.2.0", &page, &away), "0.1.0").is_err());
     assert!(!gyroship_launcher::is_release_page(&format!("{REPOSITORY}/releases/../../someone/else")));
-    let other = asset("gyroship-0.1.9-windows-x64.zip", &format!("{REPOSITORY}/releases/download/v0.2.0/gyroship-0.1.9-windows-x64.zip"));
+    let other = with_source(asset("gyroship-0.1.9-windows-x64.zip", &url("gyroship-0.1.9-windows-x64.zip"), ""));
     assert!(release_from(&answer("v0.2.0", &page, &other), "0.1.0").is_err(), "another version's archive");
     assert!(release_from(&answer("v0.2.0", "https://github.com/someone/else/releases/tag/v0.2.0", &assets), "0.1.0").is_err());
     assert!(release_from(&answer("v0.2.0+../../x", &page, &assets), "0.1.0").is_err());
     assert!(release_from("{}", "0.1.0").unwrap_err().contains("GitHub's answer"));
 }
 
-/// An update: the release's archive unpacked next to the current copy and renamed once whole;
-/// the copy's own paths in the settings follow it, the player's stay, SDL3.dll goes with the
-/// game. A stopped update's folder is removed, a folder of the same name that is not one is not.
+/// SHA-256 as sha256sum and GitHub write it (FIPS 180-2's first example).
+#[test]
+fn a_sha256_is_written_as_sha256sum_writes_it() {
+    let file = scratch("sha256").join("abc");
+    fs::write(&file, "abc").unwrap();
+    assert_eq!(gyroship_launcher::sha256_of(&file).unwrap(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+}
+
+/// SDL3 for the game: the one chosen, else the one a release puts next to the launcher, else none
+/// named (the game looks next to itself).
+#[test]
+fn sdl3_is_the_chosen_one_else_the_one_next_to_the_launcher() {
+    use gyroship_launcher::sdl_for;
+    let dir = scratch("sdl");
+    let chosen = Settings { sdl: r"C:\mine\SDL3.dll".into(), ..Settings::default() };
+    assert_eq!(sdl_for(&Settings::default(), &dir), "");
+    fs::write(dir.join("SDL3.dll"), "").unwrap();
+    assert_eq!(sdl_for(&Settings::default(), &dir), text(&dir.join("SDL3.dll")));
+    assert_eq!(sdl_for(&chosen, &dir), r"C:\mine\SDL3.dll");
+}
+
+/// Who installs a release itself (D112): a launcher in a folder of its own, playing from a
+/// release's sources. One inside the sources, or with no repository set, or a Git clone's, is
+/// only told.
+#[test]
+fn only_a_launcher_apart_from_a_releases_sources_updates_itself() {
+    use gyroship_launcher::{install_root, update_blocker};
+    let dir = scratch("blockers");
+    let (programs, repo, clone) = (dir.join("programs"), dir.join("gyroship-0.1.0"), dir.join("clone"));
+    sources_of_gyroship(&repo);
+    sources_of_gyroship(&clone);
+    fs::create_dir_all(clone.join(".git")).unwrap();
+    // A launcher apart from any sources: a path only, outside the repository that holds the tests'
+    // own folders.
+    let launcher = std::env::temp_dir().join("gyroship-nowhere").join(LAUNCHER);
+    let s = Settings { repo: text(&repo), ..Settings::default() };
+    assert_eq!((install_root(&launcher), update_blocker(&launcher, &s)), (None, None));
+    assert!(update_blocker(&launcher, &Settings::default()).unwrap().contains("not set"));
+    assert!(update_blocker(&launcher, &Settings { repo: text(&programs), ..s.clone() }).unwrap().contains("holds no Gyroship sources"));
+    assert!(update_blocker(&launcher, &Settings { repo: text(&clone), ..s.clone() }).unwrap().contains("git pull"));
+    // A launcher built in a clone, or put inside a release's sources.
+    let deep = at(&clone, "crates/launcher/target/release").join(LAUNCHER);
+    assert_eq!(install_root(&deep), Some(clone.clone()));
+    assert!(update_blocker(&deep, &s).unwrap().contains("built in a Git clone"));
+    assert!(update_blocker(&repo.join(LAUNCHER), &s).unwrap().contains("inside Gyroship's sources"));
+}
+
+/// An update's sources (D112): the release's source archive unpacked next to the repository and
+/// renamed once whole; the settings that pointed into the repository follow it, the player's own
+/// stay. A stopped update's folder is removed, a folder of the same name that is not one is not.
 #[cfg(windows)]
 #[test]
-fn a_release_installs_next_to_the_current_copy() {
-    use gyroship_launcher::{install, install_root, update_blocker};
-    let dir = scratch("update");
-    let (old, new, part) = (dir.join("Gyroship-0.1.0"), dir.join("Gyroship-0.2.0"), dir.join("Gyroship-0.2.0.part"));
-    copy_of_gyroship(&old);
-    let staged = at(&dir, "staged/Gyroship-0.2.0");
-    copy_of_gyroship(&staged);
+fn a_releases_sources_install_next_to_the_repository() {
+    use gyroship_launcher::{install_sources, rebase, target};
+    let dir = scratch("update-sources");
+    let (repo, new, part) = (dir.join("gyroship"), dir.join("gyroship-0.2.0"), dir.join("gyroship-0.2.0.part"));
+    sources_of_gyroship(&repo);
+    let staged = at(&dir, "staged/gyroship-0.2.0");
+    sources_of_gyroship(&staged);
     fs::create_dir_all(staged.join("templates")).unwrap();
     fs::write(at(&staged, "templates/practice.txt"), "new").unwrap();
-    fs::write(staged.join("gyroship-tools.exe"), "").unwrap();
-    // Windows' own tar makes the archives, as git archive would: with a top folder, or without.
-    let tar = |zip: &Path, from: &Path, what: &[&str]| {
-        let tar = at(Path::new(&std::env::var_os("SystemRoot").unwrap()), "System32/tar.exe");
-        assert!(std::process::Command::new(tar).args(["-a", "-c", "-f"]).arg(zip).arg("-C").arg(from).args(what).status().unwrap().success());
-    };
-    let (zip, flat) = (dir.join("gyroship-0.2.0-windows-x64.zip"), dir.join("flat.zip"));
-    tar(&zip, &dir.join("staged"), &["Gyroship-0.2.0"]);
-    tar(&flat, &staged, &[LAUNCHER, "gyroship-tools.exe", "crates", "templates"]);
-    fs::create_dir_all(at(&old, "generated/game/target/release")).unwrap();
-    fs::write(at(&old, "generated/game/target/release/SDL3.dll"), "sdl").unwrap();
+    // As git archive makes it, with its top folder; and without one.
+    let (archive, flat) = (dir.join("gyroship-0.2.0-source.zip"), dir.join("flat.zip"));
+    zip(&archive, &dir.join("staged"), &["gyroship-0.2.0"]);
+    zip(&flat, &staged, &["crates", "templates"]);
+    assert_eq!(install_sources(&archive, "v0.2.0", &repo).unwrap(), new);
+    assert!(at(&new, "templates/practice.txt").is_file() && !part.exists() && repo.exists());
+    // Installed: that folder is taken, and sources of that version want its programs.
+    assert!(target(&repo, "v0.2.0").unwrap_err().contains("already exists"));
+    assert!(target(&new, "v0.2.0").unwrap_err().contains("get the programs of v0.2.0"));
+    // The settings follow: the repository, the game built there, a template it has; a template of
+    // the player's own, which the new sources lack, stays (and so keeps the previous sources from
+    // being deleted), as do the player's folders.
     let s = Settings {
-        repo: text(&old),
-        build: text(&at(&old, "generated/game/target/release/gyroship.exe")),
-        practice: text(&at(&old, "templates/practice.txt")),
-        probes: text(&at(&old, "templates/my-probes.txt")),
-        sdl: text(&at(&old, "generated/game/target/release/SDL3.dll")),
-        layer: text(&at(&old, "my-layer")),
-        data: text(&old.join("Data")),
-        save: text(&dir.join("save")),
+        repo: text(&repo),
+        build: text(&at(&repo, "generated/game/target/release/gyroship.exe")),
+        practice: text(&at(&repo, "templates/practice.txt")),
+        probes: text(&at(&repo, "templates/my-probes.txt")),
+        data: text(&dir.join("data")),
+        save: text(&at(&dir, "data/save")),
         ..Settings::default()
     };
-    assert_eq!(gyroship_launcher::install(&zip, "v0.2.0", &old, &s).unwrap(), new);
-    assert!(new.join(LAUNCHER).is_file() && at(&new, "templates/practice.txt").is_file() && !part.exists());
-    assert_eq!(fs::read_to_string(at(&new, "generated/game/target/release/SDL3.dll")).unwrap(), "sdl");
-    // The copy's own files move; a file of the player's in its templates, which the new copy does
-    // not have, stays (and so keeps the old copy from being deleted), as do the player's folders.
-    let moved = Settings {
-        repo: text(&new),
-        build: text(&at(&new, "generated/game/target/release/gyroship.exe")),
-        practice: text(&at(&new, "templates/practice.txt")),
-        sdl: text(&at(&new, "generated/game/target/release/SDL3.dll")),
-        ..s.clone()
-    };
-    assert_eq!(load(&new.join("launcher.json")), (moved, None));
-    // Installed: that folder is taken, and that copy, at its version, needs no update.
-    assert!(gyroship_launcher::target(&old, "v0.2.0").unwrap_err().contains("already exists"));
-    assert!(gyroship_launcher::target(&new, "v0.2.0").unwrap_err().contains("without setting its version"));
-    // A release's tools are at its top, until the tools step builds its own.
-    assert_eq!(gyroship_launcher::tools_exe(&text(&new)), new.join("gyroship-tools.exe"));
-    fs::create_dir_all(at(&new, "target/release")).unwrap();
-    fs::write(at(&new, "target/release/gyroship-tools.exe"), "").unwrap();
-    assert_eq!(gyroship_launcher::tools_exe(&text(&new)), at(&new, "target/release/gyroship-tools.exe"));
-    assert!(install(&zip, "v0.2.0", &old, &s).unwrap_err().contains("already exists"));
+    let moved = Settings { repo: text(&new), build: text(&at(&new, "generated/game/target/release/gyroship.exe")), practice: text(&at(&new, "templates/practice.txt")), ..s.clone() };
+    assert_eq!(rebase(&s, &repo, &new, &new), moved);
+    assert!(install_sources(&archive, "v0.2.0", &repo).unwrap_err().contains("already exists"));
     // A folder named as an update's but without its mark: not the launcher's to remove.
     fs::remove_dir_all(&new).unwrap();
     fs::create_dir_all(&part).unwrap();
-    assert!(install(&flat, "v0.2.0", &old, &s).is_err());
+    assert!(install_sources(&flat, "v0.2.0", &repo).is_err());
     assert!(part.exists());
     // With the mark, a stopped update's: removed, and the archive without a top folder installs.
     fs::write(part.join(".gyroship-update"), "").unwrap();
-    assert_eq!(install(&flat, "v0.2.0", &old, &s).unwrap(), new);
-    assert!(new.join(LAUNCHER).is_file() && !new.join(".gyroship-update").exists() && !part.exists());
-    // An archive with no launcher in it: refused, and nothing left behind.
+    assert_eq!(install_sources(&flat, "v0.2.0", &repo).unwrap(), new);
+    assert!(at(&new, "crates/runtime/Cargo.toml").is_file() && !new.join(".gyroship-update").exists() && !part.exists());
+    // An archive with no sources in it: refused, and nothing left behind.
     fs::remove_dir_all(&new).unwrap();
-    fs::remove_file(staged.join(LAUNCHER)).unwrap();
     let bad = dir.join("bad.zip");
-    tar(&bad, &dir.join("staged"), &["Gyroship-0.2.0"]);
-    assert!(install(&bad, "v0.2.0", &old, &s).unwrap_err().contains("no gyroship-launcher.exe"));
+    zip(&bad, &staged, &["templates"]);
+    assert!(install_sources(&bad, "v0.2.0", &repo).unwrap_err().contains("no Gyroship sources"));
     assert!(!new.exists() && !part.exists());
-    assert!(install(&zip, "v0.2.0/../x", &old, &s).unwrap_err().contains("no version"));
-    // The copy a launcher belongs to: a release's, at its top; a Git clone's, deeper, which
-    // updates through Git.
-    assert_eq!((install_root(&old.join(LAUNCHER)), update_blocker(&old.join(LAUNCHER))), (Some(old.clone()), None));
-    fs::create_dir_all(old.join(".git")).unwrap();
-    let deep = at(&old, "crates/launcher/target/release").join(LAUNCHER);
-    assert_eq!(install_root(&deep), Some(old.clone()));
-    assert!(update_blocker(&deep).unwrap().contains("git pull"));
+    assert!(install_sources(&archive, "v0.2.0/../x", &repo).unwrap_err().contains("no version"));
 }
 
-/// The previous copy goes on the player's click: only a release's folder next to this one, whose
-/// launcher has ended, and which holds nothing the player chose.
+/// An update's programs (D112): the release's archive puts the launcher, the tools, SDL3.dll and
+/// the licences in place of those next to the launcher, each kept as `.old` until the next
+/// launcher removes it, even the launcher that runs; the launcher's other files stay. An archive
+/// without the tools changes nothing.
 #[cfg(windows)]
 #[test]
-fn the_previous_copy_goes_only_when_nothing_of_the_players_is_in_it() {
+fn a_releases_programs_replace_the_launchers_own() {
+    use gyroship_launcher::{RELEASED, install_programs, remove_replaced};
+    let dir = scratch("update-programs");
+    let (folder, staged) = (dir.join("programs"), dir.join("staged"));
+    fs::create_dir_all(&folder).unwrap();
+    fs::create_dir_all(&staged).unwrap();
+    for n in RELEASED {
+        fs::write(staged.join(n), format!("new {n}")).unwrap();
+    }
+    let (archive, toolless) = (dir.join("gyroship-0.2.0-windows-x64.zip"), dir.join("toolless.zip"));
+    zip(&archive, &staged, &RELEASED);
+    zip(&toolless, &staged, &[LAUNCHER, "SDL3.dll"]);
+    fs::write(folder.join("launcher.json"), "{}").unwrap();
+    fs::write(folder.join("gyroship-tools.exe"), "old tools").unwrap();
+    // The launcher that runs: a copy of Windows' ping, waiting under the launcher's name.
+    let ping = at(Path::new(&std::env::var_os("SystemRoot").unwrap()), "System32/PING.EXE");
+    fs::copy(ping, folder.join(LAUNCHER)).unwrap();
+    let mut running = std::process::Command::new(folder.join(LAUNCHER)).args(["-n", "60", "127.0.0.1"]).stdout(std::process::Stdio::null()).spawn().unwrap();
+    // Without the tools: refused, nothing changed.
+    assert!(install_programs(&toolless, &folder).unwrap_err().contains("no gyroship-tools.exe"));
+    assert_eq!(fs::read_to_string(folder.join("gyroship-tools.exe")).unwrap(), "old tools");
+    assert!(!folder.join(".gyroship-programs").exists() && !folder.join("SDL3.dll").exists());
+    install_programs(&archive, &folder).unwrap();
+    for n in RELEASED {
+        assert_eq!(fs::read_to_string(folder.join(n)).unwrap(), format!("new {n}"), "{n}");
+    }
+    assert_eq!(fs::read_to_string(folder.join("gyroship-tools.exe.old")).unwrap(), "old tools");
+    assert!(folder.join("gyroship-launcher.exe.old").is_file() && !folder.join("SDL3.dll.old").exists() && folder.join("launcher.json").is_file());
+    assert!(running.try_wait().unwrap().is_none(), "the launcher replaced still runs");
+    // Its file stays while it runs; the others go.
+    remove_replaced(&folder);
+    assert!(folder.join("gyroship-launcher.exe.old").is_file() && !folder.join("gyroship-tools.exe.old").exists());
+    let _ = running.kill();
+    running.wait().unwrap();
+    for _ in 0..50 {
+        remove_replaced(&folder);
+        if !folder.join("gyroship-launcher.exe.old").exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(!folder.join("gyroship-launcher.exe.old").exists());
+}
+
+/// The previous sources go on the player's click (D112): only a release's, next to the
+/// repository, once the game is built there, and when they hold nothing the player chose.
+#[cfg(windows)]
+#[test]
+fn the_previous_sources_go_only_when_nothing_of_the_players_is_in_them() {
     use gyroship_launcher::delete_previous;
-    use std::os::windows::fs::OpenOptionsExt;
     let dir = scratch("previous");
-    let (old, new, away) = (dir.join("Gyroship-0.1.0"), dir.join("Gyroship-0.2.0"), at(&dir, "away/Gyroship-0.0.9"));
+    let (old, new, away) = (dir.join("gyroship-0.1.0"), dir.join("gyroship-0.2.0"), at(&dir, "away/gyroship-0.0.9"));
     for root in [&old, &new, &away] {
-        copy_of_gyroship(root);
+        sources_of_gyroship(root);
     }
     let s = Settings { repo: text(&new), save: text(&old.join("save")), ..Settings::default() };
     assert!(delete_previous(&s, &old, &new).unwrap_err().contains("holds your save folder"));
     // The same save folder written otherwise: relative (any folder, for all the launcher knows),
     // verbatim, through `..`.
     fs::create_dir_all(old.join("save")).unwrap();
-    for save in ["save".to_string(), format!(r"\\?\{}", old.join("save").display()), text(&at(&dir, "x/../Gyroship-0.1.0/save"))] {
+    for save in ["save".to_string(), format!(r"\\?\{}", old.join("save").display()), text(&at(&dir, "x/../gyroship-0.1.0/save"))] {
         assert!(delete_previous(&Settings { save: save.clone(), ..s.clone() }, &old, &new).unwrap_err().contains("holds your save folder"), "{save}");
     }
     let s = Settings { save: String::new(), ..s };
-    for (not, why) in [(&new, "this copy"), (&dir, "no copy"), (&away, "not next to this one")] {
-        assert!(delete_previous(&s, not, &new).unwrap_err().contains("no previous copy"), "{why}");
+    for (not, why) in [(&new, "the repository"), (&dir, "no sources"), (&away, "not next to the repository")] {
+        assert!(delete_previous(&s, not, &new).unwrap_err().contains("no previous release's sources"), "{why}");
     }
     let mut this = text(&new);
     this.push(std::path::MAIN_SEPARATOR);
-    assert!(delete_previous(&s, Path::new(&this), &new).unwrap_err().contains("no previous copy"), "this copy, written with a final separator");
+    assert!(delete_previous(&s, Path::new(&this), &new).unwrap_err().contains("no previous release's sources"), "the repository, written with a final separator");
     fs::create_dir_all(old.join(".git")).unwrap();
     assert!(delete_previous(&s, &old, &new).is_err(), "a Git clone");
     fs::remove_dir_all(old.join(".git")).unwrap();
-    // Until this copy's game is built, the previous copy keeps the only one.
+    // Until the repository's game is built, the previous sources keep the only one.
     assert!(delete_previous(&s, &old, &new).unwrap_err().contains("not built"));
     fs::create_dir_all(at(&new, "generated/game/target/release")).unwrap();
     fs::write(at(&new, "generated/game/target/release/gyroship.exe"), "").unwrap();
-    let running = fs::OpenOptions::new().write(true).create(true).truncate(false).share_mode(0).open(old.join("launcher.lock")).unwrap();
-    assert!(delete_previous(&s, &old, &new).unwrap_err().contains("still running"));
-    drop(running);
     delete_previous(&s, &old, &new).unwrap();
     assert!(!old.exists() && new.exists() && away.exists());
 }

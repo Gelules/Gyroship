@@ -115,7 +115,8 @@ the bottom of Play says so.
   save and cache folders, the language, the precompiled shaders (`--renderer vulkan`, off by
   default: with it on, Play first runs Setup's step 5 again, at once when nothing changed, then
   starts the game whatever came of it), full screen, the Joy-Con and their mouse mode, the SDL3
-  library, the practice tools and the recording of inputs, then Play. Paths are typed or pasted, as
+  library (empty: the `SDL3.dll` next to the launcher, as a release's programs bring it, else the
+  one next to the game), the practice tools and the recording of inputs, then Play. Paths are typed or pasted, as
   full paths: Play refuses a save, cache, hooks, mod or practice path that is not one, as the game
   would look for it from wherever the launcher runs. The game plays on the save folder itself, or on a fresh copy of it that the launcher
   makes at each start (`<data folder>/save-copy`: the folder itself is never written), or on a new,
@@ -142,9 +143,9 @@ the bottom of Play says so.
      (`Rustlang.Rustup`; `Microsoft.VisualStudio.BuildTools` with the x64 C++ compiler and the
      Windows SDK, behind an administrator prompt, never restarting the PC by itself;
      `Microsoft.VCRedist.2015+.x64`). Clicking accepts the package's licence. Then Build the
-     tools, `cargo build --release` in the repository. A release brings them, and so do tools of
-     the same version downloaded next to the launcher (they take the repository they run in); a
-     Git clone builds them, and again after each update;
+     tools, `cargo build --release` in the repository. A release's programs bring them, next to
+     the launcher (they take the repository they run in); a Git clone builds them, and again
+     after each update;
   3. Recompile, which translates the game's code into object files and a project in
      `generated/game` (about two minutes), with the repository's `Cargo.lock`;
   4. Build, which compiles Gyroship's runtime and links it with them into `gyroship.exe` (minutes
@@ -160,21 +161,21 @@ the bottom of Play says so.
   Below the steps, **Updates**. When the launcher first opens its window, it asks GitHub for the
   latest release of the repository (through GitHub's API and Windows' own `curl`), unless "Look
   for updates at start" is off; a `--play` start whose game ends normally opens no window, so it
-  asks nothing. Check now does the same at any time. When a newer release is out, a copy of
-  Gyroship from a release installs it at once, without a question: the launcher downloads its
-  archive (at most 30 minutes), unpacks it next to the current copy into a `.part` folder,
-  carries the settings over (the repository, the game built in it, and the templates and
-  `SDL3.dll` the new copy has, point to it; every other path stays) with the `SDL3.dll` put next
-  to the game, renames the folder `Gyroship-<version>`, starts the new copy's launcher and ends. A
-  failure before that rename leaves the current copy as it was. The new launcher then recompiles
-  and builds the game for its version, before your eyes. Once the game is built, and in that
-  window only, it offers to delete the previous copy; it refuses while that copy holds a file or
-  folder of your settings, however the path is written, or while its launcher still runs. Later,
-  delete the folder in the file explorer. A shortcut to the previous copy's launcher still starts
-  that copy: point it to the new one. Nothing is downloaded for a folder that is already there: a
-  release whose launcher kept the previous version number is said, not installed again. A Git
-  clone is only told that a new version is out (update it with `git pull`, then build the tools
-  and the game again).
+  asks nothing. Check now does the same at any time. When a newer release is out, the launcher
+  installs it at once, without a question, when it stands in a folder of its own (as a release's
+  programs do) and the repository holds a release's sources. It downloads both archives (at most
+  30 minutes) and checks their size and the SHA-256 GitHub gives; unpacks the new sources next to
+  the repository, into a `.part` folder renamed `gyroship-<version>` once whole; points the
+  settings to them (the repository, the game built there, and the templates the new sources
+  have; every other path stays); then puts the new programs in place of its own, each replaced
+  file kept as `<name>.old` until the next launcher removes it, starts the new launcher and ends.
+  A failure leaves the launcher, its settings and the repository as they were. The new launcher
+  then recompiles and builds the game from the new sources, before your eyes. Once the game is
+  built, and in that window only, it offers to delete the previous sources; it refuses while they
+  hold a file or folder of your settings, however the path is written. Later, delete the folder
+  in the file explorer. Nothing is downloaded for a folder that is already there. A Git clone, or
+  a launcher inside the sources, is only told that a new version is out (update a clone with
+  `git pull`, then build the tools and the game again).
 - **Last session**: the exit code and what it means, the journal's summary line and the game's last
   messages.
 
