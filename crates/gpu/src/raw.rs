@@ -22,6 +22,46 @@ pub(crate) struct PipelineDesc<'a> {
     pub depth_stencil: Option<&'a wgpu::DepthStencilState>,
     pub targets: &'a [Option<wgpu::ColorTargetState>],
     pub layout: vk::PipelineLayout,
+    /// The game's pipelines: cull, front face, depth, stencil and bias set per draw
+    /// ([`Dynamic`]), `primitive`'s and `depth_stencil`'s being left aside (but the format).
+    pub dynamic: bool,
+}
+
+/// What the game's raw pipelines take per draw (D110 step 7a): wgpu's cull mode, front face and
+/// depth-stencil state, which wgpu bakes into its pipelines, mapped when set as wgpu-hal maps them.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Dynamic {
+    pub(crate) cull: Option<wgpu::Face>,
+    pub(crate) front: wgpu::FrontFace,
+    pub(crate) depth: Option<wgpu::DepthStencilState>,
+}
+
+impl Dynamic {
+    /// Sets these states in `cb`, all of them, as a pipeline made with them would have them.
+    pub(crate) fn set(&self, ash: &ash::Device, cb: vk::CommandBuffer) {
+        let ds = self.depth.as_ref();
+        let depth = ds.filter(|d| d.is_depth_enabled());
+        let stencil = ds.map(|d| d.stencil.clone()).filter(wgpu::StencilState::is_enabled);
+        let bias = ds.map(|d| d.bias).filter(wgpu::DepthBiasState::is_enabled);
+        unsafe {
+            ash.cmd_set_cull_mode(cb, self.cull.map_or(vk::CullModeFlags::NONE, conv::map_cull_face));
+            ash.cmd_set_front_face(cb, conv::map_front_face(self.front));
+            ash.cmd_set_depth_test_enable(cb, depth.is_some());
+            ash.cmd_set_depth_write_enable(cb, depth.is_some_and(|d| d.depth_write_enabled.unwrap_or_default()));
+            ash.cmd_set_depth_compare_op(cb, depth.map_or(vk::CompareOp::NEVER, |d| conv::map_comparison(d.depth_compare.unwrap_or_default())));
+            ash.cmd_set_stencil_test_enable(cb, stencil.is_some());
+            let s = stencil.unwrap_or_default();
+            for (face, f) in [(vk::StencilFaceFlags::FRONT, &s.front), (vk::StencilFaceFlags::BACK, &s.back)] {
+                let op = conv::map_stencil_face(f, s.read_mask, s.write_mask);
+                ash.cmd_set_stencil_op(cb, face, op.fail_op, op.pass_op, op.depth_fail_op, op.compare_op);
+                ash.cmd_set_stencil_compare_mask(cb, face, op.compare_mask);
+                ash.cmd_set_stencil_write_mask(cb, face, op.write_mask);
+            }
+            ash.cmd_set_depth_bias_enable(cb, bias.is_some());
+            let b = bias.unwrap_or_default();
+            ash.cmd_set_depth_bias(cb, b.constant as f32, b.clamp, b.slope_scale);
+        }
+    }
 }
 
 /// A binding's resource in a raw descriptor set.
@@ -119,7 +159,7 @@ impl RawMode {
         };
         let set = self.raw.set_layout(&entries)?;
         let layout = self.raw.pipeline_layout(&[set])?;
-        let pipeline = self.raw.pipeline(&PipelineDesc { vertex, pixel, entries: [c"vs", c"fs"], buffers: &[], primitive: Default::default(), depth_stencil: depth, targets, layout })?;
+        let pipeline = self.raw.pipeline(&PipelineDesc { vertex, pixel, entries: [c"vs", c"fs"], buffers: &[], primitive: Default::default(), depth_stencil: depth, targets, layout, dynamic: false })?;
         let p = std::sync::Arc::new(RawPipeline { pipeline, layout, sets: smallvec::smallvec![(set, std::sync::Arc::from(&entries[..]))] });
         self.fills.insert(key, p.clone());
         Ok(p)
@@ -129,8 +169,9 @@ impl RawMode {
 /// What wgpu-core refuses in a render pipeline that draw.rs lets through (wgpu 30: `Device::
 /// create_render_pipeline`'s checks), refused here before a raw one is made, by name: there, the
 /// frame's encoder would be lost; here, the draws of this pipeline only. Blending is checked
-/// against the adapter's own format features, which the device asks for on Vulkan.
-pub(crate) fn refused(buffers: &[Option<wgpu::VertexBufferLayout>], targets: &[Option<wgpu::ColorTargetState>], depth: Option<&wgpu::DepthStencilState>, adapter: &wgpu::Adapter) -> Option<&'static str> {
+/// against the adapter's own format features, which the device asks for on Vulkan. The stencil
+/// test on a format without stencil, set per draw (step 7a), is refused per draw (draw.rs).
+pub(crate) fn refused(buffers: &[Option<wgpu::VertexBufferLayout>], targets: &[Option<wgpu::ColorTargetState>], adapter: &wgpu::Adapter) -> Option<&'static str> {
     let limits = adapter.limits();
     if targets.iter().flatten().any(|t| t.blend.is_some() && !adapter.get_texture_format_features(t.format).flags.contains(wgpu::TextureFormatFeatureFlags::BLENDABLE)) {
         return Some("raw pipeline: blending on a format that cannot blend");
@@ -151,9 +192,6 @@ pub(crate) fn refused(buffers: &[Option<wgpu::VertexBufferLayout>], targets: &[O
     }
     if blends().any(|c| matches!(c.operation, wgpu::BlendOperation::Min | wgpu::BlendOperation::Max) && (c.src_factor != F::One || c.dst_factor != F::One)) {
         return Some("raw pipeline: min or max blending with a factor other than one");
-    }
-    if depth.is_some_and(|d| d.stencil.is_enabled() && !d.format.has_stencil_aspect()) {
-        return Some("raw pipeline: stencil test on a format without stencil");
     }
     None
 }
@@ -210,7 +248,7 @@ impl crate::surfaces::Surfaces {
         depth: Option<&wgpu::DepthStencilState>,
         groups: &[&[wgpu::BindGroupLayoutEntry]],
     ) -> Result<RawPipeline, String> {
-        if let Some(why) = refused(buffers, targets, depth, &self.adapter) {
+        if let Some(why) = refused(buffers, targets, &self.adapter) {
             return Err(why.into());
         }
         let (Some(m), ir) = (self.raw.as_mut(), &self.cache.ir) else { return Err("the raw path is off".into()) };
@@ -229,7 +267,7 @@ impl crate::surfaces::Surfaces {
         let pixel = ps.map(&mut module).transpose()?;
         let sets = groups.iter().map(|e| Ok((m.raw.set_layout(e)?, std::sync::Arc::from(*e)))).collect::<Result<smallvec::SmallVec<[_; 2]>, String>>()?;
         let layout = m.raw.pipeline_layout(&sets.iter().map(|s| s.0).collect::<Vec<_>>())?;
-        let pipeline = m.raw.pipeline(&PipelineDesc { vertex, pixel, entries: [c"main", c"main"], buffers, primitive, depth_stencil: depth, targets, layout })?;
+        let pipeline = m.raw.pipeline(&PipelineDesc { vertex, pixel, entries: [c"main", c"main"], buffers, primitive, depth_stencil: depth, targets, layout, dynamic: true })?;
         Ok(RawPipeline { pipeline, layout, sets })
     }
 }
@@ -300,7 +338,11 @@ impl Raw {
     /// A render pipeline, made as wgpu-hal makes `d` (its states through wgpu-hal's `conv`), for
     /// dynamic rendering instead of a render pass. No pipeline cache (ours is step 7's).
     pub(crate) fn pipeline(&mut self, d: &PipelineDesc) -> Result<vk::Pipeline, String> {
-        let dynamic = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR, vk::DynamicState::BLEND_CONSTANTS, vk::DynamicState::STENCIL_REFERENCE];
+        use vk::DynamicState as D;
+        let mut dynamic = vec![D::VIEWPORT, D::SCISSOR, D::BLEND_CONSTANTS, D::STENCIL_REFERENCE];
+        if d.dynamic {
+            dynamic.extend([D::CULL_MODE, D::FRONT_FACE, D::DEPTH_TEST_ENABLE, D::DEPTH_WRITE_ENABLE, D::DEPTH_COMPARE_OP, D::STENCIL_TEST_ENABLE, D::STENCIL_OP, D::STENCIL_COMPARE_MASK, D::STENCIL_WRITE_MASK, D::DEPTH_BIAS_ENABLE, D::DEPTH_BIAS]);
+        }
         let (mut bindings, mut attributes) = (Vec::new(), Vec::new());
         for (slot, b) in (0u32..).zip(d.buffers) {
             let Some(b) = b else { continue };
@@ -553,7 +595,8 @@ mod tests {
     /// Raw draws paint what wgpu paints: two draws (triangles placed by a bank read at a dynamic
     /// offset, a texture read through a filtering sampler, blending with a constant, a viewport
     /// and a scissor inside the target, bindings listed out of order and numbered as the game's)
-    /// made once by wgpu and once by the raw path, read back and compared bit for bit. In the
+    /// made once by wgpu, once by the raw path with a pipeline per state, and once with one
+    /// pipeline whose states are set per draw (step 7a), read back and compared bit for bit. In the
     /// first, the stencil keeps the second triangle, nearer, off the first; in the second, a
     /// triangle just in front of the first is hidden by the depth bias, and shown without the
     /// depth test or the bias.
@@ -634,9 +677,9 @@ mod tests {
         let sampler = d.create_sampler(&sampling);
         let target = || texture(wgpu::TextureFormat::Rgba8Unorm, wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC, 64);
         let depth = || texture(wgpu::TextureFormat::Depth24PlusStencil8, wgpu::TextureUsages::RENDER_ATTACHMENT, 64);
-        let (a, da, b, db) = (target(), depth(), target(), depth());
+        let (a, da, b, db, c, dc) = (target(), depth(), target(), depth(), target(), depth());
         let view = |t: &wgpu::Texture| t.create_view(&Default::default());
-        let (av, dav, bv, dbv, tv) = (view(&a), view(&da), view(&b), view(&db), view(&t));
+        let (av, dav, bv, dbv, cv, dcv, tv) = (view(&a), view(&da), view(&b), view(&db), view(&c), view(&dc), view(&t));
 
         // The states both pipelines have.
         let face = wgpu::StencilFaceState { compare: wgpu::CompareFunction::NotEqual, fail_op: wgpu::StencilOperation::Keep, depth_fail_op: wgpu::StencilOperation::Keep, pass_op: wgpu::StencilOperation::Replace };
@@ -697,13 +740,14 @@ mod tests {
             pass.set_pipeline(&pipelines[1]);
             pass.draw(6..9, 0..1);
         }
-        // `b` cleared as `a` was (by wgpu: the raw draw keeps what it finds), then set in the
-        // states the raw draw uses: the boundary before a raw segment.
+        // `b` and `c` cleared as `a` was (by wgpu: the raw draws keep what they find), then set in
+        // the states the raw draws use: the boundary before a raw segment.
         drop(cleared(&mut e1, &bv, &dbv));
+        drop(cleared(&mut e1, &cv, &dcv));
         let rt = |texture, state| wgpu::TextureTransition { texture, selector: None, state };
         e1.transition_resources(
             [&bank, &tint].into_iter().map(|buffer| wgpu::BufferTransition { buffer, state: wgpu::BufferUses::UNIFORM }),
-            [rt(&b, wgpu::TextureUses::COLOR_TARGET), rt(&db, wgpu::TextureUses::DEPTH_STENCIL_WRITE), rt(&t, wgpu::TextureUses::RESOURCE)].into_iter(),
+            [rt(&b, wgpu::TextureUses::COLOR_TARGET), rt(&db, wgpu::TextureUses::DEPTH_STENCIL_WRITE), rt(&c, wgpu::TextureUses::COLOR_TARGET), rt(&dc, wgpu::TextureUses::DEPTH_STENCIL_WRITE), rt(&t, wgpu::TextureUses::RESOURCE)].into_iter(),
         );
 
         // The raw draw into `b`, from the same modules, states and resources.
@@ -712,8 +756,11 @@ mod tests {
         let (vm, pm) = (module(&ir[0]), module(&ir[1]));
         let sets = [raw.set_layout(&groups[0]).unwrap(), raw.set_layout(&groups[1]).unwrap()];
         let raw_layout = raw.pipeline_layout(&sets).unwrap();
-        let mut raw_pipeline = |depth_stencil| raw.pipeline(&PipelineDesc { vertex: vm, pixel: Some(pm), entries: [c"main", c"main"], buffers: &[], primitive: Default::default(), depth_stencil: Some(depth_stencil), targets: &targets, layout: raw_layout }).unwrap();
-        let raw_pipelines = [raw_pipeline(&stenciled), raw_pipeline(&biased)];
+        let mut raw_pipeline = |depth_stencil, dynamic| raw.pipeline(&PipelineDesc { vertex: vm, pixel: Some(pm), entries: [c"main", c"main"], buffers: &[], primitive: Default::default(), depth_stencil: Some(depth_stencil), targets: &targets, layout: raw_layout, dynamic }).unwrap();
+        // The game's pipelines since step 7a: one for both draws, its states set per draw.
+        let keyed = wgpu::DepthStencilState { format: stenciled.format, depth_write_enabled: None, depth_compare: None, stencil: Default::default(), bias: Default::default() };
+        let raw_pipelines = [raw_pipeline(&stenciled, false), raw_pipeline(&biased, false), raw_pipeline(&keyed, true)];
+        let per_draw = |depth: &wgpu::DepthStencilState| Dynamic { depth: Some(depth.clone()), ..Default::default() };
         let image = |v: &wgpu::TextureView| unsafe { v.as_hal::<Vulkan>().map(|h| h.raw_handle()) }.unwrap();
         let handle = |b: &wgpu::Buffer| unsafe { b.as_hal::<Vulkan>().map(|h| h.raw_handle()) }.unwrap();
         let raw_sampler = raw.sampler(&sampling).unwrap();
@@ -721,28 +768,41 @@ mod tests {
         let mut pools = Pools::new(d).unwrap();
         let (_, s0) = pools.set(sets[0], &groups[0], &[Resource::Buffer(handle(&bank), 0, 128)]).unwrap();
         let (_, s1) = pools.set(sets[1], &groups[1], &[Resource::Sampler(raw_sampler), Resource::Buffer(handle(&tint), 0, 16), Resource::Texture(image(&tv), read)]).unwrap();
-        let (bh, dbh) = (image(&bv), image(&dbv));
+        let (bh, dbh, ch, dch) = (image(&bv), image(&dbv), image(&cv), image(&dcv));
         let mut e2 = d.create_command_encoder(&Default::default());
         unsafe {
             e2.as_hal_mut::<Vulkan, _, _>(|e| {
                 let cb = e.expect("a raw encoder").raw_handle();
-                begin_rendering(&raw.ash, cb, (64, 64), &[Some(bh)], Some((dbh, wgpu::TextureFormat::Depth24PlusStencil8)));
-                viewport(&raw.ash, cb, vp.map(|x| x as f32));
-                scissor(&raw.ash, cb, sc);
-                raw.ash.cmd_set_blend_constants(cb, &constant.map(|x| x as f32));
-                raw.ash.cmd_set_stencil_reference(cb, vk::StencilFaceFlags::FRONT_AND_BACK, reference);
+                let begin = |color, depth| {
+                    begin_rendering(&raw.ash, cb, (64, 64), &[Some(color)], Some((depth, wgpu::TextureFormat::Depth24PlusStencil8)));
+                    viewport(&raw.ash, cb, vp.map(|x| x as f32));
+                    scissor(&raw.ash, cb, sc);
+                    raw.ash.cmd_set_blend_constants(cb, &constant.map(|x| x as f32));
+                    raw.ash.cmd_set_stencil_reference(cb, vk::StencilFaceFlags::FRONT_AND_BACK, reference);
+                };
+                // Into `b`, a pipeline per state.
+                begin(bh, dbh);
                 raw.ash.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, raw_pipelines[0]);
                 raw.ash.cmd_bind_descriptor_sets(cb, vk::PipelineBindPoint::GRAPHICS, raw_layout, 0, &[s0, s1], &[256]);
                 raw.ash.cmd_draw(cb, 6, 1, 0, 0);
                 raw.ash.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, raw_pipelines[1]);
                 raw.ash.cmd_draw(cb, 3, 1, 6, 0);
                 raw.ash.cmd_end_rendering(cb);
+                // Into `c`, one pipeline, the states set per draw.
+                begin(ch, dch);
+                raw.ash.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, raw_pipelines[2]);
+                raw.ash.cmd_bind_descriptor_sets(cb, vk::PipelineBindPoint::GRAPHICS, raw_layout, 0, &[s0, s1], &[256]);
+                per_draw(&stenciled).set(&raw.ash, cb);
+                raw.ash.cmd_draw(cb, 6, 1, 0, 0);
+                per_draw(&biased).set(&raw.ash, cb);
+                raw.ash.cmd_draw(cb, 3, 1, 6, 0);
+                raw.ash.cmd_end_rendering(cb);
             })
         };
 
-        // Both targets read back.
+        // The targets read back.
         let mut e3 = d.create_command_encoder(&Default::default());
-        let readbacks: Vec<wgpu::Buffer> = [&a, &b]
+        let readbacks: Vec<wgpu::Buffer> = [&a, &b, &c]
             .into_iter()
             .map(|texture| {
                 let out = d.create_buffer(&wgpu::BufferDescriptor { label: None, size: 64 * 64 * 4, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
@@ -761,8 +821,10 @@ mod tests {
             .collect();
         let shades = pixels[0].chunks(4).collect::<std::collections::BTreeSet<_>>().len();
         assert!(shades > 20, "wgpu's draw shows {shades} shades only");
-        let differ = pixels[0].chunks(4).zip(pixels[1].chunks(4)).filter(|(x, y)| x != y).count();
-        assert_eq!(differ, 0, "{differ} of 4096 pixels differ");
+        for (name, raw) in [("static", &pixels[1]), ("dynamic", &pixels[2])] {
+            let differ = pixels[0].chunks(4).zip(raw.chunks(4)).filter(|(x, y)| x != y).count();
+            assert_eq!(differ, 0, "{name} states: {differ} of 4096 pixels differ");
+        }
     }
 }
 

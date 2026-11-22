@@ -776,10 +776,9 @@ impl Surfaces {
         if v.negate_y || v.remap_z {
             return Err("viewport needs a y flip or z remap in the vertex program".into());
         }
-        // A raw draw refuses by name the viewports wgpu-core refuses (D110 step 6b).
-        if self.raw.as_ref().is_some_and(|m| m.wants(vs.0.key, ps.as_ref().map(|p| p.0.key)))
-            && let Some(why) = crate::raw::viewport_refused([v.x, v.y, v.width, v.height, v.min_depth, v.max_depth], &self.device.limits())
-        {
+        // A raw draw (D110 step 6) refuses by name the viewports wgpu-core refuses.
+        let raw = self.raw.as_ref().is_some_and(|m| m.wants(vs.0.key, ps.as_ref().map(|p| p.0.key)));
+        if raw && let Some(why) = crate::raw::viewport_refused([v.x, v.y, v.width, v.height, v.min_depth, v.max_depth], &self.device.limits()) {
             return Err(why.into());
         }
         let [x, y, w, h] = d.render.wgpu_scissor()?;
@@ -863,7 +862,7 @@ impl Surfaces {
                 Ok(Some(wgpu::ColorTargetState { format: *format, blend, write_mask: wgpu::ColorWrites::from_bits_truncate(u32::from(o.write_mask)) }))
             })
             .collect::<Result<_, _>>()?;
-        let depth_state = match &depth {
+        let mut depth_state = match &depth {
             Some((_, format)) => {
                 let face = |f: crate::state::raster::StencilFace| f.wgpu().ok_or("stencil state");
                 let (front, back) = if ds.stencil_test { (face(ds.front)?, face(if ds.two_sided { ds.back } else { ds.front })?) } else { Default::default() };
@@ -879,12 +878,25 @@ impl Surfaces {
             None => None,
         };
         let strip = matches!(topology, P::LineStrip | P::TriangleStrip).then(|| indices.as_ref().map(|i| i.2)).flatten();
-        let primitive = wgpu::PrimitiveState {
+        let mut primitive = wgpu::PrimitiveState {
             topology,
             strip_index_format: strip,
             front_face: r.raster.wgpu_front_face().ok_or("front face")?,
             cull_mode: r.raster.wgpu_cull()?,
             ..Default::default()
+        };
+        // A raw pipeline takes cull, front face, depth, stencil and bias per draw (step 7a): out of
+        // its key (but the depth format), into the draw. The stencil test wgpu-core refuses without
+        // a stencil aspect is refused here, by name.
+        let per_draw = match raw {
+            true => {
+                if depth_state.as_ref().is_some_and(|d| d.stencil.is_enabled() && !d.format.has_stencil_aspect()) {
+                    return Err("raw draw: stencil test on a format without stencil".into());
+                }
+                let keyed = depth_state.as_ref().map(|d| wgpu::DepthStencilState { format: d.format, depth_write_enabled: None, depth_compare: None, stencil: Default::default(), bias: Default::default() });
+                crate::raw::Dynamic { cull: primitive.cull_mode.take(), front: std::mem::take(&mut primitive.front_face), depth: std::mem::replace(&mut depth_state, keyed) }
+            }
+            false => Default::default(),
         };
         // Bind groups: 0 vertex, 1 pixel; constant banks at their bank, textures at 32 + 2i, samplers at 33 + 2i.
         // A group's uniform buffers take dynamic offsets when the device allows that many: the
@@ -1029,7 +1041,7 @@ impl Surfaces {
             None => Call::Direct { first: d.first, count: d.count, instance: d.instance },
         };
         let (blend, stencil) = (d.render.blend_constant, u32::from(ds.front.reference));
-        self.push(Rec::Draw(DrawRec { pipeline: id, index: indices, vertex, groups, viewport: [v.x, v.y, v.width, v.height, v.min_depth, v.max_depth], scissor: [x, y, x1 - x, y1 - y], blend, stencil, call, pass }));
+        self.push(Rec::Draw(DrawRec { pipeline: id, index: indices, vertex, groups, viewport: [v.x, v.y, v.width, v.height, v.min_depth, v.max_depth], scissor: [x, y, x1 - x, y1 - y], blend, stencil, call, pass, dynamic: per_draw }));
         for (s, _) in colors.iter().flatten() {
             self.wrote((s.addr, s.format));
         }

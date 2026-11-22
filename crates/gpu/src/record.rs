@@ -47,6 +47,8 @@ pub(crate) struct DrawRec {
     pub(crate) stencil: u32,
     pub(crate) call: Call,
     pub(crate) pass: Option<Box<PassOpen>>,
+    /// A raw pipeline's states set per draw (D110 step 7a); the default for wgpu's.
+    pub(crate) dynamic: crate::raw::Dynamic,
 }
 
 /// A draw's bind group: its constant banks (bank, block, bytes the program may
@@ -111,14 +113,15 @@ struct Keep {
 
 /// A raw segment: the wgpu encoder before it (which gets the transitions to the states the
 /// segment begins with), the raw encoder, each texture's format with its state when the segment
-/// began and now, the arena buffers it reads, and the attachments of its open rendering, if any,
-/// with whether it began.
+/// began and now, the arena buffers it reads, the attachments of its open rendering, if any,
+/// with whether it began, and the per-draw states last set in its command buffer.
 struct Segment {
     before: wgpu::CommandEncoder,
     raw: wgpu::CommandEncoder,
     states: FxMap<wgpu::Texture, (wgpu::TextureFormat, wgpu::TextureUses, wgpu::TextureUses)>,
     buffers: Vec<wgpu::Buffer>,
     rendering: Option<(Attachments, bool)>,
+    dynamic: Option<crate::raw::Dynamic>,
 }
 
 impl RawRec {
@@ -370,7 +373,7 @@ impl Recorder {
         let raw = self.device.create_command_encoder(&Default::default());
         self.staging.recordings += 1;
         if let Some(r) = &mut self.raw {
-            r.segment = Some(Segment { before, raw, states: FxMap::default(), buffers: Vec::new(), rendering: None });
+            r.segment = Some(Segment { before, raw, states: FxMap::default(), buffers: Vec::new(), rendering: None, dynamic: None });
         }
     }
 
@@ -648,6 +651,11 @@ impl Recorder {
         let index = index.map(|((b, at, _), format)| (raw_buffer(handles, &b), at, format));
         let begin = !*begun;
         *begun = true;
+        // The per-draw states, when they differ from those this command buffer has.
+        let dynamic = (s.dynamic.as_ref() != Some(&d.dynamic)).then(|| d.dynamic.clone());
+        if dynamic.is_some() {
+            s.dynamic = dynamic.clone();
+        }
         self.staging.raw_draws += 1;
         let ash = &pools.ash;
         unsafe {
@@ -669,6 +677,9 @@ impl Recorder {
                 ash.cmd_set_blend_constants(cb, &d.blend);
                 ash.cmd_set_stencil_reference(cb, vk::StencilFaceFlags::FRONT_AND_BACK, d.stencil);
                 ash.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, p.pipeline);
+                if let Some(dynamic) = &dynamic {
+                    dynamic.set(ash, cb);
+                }
                 if !sets.is_empty() {
                     ash.cmd_bind_descriptor_sets(cb, vk::PipelineBindPoint::GRAPHICS, p.layout, 0, &sets, &offsets);
                 }
@@ -743,6 +754,8 @@ impl Recorder {
             return;
         };
         let end = s.rendering.take().is_some_and(|(_, begun)| begun);
+        // A fill binds a pipeline whose states are its own: the next draw sets its own again.
+        s.dynamic = None;
         let t = view.texture();
         let need = if t.format().has_depth_aspect() || t.format().has_stencil_aspect() { wgpu::TextureUses::DEPTH_STENCIL_WRITE } else { wgpu::TextureUses::COLOR_TARGET };
         let barrier = match s.states.get_mut(t) {

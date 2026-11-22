@@ -2748,7 +2748,7 @@ mod tests {
         }
         let draw = |color: u32, vertices: u32, x: f32, pass: Option<Box<PassOpen>>| {
             let groups = smallvec::smallvec![GroupRec { banks: smallvec::smallvec![(0, color, 16)], set: 0, swizzles: false, dynamic: false }];
-            Rec::Draw(DrawRec { pipeline: 1, index: None, vertex: smallvec::smallvec![vertices], groups, viewport: [x, 0.0, 2.0, 4.0, 0.0, 1.0], scissor: [0, 0, 4, 4], blend: [0.0; 4], stencil: 0, call: Call::Direct { first: 0, count: 3, instance: 0 }, pass })
+            Rec::Draw(DrawRec { pipeline: 1, index: None, vertex: smallvec::smallvec![vertices], groups, viewport: [x, 0.0, 2.0, 4.0, 0.0, 1.0], scissor: [0, 0, 4, 4], blend: [0.0; 4], stencil: 0, call: Call::Direct { first: 0, count: 3, instance: 0 }, pass, dynamic: Default::default() })
         };
         let open = || Some(Box::new(PassOpen { colors: vec![Some(target.create_view(&Default::default()))], depth: None, timed: None }));
         s.push(draw(0, 1, 0.0, open()));
@@ -2841,7 +2841,7 @@ mod tests {
             let (vm, pm) = (module(&modules[0]), module(&modules[1]));
             let set_layout = m.raw.set_layout(&entries).unwrap();
             let pl = m.raw.pipeline_layout(&[set_layout]).unwrap();
-            let p = m.raw.pipeline(&crate::raw::PipelineDesc { vertex: vm, pixel: Some(pm), entries: [c"main", c"main"], buffers: &buffers, primitive: Default::default(), depth_stencil: None, targets: &targets, layout: pl }).unwrap();
+            let p = m.raw.pipeline(&crate::raw::PipelineDesc { vertex: vm, pixel: Some(pm), entries: [c"main", c"main"], buffers: &buffers, primitive: Default::default(), depth_stencil: None, targets: &targets, layout: pl, dynamic: true }).unwrap();
             crate::raw::RawPipeline { pipeline: p, layout: pl, sets: smallvec::smallvec![(set_layout, Arc::from(&entries[..]))] }
         };
         // The target cleared, as `texture` clears targets on the raw path.
@@ -2862,7 +2862,7 @@ mod tests {
         }
         let draw = |pipeline: u32, color: u32, vertices: u32, x: f32, pass: Option<Box<PassOpen>>| {
             let groups = smallvec::smallvec![GroupRec { banks: smallvec::smallvec![(0, color, 16)], set: 0, swizzles: false, dynamic: false }];
-            Rec::Draw(DrawRec { pipeline, index: None, vertex: smallvec::smallvec![vertices], groups, viewport: [x, 0.0, 2.0, 4.0, 0.0, 1.0], scissor: [0, 0, 4, 4], blend: [0.0; 4], stencil: 0, call: Call::Direct { first: 0, count: 3, instance: 0 }, pass })
+            Rec::Draw(DrawRec { pipeline, index: None, vertex: smallvec::smallvec![vertices], groups, viewport: [x, 0.0, 2.0, 4.0, 0.0, 1.0], scissor: [0, 0, 4, 4], blend: [0.0; 4], stencil: 0, call: Call::Direct { first: 0, count: 3, instance: 0 }, pass, dynamic: Default::default() })
         };
         let open = || Some(Box::new(PassOpen { colors: vec![Some(target.create_view(&Default::default()))], depth: None, timed: None }));
         s.push(draw(1, 0, 1, 0.0, open()));
