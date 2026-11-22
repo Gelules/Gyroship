@@ -97,18 +97,63 @@ its options. Xbox, PlayStation and other gamepads work too, and so does the keyb
 
 Details and known issues: [docs/status.md](docs/status.md).
 
-## Get started
+## Install, step by step
 
-1. **What you need**: Windows 11 (or Windows 10 with Microsoft's WebView2 runtime), 64-bit, an
-   NVIDIA graphics card, 16 GB of RAM, your own
-   dump of the game with its update, and `SDL3.dll` for gamepads and sound. Building Gyroship and
-   its launcher needs Rust (1.97 or later) and Microsoft's C++ build tools: install them first
-   ([docs/building.md](docs/building.md)); the launcher then checks them, with the Visual C++
-   runtime, and installs any that goes missing.
-2. **Build** Gyroship and its launcher: [docs/building.md](docs/building.md).
-3. **Open the launcher**: in its Setup tab, Set up everything prepares the game in one press (or
-   step by step, as you like), then press Play ([docs/playing.md](docs/playing.md)).
-4. **Practise**: turn on the practice tools in the launcher ([docs/practice.md](docs/practice.md)).
+You need Windows 11 (or Windows 10 with Microsoft's WebView2 runtime), 64-bit, an NVIDIA graphics
+card, 16 GB of RAM, and your own dump of the game with its update. What building the game takes
+(Rust, Microsoft's C++ build tools, the Visual C++ runtime), the launcher installs on your click
+when it is missing. Here is one install from zero, on drive G:; any folders will do.
+
+1. **Get the sources.** Download the source code of the
+   [latest release](https://github.com/Gelules/Gyroship/releases/latest) and unzip it, or clone
+   this repository at that release's tag. Here: `G:\Gyroship\gyroship`.
+
+   ![The folder of Gyroship's sources](docs/install/1-sources.png)
+
+2. **Download the two programs** of the same release, `gyroship-launcher.exe` and
+   `gyroship-tools.exe`: no need to build them. Put them in a folder of their own, with an empty
+   folder for your data (saves, shader cache, logs). For gamepads and sound, add `SDL3.dll`, from
+   the `win32-x64` zip of an [SDL 3 release](https://github.com/libsdl-org/SDL/releases). Here:
+   `G:\Gyroship\Test`, with its folder `data`.
+
+   ![The two programs, SDL3.dll and the data folder](docs/install/2-programs.png)
+
+3. **Find your dump's `exefs` folder**, the update's, with its `romfs` folder next to it. Here:
+   `G:\Gyroship\Dump\update\exefs`.
+
+   ![The dump's update: exefs and romfs](docs/install/3-dump.png)
+
+4. **Start `gyroship-launcher.exe` and open Setup.** Windows may first warn that it does not know
+   the program: More info, then Run anyway. In step 1, give the sources' folder as the Repository
+   and your data folder as the Data folder, then press "Use the data folder for the save and the
+   cache".
+
+   ![Setup, step 1: the folders](docs/install/4-folders.png)
+
+   For the practice tools, give step 3 the repository's `templates\probes.txt` as Practice probes:
+   the game is then built with them from the start.
+
+   ![Setup, step 3: the practice probes](docs/install/5-probes.png)
+
+5. **In Play, give your dump's `exefs` folder.** The launcher tells you when it recognises the
+   update the practice tools are made for.
+
+   ![Play: the dump recognised](docs/install/6-exefs.png)
+
+6. **Back in Setup, press Set up everything.** It installs what is missing (you accept the
+   packages' licences, and the C++ tools ask for administrator rights), recompiles the game from
+   your dump (about two minutes) and builds it (a few minutes the first time), until it says Done.
+
+   ![Setup: everything done](docs/install/7-done.png)
+
+7. **Press Play.** To practise, give Play the repository's `templates\practice.txt` as Practice
+   file ([docs/practice.md](docs/practice.md)).
+
+   ![Play: ready](docs/install/8-play.png)
+
+When a new version is out, the launcher tells you: get its sources and its two programs the same
+way, then press Set up everything again. Every option of the launcher, and how to build everything
+yourself: [docs/playing.md](docs/playing.md) and [docs/building.md](docs/building.md).
 
 ## Documentation
 
