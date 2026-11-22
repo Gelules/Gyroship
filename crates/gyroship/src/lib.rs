@@ -48,12 +48,14 @@ pub fn main(table: Vec<Entry>) {
     }
 }
 
-/// `--backend auto|vulkan|dx12` (the HLE checks the spelling).
+/// `--backend auto|vulkan|dx12`, Vulkan under `--renderer vulkan` (the HLE checks the spelling
+/// and the two together).
 fn backend() -> gyroship_gpu::Backend {
     let args: Vec<String> = std::env::args().collect();
-    match args.iter().position(|a| a == "--backend").and_then(|i| args.get(i + 1)).map(String::as_str) {
-        Some("vulkan") => gyroship_gpu::Backend::Vulkan,
-        Some("dx12") => gyroship_gpu::Backend::Dx12,
+    let value = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).map(String::as_str);
+    match (value("--backend"), value("--renderer")) {
+        (Some("vulkan"), _) | (None | Some("auto"), Some("vulkan")) => gyroship_gpu::Backend::Vulkan,
+        (Some("dx12"), _) => gyroship_gpu::Backend::Dx12,
         _ => gyroship_gpu::Backend::Auto,
     }
 }

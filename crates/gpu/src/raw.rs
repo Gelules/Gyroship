@@ -11,9 +11,11 @@ use wgpu::hal::{api::Vulkan, vulkan::conv};
 /// What a raw render pipeline is made from: the parts of wgpu's descriptor, as draw.rs gives them,
 /// with the modules and the layout already raw. Multisampling is wgpu's default, as in draw.rs.
 pub(crate) struct PipelineDesc<'a> {
-    /// The vertex and pixel modules ([`Raw::module`]), each with its entry point `main`.
+    /// The vertex and pixel modules ([`Raw::module`]), and their entry points (the game's are
+    /// `main`; the fill module's `vs` and `fs`).
     pub vertex: vk::ShaderModule,
     pub pixel: Option<vk::ShaderModule>,
+    pub entries: [&'a std::ffi::CStr; 2],
     /// The vertex buffers by slot.
     pub buffers: &'a [Option<wgpu::VertexBufferLayout<'a>>],
     pub primitive: wgpu::PrimitiveState,
@@ -68,6 +70,8 @@ pub(crate) struct RawMode {
     pub(crate) program: Option<u64>,
     pub(crate) options: naga::back::spv::Options<'static>,
     pub(crate) modules: FxMap<u32, vk::ShaderModule>,
+    /// The fill module's raw pipelines, by format and kind (every draw raw: step 6b).
+    pub(crate) fills: FxMap<(wgpu::TextureFormat, crate::surfaces::Fill), std::sync::Arc<RawPipeline>>,
 }
 
 impl RawMode {
@@ -84,11 +88,11 @@ impl RawMode {
                 }
             },
         };
-        let mode = Raw::new(adapter, device).filter(|_| extras.dynamic_rendering).zip(crate::vk::spirv_options(adapter, device)).map(|(raw, options)| RawMode { raw, program, options, modules: FxMap::default() });
+        let mode = Raw::new(adapter, device).filter(|_| extras.dynamic_rendering).zip(crate::vk::spirv_options(adapter, device)).map(|(raw, options)| RawMode { raw, program, options, modules: FxMap::default(), fills: FxMap::default() });
         match (&mode, program) {
-            (None, _) => eprintln!("gyroship: {RAW}: this device has no Vulkan dynamic rendering: the raw path stays off"),
-            (Some(_), Some(key)) => eprintln!("gyroship: {RAW}: the draws of program {key:016x} recorded in raw Vulkan"),
-            (Some(_), None) => eprintln!("gyroship: {RAW}: every draw recorded in raw Vulkan"),
+            (None, _) => eprintln!("gyroship: the raw Vulkan path needs Vulkan with dynamic rendering, which this device lacks: the game draws through wgpu"),
+            (Some(_), Some(key)) => eprintln!("gyroship: the draws of program {key:016x} recorded in raw Vulkan"),
+            (Some(_), None) => eprintln!("gyroship: every draw recorded in raw Vulkan"),
         }
         mode
     }
@@ -96,6 +100,98 @@ impl RawMode {
     /// Whether the pipeline of these programs is raw.
     pub(crate) fn wants(&self, vertex: u64, pixel: Option<u64>) -> bool {
         self.program.is_none_or(|p| p == vertex || pixel == Some(p))
+    }
+
+    /// The fill module's raw pipeline for `targets` and `depth` (made once, kept by `key`): its
+    /// entry points `vs` and `fs`, one group with its uniform at binding 0, as `Surfaces::fill`'s.
+    pub(crate) fn fill(&mut self, key: (wgpu::TextureFormat, crate::surfaces::Fill), targets: &[Option<wgpu::ColorTargetState>], depth: Option<&wgpu::DepthStencilState>) -> Result<std::sync::Arc<RawPipeline>, String> {
+        if let Some(p) = self.fills.get(&key) {
+            return Ok(p.clone());
+        }
+        let module = naga::front::wgsl::parse_str(crate::surfaces::FILL).map_err(|e| e.message().to_string())?;
+        let info = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all()).validate(&module).map_err(|e| e.to_string())?;
+        let entries = [crate::surfaces::fill_entry()];
+        let map = crate::vk::binding_map(&[&entries]);
+        let vertex = self.raw.module(&crate::vk::spirv(&module, &info, naga::ShaderStage::Vertex, "vs", &self.options, &map)?)?;
+        let pixel = match targets.is_empty() {
+            true => None,
+            false => Some(self.raw.module(&crate::vk::spirv(&module, &info, naga::ShaderStage::Fragment, "fs", &self.options, &map)?)?),
+        };
+        let set = self.raw.set_layout(&entries)?;
+        let layout = self.raw.pipeline_layout(&[set])?;
+        let pipeline = self.raw.pipeline(&PipelineDesc { vertex, pixel, entries: [c"vs", c"fs"], buffers: &[], primitive: Default::default(), depth_stencil: depth, targets, layout })?;
+        let p = std::sync::Arc::new(RawPipeline { pipeline, layout, sets: smallvec::smallvec![(set, std::sync::Arc::from(&entries[..]))] });
+        self.fills.insert(key, p.clone());
+        Ok(p)
+    }
+}
+
+/// What wgpu-core refuses in a render pipeline that draw.rs lets through (wgpu 30: `Device::
+/// create_render_pipeline`'s checks), refused here before a raw one is made, by name: there, the
+/// frame's encoder would be lost; here, the draws of this pipeline only. Blending is checked
+/// against the adapter's own format features, which the device asks for on Vulkan.
+pub(crate) fn refused(buffers: &[Option<wgpu::VertexBufferLayout>], targets: &[Option<wgpu::ColorTargetState>], depth: Option<&wgpu::DepthStencilState>, adapter: &wgpu::Adapter) -> Option<&'static str> {
+    let limits = adapter.limits();
+    if targets.iter().flatten().any(|t| t.blend.is_some() && !adapter.get_texture_format_features(t.format).flags.contains(wgpu::TextureFormatFeatureFlags::BLENDABLE)) {
+        return Some("raw pipeline: blending on a format that cannot blend");
+    }
+    for b in buffers.iter().flatten() {
+        if b.array_stride > u64::from(limits.max_vertex_buffer_array_stride) || b.array_stride % wgpu::VERTEX_ALIGNMENT != 0 {
+            return Some("raw pipeline: vertex stride wgpu refuses");
+        }
+        let room = if b.array_stride == 0 { u64::from(limits.max_vertex_buffer_array_stride) } else { b.array_stride };
+        if b.attributes.iter().any(|a| a.offset + a.format.size() > room || a.offset % a.format.size().min(4) != 0 || a.shader_location >= limits.max_vertex_attributes) {
+            return Some("raw pipeline: vertex attribute wgpu refuses");
+        }
+    }
+    use wgpu::BlendFactor as F;
+    let blends = || targets.iter().flatten().filter_map(|t| t.blend).flat_map(|b| [b.color, b.alpha]);
+    if blends().any(|c| [c.src_factor, c.dst_factor].iter().any(|f| matches!(f, F::Src1 | F::OneMinusSrc1 | F::Src1Alpha | F::OneMinusSrc1Alpha))) {
+        return Some("raw pipeline: dual-source blending (not asked of the device)");
+    }
+    if blends().any(|c| matches!(c.operation, wgpu::BlendOperation::Min | wgpu::BlendOperation::Max) && (c.src_factor != F::One || c.dst_factor != F::One)) {
+        return Some("raw pipeline: min or max blending with a factor other than one");
+    }
+    if depth.is_some_and(|d| d.stencil.is_enabled() && !d.format.has_stencil_aspect()) {
+        return Some("raw pipeline: stencil test on a format without stencil");
+    }
+    None
+}
+
+/// A viewport wgpu-core refuses (`RenderPass::set_viewport`'s checks), refused here before a raw
+/// draw, by name.
+pub(crate) fn viewport_refused([x, y, w, h, near, far]: [f32; 6], limits: &wgpu::Limits) -> Option<&'static str> {
+    let max = limits.max_texture_dimension_2d as f32;
+    if w < 0.0 || h < 0.0 || w > max || h > max || x < -2.0 * max || y < -2.0 * max || x + w > 2.0 * max - 1.0 || y + h > 2.0 * max - 1.0 || !(0.0..=1.0).contains(&near) || !(0.0..=1.0).contains(&far) || near > far {
+        return Some("raw draw: viewport wgpu refuses");
+    }
+    None
+}
+
+/// Clears the whole of a target as wgpu's clear pass does: an instance of rendering that clears
+/// its color (made from wgpu's f64 values as wgpu-hal's `make_vk_clear_color` makes it), or its
+/// depth and stencil (each kept when None), stores, and ends.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn clear(ash: &ash::Device, cb: vk::CommandBuffer, (width, height): (u32, u32), view: vk::ImageView, format: wgpu::TextureFormat, [r, g, b, a]: [f64; 4], depth: Option<f32>, stencil: Option<u32>) {
+    let attachment = |layout, clear: bool, value| vk::RenderingAttachmentInfo::default().image_view(view).image_layout(layout).load_op(if clear { vk::AttachmentLoadOp::CLEAR } else { vk::AttachmentLoadOp::LOAD }).store_op(vk::AttachmentStoreOp::STORE).clear_value(value);
+    let none = vk::RenderingAttachmentInfo::default();
+    let area = vk::Rect2D { offset: vk::Offset2D::default(), extent: vk::Extent2D { width, height } };
+    let ds = vk::ClearValue { depth_stencil: vk::ClearDepthStencilValue { depth: depth.unwrap_or(0.0), stencil: stencil.unwrap_or(0) } };
+    let (colors, d, s) = if format.has_depth_aspect() || format.has_stencil_aspect() {
+        let layout = vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        (Vec::new(), if format.has_depth_aspect() { attachment(layout, depth.is_some(), ds) } else { none }, if format.has_stencil_aspect() { attachment(layout, stencil.is_some(), ds) } else { none })
+    } else {
+        let color = match format.sample_type(None, None) {
+            Some(wgpu::TextureSampleType::Sint) => vk::ClearColorValue { int32: [r as i32, g as i32, b as i32, a as i32] },
+            Some(wgpu::TextureSampleType::Uint) => vk::ClearColorValue { uint32: [r as u32, g as u32, b as u32, a as u32] },
+            _ => vk::ClearColorValue { float32: [r as f32, g as f32, b as f32, a as f32] },
+        };
+        (vec![attachment(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, true, vk::ClearValue { color })], none, none)
+    };
+    let info = vk::RenderingInfo::default().render_area(area).layer_count(1).color_attachments(&colors).depth_attachment(&d).stencil_attachment(&s);
+    unsafe {
+        ash.cmd_begin_rendering(cb, &info);
+        ash.cmd_end_rendering(cb);
     }
 }
 
@@ -114,6 +210,9 @@ impl crate::surfaces::Surfaces {
         depth: Option<&wgpu::DepthStencilState>,
         groups: &[&[wgpu::BindGroupLayoutEntry]],
     ) -> Result<RawPipeline, String> {
+        if let Some(why) = refused(buffers, targets, depth, &self.adapter) {
+            return Err(why.into());
+        }
         let (Some(m), ir) = (self.raw.as_mut(), &self.cache.ir) else { return Err("the raw path is off".into()) };
         let map = crate::vk::binding_map(groups);
         let mut module = |b: &crate::draw::Built| -> Result<vk::ShaderModule, String> {
@@ -130,7 +229,7 @@ impl crate::surfaces::Surfaces {
         let pixel = ps.map(&mut module).transpose()?;
         let sets = groups.iter().map(|e| Ok((m.raw.set_layout(e)?, std::sync::Arc::from(*e)))).collect::<Result<smallvec::SmallVec<[_; 2]>, String>>()?;
         let layout = m.raw.pipeline_layout(&sets.iter().map(|s| s.0).collect::<Vec<_>>())?;
-        let pipeline = m.raw.pipeline(&PipelineDesc { vertex, pixel, buffers, primitive, depth_stencil: depth, targets, layout })?;
+        let pipeline = m.raw.pipeline(&PipelineDesc { vertex, pixel, entries: [c"main", c"main"], buffers, primitive, depth_stencil: depth, targets, layout })?;
         Ok(RawPipeline { pipeline, layout, sets })
     }
 }
@@ -215,8 +314,8 @@ impl Raw {
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::default().vertex_binding_descriptions(&bindings).vertex_attribute_descriptions(&attributes);
         let assembly = vk::PipelineInputAssemblyStateCreateInfo::default().topology(conv::map_topology(d.primitive.topology)).primitive_restart_enable(d.primitive.strip_index_format.is_some());
         let flags = if self.varying { vk::PipelineShaderStageCreateFlags::ALLOW_VARYING_SUBGROUP_SIZE } else { vk::PipelineShaderStageCreateFlags::empty() };
-        let stage = |stage, module| vk::PipelineShaderStageCreateInfo::default().flags(flags).stage(stage).module(module).name(c"main");
-        let stages: Vec<_> = std::iter::once(stage(vk::ShaderStageFlags::VERTEX, d.vertex)).chain(d.pixel.map(|p| stage(vk::ShaderStageFlags::FRAGMENT, p))).collect();
+        let stage = |stage, module, name| vk::PipelineShaderStageCreateInfo::default().flags(flags).stage(stage).module(module).name(name);
+        let stages: Vec<_> = std::iter::once(stage(vk::ShaderStageFlags::VERTEX, d.vertex, d.entries[0])).chain(d.pixel.map(|p| stage(vk::ShaderStageFlags::FRAGMENT, p, d.entries[1]))).collect();
         let mut raster = vk::PipelineRasterizationStateCreateInfo::default()
             .polygon_mode(conv::map_polygon_mode(d.primitive.polygon_mode))
             .front_face(conv::map_front_face(d.primitive.front_face))
@@ -613,7 +712,7 @@ mod tests {
         let (vm, pm) = (module(&ir[0]), module(&ir[1]));
         let sets = [raw.set_layout(&groups[0]).unwrap(), raw.set_layout(&groups[1]).unwrap()];
         let raw_layout = raw.pipeline_layout(&sets).unwrap();
-        let mut raw_pipeline = |depth_stencil| raw.pipeline(&PipelineDesc { vertex: vm, pixel: Some(pm), buffers: &[], primitive: Default::default(), depth_stencil: Some(depth_stencil), targets: &targets, layout: raw_layout }).unwrap();
+        let mut raw_pipeline = |depth_stencil| raw.pipeline(&PipelineDesc { vertex: vm, pixel: Some(pm), entries: [c"main", c"main"], buffers: &[], primitive: Default::default(), depth_stencil: Some(depth_stencil), targets: &targets, layout: raw_layout }).unwrap();
         let raw_pipelines = [raw_pipeline(&stenciled), raw_pipeline(&biased)];
         let image = |v: &wgpu::TextureView| unsafe { v.as_hal::<Vulkan>().map(|h| h.raw_handle()) }.unwrap();
         let handle = |b: &wgpu::Buffer| unsafe { b.as_hal::<Vulkan>().map(|h| h.raw_handle()) }.unwrap();

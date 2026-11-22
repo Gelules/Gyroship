@@ -270,6 +270,7 @@ pub const OPTIONS: &[(&str, bool)] = &[
     // The host (crates/gyroship).
     ("--headless", false),
     ("--backend", true),
+    ("--renderer", true),
     ("--sdl", true),
     ("--fullscreen", false),
     ("--joycon", false),
@@ -360,7 +361,7 @@ pub fn literals(src: &str) -> Vec<&str> {
 
 /// The generated harness's `main`: `boot <exefs> [--log FILE] [--explore]
 /// [--all-svcs] [--seconds N] [--frames N] [--gpu] [--backend auto|vulkan|dx12]
-/// [--play] ...` runs the game (until N frames are presented, or for N
+/// [--renderer wgpu|vulkan] [--play] ...` runs the game (until N frames are presented, or for N
 /// seconds of virtual time, or of real time with `--play`: 60 when neither is
 /// given); any other mode is the runtime's. A GPU that lacks what the game
 /// needs ends the run with exit code 3.
@@ -527,9 +528,23 @@ pub fn run(mut table: Vec<rt::Entry>, window: Option<HostWindow>) {
     }
     // The host GPU runs the game's work when frames are dumped, filmed or measured, or with --gpu.
     if window.is_some() || k.config.frames_dump.is_some() || k.config.video.is_some() || k.config.perf.is_some() || k.config.hashes.is_some() || flag("--gpu") {
+        // D110 step 6b: every draw, full clear and fill recorded in raw Vulkan, on the Vulkan backend.
+        let vulkan = match value("--renderer").as_deref() {
+            None | Some("wgpu") => false,
+            Some("vulkan") => true,
+            Some(other) => {
+                eprintln!("gyroship: --renderer {other}: expected wgpu or vulkan");
+                std::process::exit(2);
+            }
+        };
         let backend = match value("--backend").as_deref() {
+            None | Some("auto") if vulkan => gyroship_gpu::Backend::Vulkan,
             None | Some("auto") => gyroship_gpu::Backend::Auto,
             Some("vulkan") => gyroship_gpu::Backend::Vulkan,
+            Some("dx12") if vulkan => {
+                eprintln!("gyroship: --renderer vulkan needs the Vulkan backend, not --backend dx12");
+                std::process::exit(2);
+            }
             Some("dx12") => gyroship_gpu::Backend::Dx12,
             Some(other) => {
                 eprintln!("gyroship: --backend {other}: expected auto, vulkan or dx12");
@@ -548,6 +563,10 @@ pub fn run(mut table: Vec<rt::Entry>, window: Option<HostWindow>) {
         match surfaces {
             Ok(mut s) => {
                 k.log(&format!("gpu: host renderer {}", s.describe()));
+                // Said on stderr only, the journal staying comparable with the wgpu path's.
+                if vulkan {
+                    s.record_raw();
+                }
                 // D42: in play mode a pipeline the driver takes seconds over holds no frame.
                 s.background = k.config.play;
                 // Said on stderr only: the journal of a run with the cache stays comparable.

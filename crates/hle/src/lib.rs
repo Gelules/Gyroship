@@ -488,6 +488,7 @@ impl Kernel {
             }
             if let Some(s) = g.as_ref().and_then(|g| g.surfaces.as_ref()) {
                 eprintln!("gyroship: staging over {} presents: {:?}", self.gs.presents, s.staging);
+                eprintln!("gyroship: recordings other than draws over {} presents: {:?}", self.gs.presents, s.runs);
                 let c = &s.compile_total;
                 eprintln!(
                     "gyroship: shaders over {} presents: {} modules in {:.1} s, {} loaded in {:.1} s ({:.1} s saved), {} pipelines in {:.1} s on the frame, {} made off it in {:.1} s; {} draws and dispatches waited for theirs",

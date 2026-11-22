@@ -776,6 +776,12 @@ impl Surfaces {
         if v.negate_y || v.remap_z {
             return Err("viewport needs a y flip or z remap in the vertex program".into());
         }
+        // A raw draw refuses by name the viewports wgpu-core refuses (D110 step 6b).
+        if self.raw.as_ref().is_some_and(|m| m.wants(vs.0.key, ps.as_ref().map(|p| p.0.key)))
+            && let Some(why) = crate::raw::viewport_refused([v.x, v.y, v.width, v.height, v.min_depth, v.max_depth], &self.device.limits())
+        {
+            return Err(why.into());
+        }
         let [x, y, w, h] = d.render.wgpu_scissor()?;
         let (x1, y1) = ((x + w).min(width), (y + h).min(height));
         if x >= x1 || y >= y1 {

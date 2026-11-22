@@ -158,7 +158,7 @@ fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
 /// A clear bounded by a scissor or a channel mask: one triangle over the
 /// target at depth `value.depth`, of color `value.color`, drawn with the
 /// scissor and write masks.
-const FILL: &str = r#"
+pub(crate) const FILL: &str = r#"
 struct Value { color: vec4<f32>, depth: f32 };
 @group(0) @binding(0) var<uniform> value: Value;
 
@@ -176,9 +176,31 @@ fn fs() -> @location(0) vec4<f32> {
 
 /// What a fill writes: a color target's channels, or depth and/or stencil.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-enum Fill {
+pub(crate) enum Fill {
     Color { mask: u8 },
     Depth { depth: bool, stencil: bool },
+}
+
+/// The fill module's one binding: its value, a uniform.
+pub(crate) fn fill_entry() -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding: 0,
+        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+        ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: wgpu::BufferSize::new(32) },
+        count: None,
+    }
+}
+
+/// The color targets and depth-stencil state of a fill of `format`.
+fn fill_states(format: wgpu::TextureFormat, fill: Fill) -> (Vec<Option<wgpu::ColorTargetState>>, Option<wgpu::DepthStencilState>) {
+    match fill {
+        Fill::Color { mask } => (vec![Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::from_bits_truncate(u32::from(mask)) })], None),
+        Fill::Depth { depth, stencil } => {
+            let face = wgpu::StencilFaceState { compare: wgpu::CompareFunction::Always, fail_op: wgpu::StencilOperation::Replace, depth_fail_op: wgpu::StencilOperation::Replace, pass_op: wgpu::StencilOperation::Replace };
+            let stencil = if stencil { wgpu::StencilState { front: face, back: face, read_mask: 0xff, write_mask: 0xff } } else { Default::default() };
+            (Vec::new(), Some(wgpu::DepthStencilState { format, depth_write_enabled: Some(depth), depth_compare: Some(wgpu::CompareFunction::Always), stencil, bias: Default::default() }))
+        }
+    }
 }
 
 pub(crate) struct Entry {
@@ -305,8 +327,11 @@ pub struct Surfaces {
     /// Under `GYROSHIP_PASSTHROUGH` (`vk::PASSTHROUGH`): the SPIR-V options our modules are
     /// written with, those of wgpu-hal.
     pub(crate) passthrough: Option<naga::back::spv::Options<'static>>,
-    /// Under `GYROSHIP_RAW` (`raw::RAW`, D110 step 6): the raw path's objects and the draws it takes.
+    /// Under `GYROSHIP_RAW` (`raw::RAW`, D110 step 6) or `--renderer vulkan`: the raw path's
+    /// objects and the draws it takes.
     pub(crate) raw: Option<crate::raw::RawMode>,
+    /// The recordings other than draws (`Rec::Run`), by the function that made them (`--perf`).
+    pub runs: BTreeMap<&'static str, u64>,
 }
 
 /// A pipeline cache kept in a file between runs (`--pipeline-cache`): the
@@ -1234,15 +1259,7 @@ impl Surfaces {
             cache: None,
         });
         let fill_module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("fill"), source: wgpu::ShaderSource::Wgsl(FILL.into()) });
-        let fill_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: None,
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: wgpu::BufferSize::new(32) },
-                count: None,
-            }],
-        });
+        let fill_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &[fill_entry()] });
         let fill = (fill_module, fill_layout, Default::default());
         let belt = wgpu::util::StagingBelt::new(device.clone(), 16 << 20);
         let texture_belt = wgpu::util::StagingBelt::new(device.clone(), 16 << 20);
@@ -1255,7 +1272,24 @@ impl Surfaces {
         recorder.raw = raw.as_ref().and_then(|_| crate::record::RawRec::new(&device));
         let rec = Arc::new(Mutex::new(recorder));
         let renderable = (0..=0xff).filter_map(color_format).chain((0..=0xff).filter_map(depth_format)).map(|f| (f, renderable_on(&adapter, &device, f))).collect();
-        Ok(Surfaces { renderable, adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, rec, batch: Vec::with_capacity(BATCH), recorder: None, recorder_ended: false, timed, open: None, sets: 0, empty_set: None, present: 0, readbacks: Default::default(), hasher: None, belt, big_upload: false, texture_belt, uploads: None, global_bytes: Vec::new(), staging: Staging::default(), last_color: None, window, submit: None, submit_ended: false, memo: Memo::default(), kept: Kept::default(), compile: Compile::default(), compile_total: Compile::default(), background: false, wait_left: PIPELINE_WAIT, workers: None, finished: Default::default(), disk_cache: None, shader_cache: None, views: Aged::default(), dynamic_max, clip_distances, vulkan, passthrough, raw })
+        Ok(Surfaces { renderable, adapter, device, queue, map: BTreeMap::new(), stamp: 0, touched: BTreeSet::new(), blit: (pipeline, layout), fill, cache: Default::default(), drawn: 0, textures_read: Vec::new(), skipped: BTreeMap::new(), errors, rec, batch: Vec::with_capacity(BATCH), recorder: None, recorder_ended: false, timed, open: None, sets: 0, empty_set: None, present: 0, readbacks: Default::default(), hasher: None, belt, big_upload: false, texture_belt, uploads: None, global_bytes: Vec::new(), staging: Staging::default(), last_color: None, window, submit: None, submit_ended: false, memo: Memo::default(), kept: Kept::default(), compile: Compile::default(), compile_total: Compile::default(), background: false, wait_left: PIPELINE_WAIT, workers: None, finished: Default::default(), disk_cache: None, shader_cache: None, views: Aged::default(), dynamic_max, clip_distances, vulkan, passthrough, raw, runs: BTreeMap::new() })
+    }
+
+    /// `--renderer vulkan` (D110 step 6b): every draw, full clear and fill from now on recorded in
+    /// raw Vulkan, when the device has Vulkan with dynamic rendering (else said on stderr: the game
+    /// draws through wgpu). Before the recorder thread starts and the first target is made.
+    pub fn record_raw(&mut self) -> bool {
+        if self.raw.is_none() {
+            self.raw = crate::raw::RawMode::new(&self.adapter, &self.device, self.vulkan, "all");
+            let raw = self.raw.as_ref().and_then(|_| crate::record::RawRec::new(&self.device));
+            self.rec().raw = raw;
+        }
+        self.all_raw()
+    }
+
+    /// Whether clears and fills are raw too: every draw is (`--renderer vulkan`, `GYROSHIP_RAW=all`).
+    pub(crate) fn all_raw(&self) -> bool {
+        self.raw.as_ref().is_some_and(|m| m.program.is_none())
     }
 
     /// Shows the presented image (the color target written last, its top-left
@@ -1390,6 +1424,9 @@ impl Surfaces {
 
     /// Records `run` into the frame's encoder, in order with the draws.
     pub(crate) fn run(&mut self, run: impl FnOnce(&mut crate::record::Recorder) + Send + 'static) {
+        // Counted by the function the closure is written in (its type's name ends `<fn>::{{closure}}`).
+        let name = std::any::type_name_of_val(&run).trim_end_matches("::{{closure}}");
+        *self.runs.entry(name.rsplit("::").next().unwrap_or(name)).or_default() += 1;
         self.push(crate::record::Rec::Run(Box::new(run)));
     }
 
@@ -2078,7 +2115,11 @@ impl Surfaces {
                 Some(format) => {
                     let view = self.texture(s, format);
                     let [r, g, b, a] = value.map(|v| f64::from(f32::from_bits(v)));
+                    let raw = self.all_raw();
                     self.run(move |rec| {
+                        if raw {
+                            return rec.raw_clear(&view, [r, g, b, a], None, None);
+                        }
                         let mut encoder = rec.encoder();
                         encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                             label: Some("clear"),
@@ -2108,10 +2149,17 @@ impl Surfaces {
                     }
                 }
                 Some(format) => {
+                    let (raw, clear_depth, clear_stencil) = (self.all_raw(), z.map(f32::from_bits), stencil.filter(|_| format.has_stencil_aspect()).map(u32::from));
+                    if raw && clear_depth.is_some_and(|d| !(0.0..=1.0).contains(&d)) {
+                        return self.skip("raw clear: depth value wgpu refuses");
+                    }
                     let view = self.texture(s, format);
                     let depth_ops = Some(wgpu::Operations { load: z.map_or(wgpu::LoadOp::Load, |z| wgpu::LoadOp::Clear(f32::from_bits(z))), store: wgpu::StoreOp::Store });
                     let stencil_ops = format.has_stencil_aspect().then(|| wgpu::Operations { load: stencil.map_or(wgpu::LoadOp::Load, |v| wgpu::LoadOp::Clear(u32::from(v))), store: wgpu::StoreOp::Store });
                     self.run(move |rec| {
+                        if raw {
+                            return rec.raw_clear(&view, [0.0; 4], clear_depth, clear_stencil);
+                        }
                         let mut encoder = rec.encoder();
                         encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                             label: Some("clear"),
@@ -2138,18 +2186,28 @@ impl Surfaces {
         if x >= x1 || y >= y1 {
             return false;
         }
+        let mut bytes: Vec<u8> = color.iter().chain(&[depth, 0.0, 0.0, 0.0]).flat_map(|v| v.to_le_bytes()).collect();
+        bytes.truncate(32);
+        if self.all_raw() {
+            let (targets, depth_stencil) = fill_states(format, fill);
+            return match self.raw.as_mut().map_or_else(|| Err("the raw path is off".to_string()), |m| m.fill((format, fill), &targets, depth_stencil.as_ref())) {
+                Ok(pipeline) => {
+                    let view = self.texture(s, format);
+                    let scissor = [x, y, x1 - x, y1 - y];
+                    self.run(move |rec| rec.raw_fill(&view, &pipeline, &bytes, scissor, u32::from(stencil)));
+                    true
+                }
+                Err(e) => {
+                    self.skip(format!("raw fill: {e}"));
+                    false
+                }
+            };
+        }
         let pipeline = match self.fill.2.get(&(format, fill)) {
             Some(p) => p.clone(),
             None => {
                 let layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&self.fill.1)], ..Default::default() });
-                let (targets, depth_stencil) = match fill {
-                    Fill::Color { mask } => (vec![Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::from_bits_truncate(u32::from(mask)) })], None),
-                    Fill::Depth { depth, stencil } => {
-                        let face = wgpu::StencilFaceState { compare: wgpu::CompareFunction::Always, fail_op: wgpu::StencilOperation::Replace, depth_fail_op: wgpu::StencilOperation::Replace, pass_op: wgpu::StencilOperation::Replace };
-                        let stencil = if stencil { wgpu::StencilState { front: face, back: face, read_mask: 0xff, write_mask: 0xff } } else { Default::default() };
-                        (Vec::new(), Some(wgpu::DepthStencilState { format, depth_write_enabled: Some(depth), depth_compare: Some(wgpu::CompareFunction::Always), stencil, bias: Default::default() }))
-                    }
-                };
+                let (targets, depth_stencil) = fill_states(format, fill);
                 let p = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                     label: Some("fill"),
                     layout: Some(&layout),
@@ -2165,8 +2223,6 @@ impl Surfaces {
                 p
             }
         };
-        let mut bytes: Vec<u8> = color.iter().chain(&[depth, 0.0, 0.0, 0.0]).flat_map(|v| v.to_le_bytes()).collect();
-        bytes.truncate(32);
         let layout = self.fill.1.clone();
         let view = self.texture(s, format);
         self.run(move |rec| {
@@ -2471,44 +2527,59 @@ mod tests {
 
     /// A clear reaches the texture: 4x2 targets in RF16_GF16_BF16_AF16 and in
     /// R16_G16_B16_A16 (the game's violet target) cleared to (0.5, 0, 0.5, 0)
-    /// read back as opaque violet. Needs a GPU adapter.
+    /// read back as opaque violet; through wgpu, then in raw Vulkan (D110 step
+    /// 6b). Needs a GPU adapter.
     #[test]
     fn a_clear_reads_back_as_its_color() {
-        let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
-            eprintln!("no GPU adapter: test skipped");
-            return;
-        };
-        let half = 0.5f32.to_bits();
-        for format in [0xca, 0xc6] {
-            let target = Surface { addr: 0x81_0000_2000, width: 4, height: 2, format, layers: 1 };
-            s.clear(&Clear { layer: 0, color: Some((target, [half, 0, half, 0], 0xf)), depth: None, scissor: None });
-            assert!(s.skipped.is_empty(), "format {format:#x}: {:?}", s.skipped);
-            s.flush();
-            let rgba = s.rgba(&s.map[&(target.addr, target.format)]).unwrap();
-            assert_eq!(rgba.len(), 4 * 2 * 4);
-            assert!(rgba.chunks(4).all(|p| p[0].abs_diff(128) <= 1 && p[1] == 0 && p[2].abs_diff(128) <= 1 && p[3] == 255), "format {format:#x}: {rgba:?}");
+        for raw in [false, true] {
+            let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
+                eprintln!("no GPU adapter: test skipped");
+                return;
+            };
+            if raw && !s.record_raw() {
+                eprintln!("no raw path: the raw half skipped");
+                return;
+            }
+            let half = 0.5f32.to_bits();
+            for format in [0xca, 0xc6] {
+                let target = Surface { addr: 0x81_0000_2000, width: 4, height: 2, format, layers: 1 };
+                s.clear(&Clear { layer: 0, color: Some((target, [half, 0, half, 0], 0xf)), depth: None, scissor: None });
+                assert!(s.skipped.is_empty(), "raw {raw}, format {format:#x}: {:?}", s.skipped);
+                s.flush();
+                let rgba = s.rgba(&s.map[&(target.addr, target.format)]).unwrap();
+                assert_eq!(rgba.len(), 4 * 2 * 4);
+                assert!(rgba.chunks(4).all(|p| p[0].abs_diff(128) <= 1 && p[1] == 0 && p[2].abs_diff(128) <= 1 && p[3] == 255), "raw {raw}, format {format:#x}: {rgba:?}");
+            }
+            assert_eq!(s.runs.get("clear"), Some(&2), "raw {raw}: {:?}", s.runs);
         }
     }
 
     /// A clear bounded by a scissor fills only its rectangle, and a channel
-    /// mask keeps the other channels. Needs a GPU adapter.
+    /// mask keeps the other channels; through wgpu, then in raw Vulkan. Needs a
+    /// GPU adapter.
     #[test]
     fn a_scissored_masked_clear_fills_its_rectangle_only() {
-        let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
-            eprintln!("no GPU adapter: test skipped");
-            return;
-        };
-        let (one, half) = (1f32.to_bits(), 0.5f32.to_bits());
-        let target = Surface { addr: 0x81_0000_4000, width: 4, height: 2, format: 0xd5, layers: 1 };
-        s.clear(&Clear { layer: 0, color: Some((target, [0, 0, one, one], 0xf)), depth: None, scissor: None });
-        // Red only (mask R), on the left half.
-        s.clear(&Clear { layer: 0, color: Some((target, [one, half, 0, one], 0x1)), depth: None, scissor: Some([0, 0, 2, 2]) });
-        assert!(s.skipped.is_empty(), "{:?}", s.skipped);
-        s.flush();
-        let rgba = s.rgba(&s.map[&(target.addr, target.format)]).unwrap();
-        for (i, p) in rgba.chunks(4).enumerate() {
-            let left = i % 4 < 2;
-            assert_eq!(p, if left { [255, 0, 255, 255] } else { [0, 0, 255, 255] }, "pixel {i}: {rgba:?}");
+        for raw in [false, true] {
+            let Ok(mut s) = Surfaces::headless(crate::Backend::Auto) else {
+                eprintln!("no GPU adapter: test skipped");
+                return;
+            };
+            if raw && !s.record_raw() {
+                eprintln!("no raw path: the raw half skipped");
+                return;
+            }
+            let (one, half) = (1f32.to_bits(), 0.5f32.to_bits());
+            let target = Surface { addr: 0x81_0000_4000, width: 4, height: 2, format: 0xd5, layers: 1 };
+            s.clear(&Clear { layer: 0, color: Some((target, [0, 0, one, one], 0xf)), depth: None, scissor: None });
+            // Red only (mask R), on the left half.
+            s.clear(&Clear { layer: 0, color: Some((target, [one, half, 0, one], 0x1)), depth: None, scissor: Some([0, 0, 2, 2]) });
+            assert!(s.skipped.is_empty(), "raw {raw}: {:?}", s.skipped);
+            s.flush();
+            let rgba = s.rgba(&s.map[&(target.addr, target.format)]).unwrap();
+            for (i, p) in rgba.chunks(4).enumerate() {
+                let left = i % 4 < 2;
+                assert_eq!(p, if left { [255, 0, 255, 255] } else { [0, 0, 255, 255] }, "raw {raw}, pixel {i}: {rgba:?}");
+            }
         }
     }
 
@@ -2720,12 +2791,10 @@ mod tests {
             eprintln!("no GPU adapter: test skipped");
             return;
         };
-        s.raw = crate::raw::RawMode::new(&s.adapter, &s.device, s.vulkan, "all");
-        if s.raw.is_none() {
+        if !s.record_raw() {
             eprintln!("no raw path: test skipped");
             return;
         }
-        s.rec().raw = crate::record::RawRec::new(&s.device);
         if threaded {
             s.start_recorder_thread().unwrap();
             assert!(s.recorder.is_some(), "no recorder thread (GYROSHIP_GPU_TIMES set?)");
@@ -2772,7 +2841,7 @@ mod tests {
             let (vm, pm) = (module(&modules[0]), module(&modules[1]));
             let set_layout = m.raw.set_layout(&entries).unwrap();
             let pl = m.raw.pipeline_layout(&[set_layout]).unwrap();
-            let p = m.raw.pipeline(&crate::raw::PipelineDesc { vertex: vm, pixel: Some(pm), buffers: &buffers, primitive: Default::default(), depth_stencil: None, targets: &targets, layout: pl }).unwrap();
+            let p = m.raw.pipeline(&crate::raw::PipelineDesc { vertex: vm, pixel: Some(pm), entries: [c"main", c"main"], buffers: &buffers, primitive: Default::default(), depth_stencil: None, targets: &targets, layout: pl }).unwrap();
             crate::raw::RawPipeline { pipeline: p, layout: pl, sets: smallvec::smallvec![(set_layout, Arc::from(&entries[..]))] }
         };
         // The target cleared, as `texture` clears targets on the raw path.

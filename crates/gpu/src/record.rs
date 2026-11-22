@@ -687,6 +687,94 @@ impl Recorder {
         };
     }
 
+    /// A full clear in the raw segment (every draw raw, D110 step 6b), as wgpu's clear pass: a
+    /// rendering of its own on `view` that clears it ([`crate::raw::clear`]).
+    pub(crate) fn raw_clear(&mut self, view: &wgpu::TextureView, color: [f64; 4], depth: Option<f32>, stencil: Option<u32>) {
+        let format = view.texture().format();
+        let (raw, size) = (raw_view(view), (view.texture().width(), view.texture().height()));
+        self.raw_alone(view, None, |ash, cb| crate::raw::clear(ash, cb, size, raw, format, color, depth, stencil));
+    }
+
+    /// A fill in the raw segment, as wgpu's fill pass: pipeline `p` drawn once over `view` with its
+    /// value (`bytes`, staged; its set freed with the frame), the pass's own viewport, `scissor` and
+    /// `stencil`.
+    pub(crate) fn raw_fill(&mut self, view: &wgpu::TextureView, p: &crate::raw::RawPipeline, bytes: &[u8], scissor: [u32; 4], stencil: u32) {
+        let (buffer, at, range) = self.stage(bytes);
+        let (Some(r), Some((layout, entries))) = (self.raw.as_mut(), p.sets.first()) else { return };
+        let resource = crate::raw::Resource::Buffer(raw_buffer(&mut r.buffers, &buffer), at, range);
+        let set = match r.pools.set(*layout, entries, &[resource]) {
+            Ok(set) => set,
+            Err(e) => {
+                eprintln!("gyroship: {e}");
+                self.lost += 1;
+                return;
+            }
+        };
+        r.keep.sets.push(set);
+        let format = view.texture().format();
+        let depth = format.has_depth_aspect() || format.has_stencil_aspect();
+        let (raw, size) = (raw_view(view), (view.texture().width(), view.texture().height()));
+        let (pipeline, layout) = (p.pipeline, p.layout);
+        self.raw_alone(view, Some(buffer), |ash, cb| {
+            match depth {
+                true => crate::raw::begin_rendering(ash, cb, size, &[], Some((raw, format))),
+                false => crate::raw::begin_rendering(ash, cb, size, &[Some(raw)], None),
+            }
+            crate::raw::viewport(ash, cb, [0.0, 0.0, size.0 as f32, size.1 as f32, 0.0, 1.0]);
+            crate::raw::scissor(ash, cb, scissor);
+            unsafe {
+                ash.cmd_set_stencil_reference(cb, vk::StencilFaceFlags::FRONT_AND_BACK, stencil);
+                ash.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pipeline);
+                ash.cmd_bind_descriptor_sets(cb, vk::PipelineBindPoint::GRAPHICS, layout, 0, &[set.1], &[]);
+                ash.cmd_draw(cb, 3, 1, 0, 0);
+                ash.cmd_end_rendering(cb);
+            }
+        });
+    }
+
+    /// A rendering of its own on `view` in the raw segment (opened if needed), as wgpu's clear
+    /// and fill passes are: the open rendering ends (the next draw begins it again), the texture
+    /// goes to its attachment state and the segment reads `buffer` (an arena's), then `record`.
+    fn raw_alone(&mut self, view: &wgpu::TextureView, buffer: Option<wgpu::Buffer>, record: impl FnOnce(&ash::Device, vk::CommandBuffer)) {
+        self.staging.recordings += 1;
+        self.open_segment();
+        let Some(RawRec { pools, segment: Some(s), keep, .. }) = self.raw.as_mut() else {
+            self.lost += 1;
+            return;
+        };
+        let end = s.rendering.take().is_some_and(|(_, begun)| begun);
+        let t = view.texture();
+        let need = if t.format().has_depth_aspect() || t.format().has_stencil_aspect() { wgpu::TextureUses::DEPTH_STENCIL_WRITE } else { wgpu::TextureUses::COLOR_TARGET };
+        let barrier = match s.states.get_mut(t) {
+            None => {
+                s.states.insert(t.clone(), (t.format(), need, need));
+                None
+            }
+            Some((format, _, now)) if *now != need => Some((raw_image(t), *format, std::mem::replace(now, need), need)),
+            Some(_) => None,
+        };
+        if let Some(b) = buffer
+            && !s.buffers.contains(&b)
+        {
+            s.buffers.push(b);
+        }
+        keep.views.push(view.clone());
+        let ash = &pools.ash;
+        unsafe {
+            s.raw.as_hal_mut::<Vulkan, _, _>(|e| {
+                let Some(e) = e else { return };
+                let cb = e.raw_handle();
+                if end {
+                    ash.cmd_end_rendering(cb);
+                }
+                if let Some((image, format, from, to)) = barrier {
+                    crate::raw::barrier(ash, cb, image, format, from, to);
+                }
+                record(ash, cb);
+            })
+        };
+    }
+
     /// Copies `bytes` (padded to 4) into this frame's upload arena; returns
     /// the buffer and the range they will occupy when the frame is submitted.
     pub(crate) fn stage(&mut self, bytes: &[u8]) -> Slice {
