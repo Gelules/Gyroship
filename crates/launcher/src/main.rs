@@ -211,6 +211,13 @@ fn open_logs(settings: Settings) -> Result<(), String> {
     Command::new("explorer.exe").arg(folder).spawn().map(drop).map_err(|e| e.to_string())
 }
 
+/// The settings' folders that are not there yet, made on the player's click: the data folder's
+/// button, and Set up everything (Play makes them itself).
+#[tauri::command]
+fn make_folders(settings: Settings) -> Result<(), String> {
+    gyroship_launcher::make_folders(&settings)
+}
+
 #[tauri::command]
 fn play(app: AppHandle, settings: Settings) -> Result<(), String> {
     start(&app, settings, false)
@@ -221,6 +228,8 @@ fn play(app: AppHandle, settings: Settings) -> Result<(), String> {
 /// shows no window after a game that ended normally: the launcher ends with it.
 fn start(app: &AppHandle, settings: Settings, shortcut: bool) -> Result<(), String> {
     let busy = app.state::<Busy>();
+    // The data, save and cache folders not there yet, made now.
+    gyroship_launcher::make_folders(&settings)?;
     for (what, path) in [("game build", &settings.build), ("game's exefs folder", &settings.exefs), ("data folder (Setup tab)", &settings.data)] {
         if path.is_empty() {
             return Err(format!("the {what} is not set"));
@@ -406,7 +415,7 @@ fn main() {
                 let _ = window.emit("notice", "A setup step or an update is running: close the window once it ends.");
             }
         })
-        .invoke_handler(tauri::generate_handler![get_settings, set_settings, list_builds, list_layers, check, list_needs, check_update, apply_update, open_release, delete_previous, last_session, open_logs, play, run_step])
+        .invoke_handler(tauri::generate_handler![get_settings, set_settings, list_builds, list_layers, check, list_needs, check_update, apply_update, open_release, delete_previous, last_session, open_logs, make_folders, play, run_step])
         .build(tauri::generate_context!())
         .expect("the launcher could not start");
     app.run(|app, event| {

@@ -774,6 +774,23 @@ pub fn dump_build(exefs: &Path) -> Option<String> {
     (&header[..4] == b"NSO0").then(|| header[0x40..0x54].iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// Makes the settings' folders that are not there yet: the data folder, and the save and shader
+/// cache folders when they are set. On the player's click (the data folder's button, Set up
+/// everything, Play), never while a path is typed, which would make a folder of each typo. Full
+/// paths only, all checked before any is made: a relative one would be made wherever the launcher
+/// runs.
+pub fn make_folders(s: &Settings) -> Result<(), String> {
+    let folders = [("data folder", &s.data), ("save folder", &s.save), ("shader cache folder", &s.cache)];
+    let set: Vec<_> = folders.into_iter().filter(|(_, path)| !path.is_empty()).collect();
+    if let Some((what, path)) = set.iter().find(|(_, path)| !Path::new(path).is_absolute()) {
+        return Err(format!("the {what} is not a full path: {path}"));
+    }
+    for (what, path) in set {
+        fs::create_dir_all(path).map_err(|e| format!("the {what} ({path}) could not be made: {e}"))?;
+    }
+    Ok(())
+}
+
 /// A folder field's problem: not set, not a full path, or not there.
 fn folder_problem(what: &str, value: &str) -> Option<String> {
     let path = Path::new(value);
@@ -802,7 +819,14 @@ pub fn checks(s: &Settings) -> Checks {
     // last recompile, yet older than it, still shows.
     let harness = PathBuf::from_iter([s.repo.as_str(), "generated", "game", "harness", "src", "main.rs"]);
     let probed = s.probes.is_empty() || (repo.is_none() && fs::read_to_string(harness).is_ok_and(|h| h.contains("trace:")));
-    let mut setup: Vec<String> = [repo.clone(), folder_problem("Data folder", &s.data)].into_iter().flatten().collect();
+    // The data folder is made when the launcher first needs it (`make_folders`): only a path not
+    // set, or not a full one, is a problem.
+    let data = match s.data.as_str() {
+        "" => Some("Data folder: not set".to_string()),
+        d if !Path::new(d).is_absolute() => Some("Data folder: not a full path".to_string()),
+        _ => None,
+    };
+    let mut setup: Vec<String> = [repo.clone(), data].into_iter().flatten().collect();
     let folders = setup.is_empty();
     if builds(s).is_empty() {
         setup.push("No game build yet: recompile the game, then build it".into());

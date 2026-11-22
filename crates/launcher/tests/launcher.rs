@@ -221,7 +221,9 @@ fn checks_say_what_the_setup_and_the_dump_lack() {
     let text = |p: &Path| p.to_string_lossy().into_owned();
     let s = Settings { repo: text(&repo), data: text(&data), exefs: text(&dump.join("exefs")), ..Settings::default() };
     let c = checks(&s);
-    assert_eq!(c.setup, ["Repository: folder not found", "Data folder: folder not found", "No game build yet: recompile the game, then build it"]);
+    // A data folder not there yet is no problem: the launcher makes it (`make_folders`).
+    assert_eq!(c.setup, ["Repository: folder not found", "No game build yet: recompile the game, then build it"]);
+    assert_eq!(checks(&Settings { data: "data".into(), ..s.clone() }).setup[1], "Data folder: not a full path");
     assert_eq!(c.exefs.as_deref(), Some("Your game's exefs folder: folder not found"));
     for folder in ["target/release", "generated/game/target/release"] {
         fs::create_dir_all(repo.join(folder)).unwrap();
@@ -277,6 +279,22 @@ fn checks_say_what_the_setup_and_the_dump_lack() {
     assert_eq!(checks(&s).dump, None);
     assert!(checks(&s).exefs.unwrap().contains("no main module"));
     assert_eq!(checks(&Settings { repo: "repo".into(), ..s }).setup[0], "Repository: not a full path");
+}
+
+/// The folders the player set and that are not there yet: made, the data folder first; a
+/// relative one refused, before anything is made.
+#[test]
+fn the_folders_not_there_yet_are_made() {
+    let dir = scratch("folders");
+    let (data, save, cache) = (at(&dir, "new/data"), at(&dir, "new/data/save"), at(&dir, "elsewhere/cache"));
+    let s = Settings { data: text(&data), save: text(&save), cache: text(&cache), ..Settings::default() };
+    gyroship_launcher::make_folders(&s).unwrap();
+    assert!(data.is_dir() && save.is_dir() && cache.is_dir());
+    gyroship_launcher::make_folders(&s).unwrap();
+    gyroship_launcher::make_folders(&Settings::default()).unwrap();
+    let relative = Settings { data: text(&dir.join("other")), save: "save".into(), ..Settings::default() };
+    assert!(gyroship_launcher::make_folders(&relative).unwrap_err().contains("the save folder is not a full path"));
+    assert!(!dir.join("other").exists(), "nothing made");
 }
 
 /// The tools: the repository's own build, else a release's at its top, else those downloaded next

@@ -136,7 +136,9 @@ the bottom of Play says so.
   first that fails or stays undone; it waits for both folders and for the exefs folder set in Play.
   One by one:
   1. the two folders, with a button that sets the empty Save and Shader cache folders to
-     `<data folder>\save` and `<data folder>\pipeline-cache`;
+     `<data folder>\save` and `<data folder>\pipeline-cache`. The data, save and cache folders not
+     there yet are made on that button's click, on Set up everything's and at Play, never while a
+     path is typed;
   2. what building and playing need: Rust 1.97 or later, Microsoft's C++ build tools and the
      Visual C++ runtime, each found without the network (Cargo's version, `vswhere`, the runtime's
      DLL) and, when missing, installed on your click through winget, Windows' package manager

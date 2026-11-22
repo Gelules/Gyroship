@@ -29,8 +29,8 @@ function follow() {
   $('hooks-note').hidden = !settings.hooks;
   const data = (settings.data || '').replace(/[\\/]+$/, '');
   $('usual-note').textContent = data
-    ? `Sets the empty Save folder to ${data}\\save and the empty Shader cache folder to ${data}\\pipeline-cache.`
-    : 'Sets the empty Save and Shader cache folders inside the data folder.';
+    ? `Sets the empty Save folder to ${data}\\save and the empty Shader cache folder to ${data}\\pipeline-cache, and makes the folders not there yet.`
+    : 'Sets the empty Save and Shader cache folders inside the data folder, and makes the folders not there yet.';
 }
 
 // True when the settings reached their file; the player is told when they did not.
@@ -150,7 +150,10 @@ async function usual() {
   const defaults = { save: under('save'), cache: under('pipeline-cache') };
   for (const [key, value] of Object.entries(defaults)) if (!settings[key]) settings[key] = value;
   show();
-  if (await save()) await Promise.all([refreshBuilds(), refreshLayers(), refreshChecks()]);
+  if (!(await save())) return;
+  // The data, save and cache folders not there yet, made now: the player asked for them.
+  await invoke('make_folders', { settings }).catch(notice);
+  await Promise.all([refreshBuilds(), refreshLayers(), refreshChecks()]);
 }
 
 async function lastSession() {
@@ -388,7 +391,9 @@ async function main() {
     await play();
   });
   for (const b of document.querySelectorAll('[data-step]')) b.addEventListener('click', () => runStep(b.dataset.step));
-  $('setup-all').addEventListener('click', () => {
+  $('setup-all').addEventListener('click', async () => {
+    // The data folder and those set inside it, made first when they are not there yet.
+    await invoke('make_folders', { settings }).catch(notice);
     all = [];
     setupNext(0);
   });
