@@ -16,6 +16,10 @@ gyroship-runtime = { version = "0.1.0", path = "../runtime" }
 gyroship-research = { version = "0.1.0", path = "../research" }
 gyroship-practice = { version = "0.1.0", path = "../practice" }
 memchr = "2"
+# The mods' builder (D113): the entries' JSON, read with its keys in their order, as the Python
+# scripts it was ported from read it.
+serde = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 # The Vulkan probe (vk-probe, D110): wgpu-hal's own ash, and naga's SPIR-V writer.
 ash = "=0.38.0"
 naga = { version = "30", features = ["wgsl-in", "spv-out"] }

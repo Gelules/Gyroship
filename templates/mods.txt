@@ -1,0 +1,49 @@
+# Gyroship mods, ready for the game's update that Gyroship targets: main's build ID
+# a7730d0f74d168d90422354c8317f76ff78ad938. The values read in the game that
+# `gyroship-tools mods <exefs> --out <folder>` needs to build the mods' layers from your own dump
+# (the launcher's Setup does it: Build the mods). No file of the game is here or in a release:
+# each player's layers are made from their own copy. Another build has other values.
+#
+# One "key value..." per line; a comment is a whole line that starts with #. The code that uses
+# each key is in crates/tools/src/mods/.
+
+# QUIT GAME's string: the menus' string table (a data.zip entry), and the string cloned for it.
+quit.strings 5139d98edd181587
+quit.template PAUSE_MENU_QUIT
+
+# QUIT GAME in the pause menu: the pause prefab's two QUIT confirmations (the single-player one,
+# and the one the mouse-mode tutorial opens), which instance the confirmation level and its
+# script; the four overrides their third button takes, as the game's own confirmations with three
+# buttons have them; button 1's signal, whose target (the pause menu's script) quits.
+quit.pause 1908883b1b2e6826
+quit.instances tutorial_quit_confirmation tutorial_mouse_targeting_quit_confirmation
+quit.confirm_level 2e28028d-50a7-11ee-9484-5ed8aab988d3
+quit.menu_script 6379b935-6cf6-11ee-b0b9-5ed821ef69d3
+quit.menu_script_suffix .confirmation_menu.confirmation_menu.vscript
+quit.fields use_button_03 button_03_loc_text _button_03_sound_level button_03_signal
+quit.override_vtable 00000001-0000-0000-1c9d-d96cfbdace5f
+quit.signal_vtable 00000001-0000-0000-db5e-e6e51ef75720
+quit.sound_level 6b6e52e4-6232-11ef-8466-5ed821ef69d3
+quit.button1_signal button_01_signal
+quit.pause_script pause_menu.pause_menu.vscript
+quit.event exit_clicked
+
+# QUIT GAME in the title menu: the main menu level, whose store-demo purchase line, under
+# TRAINING, becomes QUIT GAME (its label, its number 05 made 06, its click event, its filter);
+# then the lines' container and the three boxes drawn behind the menu, taller by one line (a line
+# of 51 and the 9.67 between two lines).
+title.level ec379152dfaf3282
+title.before training_button_prefab
+title.line eshop_purchase_button_prefab
+title.old_text ff31bef0-c807-11ef-a43b-24bc7e377711
+title.num_05 0981fca4-2198-11ee-98de-d800c63bd261
+title.num_06 098204eb-2198-11ee-98de-d800c63bd261
+title.old_event handle_purchase_game
+title.new_event handle_meteo
+title.filter eclipse.eshop_demo
+title.height 60.666666984558105
+title.container Lower_Buttons_Container
+title.behind Bottom_Menu_Frame Lower_Menu_BG_Contrast Glow_BL
+
+# The mission timer: the build setting veclipse_build.cvar turns on.
+timer.cvar eclipse.hud_show_mission_timer
