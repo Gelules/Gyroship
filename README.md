@@ -20,7 +20,7 @@ from your dump stays yours alone. It is for practice: official runs are done on 
 | | |
 |---|---|
 | 🎯 **Speedrun practice** | Perfect boost release, infinite boost, speed and release markers on screen, the level time to the millisecond |
-| 🧩 **Mods** | Another vehicle in a mission, QUIT GAME, the game's mission timer, the eShop demo's lines, a shortcut to the tutorial's mouse lesson |
+| 🧩 **Mods** | Another vehicle in a mission, QUIT GAME, the game's mission timer |
 | 🛠️ **The developers' debug menu** | Mission select, and the shield, wings, bombs, lives and laser cheats, with any mod |
 | 🎮 **Switch 2 Joy-Con** | Straight over Bluetooth, no pairing in Windows: hold sync and play |
 | 🖱️ **Mouse controls** | Each Joy-Con becomes the mouse the game expects, as on the console |
@@ -53,8 +53,6 @@ own code, with the numbers to prove it.
   theirs.
 - **QUIT GAME**, in the title menu and in the pause menu.
 - **The game's mission timer** on screen, to the millisecond.
-- **The eShop demo's menu lines** in the full game.
-- **The tutorial's mouse lesson in a minute or two**, to practise the mouse controls.
 
 The launcher's Setup builds them from your own copy of the game, in a few seconds: nothing of the
 game comes with Gyroship. Pick a mod in the launcher and play; with the debug menu box ticked, the
@@ -104,7 +102,7 @@ card, 16 GB of RAM, and your own dump of the game with its update. What building
 (Rust, Microsoft's C++ build tools, the Visual C++ runtime), the launcher installs on your click
 when it is missing. Here is one install from zero, on drive G:; any folders will do.
 
-**Prefer a video?** [Watch the full install guide on YouTube](https://www.youtube.com/watch?v=xkPR-b5stLo): the
+**Prefer a video?** [Watch the full install guide on YouTube](https://youtu.be/QWNV7FDtKxw): the
 same steps, from zero to playing.
 
 1. **Get the sources.** From the
